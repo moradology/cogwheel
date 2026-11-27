@@ -22,32 +22,36 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
 mod algorithm_math;
+mod algorithm_params;
+mod pgstac;
 mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
 mod paint;
 mod html;
-#[allow(dead_code)]
 pub(crate) mod pixel_selection;
+mod cql2_text;
+mod point_expr;
+mod zonal;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
 use crate::engine::{BandRequest, EngineError, TileEngine, TileRequest};
 use self::paint::Paint;
 use self::pixel_selection::{Fold, Selected, Selection};
 use crate::stac::{
-    get_colormap_image, get_colormap_json, get_tms_json, list_colormaps_json, list_tms_json,
-    load_stac_item, resolve_stac_assets,
+    StacItem, StacSource, get_colormap_image, get_colormap_json, get_tms_json,
+    list_colormaps_json, list_tms_json, resolve_stac_assets,
 };
 use crate::titiler::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, build_wmts_capabilities_multi,
-    compute_f32_band_stats,
+    compute_f32_band_stats, compute_f32_band_stats_with_engine,
     compute_statistics_with_options,
     encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
     get_algorithm_json,
     list_algorithms_json, native_bbox_dims_in_crs, query_point,
     render_crs_bbox, render_mercator_bbox, render_multi_asset_bbox, render_native_preview,
-    render_wgs84_bbox,
+    render_native_preview_stats, render_wgs84_bbox, render_wgs84_bbox_stats,
 };
 
 fn percent_decode(input: &str) -> String {
@@ -328,6 +332,12 @@ struct ParsedQuery {
     contour_minz: f32,
     contour_maxz: f32,
     cast_dtype: Option<String>,
+    /// `algorithm_params` as given, when it is a JSON object.
+    algorithm_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What TiTiler's model of the algorithm says of its parameters, which it answers `400`.
+    algorithm_error: Option<String>,
+    /// `algorithm_params` as given when it is not JSON, which FastAPI answers `422`.
+    algorithm_params_unread: Option<String>,
     colormap_explicit: bool,
     colormap_name_set: bool,
     colormap_type_linear: bool,
@@ -337,6 +347,16 @@ struct ParsedQuery {
     keys: Vec<String>,
     /// Values that could not be parsed or name something unsupported.
     errors: Vec<String>,
+}
+
+impl ParsedQuery {
+    fn parse_color_formula(&self) -> Result<Option<ColorFormula>, EngineError> {
+        self.color_formula
+            .as_deref()
+            .map(ColorFormula::parse)
+            .transpose()
+            .map_err(EngineError::BadRequest)
+    }
 }
 
 fn parse_bool_param(v: &str) -> Option<bool> {
@@ -407,6 +427,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         contour_minz: -12000.0,
         contour_maxz: 8000.0,
         cast_dtype: None,
+        algorithm_params: None,
+        algorithm_error: None,
+        algorithm_params_unread: None,
         colormap_explicit: false,
         colormap_name_set: false,
         colormap_type_linear: false,
@@ -530,42 +553,24 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 let dec = percent_decode(v);
                 match serde_json::from_str::<serde_json::Value>(&dec) {
                     Ok(serde_json::Value::Object(obj)) => {
-                        if let Some(val) = obj.get("azimuth") {
-                            match val.as_f64().map(|a| a as f32) {
-                                Some(a) if a.is_finite() => {
-                                    // TiTiler's HillShade uses a 90°-rotated azimuth convention
-                                    // (default 45° == compass 315°); convert to compass degrees
-                                    // while preserving cogzilla's native `?azimuth=` compass param.
-                                    pq.azimuth = (a - 90.0).rem_euclid(360.0);
-                                }
-                                _ => bad("azimuth must be a finite number"),
-                            }
+                        // Read as pydantic's lax mode reads them (`"45"`, `true`); what the
+                        // algorithm's model refuses is answered once the algorithm is known
+                        // (`algorithm_error`), and a value refused here is not taken.
+                        let number = |key: &str| algorithm_params::number(&obj, key).filter(|x| x.is_finite());
+                        if let Some(a) = number("azimuth") {
+                            // TiTiler's HillShade uses a 90°-rotated azimuth convention
+                            // (default 45° == compass 315°); convert to compass degrees
+                            // while preserving cogzilla's native `?azimuth=` compass param.
+                            pq.azimuth = (a as f32 - 90.0).rem_euclid(360.0);
                         }
-                        if let Some(val) = obj
-                            .get("angle_altitude")
-                            .or_else(|| obj.get("altitude"))
-                            .or_else(|| obj.get("angle"))
-                        {
-                            match val.as_f64().map(|a| a as f32) {
-                                Some(a) if a.is_finite() => pq.altitude = a.clamp(0.0, 90.0),
-                                _ => bad("altitude must be a finite number"),
-                            }
+                        if let Some(a) = number("angle_altitude").or_else(|| number("altitude")).or_else(|| number("angle")) {
+                            pq.altitude = (a as f32).clamp(-90.0, 90.0);
                         }
-                        if let Some(val) = obj
-                            .get("z_exaggeration")
-                            .or_else(|| obj.get("z_factor"))
-                            .or_else(|| obj.get("zfactor"))
-                        {
-                            match val.as_f64().map(|z| z as f32) {
-                                Some(z) if z.is_finite() => pq.z_factor = z.max(1e-4),
-                                _ => bad("z_factor must be a finite number"),
-                            }
+                        if let Some(z) = number("z_exaggeration").or_else(|| number("z_factor")).or_else(|| number("zfactor")) {
+                            pq.z_factor = (z as f32).max(1e-4);
                         }
-                        if let Some(val) = obj.get("threshold") {
-                            match val.as_f64().map(|t| t as f32) {
-                                Some(t) if t.is_finite() => pq.threshold = t,
-                                _ => bad("threshold must be a finite number"),
-                            }
+                        if let Some(t) = number("threshold") {
+                            pq.threshold = t as f32;
                         }
                         if let Some(val) = obj.get("dtype") {
                             match val.as_str() {
@@ -573,40 +578,27 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                                 None => bad("dtype must be a string"),
                             }
                         }
-                        if let Some(val) = obj.get("increment") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(x) if x.is_finite() && x > 0.0 => pq.contour_increment = x,
-                                _ => bad("increment must be a positive finite number"),
-                            }
+                        if let Some(x) = number("increment").filter(|x| *x > 0.0) {
+                            pq.contour_increment = x as f32;
                         }
-                        if let Some(val) = obj.get("thickness") {
-                            match val.as_u64() {
-                                Some(t) if (1..=16).contains(&t) => pq.contour_thickness = t as u32,
-                                _ => bad("thickness must be an integer in 1..=16"),
-                            }
+                        if let Some(t) = number("thickness").filter(|t| (0.0..=10.0).contains(t)) {
+                            pq.contour_thickness = t as u32;
                         }
-                        if let Some(val) = obj.get("minz") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(x) if x.is_finite() => pq.contour_minz = x,
-                                _ => bad("minz must be a finite number"),
-                            }
+                        if let Some(x) = number("minz") {
+                            pq.contour_minz = x as f32;
                         }
-                        if let Some(val) = obj.get("buffer") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(b) if b.is_finite() && (0.0..=99.0).contains(&b) => {
-                                    pq.alg_buffer = Some(b);
-                                }
-                                _ => bad("buffer must be a number in 0..=99"),
-                            }
+                        if let Some(b) = number("buffer").filter(|b| (0.0..=99.0).contains(b)) {
+                            pq.alg_buffer = Some(b as f32);
                         }
-                        if let Some(val) = obj.get("maxz") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(x) if x.is_finite() => pq.contour_maxz = x,
-                                _ => bad("maxz must be a finite number"),
-                            }
+                        if let Some(x) = number("maxz") {
+                            pq.contour_maxz = x as f32;
                         }
+                        pq.algorithm_params = Some(obj);
                     }
-                    _ => bad("expected a JSON object"),
+                    // Not a mapping: TiTiler fails with a 500 there, and a 400 says why here.
+                    Ok(_) => pq.algorithm_error = Some("algorithm_params should be a JSON object".into()),
+                    // Answered only where an algorithm is applied, as FastAPI's dependency is.
+                    Err(_) => pq.algorithm_params_unread = Some(dec.clone()),
                 }
             }
             "azimuth" => {
@@ -622,7 +614,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 if let Ok(a) = v.parse::<f32>()
                     && a.is_finite()
                 {
-                    pq.altitude = a.clamp(0.0, 90.0);
+                    pq.altitude = a.clamp(-90.0, 90.0);
                 } else {
                     bad("expected a finite number");
                 }
@@ -1004,24 +996,25 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     if pq.colormap_name_set {
         pq.custom_colormap_json = None;
     }
-    // TiTiler HillShade (default buffer 3) and Slope/Aspect (default buffer 0) crop
-    // `algorithm_params.buffer` back out of the buffered input tile; since cogzilla's Horn 3×3
-    // already fetches its own neighbor halo seamlessly, subtract that crop from `pq.buffer`
-    // so `?algorithm=hillshade&buffer=3` outputs 256×256 while `?algorithm=slope&buffer=3`
-    // keeps the requested 262×262 unless `algorithm_params.buffer` is explicitly set.
+    // TiTiler's HillShade and Slope (default buffer 3) crop `algorithm_params.buffer` back out
+    // of the buffered input tile; since cogzilla's stencil already fetches its own neighbour
+    // halo seamlessly, subtract that crop from `pq.buffer` so `?algorithm=hillshade&buffer=3`
+    // and `?algorithm=slope&buffer=3` are 256×256, as there. Aspect (cogzilla's own) crops none.
     if pq.buffer > 0.0
         && let Some(alg) = pq.algorithm.as_deref()
         && (alg.eq_ignore_ascii_case("hillshade")
             || alg.eq_ignore_ascii_case("slope")
             || alg.eq_ignore_ascii_case("aspect"))
     {
-        let default_crop = if alg.eq_ignore_ascii_case("hillshade") {
-            3.0
-        } else {
-            0.0
-        };
+        let default_crop = if alg.eq_ignore_ascii_case("aspect") { 0.0 } else { 3.0 };
         let crop = pq.alg_buffer.unwrap_or(default_crop).min(pq.buffer);
         pq.buffer = (pq.buffer - crop).max(0.0);
+    }
+    match (pq.algorithm.as_deref(), pq.algorithm_params.as_ref()) {
+        (Some(alg), Some(params)) => pq.algorithm_error = algorithm_params::check(alg, params).err(),
+        // Without an algorithm its parameters are not read, whatever they are.
+        (None, _) => pq.algorithm_error = None,
+        _ => {}
     }
     pq.errors = pq_errors;
     pq
@@ -1095,6 +1088,18 @@ fn route_supports_pixel_selection(segs: &[&str]) -> bool {
         | ["mosaicjson", "tilejson.json" | "map.html" | "WMTSCapabilities.xml"] => true,
         _ => false,
     }
+}
+
+/// Whether a route applies `algorithm`, as TiTiler's do that take its post-processing:
+/// tiles and what points at them, pictures of a box, a feature or the whole, statistics.
+fn route_applies_algorithm(segs: &[&str]) -> bool {
+    if !matches!(segs.first(), Some(&("cog" | "stac" | "mosaicjson"))) {
+        return false;
+    }
+    let named = |route: &str| segs.get(1).is_some_and(|s| *s == route || s.strip_prefix(route).is_some_and(|ext| ext.starts_with('.')));
+    matches!(segs.last(), Some(&("tilejson.json" | "map.html" | "WMTSCapabilities.xml")))
+        || (segs.get(1) == Some(&"tiles") && segs.len() > 3)
+        || ["preview", "bbox", "feature", "statistics"].iter().any(|r| named(r))
 }
 
 fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
@@ -2195,7 +2200,7 @@ fn array_asked(pq: &ParsedQuery, last: Option<&&str>) -> Option<ArrayAsked> {
         return Some(ArrayAsked::Typed(rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask));
     }
     let npy = last.is_some_and(|last| last.ends_with(".npy")) || pq.format_param.as_deref() == Some("npy");
-    let shown = npy && array_type::shown(pq) && pq.algorithm.is_none();
+    let shown = npy && array_type::shown(pq);
     shown.then(|| ArrayAsked::Shown(Box::new(pq.clone())))
 }
 
@@ -2413,16 +2418,19 @@ async fn cog_tile_in_its_type(
     Ok((cog_array_in_its_type(engine, asked, urls, data).await, ct))
 }
 
-/// A rendered `/stac` tile, its array in its type: what the tile cache keeps.
+/// A rendered `/stac` tile, its array in its type: what the tile cache keeps. The item is
+/// the one the tile was drawn from, named by `url` or read from pgSTAC.
 async fn stac_tile_in_its_type(
     engine: &TileEngine,
     asked: Option<ArrayAsked>,
-    url: Option<String>,
+    source: StacSource,
     rendered: impl std::future::Future<Output = Result<(Bytes, &'static str), EngineError>>,
 ) -> Result<(Bytes, &'static str), EngineError> {
     let (data, ct) = rendered.await?;
-    let Some(url) = url.filter(|_| asked.is_some() && may_be_f32_array(&data)) else { return Ok((data, ct)) };
-    match load_stac_item(&engine.stac_cache, &engine.store, &url).await {
+    if asked.is_none() || !may_be_f32_array(&data) {
+        return Ok((data, ct));
+    }
+    match source.load(engine).await {
         Ok(item) => Ok((stac_array_in_its_type(engine, asked, &item, data).await, ct)),
         Err(_) => Ok((data, ct)),
     }
@@ -3830,37 +3838,90 @@ async fn render_mosaic_tile_pixel_selection(
     {
         return Err(err);
     }
-    let selected = fold.and_then(Fold::finish).unwrap_or_else(|| {
-        let bands = default_raw_band_count(&treq.bands, method);
-        Selected { bands, values: vec![f32::NAN; bands * n_px] }
-    });
+    #[cfg(feature = "gpu")]
+    let gpu_selected: Option<Selected<f32>> = if let Some(ref gpu) = engine.gpu
+        && let Some(ref f) = fold
+        && let Some((nb, scenes)) = f.median_scenes()
+        && scenes.len() <= 32
+    {
+        let band_planes: Vec<Vec<&[f32]>> = (0..nb)
+            .map(|b| {
+                let b_off = b * n_px;
+                scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect()
+            })
+            .collect();
+        gpu.try_composite_mosaic_f32_bands(
+            out_dim,
+            out_dim,
+            &band_planes,
+            cogzilla_gpu::GpuPixelSelection::Median,
+        )
+        .map(|gpu_bands| {
+            engine
+                .stats
+                .gpu_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut values = Vec::with_capacity(nb * n_px);
+            for band_out in gpu_bands {
+                values.extend_from_slice(&band_out);
+            }
+            Selected { bands: nb, values }
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_selected: Option<Selected<f32>> = None;
 
-    if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
-        let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
-        for v in &selected.values {
-            out.extend_from_slice(&v.to_le_bytes());
+    let offload_cpu = gpu_selected.is_none()
+        && fold.is_some()
+        && n_px >= 256 * 256
+        && (matches!(method, Selection::Median) || n_px >= 512 * 512);
+    crate::engine::block_in_place_if_multithread(offload_cpu, || {
+        let selected = gpu_selected
+            .or_else(|| fold.and_then(Fold::finish))
+            .unwrap_or_else(|| {
+                let bands = default_raw_band_count(&treq.bands, method);
+                Selected { bands, values: vec![f32::NAN; bands * n_px] }
+            });
+
+        if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+            let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
+            for v in &selected.values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            let raw = out.freeze();
+            if matches!(treq.format, OutputFormat::Npy) {
+                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                    raw,
+                    selected.bands,
+                    out_dim,
+                    out_dim,
+                    pq.return_mask,
+                ));
+            }
+            return Ok(raw);
         }
-        let raw = out.freeze();
-        if matches!(treq.format, OutputFormat::Npy) {
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                raw,
-                selected.bands,
-                out_dim,
-                out_dim,
+
+        let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
+        #[cfg(feature = "gpu")]
+        if let Some(ref gpu) = engine.gpu {
+            return Ok(gpu.encode_rgba_output(
+                out_dim as usize,
+                out_dim as usize,
+                &rgba,
+                treq.format,
                 pq.return_mask,
             ));
         }
-        return Ok(raw);
-    }
-
-    let rgba = paint_selected(selected, n_px, &treq.bands, pq, first_lut.as_ref())?;
-    Ok(encode_rgba_output(
-        out_dim as usize,
-        out_dim as usize,
-        &rgba,
-        treq.format,
-        pq.return_mask,
-    ))
+        Ok(encode_rgba_output(
+            out_dim as usize,
+            out_dim as usize,
+            &rgba,
+            treq.format,
+            pq.return_mask,
+        ))
+    })
 }
 
 /// The picture of what a pixel selection left: `pixels` RGBA pixels, by the rules in
@@ -3876,12 +3937,7 @@ fn paint_selected(
     pq: &ParsedQuery,
     custom: Option<&CustomColormap>,
 ) -> Result<Vec<u8>, EngineError> {
-    let formula = pq
-        .color_formula
-        .as_deref()
-        .map(ColorFormula::parse)
-        .transpose()
-        .map_err(EngineError::BadRequest)?;
+    let formula = pq.parse_color_formula()?;
     let three = selected.bands >= 3;
     // The request's own ranges and colour map where it has them for this many bands;
     // otherwise bytes as they are.
@@ -4110,12 +4166,7 @@ async fn render_mosaic_tile_styled(
             }
             return Ok(raw);
         }
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+        let cf = pq.parse_color_formula()?;
         let mut comp = vec![0u8; n_px * 4];
         let mut filled = 0usize;
         let mut any_ok = false;
@@ -4208,12 +4259,7 @@ async fn render_mosaic_tile_styled(
     if (pq.color_formula.is_some() || !pq.return_mask)
         && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
     {
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+        let cf = pq.parse_color_formula()?;
         let orig_format = treq.format;
         treq.format = OutputFormat::RawRgba;
         let (raw, failed) = engine.render_mosaic_tile_with_report(urls, &treq).await?;
@@ -4539,12 +4585,7 @@ async fn render_mosaic_bbox_composite(
         if first_lut.is_none() && custom_lut.is_some() {
             first_lut = custom_lut.clone();
         }
-        let cf = pq
-            .color_formula
-            .as_deref()
-            .map(ColorFormula::parse)
-            .transpose()
-            .map_err(EngineError::BadRequest)?;
+        let cf = pq.parse_color_formula()?;
         let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), epsg);
         if urls.len() == 1 && method == Selection::First {
             let d = render_crs_bbox(
@@ -4780,6 +4821,13 @@ async fn render_mosaic_bbox_composite(
         ));
     }
     let acc = acc_rgba.unwrap_or_else(|| vec![0u8; total_px * 4]);
+    #[cfg(feature = "gpu")]
+    let data = if let Some(gpu) = engine.gpu.as_ref() {
+        gpu.encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
+    } else {
+        encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask)
+    };
+    #[cfg(not(feature = "gpu"))]
     let data = encode_rgba_output(out_w as usize, out_h as usize, &acc, final_fmt, pq.return_mask);
     Ok((
         wrap_geotiff_fmt(
@@ -5489,6 +5537,38 @@ where
     let is_post = *req.method() == Method::POST;
     let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
     let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics" | "/stats");
+    let is_control_plane = is_health_or_metrics
+        || matches!(
+            req.uri().path(),
+            "/admin/clear-cache" | "/searches" | "/searches/list" | "/searches/register"
+        );
+    let bypass_aimd = is_control_plane || *req.method() == Method::OPTIONS;
+    let mut aimd_permit = if bypass_aimd {
+        None
+    } else {
+        match engine.aimd.try_acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let body = if is_head {
+                    Bytes::new()
+                } else {
+                    Bytes::from_static(br#"{"detail":"server overloaded; retry shortly"}"#)
+                };
+                let mut resp = plain_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    body,
+                    "application/json",
+                );
+                resp.headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                if let Ok(hv) = HeaderValue::from_str(&engine.aimd.current_limit().to_string()) {
+                    resp.headers_mut()
+                        .insert(HeaderName::from_static("x-cogzilla-aimd-limit"), hv);
+                }
+                return Ok(resp);
+            }
+        }
+    };
     let accepts_gzip = req
         .headers()
         .get(hyper::header::ACCEPT_ENCODING)
@@ -5513,7 +5593,7 @@ where
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
     }
-    let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
+    let mut resp = Box::pin(handle_request_inner(engine.clone(), req, is_head)).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
     {
@@ -5522,9 +5602,18 @@ where
         *retry_req.method_mut() = m;
         *retry_req.uri_mut() = u;
         *retry_req.headers_mut() = h;
-        resp = handle_request_inner(engine, retry_req, is_head).await?;
+        resp = Box::pin(handle_request_inner(engine.clone(), retry_req, is_head)).await?;
         resp.headers_mut().remove("x-cogzilla-retry");
     }
+    if let Some(permit) = aimd_permit.as_mut()
+        && (resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status() == StatusCode::NOT_MODIFIED
+            || resp.status() == StatusCode::NO_CONTENT)
+    {
+        permit.ignore_rtt();
+    }
+    drop(aimd_permit);
     if let Some((path, query)) = as_page
         && resp.status() == StatusCode::OK
         && resp
@@ -5703,6 +5792,11 @@ where
     let if_none_match = if is_post { None } else { if_none_match };
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
+    let raw_query = if path.starts_with("/searches/") || path.starts_with("/collections/") {
+        pgstac::plain_numbers(&raw_query)
+    } else {
+        raw_query
+    };
 
     if method == Method::OPTIONS {
         let mut resp = plain_resp(StatusCode::NO_CONTENT, Bytes::new(), "text/plain");
@@ -5808,11 +5902,16 @@ where
         } else {
             "application/json"
         };
-        return Ok(plain_resp(
-            StatusCode::OK,
-            crate::openapi::openapi_json_bytes(),
-            ct,
-        ));
+        // The shared document, with the pgSTAC routes' paths beside its own.
+        let mut body = crate::openapi::openapi_json_bytes();
+        if let Ok(mut spec) = serde_json::from_slice::<serde_json::Value>(&body)
+            && let (Some(paths), serde_json::Value::Object(extra)) =
+                (spec["paths"].as_object_mut(), pgstac::openapi_paths())
+        {
+            paths.extend(extra);
+            body = Bytes::from(spec.to_string());
+        }
+        return Ok(plain_resp(StatusCode::OK, body, ct));
     }
 
     if method == Method::GET && (path == "/docs" || path == "/api.html") {
@@ -5848,6 +5947,42 @@ where
                 "read_errors": s.read_errors,
             })
         });
+        #[cfg(feature = "gpu")]
+        let gpu_stats = engine.gpu.as_ref().map(|gpu| {
+            let s = gpu.slab_cache.stats();
+            let ms = gpu.multi_slab_cache.stats();
+            serde_json::json!({
+                "dispatches": engine.stats.gpu_dispatches.load(Ordering::Relaxed),
+                "in_flight": gpu.in_flight(),
+                "slab_cache": {
+                    "hits": s.hits,
+                    "misses": s.misses,
+                    "bytes_used": s.used_bytes,
+                    "max_bytes": s.max_bytes,
+                },
+                "multi_slab_cache": {
+                    "hits": ms.hits,
+                    "misses": ms.misses,
+                    "bytes_used": ms.used_bytes,
+                    "max_bytes": ms.max_bytes,
+                },
+            })
+        });
+        #[cfg(not(feature = "gpu"))]
+        let gpu_stats: Option<serde_json::Value> = None;
+        let pgstac_stats = engine.pgstac().map(|pg| {
+            let s = pg.stats();
+            serde_json::json!({
+                "pool_size": s.pool_size,
+                "pool_available": s.pool_available,
+                "pool_waiting": s.pool_waiting,
+                "cache_items": s.cache_items,
+                "cache_searches": s.cache_searches,
+                "cache_collections": s.cache_collections,
+                "cache_item_docs": s.cache_item_docs,
+                "cache_plans": s.cache_plans,
+            })
+        });
         let body = serde_json::json!({
             "tiles_served": engine.stats.tiles_served.load(Ordering::Relaxed),
             "empty_short_circuits": engine.stats.empty_short_circuits.load(Ordering::Relaxed),
@@ -5867,6 +6002,8 @@ where
             "remote_range_requests": engine.store.metrics.remote_range_requests.load(Ordering::Relaxed),
             "remote_bytes_fetched": engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed),
             "disk_cache": disk,
+            "gpu": gpu_stats,
+            "pgstac": pgstac_stats,
         })
         .to_string();
         return Ok(plain_resp(StatusCode::OK, Bytes::from(body), "application/json"));
@@ -5885,12 +6022,16 @@ where
         engine.store.clear_open_uris();
         engine.store.cache.clear();
         engine.tile_cache.clear();
+        engine.clear_gpu_caches();
         engine.stac_cache.clear();
         engine.mosaicjson_cache.clear();
+        if let Some(pg) = engine.pgstac() {
+            pg.clear_caches();
+        }
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"cleared"), "text/plain"));
     }
 
-    let pq = parse_query(if raw_query.is_empty() {
+    let mut pq = parse_query(if raw_query.is_empty() {
         None
     } else {
         Some(&raw_query)
@@ -5898,28 +6039,151 @@ where
 
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
 
-    if let Err(msg) = validate_query(&segs, &pq) {
-        let body = serde_json::json!({
-            "detail": [
-                {
-                    "type": "value_error",
-                    "loc": ["query"],
-                    "msg": msg,
+    // titiler-pgstac's item routes, /collections/{c}/items/{i}/..., are the /stac router over
+    // an item read from pgSTAC instead of from `url`.
+    let mut pgstac_item: Option<Arc<StacItem>> = None;
+    let mut pgstac_item_extent: Option<pgstac::ItemExtent> = None;
+    let mut stac_prefix = String::from("stac");
+    let item_preview: Option<String>;
+    let item_rest: Option<Vec<&str>> = match segs.as_slice() {
+        ["collections", c, "items", i, rest @ ..] if !rest.is_empty() => {
+            let ctx = pgstac::Ctx {
+                engine: &engine,
+                host: &host,
+                forwarded_prefix: &forwarded_prefix,
+                path: &path,
+                raw_query: &raw_query,
+                if_none_match: if_none_match.as_deref(),
+                only: None,
+            };
+            // A feature posted for an item's statistics is read here: those are worked out by
+            // the search routes, from the item alone, and never reach `/stac`.
+            if method == Method::POST && rest == ["statistics"] {
+                let body = match read_limited_body(req.into_body()).await {
+                    Ok(body) => body,
+                    Err(e) => return Ok(pgstac::engine_error(&e)),
+                };
+                return Ok(match Box::pin(pgstac::item_route(&ctx, &method, c, i, rest, &pq, Some(body))).await {
+                    pgstac::ItemRoute::Done(resp) => resp,
+                    pgstac::ItemRoute::Stac(..) => pgstac::bad_request("an item's statistics of a posted feature are worked out from the item alone".into()),
+                });
+            }
+            match Box::pin(pgstac::item_route(&ctx, &method, c, i, rest, &pq, None)).await {
+                pgstac::ItemRoute::Done(resp) => return Ok(pgstac_cacheable(resp, &method)),
+                pgstac::ItemRoute::Stac(item, extent) => {
+                    pgstac_item = Some(item);
+                    pgstac_item_extent = extent;
+                    // An item is one image: titiler-pgstac's item routes have no
+                    // `pixel_selection`, and pass over any value of it.
+                    pq.keys.retain(|k| k != "pixel_selection");
+                    pq.errors.retain(|e| !e.starts_with("unsupported pixel_selection"));
+                    // What the route does not read, titiler-pgstac passes over: not checked,
+                    // and not seen by the routes' own checks of what each takes.
+                    pq.errors.retain(|e| !pgstac::item_passes_over_error(&method, rest, e));
+                    pq.keys.retain(|k| !pgstac::item_passes_over(&method, rest, k));
+                    if pgstac::item_passes_over(&method, rest, "algorithm") {
+                        (pq.algorithm, pq.algorithm_error, pq.algorithm_params_unread) = (None, None, None);
+                    }
+                    pq.pixel_selection = Selection::First;
+                    // Band math on an item's point is applied to the `/stac` answer by
+                    // `pgstac::item_fixup`, with TiTiler's names: `/stac` must not apply it first.
+                    // An expression is over every band read, so the request's `bidx` does
+                    // not narrow them first; each asset's own selection still applies.
+                    match pgstac::item_asset_options(rest, &raw_query) {
+                        Err(resp) => return Ok(resp),
+                        Ok(Some((per_asset, own))) => {
+                            pq.bidx = own;
+                            pq.asset_bidx = per_asset;
+                        }
+                        Ok(None) => {}
+                    }
+                    if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
+                        pq.bidx.clear();
+                    }
+                    stac_prefix = format!("collections/{c}/items/{i}");
+                    let mut as_stac = vec!["stac"];
+                    // A preview with a side of zero in its path is the preview sized from
+                    // the query, which is what works such a side out.
+                    item_preview = pgstac::item_preview_by_query(rest, &mut pq);
+                    match &item_preview {
+                        Some(preview) => as_stac.push(preview),
+                        None => as_stac.extend_from_slice(rest),
+                    }
+                    Some(as_stac)
                 }
-            ]
-        })
-        .to_string();
-        return Ok(plain_resp(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Bytes::from(body),
-            "application/json",
-        ));
+            }
+        }
+        _ => None,
+    };
+    let segs = item_rest.unwrap_or(segs);
+
+    if let Err(msg) = validate_query(&segs, &pq) {
+        if pgstac_item.is_none() {
+            let body = serde_json::json!({
+                "detail": [
+                    {
+                        "type": "value_error",
+                        "loc": ["query"],
+                        "msg": msg,
+                    }
+                ]
+            })
+            .to_string();
+            return Ok(plain_resp(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Bytes::from(body),
+                "application/json",
+            ));
+        }
+        // Item routes answer in JSON, and do band math on point values themselves.
+        let point_math = segs.get(1) == Some(&"point") && msg.contains("'expression'");
+        if !point_math {
+            return Ok(pgstac::bad_request(msg));
+        }
+    }
+
+    // titiler-pgstac's routes: /searches/... and /collections/...
+    if matches!(segs.first(), Some(&("searches" | "collections"))) {
+        let ctx = pgstac::Ctx {
+            engine: &engine,
+            host: &host,
+            forwarded_prefix: &forwarded_prefix,
+            path: &path,
+            raw_query: &raw_query,
+            if_none_match: if_none_match.as_deref(),
+            only: None,
+        };
+        let list = matches!(segs[..], ["searches"] | ["searches", "" | "list"]);
+        let cacheable = method == Method::GET && !list;
+        let mut resp = Box::pin(pgstac::handle(ctx, &method, &segs, pq, req)).await;
+        if list && method == Method::GET && resp.status() == StatusCode::OK {
+            // Prevent handle_request's default GET Cache-Control from caching live search listings.
+            resp.headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+        return Ok(if cacheable { pgstac_cacheable(resp, &Method::GET) } else { resp });
     }
     if pq.keys.iter().any(|k| k == "pixel_selection") && !route_supports_pixel_selection(&segs) {
         return Ok(json_error_resp(
             StatusCode::BAD_REQUEST,
             "parameter 'pixel_selection' is only supported on mosaic tiles, bbox, feature, and statistics routes",
         ));
+    }
+    // Parameters the algorithm's model refuses, as TiTiler answers them, on the routes that
+    // apply an algorithm.
+    if route_applies_algorithm(&segs) {
+        if let Some(input) = &pq.algorithm_params_unread {
+            let body = serde_json::json!({"detail": [{
+                "type": "value_error",
+                "loc": ["query", "algorithm_params"],
+                "msg": "Value error, invalid JSON content",
+                "input": input,
+            }]});
+            return Ok(plain_resp(StatusCode::UNPROCESSABLE_ENTITY, Bytes::from(body.to_string()), "application/json"));
+        }
+        if let Some(msg) = pq.algorithm_error.as_deref() {
+            return Ok(json_error_resp(StatusCode::BAD_REQUEST, msg));
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -7341,12 +7605,7 @@ where
                                 || !crate::engine::cogs_share_base_grid(&cogs);
                             if needs_general_path {
                                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
-                                let cf = pq
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
+                                let cf = pq.parse_color_formula()?;
                                 let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                                 let bbox_3857 = web_mercator_buffered_3857_bbox(
                                     z,
@@ -7385,12 +7644,7 @@ where
                             } else if (pq.color_formula.is_some() || !pq.return_mask)
                                 && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                             {
-                                let cf = pq
-                                    .color_formula
-                                    .as_deref()
-                                    .map(ColorFormula::parse)
-                                    .transpose()
-                                    .map_err(EngineError::BadRequest)?;
+                                let cf = pq.parse_color_formula()?;
                                 let orig_format = treq.format;
                                 treq.format = OutputFormat::RawRgba;
                                 let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -7536,8 +7790,10 @@ where
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"stac") {
         let sub = &segs[1..];
-        let stac_url = pq.urls.first().cloned();
-        let stac_url_hdr = stac_url.clone();
+        let stac_x_assets = pq.assets.clone();
+        let stac_url_hdr = pq.urls.first().cloned();
+        // An item read from pgSTAC is held here; one named by `url` is in the cache by then.
+        let stac_item_hdr = pgstac_item.clone();
         let stac_req_assets = pq.assets.clone();
         let stac_req_expr = pq.expr_raw.clone();
         let stac_array = array_asked(&pq, sub.last());
@@ -7545,8 +7801,10 @@ where
             if !resp.status().is_success() {
                 return;
             }
-            if let Some(ref u) = stac_url_hdr
-                && let Some(item) = engine.stac_cache.get(u)
+            let item = stac_item_hdr
+                .clone()
+                .or_else(|| stac_url_hdr.as_ref().and_then(|u| engine.stac_cache.get(u).map(|item| item.value().clone())));
+            if let Some(item) = item
                 && let Ok(names) = crate::stac::select_stac_asset_names(
                     &item,
                     &stac_req_assets,
@@ -7557,11 +7815,14 @@ where
             }
         };
         let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
+        let stac_source = match pgstac_item.take() {
+            Some(item) => StacSource::Item(item),
+            None => StacSource::Url(pq.urls.first().cloned()),
+        };
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // GET /stac/assets?url=item.json
             (Method::GET, ["assets"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let keys: Vec<&String> = item.assets.keys().collect();
                 Ok((Bytes::from(serde_json::json!(keys).to_string()), "application/json"))
             }
@@ -7569,8 +7830,7 @@ where
 
             // GET /stac/bounds?url=item.json
             (Method::GET, ["bounds"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let bounds = if let Some(b) = item.bbox {
                     b
                 } else {
@@ -7603,8 +7863,7 @@ where
 
             // GET /stac/info?url=item.json&assets=...
             (Method::GET, ["info"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut map = serde_json::Map::new();
@@ -7624,8 +7883,7 @@ where
 
             // GET /stac/info.geojson?url=item.json&assets=...
             (Method::GET, ["info.geojson"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let mut props = serde_json::Map::new();
@@ -7657,8 +7915,7 @@ where
 
             // GET /stac/asset_statistics (per-asset dict: {asset: {b1: ...}})
             (Method::GET, ["asset_statistics"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
                 let n = names.len();
@@ -7712,10 +7969,16 @@ where
             .await,
             // GET /stac/statistics (merged band dict: {b1: ..., b2: ...})
             (Method::GET, ["statistics"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                if stac_prefix != "stac"
+                    && let Some(expression) = pq.expr_raw.as_deref()
+                {
+                    let bands: Vec<usize> = cogs.iter().map(|c| usize::from(c.index.full_res().samples_per_pixel)).collect();
+                    let selected = !pq.bidx.is_empty() || pq.assets.iter().any(|a| stac_asset_selected_bands(&pq, a).is_some());
+                    pgstac::check_item_statistics_expression(expression, &bands, pq.asset_as_band, selected)?;
+                }
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
                     matches!(
                         a.to_ascii_lowercase().as_str(),
@@ -7736,6 +7999,37 @@ where
                         apply_unscale_cogs(&mut bands, &cogs);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    if matches!(
+                        bands,
+                        BandRequest::Single { .. }
+                            | BandRequest::Dem { .. }
+                            | BandRequest::CustomExpr { .. }
+                            | BandRequest::Spectral1 { .. }
+                            | BandRequest::Spectral2 { .. }
+                            | BandRequest::Spectral3 { .. }
+                    ) {
+                        let stat = render_native_preview_stats(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            pq.nodata,
+                            pq.unscale,
+                            alg_name,
+                            &stats_opts,
+                        )
+                        .await?;
+                        let mut map = serde_json::Map::new();
+                        map.insert("b1".into(), stat);
+                        return Ok((
+                            Bytes::from(serde_json::Value::Object(map).to_string()),
+                            "application/json",
+                        ));
+                    }
                     let raw = render_native_preview(
                         &engine,
                         &cogs,
@@ -7774,7 +8068,7 @@ where
                         };
                         map.insert(
                             format!("b{}", b + 1),
-                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &plane, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
@@ -7833,7 +8127,7 @@ where
                         if pq.unscale {
                             apply_unscale_cogs(&mut bands, &cogs);
                         }
-                        let raw = render_native_preview(
+                        let stat = render_native_preview_stats(
                             &engine,
                             &cogs,
                             bbox,
@@ -7841,22 +8135,13 @@ where
                             out_h,
                             &bands,
                             pq.resample,
-                            OutputFormat::RawF32,
                             pq.nodata,
-                            None,
-                            None,
-                            true,
                             pq.unscale,
+                            &desc,
+                            &stats_opts,
                         )
                         .await?;
-                        let pixels: Vec<f32> = raw
-                            .chunks_exact(4)
-                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                            .collect();
-                        map.insert(
-                            format!("b{}", idx + 1),
-                            compute_f32_band_stats(&pixels, &desc, &stats_opts),
-                        );
+                        map.insert(format!("b{}", idx + 1), stat);
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
                 }
@@ -7930,9 +8215,9 @@ where
             }
             .await,
             (Method::POST, ["statistics"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                // (An item's posted statistics are the search routes', and never come here.)
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
@@ -8020,6 +8305,25 @@ where
                                 if unscale {
                                     apply_unscale_cogs(&mut bands, &cogs_c);
                                 }
+                                let alg_name = alg_c.as_deref().unwrap_or("algorithm");
+                                if matches!(
+                                    bands,
+                                    BandRequest::Single { .. }
+                                        | BandRequest::Dem { .. }
+                                        | BandRequest::CustomExpr { .. }
+                                        | BandRequest::Spectral1 { .. }
+                                        | BandRequest::Spectral2 { .. }
+                                        | BandRequest::Spectral3 { .. }
+                                ) {
+                                    let stat = render_wgs84_bbox_stats(
+                                        &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
+                                        resample, nodata, unscale, alg_name, &stats_opts,
+                                    )
+                                    .await?;
+                                    let mut map = serde_json::Map::new();
+                                    map.insert("b1".into(), stat);
+                                    return Ok::<_, EngineError>(serde_json::Value::Object(map));
+                                }
                                 let raw = render_wgs84_bbox(
                                     &eng, &cogs_c, poly_bbox, out_w, out_h, Some(&mask), &bands,
                                     resample, OutputFormat::RawF32, nodata, None, None, true, unscale,
@@ -8040,7 +8344,7 @@ where
                                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                         .collect();
                                     let desc = if nb == 1 { alg_name.to_string() } else { format!("{alg_name}_b{}", b + 1) };
-                                    map.insert(format!("b{}", b + 1), compute_f32_band_stats(&plane, &desc, &stats_opts));
+                                    map.insert(format!("b{}", b + 1), compute_f32_band_stats_with_engine(&eng, &plane, &desc, &stats_opts));
                                 }
                                 return Ok::<_, EngineError>(serde_json::Value::Object(map));
                             }
@@ -8314,18 +8618,14 @@ where
 
             // GET /stac/tiles & /stac/tiles/{tms} (OGC TilesetList & Tileset, matching /cog/tiles*)
             (Method::GET, ["tiles"]) => async {
-                let bounds = if let Some(ref u) = stac_url {
-                    match load_stac_item(&engine.stac_cache, &engine.store, u).await {
-                        Ok(item) => item.bbox,
-                        Err(EngineError::Io(io))
-                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => None,
+                let bounds = match stac_source.load(&engine).await {
+                    Ok(item) => item.bbox,
+                    Err(EngineError::Io(io))
+                        if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                    {
+                        return Err(EngineError::Io(io));
                     }
-                } else {
-                    None
+                    Err(_) => None,
                 };
                 let body = build_ogc_tilesets_list(
                     &host,
@@ -8341,18 +8641,14 @@ where
             (Method::GET, ["tiles", tms]) => async {
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
-                let bounds = if let Some(ref u) = stac_url {
-                    match load_stac_item(&engine.stac_cache, &engine.store, u).await {
-                        Ok(item) => item.bbox,
-                        Err(EngineError::Io(io))
-                            if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
-                        {
-                            return Err(EngineError::Io(io));
-                        }
-                        Err(_) => None,
+                let bounds = match stac_source.load(&engine).await {
+                    Ok(item) => item.bbox,
+                    Err(EngineError::Io(io))
+                        if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)) =>
+                    {
+                        return Err(EngineError::Io(io));
                     }
-                } else {
-                    None
+                    Err(_) => None,
                 };
                 let body = build_ogc_tileset_json(
                     &host,
@@ -8372,12 +8668,11 @@ where
             // GET /stac/{tms}/tilejson.json, /stac/tilejson.json, /stac/{tms}/map.html, /stac/map.html
             (Method::GET, [_, "tilejson.json"]) | (Method::GET, ["tilejson.json"]) => async {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (_, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
-                apply_tilejson_overrides(&mut tj, &pq, &host, "stac", tms, &raw_query);
+                apply_tilejson_overrides(&mut tj, &pq, &host, &stac_prefix, tms, &raw_query);
                 tj["name"] = serde_json::json!(item.id);
                 if !item.renders.is_empty() {
                     tj["raster_layers"] = serde_json::json!(&item.renders);
@@ -8385,14 +8680,23 @@ where
                 Ok((Bytes::from(tj.to_string()), "application/json"))
             }
             .await,
+            // titiler-pgstac has no viewer on an item.
+            (Method::GET, ["viewer"]) if stac_prefix != "stac" => {
+                Err(EngineError::NotFound("Not Found".into()))
+            }
             (Method::GET, [_, "map.html"]) | (Method::GET, ["map.html"]) | (Method::GET, ["viewer"]) => {
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
-                let tj_url = format!("{forwarded_prefix}/stac/{tms}/tilejson.json?{raw_query}");
+                let tj_url =
+                    format!("{forwarded_prefix}/{stac_prefix}/{tms}/tilejson.json?{raw_query}");
                 Ok((Bytes::from(build_map_html(&tj_url)), "text/html; charset=utf-8"))
             }
             (Method::GET, ["renders"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                // The links name the item's address, which only an item given by `url` has.
+                let u = match &stac_source {
+                    StacSource::Url(Some(u)) => u.clone(),
+                    _ => return Err(EngineError::BadRequest("missing ?url=".into())),
+                };
+                let item = stac_source.load(&engine).await?;
                 let suffix = if !forwarded_prefix.is_empty() && !host.ends_with(&forwarded_prefix) {
                     forwarded_prefix.as_str()
                 } else {
@@ -8424,8 +8728,11 @@ where
             }
             .await,
             (Method::GET, ["renders", render_id]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let u = match &stac_source {
+                    StacSource::Url(Some(u)) => u.clone(),
+                    _ => return Err(EngineError::BadRequest("missing ?url=".into())),
+                };
+                let item = stac_source.load(&engine).await?;
                 let dec_id = percent_decode_opts(render_id, false);
                 let render = item
                     .renders
@@ -8438,8 +8745,7 @@ where
             .await,
             // GET /stac/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -8490,7 +8796,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
                 let data = render_stac_bbox_opt(
                     &engine, &cogs, slot_bands.as_deref(), out_bbox, &dst_crs, false, out_w, out_h, None, &bands, resample, fmt,
@@ -8510,8 +8816,7 @@ where
                     {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
-                    let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                    let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                    let item = stac_source.load(&engine).await?;
                     let (_, cogs, _) =
                         resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref())
                             .await?;
@@ -8586,8 +8891,15 @@ where
             // and alias GET /stac/tiles/{z}/{x}/{y}[@scale][.{format}] (implicit WebMercatorQuad)
             (Method::GET, ["tiles", _, zs, xs, ys]) | (Method::GET, ["tiles", zs, xs, ys]) => {
                 let tms = if sub.len() == 5 { sub[1] } else { "WebMercatorQuad" };
-                let cache_key = format!("{path}?{raw_query}");
-                if let Some(u) = stac_url.as_deref()
+                // An item read from the database can change under the same path: its tile
+                // is of the assets it has now.
+                let cache_key = match &stac_source {
+                    StacSource::Item(item) => {
+                        format!("{path}?{raw_query}#{:x}", pgstac::source_identity(&item.assets))
+                    }
+                    StacSource::Url(_) => format!("{path}?{raw_query}"),
+                };
+                if let StacSource::Url(Some(u)) = &stac_source
                     && let Some(item) = engine.stac_cache.get(u)
                 {
                     let asset_urls: Vec<String> = item.assets.values().cloned().collect();
@@ -8595,14 +8907,11 @@ where
                     engine.sync_tile_cache_epoch();
                 }
                 let stac_tile_geo = TileGeoOpts::from_pq(&pq);
-                let stac_tile_url = stac_url.clone();
+                let stac_tile_source = stac_source.clone();
                 let cached = engine
                     .tile_cache
-                    .get_or_render(cache_key, || stac_tile_in_its_type(&engine, stac_array.clone(), stac_tile_url, async {
-                        let u = stac_url
-                            .ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                        let item =
-                            load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                    .get_or_render(cache_key, || stac_tile_in_its_type(&engine, stac_array.clone(), stac_tile_source, async {
+                        let item = stac_source.load(&engine).await?;
                         let (names, cogs, rewritten_expr) = resolve_stac_assets(
                             &engine,
                             &item,
@@ -8638,6 +8947,12 @@ where
                             Some(&cogs[0]),
                             true,
                         )?;
+                        // titiler-pgstac's item routes name the media type after the extension
+                        // and, without one, choose the format from the pixels.
+                        let item_route = stac_prefix != "stac";
+                        let ct = if item_route && ext == Some("jpg") { "image/jpg" } else { ct };
+                        let item_auto_format =
+                            item_route && ext.is_none() && pq_stac.format_param.is_none();
                         if pq_stac.unscale {
                             apply_unscale_cogs(&mut treq.bands, &cogs);
                         }
@@ -8713,12 +9028,7 @@ where
                         }
                         if needs_general {
                             let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &treq.bands)?;
-                            let cf = pq_stac
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq_stac.parse_color_formula()?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq_stac.buffer).round() as u32;
                             let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
                                 let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
@@ -8783,16 +9093,23 @@ where
                                 .await?;
                                 (d, bbox_3857, 3857u16)
                             };
+                            // An item's picture with pixels missing is a PNG whether or not
+                            // the mask was asked for: the format is chosen from the pixels.
+                            if item_auto_format
+                                && !pq_stac.return_mask
+                                && data.len() == (out_dim as usize).pow(2) * 4
+                                && data.chunks_exact(4).any(|p| p[3] != 255)
+                            {
+                                let (w, h) = (out_dim as usize, out_dim as usize);
+                                return Ok((encode_rgba_output(w, h, &data, OutputFormat::Png, false), "image/png"));
+                            }
                             Ok(finalize_image_output(data, ct, treq.format, auto_fmt, out_dim, out_dim, bbox, epsg, pq_stac.jpeg_quality, pq_stac.return_mask))
+                        } else if item_auto_format {
+                            pgstac::item_tile_auto_format(&engine, &cogs, treq, &pq_stac).await
                         } else if (pq_stac.color_formula.is_some() || !pq_stac.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                         {
-                            let cf = pq_stac
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq_stac.parse_color_formula()?;
                             let orig_format = treq.format;
                             treq.format = OutputFormat::RawRgba;
                             let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -8825,6 +9142,11 @@ where
                         }
                     }))
                     .await;
+                if stac_prefix != "stac"
+                    && let Err(e) = &cached
+                {
+                    return Ok(pgstac::engine_error(e));
+                }
                 let mut resp = to_http_response_cached(&engine, cached, if_none_match.as_deref());
                 attach_resolved_stac_assets(&mut resp);
                 if let (Some(z), Some(x), Some((y, sc, _))) =
@@ -8832,13 +9154,16 @@ where
                 {
                     attach_tile_geo_headers_opts(&mut resp, tms, z, x, y, sc, stac_tile_geo);
                 }
+                // An item's tile says where it lies as titiler-pgstac writes it.
+                if stac_prefix != "stac" {
+                    resp = pgstac::item_placed(resp, &segs[1..], &raw_query);
+                }
                 return Ok(resp);
             }
 
             // GET /stac/point/{lon},{lat}
             (Method::GET, ["point", coord]) => async {
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let Some((x, y)) = parse_point_coord(coord) else {
@@ -8963,8 +9288,7 @@ where
             (Method::GET, [p]) if *p == "preview" || p.starts_with("preview.") => async {
                 let ext_opt = p.strip_prefix("preview.");
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -8995,12 +9319,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, pq_stac.max_size);
@@ -9056,8 +9375,7 @@ where
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -9084,12 +9402,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq_stac.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let rs = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), dst_epsg);
@@ -9145,8 +9458,7 @@ where
                 };
                 let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -9177,12 +9489,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let wgs_bbox_src = bbox_to_wgs84(bbox, pq_stac.coord_crs.as_ref())?;
                 let bbox_max = effective_bbox_max_size(&pq_stac);
                 let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
@@ -9247,8 +9554,7 @@ where
                 };
                 let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
+                let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -9272,12 +9578,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let (data, out_bbox, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq_stac).filter(|(_, e)| *e != 4326 && *e != 3857) {
                     let dst_bbox = if pq_stac.coord_crs_epsg == Some(dst_epsg) {
                         bbox
@@ -9333,12 +9634,11 @@ where
             // POST /stac/feature/{w}x{h}[.{ext}] and POST /stac/feature[.{ext}]
             (Method::POST, ["feature", dims_ext]) => async {
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -9362,12 +9662,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq_stac);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
@@ -9399,12 +9694,11 @@ where
                 let ext_opt = feat_ext.strip_prefix("feature.");
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
                 let s = effective_bbox_max_size(&pq);
-                let u = stac_url.ok_or_else(|| EngineError::BadRequest("missing ?url=".into()))?;
+                let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
-                let item = load_stac_item(&engine.stac_cache, &engine.store, &u).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
                 let mut pq_stac = pq;
@@ -9432,12 +9726,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
-                let cf = pq_stac
-                    .color_formula
-                    .as_deref()
-                    .map(ColorFormula::parse)
-                    .transpose()
-                    .map_err(EngineError::BadRequest)?;
+                let cf = pq_stac.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq_stac);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq_stac, Some(&cogs[0]), target_epsg);
@@ -9481,17 +9770,45 @@ where
         };
         let res = match res {
             Ok((data, ct)) if stac_array.is_some() && may_be_f32_array(&data) => {
-                let item = match &stac_url_hdr {
-                    Some(u) => load_stac_item(&engine.stac_cache, &engine.store, u).await.ok(),
-                    None => None,
+                let source = match &stac_item_hdr {
+                    Some(item) => StacSource::Item(item.clone()),
+                    None => StacSource::Url(stac_url_hdr.clone()),
                 };
-                match item {
-                    Some(item) => Ok((stac_array_in_its_type(&engine, stac_array, &item, data).await, ct)),
-                    None => Ok((data, ct)),
+                match source.load(&engine).await {
+                    Ok(item) => Ok((stac_array_in_its_type(&engine, stac_array, &item, data).await, ct)),
+                    Err(_) => Ok((data, ct)),
                 }
             }
             res => res,
         };
+        // titiler-pgstac answers errors as JSON `{"detail": ...}`.
+        if stac_prefix != "stac" {
+            return Ok(match res {
+                Err(e) => pgstac::engine_error(&e),
+                Ok((body, ct)) => {
+                    match pgstac::item_fixup(
+                        &segs[1..],
+                        pgstac_item_extent.as_ref(),
+                        &raw_query,
+                        body,
+                        ct,
+                    ) {
+                        Ok(fixed) => {
+                            let mut resp = to_http_response(&engine, Ok(fixed), if_none_match.as_deref());
+                            attach_x_assets(&mut resp, &stac_x_assets);
+                            let resp = if method == Method::GET {
+                                pgstac::item_placed(resp, &segs[1..], &raw_query)
+                            } else {
+                                resp
+                            };
+                            let resp = pgstac::item_drawn_placed(resp, &segs[1..], geo_meta);
+                            pgstac_cacheable(resp, &method)
+                        }
+                        Err(resp) => resp,
+                    }
+                }
+            });
+        }
         let mut resp = to_http_response(&engine, res, if_none_match.as_deref());
         if !matches!(
             sub,
@@ -9616,6 +9933,37 @@ where
                         apply_unscale_cogs(&mut bands, &cogs);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
+                    let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
+                    if matches!(
+                        bands,
+                        BandRequest::Single { .. }
+                            | BandRequest::Dem { .. }
+                            | BandRequest::CustomExpr { .. }
+                            | BandRequest::Spectral1 { .. }
+                            | BandRequest::Spectral2 { .. }
+                            | BandRequest::Spectral3 { .. }
+                    ) {
+                        let stat = render_native_preview_stats(
+                            &engine,
+                            &cogs,
+                            bbox,
+                            out_w,
+                            out_h,
+                            &bands,
+                            pq.resample,
+                            pq.nodata,
+                            pq.unscale,
+                            alg_name,
+                            &stats_opts,
+                        )
+                        .await?;
+                        let mut map = serde_json::Map::new();
+                        map.insert("b1".into(), stat);
+                        return Ok((
+                            Bytes::from(serde_json::Value::Object(map).to_string()),
+                            "application/json",
+                        ));
+                    }
                     let raw = render_native_preview(
                         &engine,
                         &cogs,
@@ -9654,7 +10002,7 @@ where
                         };
                         map.insert(
                             format!("b{}", b + 1),
-                            compute_f32_band_stats(&plane, &desc, &stats_opts),
+                            compute_f32_band_stats_with_engine(&engine, &plane, &desc, &stats_opts),
                         );
                     }
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
@@ -10020,12 +10368,7 @@ where
 
                         if needs_general_path {
                             let custom_lut = resolve_custom_lut(&pq, &cogs[0], &treq.bands)?;
-                            let cf = pq
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq.parse_color_formula()?;
                             let out_dim = (treq.tile_size as f32 + 2.0 * pq.buffer).round() as u32;
                             let (data, bbox, epsg) = if tms != "WebMercatorQuad" {
                                 let tms_def = crate::tms::lookup_tms(tms).ok_or_else(|| {
@@ -10088,12 +10431,7 @@ where
                         } else if (pq.color_formula.is_some() || !pq.return_mask)
                             && !matches!(treq.format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
                         {
-                            let cf = pq
-                                .color_formula
-                                .as_deref()
-                                .map(ColorFormula::parse)
-                                .transpose()
-                                .map_err(EngineError::BadRequest)?;
+                            let cf = pq.parse_color_formula()?;
                             let orig_format = treq.format;
                             treq.format = OutputFormat::RawRgba;
                             let raw = engine.render_multi_cog_tile(&cogs, &treq).await?;
@@ -10488,7 +10826,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg.unwrap_or(0));
                 let data = render_crs_bbox(
                     &engine, &cogs, out_bbox, &dst_crs, out_w, out_h, None, &bands, resample, fmt,
@@ -10643,7 +10981,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let (data, out_bbox, out_w, out_h, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let (def_w, def_h) = capped_native_bbox_dims(&engine, &cogs[0], dst_crs, bbox, dst_bbox, pq.max_size);
@@ -10741,7 +11079,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let (data, out_bbox, out_epsg) = if let Some((ref dst_crs, dst_epsg)) = pq.dst_crs {
                     let dst_bbox = reproject_wgs84_bounds(bbox, dst_crs)?;
                     let rs = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), dst_epsg);
@@ -10830,7 +11168,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let wgs_bbox_src = bbox_to_wgs84(bbox, pq.coord_crs.as_ref())?;
                 let bbox_max = effective_bbox_max_size(&pq);
                 let (data, out_bbox, out_w, out_h, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
@@ -10907,7 +11245,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let (data, out_bbox, epsg) = if let Some((dst_crs, dst_epsg)) = resolve_bbox_dst_crs(&pq).filter(|(_, e)| *e != 4326 && *e != 3857) {
                     let dst_bbox = if pq.coord_crs_epsg == Some(dst_epsg) {
                         bbox
@@ -10986,7 +11324,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
@@ -11041,7 +11379,7 @@ where
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
-                let cf = pq.color_formula.as_deref().map(ColorFormula::parse).transpose().map_err(EngineError::BadRequest)?;
+                let cf = pq.parse_color_formula()?;
                 let eff_dst = resolve_bbox_dst_crs(&pq);
                 let target_epsg = eff_dst.as_ref().map(|(_, e)| *e).unwrap_or(4326);
                 let resample = resolve_resample(Some(&engine), &pq, Some(&cogs[0]), target_epsg);
@@ -11123,6 +11461,16 @@ where
     Ok(json_error_resp(StatusCode::NOT_FOUND, &path))
 }
 
+/// A pgSTAC route's answer with the `Cache-Control` the tiles carry, as titiler-pgstac
+/// puts one on what it serves: on what a `GET` found, never on an error, and not where
+/// one is already set.
+fn pgstac_cacheable(mut resp: Response<Full<Bytes>>, method: &Method) -> Response<Full<Bytes>> {
+    if *method == Method::GET && resp.status().is_success() && !resp.headers().contains_key(CACHE_CONTROL) {
+        resp.headers_mut().insert(CACHE_CONTROL, cache_control_header().clone());
+    }
+    resp
+}
+
 fn cache_control_header() -> &'static HeaderValue {
     static VAL: std::sync::OnceLock<HeaderValue> = std::sync::OnceLock::new();
     VAL.get_or_init(|| {
@@ -11199,6 +11547,17 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
     let _ = writeln!(out, "# TYPE cogzilla_remote_bytes_fetched_total counter");
     let _ = writeln!(out, "cogzilla_remote_bytes_fetched_total {}", engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed));
 
+    let aimd = engine.aimd.snapshot();
+    let _ = writeln!(out, "# HELP cogzilla_aimd_limit Current adaptive AIMD concurrency limit.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_limit gauge");
+    let _ = writeln!(out, "cogzilla_aimd_limit {}", aimd.limit);
+    let _ = writeln!(out, "# HELP cogzilla_aimd_in_flight Current in-flight HTTP requests admitted by AIMD.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_in_flight gauge");
+    let _ = writeln!(out, "cogzilla_aimd_in_flight {}", aimd.in_flight);
+    let _ = writeln!(out, "# HELP cogzilla_aimd_rejected_429_total Total HTTP requests shed with 429 Too Many Requests by AIMD.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_rejected_429_total counter");
+    let _ = writeln!(out, "cogzilla_aimd_rejected_429_total {}", aimd.rejected_429);
+
     if let Some(dc) = &engine.store.disk_cache {
         let s = dc.stats();
         let _ = writeln!(out, "# TYPE cogzilla_disk_cache_hits_total counter");
@@ -11207,6 +11566,50 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
         let _ = writeln!(out, "cogzilla_disk_cache_misses_total {}", s.misses);
         let _ = writeln!(out, "# TYPE cogzilla_disk_cache_bytes gauge");
         let _ = writeln!(out, "cogzilla_disk_cache_bytes {}", s.bytes_used);
+    }
+
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = &engine.gpu {
+        let s = gpu.slab_cache.stats();
+        let ms = gpu.multi_slab_cache.stats();
+        let _ = writeln!(out, "# HELP cogzilla_gpu_dispatches_total Total GPU compute dispatches.");
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_dispatches_total counter");
+        let _ = writeln!(
+            out,
+            "cogzilla_gpu_dispatches_total {}",
+            engine.stats.gpu_dispatches.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(out, "# HELP cogzilla_gpu_in_flight Current in-flight GPU operations.");
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_in_flight gauge");
+        let _ = writeln!(out, "cogzilla_gpu_in_flight {}", gpu.in_flight());
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_hits_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_slab_cache_hits_total {}", s.hits);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_misses_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_slab_cache_misses_total {}", s.misses);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_slab_cache_bytes gauge");
+        let _ = writeln!(out, "cogzilla_gpu_slab_cache_bytes {}", s.used_bytes);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_hits_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_hits_total {}", ms.hits);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_misses_total counter");
+        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_misses_total {}", ms.misses);
+        let _ = writeln!(out, "# TYPE cogzilla_gpu_multi_slab_cache_bytes gauge");
+        let _ = writeln!(out, "cogzilla_gpu_multi_slab_cache_bytes {}", ms.used_bytes);
+    }
+
+    if let Some(pg) = engine.pgstac() {
+        let s = pg.stats();
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_size Current pgSTAC connection pool size.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_size gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_pool_size {}", s.pool_size);
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_available Available idle pgSTAC connections.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_available gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_pool_available {}", s.pool_available);
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_pool_waiting Tasks waiting for a pgSTAC connection.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_pool_waiting gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_pool_waiting {}", s.pool_waiting);
+        let _ = writeln!(out, "# HELP cogzilla_pgstac_cache_entries Total entries across pgSTAC TTL caches.");
+        let _ = writeln!(out, "# TYPE cogzilla_pgstac_cache_entries gauge");
+        let _ = writeln!(out, "cogzilla_pgstac_cache_entries {}", s.total_cache_entries());
     }
     out
 }

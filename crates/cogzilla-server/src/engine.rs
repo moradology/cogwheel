@@ -11,14 +11,69 @@ use cogzilla_kernel::{
     render_rgb_bands, render_sar_rgb, render_single_band, render_terrain_tile,
 };
 use cogzilla_proj::{
-    CoordPlan, CrsModel, ProjError, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857,
+    CoordPlan, CrsModel, ProjError, TileCoord, tile_bounds_3857,
 };
 use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
 use dashmap::DashMap;
+use futures_util::stream::{FuturesOrdered, StreamExt};
 use thiserror::Error;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog};
 use crate::tile_cache::TileCache;
+
+/// The most scenes of a mosaic that are read at once.
+pub const MOSAIC_SCENES_AHEAD: usize = 8;
+
+/// A mosaic's scenes, rendered in order with some read ahead of the one being waited for.
+/// Dropping it drops the scenes still being read.
+struct ScenesInOrder<'a> {
+    engine: &'a TileEngine,
+    scenes: &'a [Vec<String>],
+    base: &'a TileRequest,
+    unscale: bool,
+    next: usize,
+    window: usize,
+    reading: FuturesOrdered<SceneRead<'a>>,
+}
+
+/// One scene of a mosaic on its way.
+type SceneRead<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, SceneFailure>> + Send + 'a>>;
+
+/// Why a scene of a mosaic gave no pixels: it could not be opened, or it was open and
+/// could not be read. A mosaic of a list of URLs passes over the first and goes on to
+/// the next scene; one whose scenes were chosen for the tile fails on either.
+enum SceneFailure {
+    Unopened(EngineError),
+    Unread(EngineError),
+}
+
+/// Whether opening a scene failed because the allowlist refuses its asset.
+fn refused(e: &EngineError) -> bool {
+    matches!(e, EngineError::Io(io) if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)))
+}
+
+impl SceneFailure {
+    fn into_error(self) -> EngineError {
+        match self {
+            Self::Unopened(e) | Self::Unread(e) => e,
+        }
+    }
+}
+
+impl<'a> ScenesInOrder<'a> {
+    /// The next scene in order, or `None` after the last.
+    async fn next(&mut self) -> Option<Result<Bytes, SceneFailure>> {
+        while self.reading.len() < self.window && self.next < self.scenes.len() {
+            let scene = &self.scenes[self.next];
+            self.reading.push_back(Box::pin(self.engine.render_mosaic_scene(scene, self.base, self.unscale)));
+            self.next += 1;
+        }
+        let scene = self.reading.next().await;
+        // Being asked again means the tile is not full yet: read twice as many at once.
+        self.window = (self.window * 2).min(MOSAIC_SCENES_AHEAD);
+        scene
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -125,8 +180,49 @@ pub struct TileRequest {
 /// algorithms, terrain encodings, spectral indices, SAR dB, and custom band-math expressions.
 #[inline]
 pub(crate) fn needs_source_unscale(bands: &BandRequest, format: OutputFormat) -> bool {
-    matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
-        || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
+    matches!(
+        format,
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64
+    ) || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
+}
+
+/// Wrap raw band-major little-endian `f32` tile bytes into the requested float output format
+/// (`RawF32`, `Npy`, `RawF64`, or `NpyF64`) so float64 requests on multi-COG/mosaic paths never
+/// fall through to RGBA8.
+fn format_float_tile(raw_f32: Bytes, bands: usize, tile_size: u32, fmt: OutputFormat) -> Bytes {
+    match fmt {
+        OutputFormat::Npy => cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+            raw_f32,
+            bands,
+            tile_size,
+            tile_size,
+            true,
+        ),
+        OutputFormat::RawF64 => {
+            let mut out = bytes::BytesMut::with_capacity(raw_f32.len() * 2);
+            for chunk in raw_f32.chunks_exact(4) {
+                let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.freeze()
+        }
+        OutputFormat::NpyF64 => {
+            let vals: Vec<f64> = raw_f32
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .collect();
+            cogzilla_kernel::encode_npy_typed_f64(
+                &vals,
+                bands,
+                tile_size as usize,
+                tile_size as usize,
+                cogzilla_tiff::SampleType::Float64,
+                None,
+                true,
+            )
+        }
+        _ => raw_f32,
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +231,7 @@ pub struct EngineStats {
     pub empty_short_circuits: AtomicU64,
     pub passthrough_hits: AtomicU64,
     pub http_304_not_modified: AtomicU64,
+    pub gpu_dispatches: AtomicU64,
 }
 
 /// Map a fetch/I/O error on an asset referenced by a STAC item or MosaicJSON document to
@@ -165,6 +262,32 @@ pub struct TileEngine {
     pub tile_cache: Arc<TileCache>,
     tile_cache_epoch: AtomicU64,
     pub stats: Arc<EngineStats>,
+    pgstac: std::sync::OnceLock<Arc<cogzilla_pgstac::PgStac>>,
+    pub aimd: crate::aimd::AimdLimiter,
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
+}
+
+/// Run a synchronous CPU-heavy closure via `tokio::task::block_in_place` when `should_offload` is
+/// true and we are on a multi-threaded Tokio runtime, so `/healthz`, `/metrics`, and AIMD
+/// `429 Too Many Requests` shedding stay responsive under CPU-only saturation.
+#[inline]
+pub(crate) fn block_in_place_if_multithread<R>(should_offload: bool, f: impl FnOnce() -> R) -> R {
+    if should_offload
+        && tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+/// Run a synchronous CPU tile render, moving heavy non-Nearest renders (`N >= 256`) off Tokio's
+/// async I/O worker pool via [`block_in_place_if_multithread`].
+#[inline]
+fn run_cpu_render<R>(n: usize, resample: ResampleMode, f: impl FnOnce() -> R) -> R {
+    block_in_place_if_multithread(n >= 256 && !matches!(resample, ResampleMode::Nearest), f)
 }
 
 fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
@@ -235,10 +358,25 @@ fn tile_fetch_range_for_plan<const N: usize>(
             | ResampleMode::Q3
             | ResampleMode::Sum
     );
+    let widened = if is_footprint || resample == ResampleMode::Nearest {
+        None
+    } else {
+        let (sx, sy) = cogzilla_kernel::coord_plan_scale(plan);
+        cogzilla_kernel::kernel_widens(resample, sx, sy).then_some((sx, sy))
+    };
     let (pad_lo_x, pad_hi_x, pad_lo_y, pad_hi_y) = if is_footprint {
         let (sx, sy) = cogzilla_kernel::coord_plan_scale(plan);
         let hx = (0.5 * sx).ceil().max(1.0) as i32;
         let hy = (0.5 * sy).ceil().max(1.0) as i32;
+        if is_dem {
+            (hx + 2, hx + 3, hy + 2, hy + 3)
+        } else {
+            (hx, hx + 1, hy, hy + 1)
+        }
+    } else if let Some((sx, sy)) = widened {
+        // GDAL-style widened kernel: the support grows to `radius * scale` source pixels.
+        let hx = cogzilla_kernel::widened_kernel_radius(resample, sx).ceil().max(1.0) as i32;
+        let hy = cogzilla_kernel::widened_kernel_radius(resample, sy).ceil().max(1.0) as i32;
         if is_dem {
             (hx + 2, hx + 3, hy + 2, hy + 3)
         } else {
@@ -352,6 +490,13 @@ impl TileEngine {
     }
 
     pub fn with_store_and_tile_cache(store: Arc<CogStore>, tile_cache_max_bytes: usize) -> Self {
+        #[cfg(feature = "gpu")]
+        let gpu = crate::gpu_backend::GpuBackend::try_init(256 * 1024 * 1024);
+        #[cfg(feature = "gpu")]
+        let has_gpu = gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let has_gpu = false;
+
         Self {
             store,
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
@@ -362,7 +507,38 @@ impl TileEngine {
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             tile_cache_epoch: AtomicU64::new(0),
             stats: Arc::new(EngineStats::default()),
+            pgstac: std::sync::OnceLock::new(),
+            aimd: crate::aimd::AimdLimiter::from_env(has_gpu),
+            #[cfg(feature = "gpu")]
+            gpu,
         }
+    }
+
+    /// Attach the pgSTAC database behind the `/searches` routes. The first call wins.
+    pub fn set_pgstac(&self, pgstac: Arc<cogzilla_pgstac::PgStac>) -> bool {
+        self.pgstac.set(pgstac).is_ok()
+    }
+
+    /// The pgSTAC database, when one is configured.
+    pub fn pgstac(&self) -> Option<&Arc<cogzilla_pgstac::PgStac>> {
+        self.pgstac.get()
+    }
+
+    /// Attach the pgSTAC database named by `DATABASE_URL` or the `PG*` variables, if any.
+    /// `Ok(false)` means none is configured. No connection is opened here.
+    pub fn attach_pgstac_from_env(&self) -> Result<bool, String> {
+        let Some(config) = cogzilla_pgstac::PgStacConfig::from_env().map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let pgstac = cogzilla_pgstac::PgStac::new(config).map_err(|e| e.to_string())?;
+        Ok(self.set_pgstac(Arc::new(pgstac)))
+    }
+
+    /// Replace the engine's AIMD concurrency limiter (useful for tests and custom deployments).
+    pub fn with_aimd(mut self, aimd: crate::aimd::AimdLimiter) -> Self {
+        self.aimd = aimd;
+        self
     }
 
     /// Flush the rendered tile cache if any underlying source was invalidated or replaced.
@@ -373,6 +549,16 @@ impl TileEngine {
         let seen = self.tile_cache_epoch.load(Ordering::Relaxed);
         if cur != seen && self.tile_cache_epoch.swap(cur, Ordering::AcqRel) != cur {
             self.tile_cache.clear();
+            self.clear_gpu_caches();
+        }
+    }
+
+    /// Synchronously clear all GPU VRAM slab caches (used by `/admin/clear-cache` and epoch sync).
+    pub fn clear_gpu_caches(&self) {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            gpu.slab_cache.clear();
+            gpu.multi_slab_cache.clear();
         }
     }
 
@@ -452,7 +638,7 @@ impl TileEngine {
             if let Some(b1) = bands_1based {
                 let kind = cog.index.full_res().sample_type;
                 let (minx, miny, maxx, maxy) = cogzilla_proj::tile_bounds_3857(req.tile);
-                return crate::titiler::render_exact_f64_array(
+                return Box::pin(crate::titiler::render_exact_f64_array(
                     self,
                     cog,
                     [minx, miny, maxx, maxy],
@@ -469,7 +655,7 @@ impl TileEngine {
                     true,
                     matches!(req.format, OutputFormat::RawF64),
                     true,
-                )
+                ))
                 .await;
             }
         }
@@ -477,8 +663,8 @@ impl TileEngine {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
             let raw = match raw_req.tile_size {
-                256 => self.render_tile_sized::<256>(cog, &raw_req).await?,
-                512 => self.render_tile_sized::<512>(cog, &raw_req).await?,
+                256 => Box::pin(self.render_tile_sized::<256>(cog, &raw_req)).await?,
+                512 => Box::pin(self.render_tile_sized::<512>(cog, &raw_req)).await?,
                 other => {
                     return Err(EngineError::BadRequest(format!(
                         "unsupported tile_size={other}, expected 256 or 512"
@@ -503,12 +689,267 @@ impl TileEngine {
             ));
         }
         match req.tile_size {
-            256 => self.render_tile_sized::<256>(cog, req).await,
-            512 => self.render_tile_sized::<512>(cog, req).await,
+            256 => Box::pin(self.render_tile_sized::<256>(cog, req)).await,
+            512 => Box::pin(self.render_tile_sized::<512>(cog, req)).await,
             other => Err(EngineError::BadRequest(format!(
                 "unsupported tile_size={other}, expected 256 or 512"
             ))),
         }
+    }
+
+    /// Render a batch of XYZ tiles for a single COG (e.g. a map viewport burst or pyramid
+    /// cache-warming pass).
+    ///
+    /// When built with `--features gpu` and a hardware GPU is active, eligible single-band
+    /// separable tiles that share the same `(ifd_idx, band, tile-block neighborhood, style)` are
+    /// fused into a single 3D GPU micro-batch (`GpuTileBatcher`), amortizing the Metal/Vulkan
+    /// dispatch floor across all `K` tiles. Any remaining tiles fall back transparently to
+    /// `render_tile`.
+    pub async fn render_tiles_batch(
+        &self,
+        cog: &OpenedCog,
+        reqs: &[TileRequest],
+    ) -> Vec<Result<Bytes, EngineError>> {
+        if reqs.is_empty() {
+            return Vec::new();
+        }
+        #[allow(unused_mut)]
+        let mut results: Vec<Option<Result<Bytes, EngineError>>> =
+            (0..reqs.len()).map(|_| None).collect();
+
+        #[cfg(feature = "gpu")]
+        if reqs.len() >= 2
+            && let Some(ref gpu) = self.gpu
+            && let Ok(crs) = self.get_or_build_crs(cog)
+        {
+            #[derive(Hash, PartialEq, Eq)]
+            struct BatchKey {
+                ifd_idx: usize,
+                band0: u16,
+                tx0: u32,
+                ty0: u32,
+                grid_w: u32,
+                grid_h: u32,
+                tile_size: u32,
+                resample: u8,
+                rmin_bits: u32,
+                rmax_bits: u32,
+                colormap: String,
+                format_tag: u8,
+                format_q: u32,
+            }
+            struct BatchItem {
+                req_idx: usize,
+                u: Vec<f32>,
+                v: Vec<f32>,
+            }
+            let mut groups: std::collections::HashMap<BatchKey, (SingleBandStyle, Vec<BatchItem>)> =
+                std::collections::HashMap::new();
+
+            for (idx, req) in reqs.iter().enumerate() {
+                if req.unscale {
+                    continue;
+                }
+                let BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    colormap,
+                } = req.bands
+                else {
+                    continue;
+                };
+                if req.tile_size != 256 && req.tile_size != 512 {
+                    continue;
+                }
+                let (format_tag, format_q) = match req.format {
+                    OutputFormat::Png => (0u8, 0u32),
+                    OutputFormat::RawRgba => (1u8, 0u32),
+                    OutputFormat::Webp { quality } => {
+                        (2u8, quality.map(f32::to_bits).unwrap_or(0))
+                    }
+                    OutputFormat::Jpeg { quality } => (3u8, quality as u32),
+                    _ => continue,
+                };
+                let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, req.tile_size);
+                let ifd_idx = cog.index.select_ifd(target_rx, target_ry);
+                let ifd = &cog.index.ifds[ifd_idx];
+                let band0 = band_1based.saturating_sub(1);
+                if band0 >= ifd.samples_per_pixel {
+                    continue;
+                }
+                let pad = match req.resample {
+                    ResampleMode::Nearest => 0i64,
+                    ResampleMode::Bilinear => 1i64,
+                    ResampleMode::Cubic => 2i64,
+                    _ => 3i64,
+                };
+                let uv_bounds: Option<(Vec<f32>, Vec<f32>, f32, f32, f32, f32)> =
+                    if req.tile_size == 256 {
+                        CoordPlan::<256>::build_with_gcp(
+                            &crs,
+                            &ifd.crs_to_pixel,
+                            ifd.gcp_poly.as_deref(),
+                            ifd.width,
+                            ifd.height,
+                            req.tile,
+                        )
+                        .and_then(|p| match p {
+                            CoordPlan::Separable1D { u, v, .. } => {
+                                let (mut u0, mut u1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                let (mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                for &x in u.iter() {
+                                    u0 = u0.min(x);
+                                    u1 = u1.max(x);
+                                }
+                                for &y in v.iter() {
+                                    v0 = v0.min(y);
+                                    v1 = v1.max(y);
+                                }
+                                Some((u.to_vec(), v.to_vec(), u0, u1, v0, v1))
+                            }
+                            _ => None,
+                        })
+                    } else {
+                        CoordPlan::<512>::build_with_gcp(
+                            &crs,
+                            &ifd.crs_to_pixel,
+                            ifd.gcp_poly.as_deref(),
+                            ifd.width,
+                            ifd.height,
+                            req.tile,
+                        )
+                        .and_then(|p| match p {
+                            CoordPlan::Separable1D { u, v, .. } => {
+                                let (mut u0, mut u1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                let (mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                for &x in u.iter() {
+                                    u0 = u0.min(x);
+                                    u1 = u1.max(x);
+                                }
+                                for &y in v.iter() {
+                                    v0 = v0.min(y);
+                                    v1 = v1.max(y);
+                                }
+                                Some((u.to_vec(), v.to_vec(), u0, u1, v0, v1))
+                            }
+                            _ => None,
+                        })
+                    };
+                let Some((u_vec, v_vec, min_u, max_u, min_v, max_v)) = uv_bounds else {
+                    continue;
+                };
+                if !min_u.is_finite() || !min_v.is_finite() {
+                    continue;
+                }
+                let px0 = (min_u.floor() as i64 - pad).clamp(0, ifd.width.saturating_sub(1) as i64) as u32;
+                let py0 = (min_v.floor() as i64 - pad).clamp(0, ifd.height.saturating_sub(1) as i64) as u32;
+                let px1 = (max_u.ceil() as i64 + pad).clamp(0, ifd.width.saturating_sub(1) as i64) as u32;
+                let py1 = (max_v.ceil() as i64 + pad).clamp(0, ifd.height.saturating_sub(1) as i64) as u32;
+                let tx0 = px0 / ifd.tile_width;
+                let ty0 = py0 / ifd.tile_height;
+                let tx1 = (px1 / ifd.tile_width).min(ifd.tiles_across.saturating_sub(1));
+                let ty1 = (py1 / ifd.tile_height).min(ifd.tiles_down.saturating_sub(1));
+                let grid_w = tx1 - tx0 + 1;
+                let grid_h = ty1 - ty0 + 1;
+
+                let key = BatchKey {
+                    ifd_idx,
+                    band0,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
+                    tile_size: req.tile_size,
+                    resample: req.resample as u8,
+                    rmin_bits: rescale.0.to_bits(),
+                    rmax_bits: rescale.1.to_bits(),
+                    colormap: format!("{colormap:?}"),
+                    format_tag,
+                    format_q,
+                };
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (style, Vec::new()))
+                    .1
+                    .push(BatchItem {
+                        req_idx: idx,
+                        u: u_vec,
+                        v: v_vec,
+                    });
+            }
+
+            for (key, (style, items)) in groups {
+                if items.len() < 2 {
+                    continue;
+                }
+                let ifd = &cog.index.ifds[key.ifd_idx];
+                let mut indices = Vec::with_capacity((key.grid_w * key.grid_h) as usize);
+                for ty in key.ty0..key.ty0 + key.grid_h {
+                    for tx in key.tx0..key.tx0 + key.grid_w {
+                        indices.push(Some(ifd.tile_index(tx, ty, key.band0) as u32));
+                    }
+                }
+                let Ok(tiles) = self.store.get_blocks(cog, key.ifd_idx, &indices).await else {
+                    continue;
+                };
+                let band_in_decoded = match ifd.planar_config {
+                    PlanarConfig::Chunky => key.band0 as usize,
+                    PlanarConfig::Planar => 0,
+                };
+                let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                    .iter()
+                    .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+                    .collect();
+                let src = BandSource::new(
+                    ifd.width,
+                    ifd.height,
+                    ifd.tile_width,
+                    ifd.tile_height,
+                    key.tx0,
+                    key.ty0,
+                    key.grid_w,
+                    key.grid_h,
+                    &block_refs,
+                );
+                let uvs: Vec<(&[f32], &[f32])> = items
+                    .iter()
+                    .map(|it| (it.u.as_slice(), it.v.as_slice()))
+                    .collect();
+                if let Some(batch_out) = gpu.try_render_single_band_batch(
+                    cog.id,
+                    key.ifd_idx,
+                    key.band0,
+                    key.tile_size as usize,
+                    &uvs,
+                    &src,
+                    &style,
+                ) {
+                    self.stats
+                        .tiles_served
+                        .fetch_add(items.len() as u64, Ordering::Relaxed);
+                    self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                    for (item, bytes) in items.into_iter().zip(batch_out.into_iter()) {
+                        results[item.req_idx] = Some(Ok(bytes));
+                    }
+                }
+            }
+        }
+
+        let mut final_out = Vec::with_capacity(reqs.len());
+        for (slot, req) in results.into_iter().zip(reqs.iter()) {
+            match slot {
+                Some(res) => final_out.push(res),
+                None => final_out.push(self.render_tile(cog, req).await),
+            }
+        }
+        final_out
     }
 
     async fn render_tile_sized<const N: usize>(
@@ -624,7 +1065,21 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_single_band::<N>(&plan, &src, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_single_band::<N>(
+                            cog.id, ifd_idx, band0, tx0, ty0, &plan, &src, &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_single_band::<N>(&plan, &src, &style)
+                }))
             }
             BandRequest::Terrain {
                 band_1based,
@@ -676,13 +1131,30 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(render_terrain_tile::<N>(
-                    &plan,
-                    &src,
-                    *encoding,
-                    req.resample,
-                    req.format,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_terrain::<N>(
+                            cog.id,
+                            ifd_idx,
+                            band0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *encoding,
+                            req.resample,
+                            req.format,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, req.resample, || {
+                    render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
+                }))
             }
             BandRequest::Dem {
                 band_1based,
@@ -736,11 +1208,10 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                // Ground pixel spacing in meters at the tile's center latitude (correcting WebMercator sec(lat)).
-                let (bx0, by0, bx1, by1) = tile_bounds_3857(req.tile);
-                let (_, lat_deg) = mercator_to_lonlat_deg((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
-                let pixel_size_m =
-                    (((bx1 - bx0) / N as f64) * lat_deg.to_radians().cos().max(0.05)) as f32;
+                let (bx0, _, bx1, _) = tile_bounds_3857(req.tile);
+                // The tile's pixel size in Web Mercator metres, as TiTiler's slope divides by the
+                // transform's pixel size.
+                let pixel_size_m = ((bx1 - bx0) / N as f64) as f32;
                 let style = SingleBandStyle {
                     rescale_min: rescale.0,
                     rescale_max: rescale.1,
@@ -748,13 +1219,30 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_dem_algorithm::<N>(
-                    &plan,
-                    &src,
-                    *algorithm,
-                    pixel_size_m,
-                    &style,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_dem::<N>(
+                            cog.id,
+                            ifd_idx,
+                            band0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *algorithm,
+                            pixel_size_m,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_dem_algorithm::<N>(&plan, &src, *algorithm, pixel_size_m, &style)
+                }))
             }
             BandRequest::Spectral1 {
                 expr,
@@ -804,7 +1292,27 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            cog.id,
+                            ifd_idx,
+                            &[*band_1based],
+                            &plan,
+                            std::slice::from_ref(&src),
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath1::<N>(&plan, &src, *expr, &style)
+                }))
             }
             BandRequest::SarRgb {
                 bands_1based,
@@ -871,7 +1379,26 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_sar_rgb::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    *bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_sar_rgb::<N>(&plan, &srcs, &style)
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * 2);
@@ -905,7 +1432,26 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_sar_rgb::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    *bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_sar_rgb::<N>(&plan, &srcs, &style)
+                }))
                     }
                 }
             }
@@ -994,7 +1540,19 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                            render_rgb_bands::<N>(&plan, &srcs, &style)
+                        }))
                     }
                     PlanarConfig::Planar => {
                         // Fetch all 3 planes in one coalesced call
@@ -1055,7 +1613,19 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                            render_rgb_bands::<N>(&plan, &srcs, &style)
+                        }))
                     }
                 }
             }
@@ -1126,7 +1696,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath2::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * 2);
@@ -1160,7 +1750,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath2::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                 }
             }
@@ -1242,7 +1852,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath3::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * 3);
@@ -1296,7 +1926,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath3::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                 }
             }
@@ -1375,7 +2025,19 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height))
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * nb);
@@ -1418,7 +2080,19 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height))
+                }))
                     }
                 }
             }
@@ -1436,7 +2110,10 @@ impl TileEngine {
             return self.render_tile(&cogs[0], req).await;
         }
         self.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
-        if req.format == OutputFormat::Npy {
+        if matches!(
+            req.format,
+            OutputFormat::Npy | OutputFormat::RawF64 | OutputFormat::NpyF64
+        ) {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
             let raw = match raw_req.tile_size {
@@ -1448,22 +2125,8 @@ impl TileEngine {
                     )));
                 }
             };
-            let nb = match req.bands {
-                BandRequest::Rgb { .. }
-                | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. }
-                | BandRequest::CustomExprRgb { .. } => 3,
-                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
-                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
-                _ => 1,
-            };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                raw,
-                nb,
-                req.tile_size,
-                req.tile_size,
-                true,
-            ));
+            let nb = Self::value_bands(&req.bands);
+            return Ok(format_float_tile(raw, nb, req.tile_size, req.format));
         }
         match req.tile_size {
             256 => self.render_multi_cog_sized::<256>(cogs, req).await,
@@ -1592,6 +2255,24 @@ impl TileEngine {
             .with_scale_offset(sc, off))
         };
 
+        #[cfg(feature = "gpu")]
+        let scene_cog_id = |bands_1based: &[u16]| -> u64 {
+            // Deterministic FNV-1a hash with high-bit tag so multi-COG scene keys never collide
+            // with single-COG `OpenedCog::id` values in `GpuMultiBandCache`.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in bands_1based {
+                let cid = cogs
+                    .get(b.saturating_sub(1) as usize)
+                    .map(|c| c.id)
+                    .unwrap_or(0);
+                for byte in cid.to_le_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            h | (1u64 << 63)
+        };
+
         match &req.bands {
             BandRequest::Single {
                 band_1based,
@@ -1606,20 +2287,51 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_single_band::<N>(&plan, &src, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_single_band::<N>(cid, ifd_idx, 0, tx0, ty0, &plan, &src, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_single_band::<N>(&plan, &src, &style)
+                }))
             }
             BandRequest::Terrain {
                 band_1based,
                 encoding,
             } => {
                 let src = make_src(*band_1based)?;
-                Ok(render_terrain_tile::<N>(
-                    &plan,
-                    &src,
-                    *encoding,
-                    req.resample,
-                    req.format,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_terrain::<N>(
+                            cid,
+                            ifd_idx,
+                            0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *encoding,
+                            req.resample,
+                            req.format,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, req.resample, || {
+                    render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
+                }))
             }
             BandRequest::Dem {
                 band_1based,
@@ -1628,10 +2340,10 @@ impl TileEngine {
                 colormap,
             } => {
                 let src = make_src(*band_1based)?;
-                let (bx0, by0, bx1, by1) = tile_bounds_3857(req.tile);
-                let (_, lat_deg) = mercator_to_lonlat_deg((bx0 + bx1) * 0.5, (by0 + by1) * 0.5);
-                let pixel_size_m =
-                    (((bx1 - bx0) / N as f64) * lat_deg.to_radians().cos().max(0.05)) as f32;
+                let (bx0, _, bx1, _) = tile_bounds_3857(req.tile);
+                // The tile's pixel size in Web Mercator metres, as TiTiler's slope divides by the
+                // transform's pixel size.
+                let pixel_size_m = ((bx1 - bx0) / N as f64) as f32;
                 let style = SingleBandStyle {
                     rescale_min: rescale.0,
                     rescale_max: rescale.1,
@@ -1639,13 +2351,31 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_dem_algorithm::<N>(
-                    &plan,
-                    &src,
-                    *algorithm,
-                    pixel_size_m,
-                    &style,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_dem::<N>(
+                            cid,
+                            ifd_idx,
+                            0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *algorithm,
+                            pixel_size_m,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_dem_algorithm::<N>(&plan, &src, *algorithm, pixel_size_m, &style)
+                }))
             }
             BandRequest::Spectral1 {
                 expr,
@@ -1661,7 +2391,28 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            cid,
+                            ifd_idx,
+                            &[1],
+                            &plan,
+                            std::slice::from_ref(&src),
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath1::<N>(&plan, &src, *expr, &style)
+                }))
             }
             BandRequest::SarRgb {
                 bands_1based,
@@ -1675,7 +2426,20 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_sar_rgb::<N>(sid, ifd_idx, [1, 2], &plan, &srcs, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_sar_rgb::<N>(&plan, &srcs, &style)
+                }))
             }
             BandRequest::Spectral2 {
                 expr,
@@ -1691,7 +2455,20 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(sid, ifd_idx, &[1, 2], &plan, &srcs, *expr, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath2::<N>(&plan, &srcs, *expr, &style)
+                }))
             }
             BandRequest::Spectral3 {
                 expr,
@@ -1711,7 +2488,28 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            sid,
+                            ifd_idx,
+                            &[1, 2, 3],
+                            &plan,
+                            &srcs,
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath3::<N>(&plan, &srcs, *expr, &style)
+                }))
             }
             BandRequest::Rgb {
                 bands_1based,
@@ -1729,7 +2527,20 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_rgb::<N>(sid, ifd_idx, [1, 2, 3], &plan, &srcs, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_rgb_bands::<N>(&plan, &srcs, &style)
+                }))
             }
             BandRequest::CustomExprRgb { .. }
             | BandRequest::CustomExprMulti { .. }
@@ -1752,15 +2563,30 @@ impl TileEngine {
                 for &b in &prog.used_bands {
                     ordered.push(make_src(b)?);
                 }
-                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height)))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(&prog.used_bands);
+                    if let Some(bytes) = gpu
+                        .try_render_expr::<N>(sid, ifd_idx, &plan, &ordered, prog, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height))
+                }))
             }
         }
     }
 
     /// Render a dynamic front-to-back mosaic across `urls` with **early-exit pixel coverage**:
     /// walks scenes in priority order, composites only into unfilled (`alpha == 0`) pixels, and
-    /// stops immediately once all `tile_size * tile_size` pixels are opaque — never opening,
-    /// fetching, or decoding remaining background scenes!
+    /// stops once all `tile_size * tile_size` pixels are opaque. The first scene is read
+    /// alone, so a tile it fills opens nothing else; after it, scenes are read a few at a
+    /// time (see [`Self::render_mosaic_scenes_ahead`]), so at most that few are opened beyond
+    /// the one that fills the tile.
     pub async fn render_mosaic_tile(
         &self,
         urls: &[String],
@@ -1785,7 +2611,296 @@ impl TileEngine {
         // Bound per-tile scene fan-out so a huge MosaicJSON/catalog of transparent or OOB COGs
         // cannot trigger thousands of sequential open_uri + render_tile calls on a single GET.
         const MAX_MOSAIC_SCENES_PER_TILE: usize = 64;
-        let urls = &urls[..urls.len().min(MAX_MOSAIC_SCENES_PER_TILE)];
+        let scenes: Vec<Vec<String>> = urls
+            .iter()
+            .take(MAX_MOSAIC_SCENES_PER_TILE)
+            .map(|u| vec![u.clone()])
+            .collect();
+        self.render_mosaic(&scenes, req, 1, true).await
+    }
+
+    /// Open every asset of one mosaic scene, concurrently when there is more than one.
+    async fn open_scene(&self, scene: &[String]) -> Result<Vec<Arc<OpenedCog>>, EngineError> {
+        if let [only] = scene {
+            return Ok(vec![self.store.open_uri(only).await.map_err(|e| asset_fetch_error(only, e))?]);
+        }
+        let mut js = tokio::task::JoinSet::new();
+        for (idx, uri) in scene.iter().enumerate() {
+            let store = self.store.clone();
+            let uri = uri.clone();
+            js.spawn(async move { Ok::<_, IoError>((idx, store.open_uri(&uri).await?)) });
+        }
+        let mut slots: Vec<Option<Arc<OpenedCog>>> = vec![None; scene.len()];
+        while let Some(res) = js.join_next().await {
+            let (idx, cog) = res
+                .map_err(|e| EngineError::BadRequest(format!("open task failed: {e}")))??;
+            slots[idx] = Some(cog);
+        }
+        Ok(slots.into_iter().flatten().collect())
+    }
+
+    /// One scene of a mosaic, as the tile `base` asks for.
+    async fn render_mosaic_scene(
+        &self,
+        scene: &[String],
+        base: &TileRequest,
+        unscale: bool,
+    ) -> Result<Bytes, SceneFailure> {
+        let cogs = self.open_scene(scene).await.map_err(SceneFailure::Unopened)?;
+        let cog = &cogs[0];
+        // Fold each scene's own GDAL scale/offset into Single/Rgb rescale bounds when
+        // `?unscale=true` so heterogeneous mosaic scenes unscale accurately at zero per-pixel cost.
+        // Band indices address one file, so this applies to single-asset scenes only.
+        let scene_req = if unscale
+            && cogs.len() == 1
+            && matches!(
+                base.bands,
+                BandRequest::Single { .. } | BandRequest::Rgb { .. }
+            ) {
+            let mut sr = base.clone();
+            let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+                let i = b1.saturating_sub(1) as usize;
+                let sc = cog.index.scales.get(i).copied().unwrap_or(1.0);
+                let off = cog.index.offsets.get(i).copied().unwrap_or(0.0);
+                if ((sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9) || sc.abs() < 1e-12 {
+                    (mn, mx)
+                } else {
+                    ((mn - off) / sc, (mx - off) / sc)
+                }
+            };
+            match &mut sr.bands {
+                BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    ..
+                } => {
+                    *rescale = adj(*band_1based, rescale.0, rescale.1);
+                }
+                BandRequest::Rgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } => {
+                    for k in 0..3 {
+                        let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                        rescale_min[k] = mn;
+                        rescale_max[k] = mx;
+                    }
+                }
+                _ => {}
+            }
+            sr
+        } else {
+            base.clone()
+        };
+        self.render_multi_cog_tile(&cogs, &scene_req).await.map_err(SceneFailure::Unread)
+    }
+
+    /// The scenes of a mosaic rendered in order, up to a growing number of them at once.
+    fn mosaic_scenes_in_order<'a>(
+        &'a self,
+        scenes: &'a [Vec<String>],
+        base: &'a TileRequest,
+        unscale: bool,
+        ahead: usize,
+    ) -> ScenesInOrder<'a> {
+        ScenesInOrder {
+            engine: self,
+            scenes,
+            base,
+            unscale,
+            next: 0,
+            window: ahead.clamp(1, MOSAIC_SCENES_AHEAD),
+            reading: FuturesOrdered::new(),
+        }
+    }
+
+    /// Whether rasters lie on one grid, pixel for pixel at every overview and in the same
+    /// place, so that they can be read as the bands of one image.
+    pub fn on_one_grid(cogs: &[Arc<OpenedCog>]) -> bool {
+        let Some(first) = cogs.first() else {
+            return true;
+        };
+        let placed = |c: &OpenedCog| {
+            let t = &c.index.full_res().crs_to_pixel;
+            [t.a, t.b, t.c, t.d, t.e, t.f]
+        };
+        let origin = placed(first);
+        cogs.iter().all(|c| {
+            c.index.ifds.len() == first.index.ifds.len()
+                && placed(c).iter().zip(&origin).all(|(a, b)| (a - b).abs() <= 1e-9 * b.abs().max(1.0))
+        }) && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
+    }
+
+    /// The bands to read of a raster that has `count`, `extra` of them extra samples: those
+    /// asked for, counted from one, or all of its own when none is. Refuses a band the raster has not, and more than
+    /// [`Self::MAX_PLANES_PER_RASTER`].
+    pub fn wanted_bands(count: u16, extra: usize, bands_1based: &[u16]) -> Result<Vec<u16>, EngineError> {
+        // With none asked for: every band that is not an extra sample (alpha), as rio-tiler
+        // leaves those out. They come last.
+        let own = count.saturating_sub(extra.min(usize::from(u16::MAX)) as u16).max(1).min(count);
+        let wanted: Vec<u16> =
+            if bands_1based.is_empty() { (1..=own).collect() } else { bands_1based.to_vec() };
+        if let Some(bad) = wanted.iter().find(|b| **b == 0 || **b > count) {
+            let known: Vec<String> = (1..=count).map(|b| b.to_string()).collect();
+            let tail = if count == 1 { "," } else { "" };
+            return Err(EngineError::BadRequest(format!(
+                "band index {bad} out of range (not in ({}{tail}))",
+                known.join(", ")
+            )));
+        }
+        if wanted.len() > Self::MAX_PLANES_PER_RASTER {
+            return Err(EngineError::BadRequest(format!(
+                "{} bands of one asset are too many to read at once (at most {}); choose bands with `bidx`",
+                wanted.len(),
+                Self::MAX_PLANES_PER_RASTER
+            )));
+        }
+        Ok(wanted)
+    }
+
+    /// The most bands of one raster [`Self::raster_planes`] reads for one tile.
+    pub const MAX_PLANES_PER_RASTER: usize = 32;
+
+    /// Bands of one raster over a tile, each a plane of `f32` on the tile's grid whatever
+    /// the raster's own, NaN where it has no data. An empty `bands_1based` asks for every
+    /// band. `req` gives the tile, its size and `unscale`; `resampling` is used for a raster
+    /// already in the tile's projection and `reproject` for one that has to be warped into
+    /// it. The raster's sample type comes back with the planes.
+    pub async fn raster_planes(
+        &self,
+        uri: &str,
+        bands_1based: &[u16],
+        req: &TileRequest,
+        resampling: ResampleMode,
+        reproject: ResampleMode,
+    ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
+        let cog = self.store.open_uri(uri).await?;
+        let full = cog.index.full_res();
+        let sample_type = full.sample_type;
+        let wanted = Self::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
+        let mut one = req.clone();
+        one.format = OutputFormat::RawF32;
+        one.resample = match self.get_or_build_crs(&cog)? {
+            CrsModel::Epsg3857 => resampling,
+            _ => reproject,
+        };
+        let pixels = (req.tile_size as usize).pow(2);
+        let mut planes = Vec::with_capacity(wanted.len());
+        // One band at a time: read three together and the renderer gives none of them
+        // where it finds one of them empty.
+        for band in &wanted {
+            one.bands = BandRequest::Single {
+                band_1based: *band,
+                rescale: (0.0, 255.0),
+                colormap: ColormapName::Grayscale,
+            };
+            let values = self.render_tile(&cog, &one).await?;
+            if values.len() != pixels * 4 {
+                return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
+            }
+            planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
+        }
+        if planes.len() != wanted.len() {
+            return Err(EngineError::BadRequest("unexpected number of planes from the renderer".into()));
+        }
+        Ok((planes, sample_type))
+    }
+
+    /// How many bands of values a request's scenes hold: three for a colour composite or terrain
+    /// encoding, N for multi-band / multi-expression requests, else one.
+    pub fn value_bands(bands: &BandRequest) -> usize {
+        match bands {
+            BandRequest::Rgb { .. }
+            | BandRequest::SarRgb { .. }
+            | BandRequest::Terrain { .. }
+            | BandRequest::CustomExprRgb { .. } => 3,
+            BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+            BandRequest::CustomExprMulti { progs } => progs.len().max(1),
+            _ => 1,
+        }
+    }
+
+    /// Every scene of a mosaic as the values its bands hold over the tile, before any
+    /// rescaling or colour, handed to `each` in the mosaic's order: band after band
+    /// ([`Self::value_bands`] of them) of little-endian `f32`, NaN where the scene has no
+    /// data. A scene that does not reach the tile is not handed over. This is what a mosaic
+    /// that has to look at every scene is made from; one that takes the first value it finds
+    /// should use [`Self::render_mosaic_scenes_ahead`], which stops when the tile is full.
+    pub async fn mosaic_scene_values(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        mut each: impl FnMut(&[u8]),
+    ) -> Result<(), EngineError> {
+        if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one asset per scene".into(),
+            ));
+        }
+        let len = Self::value_bands(&req.bands) * (req.tile_size as usize).pow(2) * 4;
+        let mut scene_req = req.clone();
+        scene_req.format = OutputFormat::RawF32;
+        let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, MOSAIC_SCENES_AHEAD);
+        // A scene that misses the tile comes back as nothing but no data. It is not a scene
+        // of this tile: counted, it would make a tile of zeros out of nothing.
+        let nothing = |scene: &[u8]| {
+            scene.chunks_exact(4).all(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]).is_nan())
+        };
+        while let Some(scene) = reading.next().await {
+            let scene = scene.map_err(SceneFailure::into_error)?;
+            if scene.len() == len && !nothing(&scene) {
+                each(&scene);
+            }
+        }
+        Ok(())
+    }
+
+    /// The mosaic behind [`Self::render_mosaic_tile`], over scenes that are each one asset or
+    /// two to three co-registered single-band assets (rendered as one multi-asset composite).
+    /// The caller bounds how many scenes it passes.
+    pub async fn render_mosaic_scenes(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+    ) -> Result<Bytes, EngineError> {
+        Ok(self.render_mosaic(scenes, req, 1, true).await?.0)
+    }
+
+    /// [`Self::render_mosaic_scenes`], reading up to `ahead` scenes at once from the start.
+    ///
+    /// Scenes are always composited in order, and a tile's answer does not depend on
+    /// `ahead`. What it changes is the wait: a scene is mostly time spent on its storage,
+    /// and scenes read one after another add those waits up. With `ahead` of one, the first
+    /// scene is read alone, so a tile it fills opens nothing else, and each scene that
+    /// does not fill the tile doubles how many are read at once, up to
+    /// [`MOSAIC_SCENES_AHEAD`]. A caller whose list is already only the scenes that add to
+    /// the tile (pgSTAC's, chosen by footprint) passes the limit and reads them together.
+    pub async fn render_mosaic_scenes_ahead(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        ahead: usize,
+    ) -> Result<Bytes, EngineError> {
+        Ok(self.render_mosaic(scenes, req, ahead, false).await?.0)
+    }
+
+    /// The mosaic itself. With `skip_unopened`, a scene that cannot be opened is passed
+    /// over, and its error is the answer only when no scene could be opened at all: a
+    /// list of URLs may hold a dead one. Without, it fails the tile, as any scene that
+    /// cannot be read does.
+    async fn render_mosaic(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        ahead: usize,
+        skip_unopened: bool,
+    ) -> Result<(Bytes, Vec<String>), EngineError> {
+        if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one asset per scene".into(),
+            ));
+        }
         let n = req.tile_size as usize;
         let total_pixels = n * n;
         let f32_bands: usize = match req.bands {
@@ -1846,20 +2961,23 @@ impl TileEngine {
 
         // 1-scene fast path: skip canvas allocation, pixel compositing, and re-encoding so single-scene
         // mosaic tiles keep zero-decode JPEG/WebP passthrough and 8-bit indexed PLTE PNG encoding!
-        if urls.len() == 1 {
+        if scenes.len() == 1 && scenes[0].len() == 1 {
             let cog = self
                 .store
-                .open_uri(&urls[0])
+                .open_uri(&scenes[0][0])
                 .await
-                .map_err(|e| asset_fetch_error(&urls[0], e))?;
+                .map_err(|e| asset_fetch_error(&scenes[0][0], e))?;
             let scene_req = fold_scene_unscale(&cog, req);
             let bytes = self.render_tile(&cog, &scene_req).await?;
             return Ok((bytes, Vec::new()));
         }
 
-        // RawF32 / Npy mosaic path: composite real f32 band-major planes (CHW) with NaN transparency
-        // and early exit once every pixel has valid data.
-        if matches!(req.format, OutputFormat::RawF32 | OutputFormat::Npy) {
+        // RawF32 / RawF64 / Npy / NpyF64 mosaic path: composite real float band-major planes (CHW)
+        // with NaN transparency and early exit once every pixel has valid data.
+        if matches!(
+            req.format,
+            OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64
+        ) {
             let mut canvas = vec![f32::NAN; f32_bands * total_pixels];
             let mut filled = 0usize;
             let mut scene_req = req.clone();
@@ -1869,35 +2987,34 @@ impl TileEngine {
             let mut opened_any = false;
             let mut last_open_err: Option<EngineError> = None;
             let mut failed_assets: Vec<String> = Vec::new();
-            for (scene_i, url) in urls.iter().enumerate() {
-                if filled >= total_pixels {
+            let mut scene_i = 0usize;
+            let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, ahead);
+            while filled < total_pixels {
+                let scene_urls = &scenes[scene_i.min(scenes.len() - 1)];
+                scene_i += 1;
+                let Some(src) = reading.next().await else {
                     break;
-                }
-                if scene_i > 0 {
-                    tokio::task::consume_budget().await;
-                }
-                let cog = match self.store.open_uri(url).await {
-                    Ok(c) => {
-                        opened_any = true;
-                        c
-                    }
-                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                        return Err(EngineError::Io(e));
-                    }
-                    Err(e) => {
-                        failed_assets.push(cogzilla_io::redact_http_url(url));
-                        last_open_err = Some(asset_fetch_error(url, e));
-                        continue;
-                    }
                 };
-                let src = match self.render_tile(&cog, &scene_req).await {
-                    Ok(b) => b,
-                    Err(EngineError::Io(e)) if !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                        failed_assets.push(cogzilla_io::redact_http_url(url));
-                        last_open_err = Some(asset_fetch_error(url, e));
+                let src = match src {
+                    Ok(src) => {
+                        opened_any = true;
+                        src
+                    }
+                    // An asset the allowlist refuses fails the tile, as on `main`, rather than being
+                    // passed over as one that could not be read.
+                    Err(SceneFailure::Unopened(e)) if skip_unopened && !refused(&e) => {
+                        failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                        last_open_err = Some(e);
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    // As on `main`: a scene that opened but could not be read is passed over
+                    // too, unless the allowlist refused what it reads.
+                    Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                        last_open_err = Some(asset_fetch_error(&scene_urls[0], e));
+                        continue;
+                    }
+                    Err(failure) => return Err(failure.into_error()),
                 };
                 if src.len() != f32_bands * total_pixels * 4
                     || src.as_ptr() == empty_f32_sentinel.as_ptr()
@@ -1943,21 +3060,9 @@ impl TileEngine {
                 {
                     return Err(err);
                 }
-                if req.format == OutputFormat::Npy {
-                    let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
-                    return Ok((
-                        cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                            raw,
-                            f32_bands,
-                            req.tile_size,
-                            req.tile_size,
-                            true,
-                        ),
-                        failed_assets,
-                    ));
-                }
+                let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
                 return Ok((
-                    empty_tile_bytes(req.tile_size, req.format, f32_bands),
+                    format_float_tile(raw, f32_bands, req.tile_size, req.format),
                     failed_assets,
                 ));
             }
@@ -1966,19 +3071,10 @@ impl TileEngine {
                 out.extend_from_slice(&v.to_le_bytes());
             }
             let raw = out.freeze();
-            if req.format == OutputFormat::Npy {
-                return Ok((
-                    cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                        raw,
-                        f32_bands,
-                        req.tile_size,
-                        req.tile_size,
-                        true,
-                    ),
-                    failed_assets,
-                ));
-            }
-            return Ok((raw, failed_assets));
+            return Ok((
+                format_float_tile(raw, f32_bands, req.tile_size, req.format),
+                failed_assets,
+            ));
         }
 
         let mut canvas = vec![0u8; total_pixels * 4];
@@ -1991,36 +3087,32 @@ impl TileEngine {
         let mut opened_any = false;
         let mut last_open_err: Option<EngineError> = None;
         let mut failed_assets: Vec<String> = Vec::new();
-        for (scene_i, url) in urls.iter().enumerate() {
-            if filled >= total_pixels {
+        let mut scene_i = 0usize;
+        let mut reading = self.mosaic_scenes_in_order(scenes, &base_scene_req, req.unscale, ahead);
+        while filled < total_pixels {
+            let scene_urls = &scenes[scene_i.min(scenes.len() - 1)];
+            scene_i += 1;
+            let Some(src) = reading.next().await else {
                 break;
-            }
-            if scene_i > 0 {
-                tokio::task::consume_budget().await;
-            }
-            let cog = match self.store.open_uri(url).await {
-                Ok(c) => {
-                    opened_any = true;
-                    c
-                }
-                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                    return Err(EngineError::Io(e));
-                }
-                Err(e) => {
-                    failed_assets.push(cogzilla_io::redact_http_url(url));
-                    last_open_err = Some(asset_fetch_error(url, e));
-                    continue;
-                }
             };
-            let scene_req = fold_scene_unscale(&cog, &base_scene_req);
-            let src = match self.render_tile(&cog, &scene_req).await {
-                Ok(b) => b,
-                Err(EngineError::Io(e)) if !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                    failed_assets.push(cogzilla_io::redact_http_url(url));
-                    last_open_err = Some(asset_fetch_error(url, e));
+            let src = match src {
+                Ok(src) => {
+                    opened_any = true;
+                    src
+                }
+                // An asset the allowlist refuses fails the tile, as on `main`, rather than being
+                // passed over as one that could not be read.
+                Err(SceneFailure::Unopened(e)) if skip_unopened && !refused(&e) => {
+                    failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                    last_open_err = Some(e);
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                    last_open_err = Some(asset_fetch_error(&scene_urls[0], e));
+                    continue;
+                }
+                Err(failure) => return Err(failure.into_error()),
             };
             if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
                 continue;
@@ -2074,24 +3166,13 @@ impl TileEngine {
             self.stats
                 .empty_short_circuits
                 .fetch_add(1, Ordering::Relaxed);
-            let f32_bands = match req.bands {
-                BandRequest::Rgb { .. }
-                | BandRequest::SarRgb { .. }
-                | BandRequest::Terrain { .. }
-                | BandRequest::CustomExprRgb { .. } => 3,
-                BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
-                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
-                _ => 1,
-            };
-            if req.format == OutputFormat::Npy {
+            let f32_bands = Self::value_bands(&req.bands);
+            if matches!(
+                req.format,
+                OutputFormat::Npy | OutputFormat::RawF64 | OutputFormat::NpyF64
+            ) {
                 let raw = empty_tile_bytes(req.tile_size, OutputFormat::RawF32, f32_bands);
-                return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                    raw,
-                    f32_bands,
-                    req.tile_size,
-                    req.tile_size,
-                    true,
-                ));
+                return Ok(format_float_tile(raw, f32_bands, req.tile_size, req.format));
             }
             return Ok(empty_tile_bytes(req.tile_size, req.format, f32_bands));
         }
@@ -2523,5 +3604,70 @@ mod tests {
             tile_fetch_range_for_plan(&plan, ResampleMode::Average, false, &ifd);
         assert_eq!(tx0, 0, "footprint sx=16 at u=260 must fetch left neighbor tile 0");
         assert_eq!(ty0, 0, "footprint sy=16 at v=260 must fetch top neighbor tile 0");
+    }
+
+    #[test]
+    fn value_bands_covers_custom_expr_and_terrain() {
+        let p = cogzilla_kernel::ExprProgram::compile("b1").unwrap();
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::CustomExprRgb {
+                progs: [p.clone(), p.clone(), p.clone()],
+                rescale_min: [0.0; 3],
+                rescale_max: [1.0; 3],
+            }),
+            3
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::CustomExprMulti {
+                progs: vec![p.clone(), p.clone(), p.clone(), p.clone()],
+            }),
+            4
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::Terrain {
+                band_1based: 1,
+                encoding: cogzilla_kernel::TerrainEncoding::Terrarium,
+            }),
+            3
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::MultiBand {
+                bands_1based: vec![1, 2],
+            }),
+            2
+        );
+        assert_eq!(
+            TileEngine::value_bands(&BandRequest::Single {
+                band_1based: 1,
+                rescale: (0.0, 255.0),
+                colormap: ColormapName::Grayscale,
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn format_float_tile_handles_raw_f64_and_npy_f64() {
+        let raw_f32: Vec<u8> = [1.5f32, -2.0, 0.25, f32::NAN]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let raw64 = format_float_tile(Bytes::from(raw_f32.clone()), 1, 2, OutputFormat::RawF64);
+        assert_eq!(raw64.len(), 4 * 8);
+        let vals: Vec<f64> = raw64
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(vals[0], 1.5);
+        assert_eq!(vals[1], -2.0);
+        assert_eq!(vals[2], 0.25);
+        assert!(vals[3].is_nan());
+
+        let npy64 = format_float_tile(Bytes::from(raw_f32), 1, 2, OutputFormat::NpyF64);
+        assert_eq!(&npy64[..6], b"\x93NUMPY");
+        let hdr_len = u16::from_le_bytes([npy64[8], npy64[9]]) as usize;
+        let hdr = std::str::from_utf8(&npy64[10..10 + hdr_len]).unwrap();
+        assert!(hdr.contains("<f8"), "expected float64 dtype, got {hdr}");
+        assert!(hdr.contains("(2, 2, 2)"), "expected (band+mask, 2, 2), got {hdr}");
     }
 }

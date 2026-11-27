@@ -73,5 +73,6 @@ Single-request warm loopback HTTP measurements from [benches/titiler_diff_oracle
 
 ## Sources
 
+- [docs/gpu-benchmarks.md](gpu-benchmarks.md): GPU acceleration & sustained realistic map-server soak benchmarks (RTX 3090 Ti Vulkan & Apple M5 Metal — staggered pan/zoom, 32-client tile flood, live tiles + `2048²` analytics contention, concurrency scaling, and `GpuCoalescer` telemetry).
 - [benches/S3_BENCHMARK.md](../benches/S3_BENCHMARK.md): real COGs on S3 against a tuned TiTiler, covering time, memory and cost, with caveats and reproduction steps. This is the source of the S3 table above.
 - [benches/COGMARK.md](../benches/COGMARK.md): the local `BM-01` to `BM-11` suite against GDAL, `rio-tiler` and TiTiler on synthetic fixtures, on an Apple M5 and on a Linux x86-64 runner, with reproduction steps. This is the source of the local table, and it is the best case: no network and a warm cache. The Linux numbers come from the manually triggered [COGMark workflow](../.github/workflows/bench.yml).

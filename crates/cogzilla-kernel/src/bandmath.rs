@@ -113,6 +113,66 @@ impl SpectralExpr {
             2.5 * (nir - red) / d
         }
     }
+
+    /// Canonical `expr_vm::Op` bytecode sequence for built-in single-output spectral indices.
+    /// Returns `None` for multi-channel `SarRgb`. Used as the single source of truth so GPU
+    /// compilation (`compile_spectral_to_gpu`) cannot drift from the CPU definitions above.
+    pub fn to_ops(self) -> Option<&'static [crate::expr_vm::Op]> {
+        use crate::expr_vm::Op;
+        static DB_OPS: [Op; 2] = [Op::LoadBand(0), Op::Db];
+        static ND_OPS: [Op; 7] = [
+            Op::LoadBand(0),
+            Op::LoadBand(1),
+            Op::Sub,
+            Op::LoadBand(0),
+            Op::LoadBand(1),
+            Op::Add,
+            Op::Div,
+        ];
+        static SAVI_OPS: [Op; 11] = [
+            Op::PushConst(1.5),
+            Op::LoadBand(0),
+            Op::LoadBand(1),
+            Op::Sub,
+            Op::Mul,
+            Op::LoadBand(0),
+            Op::LoadBand(1),
+            Op::Add,
+            Op::PushConst(0.5),
+            Op::Add,
+            Op::Div,
+        ];
+        static RATIO_OPS: [Op; 3] = [Op::LoadBand(0), Op::LoadBand(1), Op::Div];
+        static DIFF_OPS: [Op; 3] = [Op::LoadBand(0), Op::LoadBand(1), Op::Sub];
+        static EVI_OPS: [Op; 17] = [
+            Op::PushConst(2.5),
+            Op::LoadBand(0),
+            Op::LoadBand(1),
+            Op::Sub,
+            Op::Mul,
+            Op::LoadBand(0),
+            Op::PushConst(6.0),
+            Op::LoadBand(1),
+            Op::Mul,
+            Op::Add,
+            Op::PushConst(7.5),
+            Op::LoadBand(2),
+            Op::Mul,
+            Op::Sub,
+            Op::PushConst(1.0),
+            Op::Add,
+            Op::Div,
+        ];
+        match self {
+            Self::Db => Some(&DB_OPS),
+            Self::NormalizedDiff => Some(&ND_OPS),
+            Self::Savi => Some(&SAVI_OPS),
+            Self::Ratio => Some(&RATIO_OPS),
+            Self::Diff => Some(&DIFF_OPS),
+            Self::Evi => Some(&EVI_OPS),
+            Self::SarRgb => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -136,5 +196,49 @@ mod tests {
         assert!(fast_db_from_power(0.0).is_nan());
         assert!(fast_db_from_power(-0.5).is_nan());
         assert!(fast_db_from_power(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn spectral_expr_to_ops_matches_eval() {
+        use crate::expr_vm::ExprProgram;
+        let samples = [
+            (0.8f32, 0.2f32, 0.1f32),
+            (0.15, 0.45, 0.05),
+            (1.2, 0.0, 0.3),
+        ];
+        for expr in [
+            SpectralExpr::Db,
+            SpectralExpr::NormalizedDiff,
+            SpectralExpr::Savi,
+            SpectralExpr::Ratio,
+            SpectralExpr::Diff,
+            SpectralExpr::Evi,
+        ] {
+            let ops = expr.to_ops().expect("single-output spectral expr has ops");
+            let n = expr.required_bands();
+            let prog = ExprProgram {
+                ops: ops.to_vec(),
+                used_bands: (1..=n as u16).collect(),
+                max_depth: 8,
+            };
+            for &(a, b, c) in &samples {
+                let got = prog.eval(&[a, b, c][..n]);
+                let want = match n {
+                    1 => expr.eval1(a),
+                    2 => expr.eval2(a, b),
+                    3 => expr.eval3(a, b, c),
+                    _ => unreachable!(),
+                };
+                if want.is_nan() {
+                    assert!(got.is_nan(), "{expr:?}: expected NaN, got {got}");
+                } else {
+                    assert!(
+                        (got - want).abs() < 1e-5,
+                        "{expr:?} ({a},{b},{c}): to_ops={got} vs eval={want}"
+                    );
+                }
+            }
+        }
+        assert!(SpectralExpr::SarRgb.to_ops().is_none());
     }
 }

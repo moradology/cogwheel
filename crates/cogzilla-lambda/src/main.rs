@@ -49,6 +49,12 @@ fn build_engine_from_env() -> Arc<TileEngine> {
         tile_cache_mb * 1024 * 1024,
     ));
 
+    match engine.attach_pgstac_from_env() {
+        Ok(true) => tracing::info!("pgSTAC database configured; serving /searches"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "invalid pgSTAC database settings; /searches disabled"),
+    }
+
     if let Ok(specs) = std::env::var("COGZILLA_MOSAIC") {
         for spec in specs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if let Some((name, path)) = spec.split_once('=') {

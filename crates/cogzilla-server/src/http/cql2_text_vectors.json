@@ -1,0 +1,8300 @@
+[
+{
+"text": "a = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1.5",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.5
+]
+},
+"valid": true
+},
+{
+"text": "a = -1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+-1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = -1.5e3",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+-1500.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1e3",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1000.0
+]
+},
+"valid": true
+},
+{
+"text": "a = .5",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 10000000000000000000000",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1e+22
+]
+},
+"valid": true
+},
+{
+"text": "a = 'x'",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "a = 'it''s'",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+"it's"
+]
+},
+"valid": true
+},
+{
+"text": "a = ''",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+""
+]
+},
+"valid": true
+},
+{
+"text": "a = TRUE",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+"valid": true
+},
+{
+"text": "a = false",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+false
+]
+},
+"valid": true
+},
+{
+"text": "a = b",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a <> 1",
+"json": {
+"op": "<>",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a != 1",
+"json": {
+"op": "<>",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a < 1",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a <= 1",
+"json": {
+"op": "<=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a > 1",
+"json": {
+"op": ">",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a >= 1",
+"json": {
+"op": ">=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "1 = a",
+"json": {
+"op": "=",
+"args": [
+1.0,
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND b = 2",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND b = 2 AND c = 3",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 OR b = 2 OR c = 3",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 OR b = 2 AND c = 3",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "(a = 1 OR b = 2) AND c = 3",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "or",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 and b = 2 or c = 3",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT a = 1",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT (a = 1 AND b = 2)",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT NOT a = 1",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND NOT b = 2",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a LIKE 'x%'",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+"x%"
+]
+},
+"valid": true
+},
+{
+"text": "a NOT LIKE 'x%'",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+"x%"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a like 'x_'",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+"x_"
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN 1 AND 2",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+1.0,
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a NOT BETWEEN 1 AND 2",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+1.0,
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN 1 AND 2 AND b = 3",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+1.0,
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a IN (1, 2, 3)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+1.0,
+2.0,
+3.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "a IN ('x')",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+"x"
+]
+]
+},
+"valid": true
+},
+{
+"text": "a NOT IN ('x', 'y')",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+"x",
+"y"
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a IS NOT NULL",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a + 1 = 2",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a - 1 = 2",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "-",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a * 2 = 4",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+{
+"property": "a"
+},
+2.0
+]
+},
+4.0
+]
+},
+"valid": true
+},
+{
+"text": "a / 2 = 4",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "/",
+"args": [
+{
+"property": "a"
+},
+2.0
+]
+},
+4.0
+]
+},
+"valid": true
+},
+{
+"text": "a % 2 = 0",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "%",
+"args": [
+{
+"property": "a"
+},
+2.0
+]
+},
+0.0
+]
+},
+"valid": true
+},
+{
+"text": "a ^ 2 = 4",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "^",
+"args": [
+{
+"property": "a"
+},
+2.0
+]
+},
+4.0
+]
+},
+"valid": true
+},
+{
+"text": "a div 2 = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "div",
+"args": [
+{
+"property": "a"
+},
+2.0
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a + b * c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "*",
+"args": [
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "(a + b) * c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a - b - c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "-",
+"args": [
+{
+"op": "-",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a / b / c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "/",
+"args": [
+{
+"op": "/",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "2 ^ 3 ^ 2 = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "^",
+"args": [
+{
+"op": "^",
+"args": [
+2.0,
+3.0
+]
+},
+2.0
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "-a = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"property": "a"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = -b",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a + -1 = 0",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+-1.0
+]
+},
+0.0
+]
+},
+"valid": true
+},
+{
+"text": "a - -1 = 0",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "-",
+"args": [
+{
+"property": "a"
+},
+-1.0
+]
+},
+0.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 + 2 * 3 - 4 / 5",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "-",
+"args": [
+{
+"op": "+",
+"args": [
+1.0,
+{
+"op": "*",
+"args": [
+2.0,
+3.0
+]
+}
+]
+},
+{
+"op": "/",
+"args": [
+4.0,
+5.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "foo(a) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "foo(a, 1, 'x') = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+},
+1.0,
+"x"
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "foo() = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "foo",
+"args": []
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "CASEI(a) = CASEI('X')",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "casei",
+"args": [
+"X"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "casei(a) = 'x'",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "ACCENTI(a) = ACCENTI('é')",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "accenti",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "accenti",
+"args": [
+"é"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "eo:cloud_cover < 20",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "eo:cloud_cover"
+},
+20.0
+]
+},
+"valid": true
+},
+{
+"text": "s2:mgrs_tile = '32TMR'",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "s2:mgrs_tile"
+},
+"32TMR"
+]
+},
+"valid": true
+},
+{
+"text": "properties.eo:cloud_cover < 20",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "properties.eo:cloud_cover"
+},
+20.0
+]
+},
+"valid": true
+},
+{
+"text": "\"eo:cloud_cover\" < 20",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "eo:cloud_cover"
+},
+20.0
+]
+},
+"valid": true
+},
+{
+"text": "\"a b\" = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a b"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a.b.c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a.b.c"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a_b1 = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a_b1"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "A = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "A"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "datetime > TIMESTAMP('2024-12-01T00:00:00Z')",
+"json": {
+"op": ">",
+"args": [
+{
+"property": "datetime"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "datetime > timestamp('2024-12-01T00:00:00Z')",
+"json": {
+"op": ">",
+"args": [
+{
+"property": "datetime"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "d = DATE('2024-12-01')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "d"
+},
+{
+"date": "2024-12-01"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_BEFORE(datetime, TIMESTAMP('2024-12-01T00:00:00Z'))",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "datetime"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_AFTER(datetime, DATE('2024-12-01'))",
+"json": {
+"op": "t_after",
+"args": [
+{
+"property": "datetime"
+},
+{
+"date": "2024-12-01"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_DURING(datetime, INTERVAL('2024-01-01T00:00:00Z', '2024-12-31T00:00:00Z'))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "datetime"
+},
+{
+"interval": [
+"2024-01-01T00:00:00Z",
+"2024-12-31T00:00:00Z"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_INTERSECTS(datetime, INTERVAL('2024-01-01', '..'))",
+"json": {
+"op": "t_intersects",
+"args": [
+{
+"property": "datetime"
+},
+{
+"interval": [
+"2024-01-01",
+".."
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_INTERSECTS(INTERVAL(start_datetime, end_datetime), INTERVAL('..', '2024-12-31'))",
+"json": {
+"op": "t_intersects",
+"args": [
+{
+"interval": [
+{
+"property": "start_datetime"
+},
+{
+"property": "end_datetime"
+}
+]
+},
+{
+"interval": [
+"..",
+"2024-12-31"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "t_equals(datetime, TIMESTAMP('2024-12-01T00:00:00.123Z'))",
+"json": {
+"op": "t_equals",
+"args": [
+{
+"property": "datetime"
+},
+{
+"timestamp": "2024-12-01T00:00:00.123Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_MEETS(a, b)",
+"json": {
+"op": "t_meets",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8.5 45.7))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "s_intersects(geometry, point(8.5 45.7))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT (8.5 45.7))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT Z (8.5 45.7 100))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7,
+100.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8 45))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.0,
+45.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(-8.5 -45.7))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+-8.5,
+-45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, LINESTRING(0 0, 1 1, 2 2))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "LineString",
+"coordinates": [
+[
+0.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+2.0,
+2.0
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON((0 0, 1 0, 1 1, 0 1, 0 0)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 3 2, 3 3, 2 2)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+10.0,
+0.0
+],
+[
+10.0,
+10.0
+],
+[
+0.0,
+10.0
+],
+[
+0.0,
+0.0
+]
+],
+[
+[
+2.0,
+2.0
+],
+[
+3.0,
+2.0
+],
+[
+3.0,
+3.0
+],
+[
+2.0,
+2.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, MULTIPOINT(0 0, 1 1))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiPoint",
+"coordinates": [
+[
+0.0,
+0.0
+],
+[
+1.0,
+1.0
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, MULTIPOINT((0 0), (1 1)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiPoint",
+"coordinates": [
+[
+0.0,
+0.0
+],
+[
+1.0,
+1.0
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, MULTILINESTRING((0 0, 1 1), (2 2, 3 3)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiLineString",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+1.0
+]
+],
+[
+[
+2.0,
+2.0
+],
+[
+3.0,
+3.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)), ((5 5, 6 5, 6 6, 5 5))))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiPolygon",
+"coordinates": [
+[
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+],
+[
+[
+[
+5.0,
+5.0
+],
+[
+6.0,
+5.0
+],
+[
+6.0,
+6.0
+],
+[
+5.0,
+5.0
+]
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(0 0, 1 1)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "GeometryCollection",
+"geometries": [
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+},
+{
+"type": "LineString",
+"coordinates": [
+[
+0.0,
+0.0
+],
+[
+1.0,
+1.0
+]
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(0, 1, 2, 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(0, 1, 2, 3, 4, 5))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0,
+4.0,
+5.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_WITHIN(geometry, BBOX(0,1,2,3))",
+"json": {
+"op": "s_within",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_CONTAINS(a, b)",
+"json": {
+"op": "s_contains",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_CROSSES(geometry, POINT(0 0))",
+"json": {
+"op": "s_crosses",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_DISJOINT(geometry, POINT(0 0))",
+"json": {
+"op": "s_disjoint",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_EQUALS(geometry, POINT(0 0))",
+"json": {
+"op": "s_equals",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_OVERLAPS(geometry, POINT(0 0))",
+"json": {
+"op": "s_overlaps",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_TOUCHES(geometry, POINT(0 0))",
+"json": {
+"op": "s_touches",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT EMPTY)",
+"json": null,
+"valid": false
+},
+{
+"text": "A_CONTAINS(tags, ('a', 'b'))",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "tags"
+},
+[
+"a",
+"b"
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_EQUALS(tags, ('a'))",
+"json": {
+"op": "a_equals",
+"args": [
+{
+"property": "tags"
+},
+[
+"a"
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_OVERLAPS(tags, (1, 2))",
+"json": {
+"op": "a_overlaps",
+"args": [
+{
+"property": "tags"
+},
+[
+1.0,
+2.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINEDBY(tags, ('a', b))",
+"json": {
+"op": "a_containedBy",
+"args": [
+{
+"property": "tags"
+},
+[
+"a",
+{
+"property": "b"
+}
+]
+]
+},
+"valid": true
+},
+{
+"text": "a = ('x', 'y')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+[
+"x",
+"y"
+]
+]
+},
+"valid": false
+},
+{
+"text": "a IN (b, 'c', 1)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+{
+"property": "b"
+},
+"c",
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "  a   =   1  ",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a=1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a=1AND b=2",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND (b = 2 OR (c = 3 AND d = 4))",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "or",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "d"
+},
+4.0
+]
+}
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "((a = 1))",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = (1)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND",
+"json": null,
+"valid": false
+},
+{
+"text": "a = ",
+"json": null,
+"valid": false
+},
+{
+"text": "= 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a == 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 1 b = 2",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 'x",
+"json": null,
+"valid": false
+},
+{
+"text": "a IN ()",
+"json": null,
+"valid": false
+},
+{
+"text": "a BETWEEN 1",
+"json": null,
+"valid": false
+},
+{
+"text": "NOT",
+"json": null,
+"valid": false
+},
+{
+"text": "(a = 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 1)",
+"json": null,
+"valid": false
+},
+{
+"text": "'x' = 'x'",
+"json": {
+"op": "=",
+"args": [
+"x",
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "1 = 1",
+"json": {
+"op": "=",
+"args": [
+1.0,
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "TRUE",
+"json": true,
+"valid": true
+},
+{
+"text": "a",
+"json": {
+"property": "a"
+},
+"valid": false
+},
+{
+"text": "foo(a)",
+"json": {
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT a",
+"json": {
+"op": "not",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a AND b",
+"json": {
+"op": "and",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a IS TRUE",
+"json": null,
+"valid": false
+},
+{
+"text": "a = NULL",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+null
+]
+},
+"valid": false
+},
+{
+"text": "a = 1 AND b IN ('x') OR NOT c LIKE 'y%' AND d BETWEEN 1 AND 2",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "in",
+"args": [
+{
+"property": "b"
+},
+[
+"x"
+]
+]
+}
+]
+},
+{
+"op": "and",
+"args": [
+{
+"op": "not",
+"args": [
+{
+"op": "like",
+"args": [
+{
+"property": "c"
+},
+"y%"
+]
+}
+]
+},
+{
+"op": "between",
+"args": [
+{
+"property": "d"
+},
+1.0,
+2.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "id='LC08_L1TP_060247_20180905_20180912_01_T1_L1TP' AND collection='landsat8_l1tp'",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "id"
+},
+"LC08_L1TP_060247_20180905_20180912_01_T1_L1TP"
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "collection"
+},
+"landsat8_l1tp"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 0",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+0.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 0.0",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+0.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1.0",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 100",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+100.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1.10",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.1
+]
+},
+"valid": true
+},
+{
+"text": "a = 123456789012",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+123456789012.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 0.1 + 0.2",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "+",
+"args": [
+0.1,
+0.2
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a < 3.14159265358979",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "a"
+},
+3.14159265358979
+]
+},
+"valid": true
+},
+{
+"text": "a = -0",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+-0.0
+]
+},
+"valid": true
+},
+{
+"text": "eo:cloud_cover>=10.5",
+"json": {
+"op": ">=",
+"args": [
+{
+"property": "eo:cloud_cover"
+},
+10.5
+]
+},
+"valid": true
+},
+{
+"text": "(a = 1 AND b = 2) AND c = 3",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND (b = 2 AND c = 3)",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "(a = 1 OR b = 2) OR c = 3",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND b = 2 OR c = 3 AND d = 4",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "d"
+},
+4.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT a = 1 AND b = 2",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT a = 1 OR b = 2",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT (a = 1) AND NOT (b = 2)",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+{
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 And b = 2 oR c = 3",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "c"
+},
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "nOt a = 1",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a iS nUlL",
+"json": {
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a Is NoT nUll",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a nOt LiKe 'x'",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a bEtWeen 1 aNd 2",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+1.0,
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a iN (1)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "CASEI(a) LIKE CASEI('x%')",
+"json": {
+"op": "like",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "casei",
+"args": [
+"x%"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a LIKE b",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a LIKE 1",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "a IN ((1, 2), (3, 4))",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+[
+1.0,
+2.0
+],
+[
+3.0,
+4.0
+]
+]
+]
+},
+"valid": false
+},
+{
+"text": "a IN (1, 'x')",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+1.0,
+"x"
+]
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN b AND c + 1",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+},
+{
+"op": "+",
+"args": [
+{
+"property": "c"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN 1 AND 2 OR b BETWEEN 3 AND 4",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+1.0,
+2.0
+]
+},
+{
+"op": "between",
+"args": [
+{
+"property": "b"
+},
+3.0,
+4.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT a BETWEEN 1 AND 2",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+1.0,
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a + 1 BETWEEN 1 AND 2",
+"json": {
+"op": "between",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+1.0,
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN 'x' AND 'y'",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+"x",
+"y"
+]
+},
+"valid": false
+},
+{
+"text": "a IS NULL AND b IS NOT NULL",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "not",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "foo(a) IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a + b ^ c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "^",
+"args": [
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a * b ^ c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "^",
+"args": [
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a ^ b * c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+{
+"op": "^",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a div b * c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+{
+"op": "div",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a % b / c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "/",
+"args": [
+{
+"op": "%",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a * b div c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "div",
+"args": [
+{
+"op": "*",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a + b - c + d = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"op": "-",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"property": "c"
+}
+]
+},
+{
+"property": "d"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "-a ^ 2 = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "^",
+"args": [
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"property": "a"
+}
+]
+},
+2.0
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "-(a + b) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = - 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+-1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = --1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = +1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "1 + 2 = 3",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+1.0,
+2.0
+]
+},
+3.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1.5E-3",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+0.0015
+]
+},
+"valid": true
+},
+{
+"text": "a = 1E+3",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1000.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 007",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+7.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1.",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1_000",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 0x10",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 1e400",
+"json": null,
+"valid": false
+},
+{
+"text": "Foo(a) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "Foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "FOO_Bar(a) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "FOO_Bar",
+"args": [
+{
+"property": "a"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "FooBar(a)",
+"json": {
+"op": "FooBar",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "foo(bar(a), 1 + 2) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"op": "bar",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "+",
+"args": [
+1.0,
+2.0
+]
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "foo(a = 1)",
+"json": {
+"op": "foo",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "foo(a) AND bar(b)",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "bar",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT foo(a)",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TRUE AND foo(b)",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a + 1",
+"json": {
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "'x'",
+"json": "x",
+"valid": false
+},
+{
+"text": "1",
+"json": 1.0,
+"valid": false
+},
+{
+"text": "NULL",
+"json": null,
+"valid": false
+},
+{
+"text": "a = b = c",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "(a = 1) = TRUE",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+true
+]
+},
+"valid": false
+},
+{
+"text": "a = (b = c)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = POINT(0 0)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "a < TIMESTAMP('2024-01-01T00:00:00Z')",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-01-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('nope')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "nope"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = DATE('nope')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"date": "nope"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = DATE('2024-01-01T00:00:00Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"date": "2024-01-01T00:00:00Z"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = TIMESTAMP('2024-01-01')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-01-01"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = TIMESTAMP('2024-01-01T00:00:00+01:00')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2023-12-31T23:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-01-01T00:00:00')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-01-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_BEFORE(a, 1)",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "T_BEFORE(a, 'x')",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL(TIMESTAMP('2024-01-01T00:00:00Z'), DATE('2024-02-01')))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+{
+"timestamp": "2024-01-01T00:00:00Z"
+},
+{
+"date": "2024-02-01"
+}
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL('2024-01-01T00:00:00Z', b))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"2024-01-01T00:00:00Z",
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_DURING(INTERVAL(a, b), INTERVAL(c, d))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"interval": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+{
+"interval": [
+{
+"property": "c"
+},
+{
+"property": "d"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = INTERVAL('2024-01-01', '2024-02-01')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"2024-01-01",
+"2024-02-01"
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_AFTER(a, b)",
+"json": {
+"op": "t_after",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_CONTAINS(a, b)",
+"json": {
+"op": "t_contains",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_DISJOINT(a, b)",
+"json": {
+"op": "t_disjoint",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_FINISHEDBY(a, b)",
+"json": {
+"op": "t_finishedBy",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_FINISHES(a, b)",
+"json": {
+"op": "t_finishes",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_METBY(a, b)",
+"json": {
+"op": "t_metBy",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_OVERLAPPEDBY(a, b)",
+"json": {
+"op": "t_overlappedBy",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_OVERLAPS(a, b)",
+"json": {
+"op": "t_overlaps",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_STARTEDBY(a, b)",
+"json": {
+"op": "t_startedBy",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_STARTS(a, b)",
+"json": {
+"op": "t_starts",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(a, 1)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(POINT(0 0), geometry)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+},
+{
+"property": "geometry"
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT( 8.5   45.7 ))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(1e1 -2.5E-1))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"op": "POINT",
+"args": [
+{
+"op": "-",
+"args": [
+10.0,
+0.25
+]
+}
+]
+}
+]
+},
+"valid": true,
+"quirk": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(1 2 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT M (1 2 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+1.0,
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT ZM (1 2 3 4))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINTZ(1 2 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, LINESTRING Z (0 0 0, 1 1 1))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "LineString",
+"coordinates": [
+[
+0.0,
+0.0,
+0.0
+],
+[
+1.0,
+1.0,
+1.0
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON Z ((0 0 0, 1 0 0, 1 1 0, 0 0 0)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0,
+0.0
+],
+[
+1.0,
+0.0,
+0.0
+],
+[
+1.0,
+1.0,
+0.0
+],
+[
+0.0,
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON EMPTY)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": []
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, polygon((0 0, 1 0, 1 1, 0 0)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, Polygon((0 0,1 0,1 1,0 0)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, SRID=4326;POINT(0 0))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, GEOMETRYCOLLECTION(POINT(0 0), GEOMETRYCOLLECTION(POINT(1 1))))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, MULTIPOINT Z ((0 0 0), (1 1 1)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiPoint",
+"coordinates": [
+[
+0.0,
+0.0,
+0.0
+],
+[
+1.0,
+1.0,
+1.0
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(0, 1, 2))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(0 1 2 3))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(-10.5, 1e1, 2, 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+-10.5,
+10.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, bbox(0,1,2,3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, foo(a))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(a, b, c)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_FOO(a, b)",
+"json": {
+"op": "S_FOO",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_FOO(a, b)",
+"json": {
+"op": "T_FOO",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "A_FOO(a, b)",
+"json": {
+"op": "A_FOO",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS(a, b)",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS(a, (1))",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS((1, 2), (3))",
+"json": {
+"op": "a_contains",
+"args": [
+[
+1.0,
+2.0
+],
+[
+3.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS(a, ())",
+"json": null,
+"valid": false
+},
+{
+"text": "A_CONTAINS(a, ((1, 2), 'x', TRUE, b, foo(c)))",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+[
+[
+1.0,
+2.0
+],
+"x",
+true,
+{
+"property": "b"
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "c"
+}
+]
+}
+]
+]
+},
+"valid": true
+},
+{
+"text": "foo(('a'))",
+"json": {
+"op": "foo",
+"args": [
+"a"
+]
+},
+"valid": true
+},
+{
+"text": "foo((1))",
+"json": {
+"op": "foo",
+"args": [
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "foo(('a', 'b'))",
+"json": {
+"op": "foo",
+"args": [
+[
+"a",
+"b"
+]
+]
+},
+"valid": true
+},
+{
+"text": "a = ('x')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "a = (1, 2)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+[
+1.0,
+2.0
+]
+]
+},
+"valid": false
+},
+{
+"text": "a = 'x' AND b = \"y\"",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+{
+"property": "y"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "\"a\"\"b\" = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a\"b"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "\"\" = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": ""
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "_a = 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a-b = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "-",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a/b = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "/",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a@b = 1",
+"json": null,
+"valid": false
+},
+{
+"text": "1a = 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a1 = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a1"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "é = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "é"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a:b:c = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a:b:c"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a. = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a."
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a: = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a:"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": ":a = 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a = 'é ü'",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+"é ü"
+]
+},
+"valid": true
+},
+{
+"text": "a = 'x\\'y'",
+"json": null,
+"valid": false
+},
+{
+"text": "a = \"x\"",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "x"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 -- c",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "-",
+"args": [
+1.0,
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"property": "c"
+}
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 /* c */",
+"json": null,
+"valid": false
+},
+{
+"text": "a\t=\n1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1;",
+"json": null,
+"valid": false
+},
+{
+"text": "a = true",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+"valid": true
+},
+{
+"text": "a = True",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+"valid": true
+},
+{
+"text": "a = tRuE",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+"valid": true
+},
+{
+"text": "a = truex",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "truex"
+}
+]
+},
+"valid": true
+},
+{
+"text": "true = a",
+"json": {
+"op": "=",
+"args": [
+true,
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "TRUE AND a = 1",
+"json": {
+"op": "and",
+"args": [
+true,
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT TRUE",
+"json": {
+"op": "not",
+"args": [
+true
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND TRUE",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+true
+]
+},
+"valid": true
+},
+{
+"text": "and = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "and"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "\"and\" = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "and"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "not_a = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "not_a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "android = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "android"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 ANDb = 2",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 OR(b = 2)",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+2.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "NOT(a = 1)",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a IN(1)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "a NOT IN(1)",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+1.0
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a LIKE'x'",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "a IS NULL OR a IS NOT NULL",
+"json": {
+"op": "or",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "not",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "date = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "date"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "timestamp = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "timestamp"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "interval = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "interval"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "bbox = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "bbox"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "point = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "point"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "casei = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "casei"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "div = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "div"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "like = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "like"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "in = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "in"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "between = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "between"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "is = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "is"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "null = 1",
+"json": {
+"op": "=",
+"args": [
+null,
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "a = date",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "date"
+}
+]
+},
+"valid": true
+},
+{
+"text": "geometry = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "geometry"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00.120Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00.12Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00.000Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00.123456789Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00.123456789Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01t00:00:00Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01t00:00:00Z"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = TIMESTAMP('2024-12-01 00:00:00Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00-05:30')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T05:30:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00+00:00')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-02-30T00:00:00Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-02-30T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T25:00:00Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T25:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('20241201T000000Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "20241201T000000Z"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T23:59:60Z')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T23:59:60Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP( '2024-12-01T00:00:00Z' )",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = TIMESTAMP('')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": ""
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = TIMESTAMP(b)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": {
+"property": "b"
+}
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = TIMESTAMP('2024-12-01T00:00:00Z', 'x')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-12-01T00:00:00Z"
+}
+]
+},
+"valid": true,
+"quirk": true
+},
+{
+"text": "a = DATE('2024-02-30')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"date": "2024-02-30"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = DATE('2024-2-3')",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"date": "2024-2-3"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = DATE(b)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"date": {
+"property": "b"
+}
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL('2024-01-01T00:00:00+01:00', '2024-02-01T00:00:00'))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"2023-12-31T23:00:00Z",
+"2024-02-01T00:00:00Z"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_DURING(a, INTERVAL('nope', '..'))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"nope",
+".."
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL('..', '..'))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"..",
+".."
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_DURING(a, INTERVAL('2024-01-01'))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"2024-01-01"
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL('2024-01-01', '2024-02-01', '2024-03-01'))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"2024-01-01",
+"2024-02-01",
+"2024-03-01"
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL(1, 2))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+1.0,
+2.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_DURING(a, INTERVAL(foo(a), b))",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_DURING(a, '2024-01-01')",
+"json": {
+"op": "t_during",
+"args": [
+{
+"property": "a"
+},
+"2024-01-01"
+]
+},
+"valid": false
+},
+{
+"text": "T_BEFORE(a, DATE('2024-01-01'))",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+{
+"date": "2024-01-01"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_BEFORE(TIMESTAMP('2024-01-01T00:00:00Z'), a)",
+"json": {
+"op": "t_before",
+"args": [
+{
+"timestamp": "2024-01-01T00:00:00Z"
+},
+{
+"property": "a"
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_BEFORE(a)",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_BEFORE(a, b, c)",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_BEFORE(a, foo(b))",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "T_BEFORE(a, b + 1)",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "+",
+"args": [
+{
+"property": "b"
+},
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_BEFORE(a, POINT(0 0))",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "T_BEFORE(a, INTERVAL('2024-01-01', '2024-02-01'))",
+"json": {
+"op": "t_before",
+"args": [
+{
+"property": "a"
+},
+{
+"interval": [
+"2024-01-01",
+"2024-02-01"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(a, TIMESTAMP('2024-01-01T00:00:00Z'))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-01-01T00:00:00Z"
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(a, 'x')",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(a, b + 1)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "+",
+"args": [
+{
+"property": "b"
+},
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(a, (1, 2))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+[
+1.0,
+2.0
+]
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(a, TRUE)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+"valid": false
+},
+{
+"text": "A_CONTAINS(a, 1)",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS(a, 'x')",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+[
+"x"
+]
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS(a, foo(b))",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "A_CONTAINS(a, b + 1)",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "+",
+"args": [
+{
+"property": "b"
+},
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "A_CONTAINS(a, POINT(0 0))",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+},
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "A_CONTAINS(a)",
+"json": {
+"op": "a_contains",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a IN (b)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+{
+"property": "b"
+}
+]
+]
+},
+"valid": true
+},
+{
+"text": "a IN (foo(b), 1 + 2)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+},
+{
+"op": "+",
+"args": [
+1.0,
+2.0
+]
+}
+]
+]
+},
+"valid": true
+},
+{
+"text": "a IN (TIMESTAMP('2024-01-01T00:00:00Z'))",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+{
+"timestamp": "2024-01-01T00:00:00Z"
+}
+]
+]
+},
+"valid": true
+},
+{
+"text": "a IN (TRUE, FALSE)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+true,
+false
+]
+]
+},
+"valid": true
+},
+{
+"text": "a IN (NULL)",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+null
+]
+]
+},
+"valid": false
+},
+{
+"text": "a IN (POINT(0 0))",
+"json": {
+"op": "in",
+"args": [
+{
+"property": "a"
+},
+[
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+]
+},
+"valid": false
+},
+{
+"text": "foo(a) IN (1)",
+"json": {
+"op": "in",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "1 IN (1)",
+"json": {
+"op": "in",
+"args": [
+1.0,
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "'x' IN ('x')",
+"json": {
+"op": "in",
+"args": [
+"x",
+[
+"x"
+]
+]
+},
+"valid": true
+},
+{
+"text": "a + 1 IN (1)",
+"json": {
+"op": "in",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+[
+1.0
+]
+]
+},
+"valid": true
+},
+{
+"text": "a = 'x' + 1",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "+",
+"args": [
+"x",
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "a + 'x' = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "a + TRUE = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "a + foo(b) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a + TIMESTAMP('2024-01-01T00:00:00Z') = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-01-01T00:00:00Z"
+}
+]
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "a < 'x'",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "a"
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "a < TRUE",
+"json": {
+"op": "<",
+"args": [
+{
+"property": "a"
+},
+true
+]
+},
+"valid": true
+},
+{
+"text": "a = foo(b = 1)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "foo",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+1.0
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "foo(1 + 2, 'x', TRUE, NULL, (1, 2), POINT(0 0), TIMESTAMP('2024-01-01T00:00:00Z'), b = 1)",
+"json": {
+"op": "foo",
+"args": [
+{
+"op": "+",
+"args": [
+1.0,
+2.0
+]
+},
+"x",
+true,
+null,
+[
+1.0,
+2.0
+],
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+},
+{
+"timestamp": "2024-01-01T00:00:00Z"
+},
+{
+"op": "=",
+"args": [
+{
+"property": "b"
+},
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "casei(a) = casei(b)",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+}
+]
+},
+{
+"op": "casei",
+"args": [
+{
+"property": "b"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "casei(1) = 1",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "casei",
+"args": [
+1.0
+]
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "casei(a, b) = 'x'",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+}
+]
+},
+"x"
+]
+},
+"valid": false
+},
+{
+"text": "accenti(casei(a)) = 'x'",
+"json": {
+"op": "=",
+"args": [
+{
+"op": "accenti",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "a LIKE casei('x')",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "casei",
+"args": [
+"x"
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a LIKE accenti(casei('x'))",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "accenti",
+"args": [
+{
+"op": "casei",
+"args": [
+"x"
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a LIKE foo('x')",
+"json": {
+"op": "like",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "foo",
+"args": [
+"x"
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "casei(a) LIKE 'x'",
+"json": {
+"op": "like",
+"args": [
+{
+"op": "casei",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "'abc' LIKE 'a%'",
+"json": {
+"op": "like",
+"args": [
+"abc",
+"a%"
+]
+},
+"valid": true
+},
+{
+"text": "1 LIKE 'a%'",
+"json": {
+"op": "like",
+"args": [
+1.0,
+"a%"
+]
+},
+"valid": false
+},
+{
+"text": "foo(a) LIKE 'a%'",
+"json": {
+"op": "like",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+"a%"
+]
+},
+"valid": true
+},
+{
+"text": "a + 1 LIKE 'a%'",
+"json": {
+"op": "like",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"a%"
+]
+},
+"valid": false
+},
+{
+"text": "a BETWEEN b AND c",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+{
+"property": "b"
+},
+{
+"property": "c"
+}
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN foo(b) AND 2",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+},
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a BETWEEN TIMESTAMP('2024-01-01T00:00:00Z') AND TIMESTAMP('2024-02-01T00:00:00Z')",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+{
+"timestamp": "2024-01-01T00:00:00Z"
+},
+{
+"timestamp": "2024-02-01T00:00:00Z"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a BETWEEN TRUE AND FALSE",
+"json": {
+"op": "between",
+"args": [
+{
+"property": "a"
+},
+true,
+false
+]
+},
+"valid": false
+},
+{
+"text": "1 BETWEEN 0 AND 2",
+"json": {
+"op": "between",
+"args": [
+1.0,
+0.0,
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "foo(a) BETWEEN 0 AND 2",
+"json": {
+"op": "between",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "a"
+}
+]
+},
+0.0,
+2.0
+]
+},
+"valid": true
+},
+{
+"text": "a IS NULL IS NULL",
+"json": null,
+"valid": false
+},
+{
+"text": "1 IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "'x' IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+"x"
+]
+},
+"valid": true
+},
+{
+"text": "a + 1 IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "(a = 1) IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "TRUE IS NULL",
+"json": {
+"op": "isNull",
+"args": [
+true
+]
+},
+"valid": true
+},
+{
+"text": "NOT a IS NULL",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "isNull",
+"args": [
+{
+"property": "a"
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 IS NULL",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "isNull",
+"args": [
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "TRUE = TRUE",
+"json": {
+"op": "=",
+"args": [
+true,
+true
+]
+},
+"valid": true
+},
+{
+"text": "TRUE OR FALSE",
+"json": {
+"op": "or",
+"args": [
+true,
+false
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND 1",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "a = 1 AND 'x'",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"x"
+]
+},
+"valid": false
+},
+{
+"text": "a = 1 AND b",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"property": "b"
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = 1 AND foo(b) = 1",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"op": "=",
+"args": [
+{
+"op": "foo",
+"args": [
+{
+"property": "b"
+}
+]
+},
+1.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "a = 1 AND (b)",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+{
+"property": "b"
+}
+]
+},
+"valid": false
+},
+{
+"text": "NOT 1",
+"json": {
+"op": "not",
+"args": [
+1.0
+]
+},
+"valid": false
+},
+{
+"text": "NOT 'x'",
+"json": {
+"op": "not",
+"args": [
+"x"
+]
+},
+"valid": false
+},
+{
+"text": "NOT (a + 1)",
+"json": {
+"op": "not",
+"args": [
+{
+"op": "+",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "+a = 1",
+"json": null,
+"valid": false
+},
+{
+"text": "a = +b",
+"json": null,
+"valid": false
+},
+{
+"text": "a = -(-1)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = -(1)",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+-1.0
+]
+},
+"valid": true
+},
+{
+"text": "a = -'x'",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "*",
+"args": [
+-1.0,
+"x"
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = -TRUE",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "*",
+"args": [
+-1.0,
+true
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "a = - - b",
+"json": {
+"op": "=",
+"args": [
+{
+"property": "a"
+},
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"op": "*",
+"args": [
+-1.0,
+{
+"property": "b"
+}
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8.5 45.7)) AND eo:cloud_cover < 20",
+"json": {
+"op": "and",
+"args": [
+{
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+{
+"op": "<",
+"args": [
+{
+"property": "eo:cloud_cover"
+},
+20.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8.5,45.7))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"op": "POINT",
+"args": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true,
+"quirk": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8.5))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"op": "POINT",
+"args": [
+8.5
+]
+}
+]
+},
+"valid": true,
+"quirk": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT())",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"op": "POINT",
+"args": []
+}
+]
+},
+"valid": true,
+"quirk": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8.50 045.70))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(+8.5 45.7))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.5,
+45.7
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(8. 45.))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+8.0,
+45.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(.5 .7))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, LINESTRING(0 0))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "LineString",
+"coordinates": [
+[
+0.0,
+0.0
+]
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON((0 0, 1 0, 1 1)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+]
+]
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON(0 0, 1 0, 1 1, 0 0))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, MULTIPOLYGON EMPTY)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiPolygon",
+"coordinates": []
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, LINESTRING EMPTY)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "LineString",
+"coordinates": []
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, MULTIPOINT EMPTY)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "MultiPoint",
+"coordinates": []
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, GEOMETRYCOLLECTION EMPTY)",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "GeometryCollection",
+"geometries": []
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, GEOMETRYCOLLECTION(POINT(0 0)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "GeometryCollection",
+"geometries": [
+{
+"type": "Point",
+"coordinates": [
+0.0,
+0.0
+]
+}
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, GEOMETRYCOLLECTION(POLYGON((0 0, 1 0, 1 1, 0 0)), MULTIPOINT(0 0, 1 1)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "GeometryCollection",
+"geometries": [
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+},
+{
+"type": "MultiPoint",
+"coordinates": [
+[
+0.0,
+0.0
+],
+[
+1.0,
+1.0
+]
+]
+}
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON ((0 0, 1 0, 1 1, 0 0)) )",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POLYGON( (0 0 , 1 0 , 1 1 , 0 0) ))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry,POLYGON((0 0,1 0,1 1,0 0)))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Polygon",
+"coordinates": [
+[
+[
+0.0,
+0.0
+],
+[
+1.0,
+0.0
+],
+[
+1.0,
+1.0
+],
+[
+0.0,
+0.0
+]
+]
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, LINESTRING(0 0, 1 1 1))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, CIRCULARSTRING(0 0, 1 1, 2 0))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, TRIANGLE((0 0, 1 0, 1 1, 0 0)))",
+"json": null,
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(0, 1, 2, 3, 4))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0,
+4.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(a, 1, 2, 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+{
+"property": "a"
+},
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX())",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": []
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(geometry, BBOX(1+1, 1, 2, 3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"bbox": [
+{
+"op": "+",
+"args": [
+1.0,
+1.0
+]
+},
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": false
+},
+{
+"text": "S_INTERSECTS(BBOX(0,1,2,3), BBOX(0,1,2,3))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0
+]
+},
+{
+"bbox": [
+0.0,
+1.0,
+2.0,
+3.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(180 90))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+180.0,
+90.0
+]
+}
+]
+},
+"valid": true
+},
+{
+"text": "S_INTERSECTS(geometry, POINT(1000 1000))",
+"json": {
+"op": "s_intersects",
+"args": [
+{
+"property": "geometry"
+},
+{
+"type": "Point",
+"coordinates": [
+1000.0,
+1000.0
+]
+}
+]
+},
+"valid": true
+}
+]

@@ -81,6 +81,15 @@ async fn main() {
         args.tile_cache_mb.saturating_mul(1024 * 1024),
     ));
 
+    match engine.attach_pgstac_from_env() {
+        Ok(true) => tracing::info!("pgSTAC database configured; serving /searches"),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("Invalid pgSTAC database settings: {e}");
+            std::process::exit(1);
+        }
+    }
+
     for spec in &args.datasets {
         let Some((name, path)) = spec.split_once('=') else {
             eprintln!("Invalid --dataset '{spec}', expected name=/path/to/file.tif");

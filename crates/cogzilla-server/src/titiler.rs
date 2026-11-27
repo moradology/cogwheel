@@ -12,6 +12,8 @@ use cogzilla_kernel::{
 use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
+pub use crate::histogram::HistDtype;
+use crate::histogram::{AscendingBins, bin_of, sorted_bin_ranges};
 use crate::geotiff::{
     GeoTiffLayout, GeoTiffPhotometric, GeoTiffSample, GeoTiffSpec, write_geotiff,
 };
@@ -571,7 +573,7 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             "inputs": { "nbands": 1 },
             "outputs": { "nbands": 1, "dtype": "uint8", "min": null, "max": null },
             "parameters": {
-                "azimuth": { "default": 45.0, "maximum": 360.0, "minimum": 0.0, "title": "Azimuth", "type": "number" },
+                "azimuth": { "default": 45, "maximum": 360, "minimum": 0, "title": "Azimuth", "type": "integer" },
                 "angle_altitude": { "default": 45.0, "maximum": 90.0, "minimum": -90.0, "title": "Angle Altitude", "type": "number" },
                 "buffer": { "default": 3, "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
                 "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
@@ -583,7 +585,7 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             "inputs": { "nbands": 1 },
             "outputs": { "nbands": 1, "dtype": "float32", "min": [0.0], "max": [90.0] },
             "parameters": {
-                "buffer": { "default": 0, "description": "Buffer size for edge effects", "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "buffer": { "default": 3, "description": "Buffer size for edge effects", "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
                 "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
             }
         }),
@@ -731,7 +733,7 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
 }
 
 /// Escape XML text and attribute special characters.
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -1629,6 +1631,22 @@ pub struct StatsOptions {
     pub height: Option<u32>,
     pub max_size_explicit: bool,
     pub area_weighted: bool,
+    /// The type numpy builds the histogram's bin edges in, for paths that only see `f32` values;
+    /// `None` infers it from the values (see [`HistDtype::infer`]).
+    pub hist_dtype: Option<HistDtype>,
+}
+
+impl StatsOptions {
+    /// numpy's histogram bin edges for this request over data spanning `min_max`.
+    pub fn histogram_bin_edges(&self, min_max: Option<(f64, f64)>, dtype: HistDtype) -> Vec<f64> {
+        crate::histogram::bin_edges(
+            self.histogram_bins.clamp(1, 1000),
+            self.histogram_edges.as_deref(),
+            self.histogram_range,
+            min_max,
+            dtype,
+        )
+    }
 }
 
 impl Default for StatsOptions {
@@ -1646,26 +1664,8 @@ impl Default for StatsOptions {
             height: None,
             max_size_explicit: false,
             area_weighted: true,
+            hist_dtype: None,
         }
-    }
-}
-
-/// Bin a value `v` into sorted `edges` (`edges.len() >= 2`) using NumPy `np.histogram` semantics:
-/// `[edges[i], edges[i+1])` for `i < n-1`, and `[edges[n-2], edges[n-1]]` inclusive on the last bin.
-#[inline]
-fn bin_into_edges(edges: &[f64], v: f64) -> Option<usize> {
-    let n_bins = edges.len().checked_sub(1)?;
-    if n_bins == 0 || v < edges[0] || v > edges[n_bins] {
-        return None;
-    }
-    if v == edges[n_bins] {
-        return Some(n_bins - 1);
-    }
-    let idx = edges.partition_point(|&e| e <= v);
-    if idx == 0 {
-        None
-    } else {
-        Some((idx - 1).min(n_bins - 1))
     }
 }
 
@@ -1708,10 +1708,102 @@ pub fn compute_f32_band_stats(
 ) -> serde_json::Value {
     let denom = pixels.len();
     let valid: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
-    BandStatsAcc::Floats(valid).finalize(denom, false, 1.0, 0.0, None, description, opts)
+    BandStatsAcc::Floats(valid).finalize(denom, false, 1.0, 0.0, None, description, opts, opts.hist_dtype)
 }
 
-fn percentile_key(p: f64) -> String {
+/// GPU-accelerated variant of `compute_f32_band_stats`: when built with `--features gpu` and
+/// above the adapter-calibrated pixel crossover (non-categorical, standard histogram bins),
+/// runs the two-pass WGSL `GpuStatsReducer` (20×–51× faster than CPU `sort_unstable_by` on
+/// 4096² rasters) and formats the identical TiTiler JSON object.
+pub fn compute_f32_band_stats_with_engine(
+    engine: &TileEngine,
+    pixels: &[f32],
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    #[cfg(feature = "gpu")]
+    {
+        if !opts.categorical
+            && opts.histogram_edges.is_none()
+            && let Some(gpu) = engine.gpu.as_ref()
+            && let Some(gs) = gpu.try_reduce_f32_stats(
+                pixels,
+                None,
+                opts.histogram_bins.clamp(1, 1000),
+                opts.histogram_range,
+                &opts.percentiles,
+            )
+        {
+            let dtype = opts
+                .hist_dtype
+                .unwrap_or_else(|| HistDtype::infer(pixels.iter().copied()));
+            return gpu_band_stats_to_json(&gs, pixels.len(), description, opts, dtype, Some(pixels));
+        }
+    }
+    let _ = engine;
+    compute_f32_band_stats(pixels, description, opts)
+}
+
+#[cfg(feature = "gpu")]
+/// `values`, when the band's values are at hand, are binned here as numpy bins them; without
+/// them the GPU's own counts are kept against numpy's edges.
+fn gpu_band_stats_to_json(
+    gs: &cogzilla_gpu::GpuBandStats,
+    denom_pixels: usize,
+    description: &str,
+    opts: &StatsOptions,
+    dtype: HistDtype,
+    values: Option<&[f32]>,
+) -> serde_json::Value {
+    let masked_pixels = denom_pixels.saturating_sub(gs.valid_pixels);
+    if gs.valid_pixels == 0 {
+        return empty_band_stats_json(masked_pixels, description, opts, dtype);
+    }
+    let edges = opts.histogram_bin_edges(gs.min.zip(gs.max), dtype);
+    let counts = match values {
+        Some(v) => crate::histogram::unsorted_counts(v, &edges),
+        None if gs.min.is_some() && gs.min == gs.max => {
+            let mut c = vec![0u64; edges.len().saturating_sub(1)];
+            if let Some(v) = gs.min
+                && let Some(b) = crate::histogram::bin_of(&edges, v)
+            {
+                c[b] = gs.valid_pixels as u64;
+            }
+            c
+        }
+        None => gs.hist_counts.clone(),
+    };
+    let valid_percent = if denom_pixels > 0 {
+        ((gs.valid_pixels as f64 / denom_pixels as f64) * 100.0 * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("min".into(), serde_json::json!(gs.min));
+    obj.insert("max".into(), serde_json::json!(gs.max));
+    obj.insert("mean".into(), serde_json::json!(gs.mean));
+    obj.insert("count".into(), serde_json::json!(gs.valid_pixels));
+    obj.insert("sum".into(), serde_json::json!(gs.sum));
+    obj.insert("std".into(), serde_json::json!(gs.std));
+    obj.insert("median".into(), serde_json::json!(gs.median));
+    obj.insert("majority".into(), serde_json::json!(gs.majority));
+    obj.insert("minority".into(), serde_json::json!(gs.minority));
+    obj.insert("unique".into(), serde_json::json!(gs.unique_bins));
+    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
+    obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels));
+    for &(p, val) in &gs.percentiles {
+        obj.insert(percentile_key(p), serde_json::json!(val));
+    }
+    obj.insert(
+        "histogram".into(),
+        serde_json::json!([counts, edges]),
+    );
+    obj.insert("description".into(), serde_json::json!(description));
+    serde_json::Value::Object(obj)
+}
+
+pub(crate) fn percentile_key(p: f64) -> String {
     if p.fract() == 0.0 {
         format!("percentile_{}", p as i64)
     } else {
@@ -1738,6 +1830,7 @@ fn empty_band_stats_json(
     masked_px: usize,
     description: &str,
     opts: &StatsOptions,
+    dtype: HistDtype,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("min".into(), serde_json::Value::Null);
@@ -1756,7 +1849,14 @@ fn empty_band_stats_json(
     for &p in &opts.percentiles {
         obj.insert(percentile_key(p), serde_json::Value::Null);
     }
-    obj.insert("histogram".into(), serde_json::json!([[], []]));
+    if opts.categorical {
+        obj.insert("histogram".into(), serde_json::json!([[], []]));
+    } else {
+        // numpy.histogram of no values: zero counts over the range (0 .. 1 when none is given).
+        let edges = opts.histogram_bin_edges(None, dtype);
+        let counts = vec![0u64; edges.len() - 1];
+        obj.insert("histogram".into(), serde_json::json!([counts, edges]));
+    }
     if opts.categorical {
         obj.insert("categories".into(), serde_json::json!({}));
     }
@@ -1765,6 +1865,7 @@ fn empty_band_stats_json(
 }
 
 impl BandStatsAcc {
+    #[allow(clippy::too_many_arguments)]
     fn finalize_hist_with_opts(
         hist: &[u64],
         denom_pixels: usize,
@@ -1773,6 +1874,7 @@ impl BandStatsAcc {
         offset: f32,
         description: &str,
         opts: &StatsOptions,
+        dtype: HistDtype,
     ) -> serde_json::Value {
         let valid_px: usize = hist.iter().map(|&c| c as usize).sum();
         let masked_px = denom_pixels.saturating_sub(valid_px);
@@ -1782,7 +1884,7 @@ impl BandStatsAcc {
             0.0
         };
         if valid_px == 0 {
-            return empty_band_stats_json(masked_px, description, opts);
+            return empty_band_stats_json(masked_px, description, opts, dtype);
         }
         let reverse = unscale && scale < 0.0;
         let to_val = |k: usize| -> f32 {
@@ -1860,46 +1962,22 @@ impl BandStatsAcc {
 
         let mean = sum / (valid_px as f64);
         let mut var_sum = 0.0f64;
-        let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
-            && custom_edges.len() >= 2
-        {
-            let mut counts = vec![0u64; custom_edges.len() - 1];
-            for (k, &c) in hist.iter().enumerate() {
-                if c == 0 {
-                    continue;
-                }
-                let v = to_val(k) as f64;
-                let d = v - mean;
-                var_sum += d * d * (c as f64);
-                if let Some(bin) = bin_into_edges(custom_edges, v) {
-                    counts[bin] += c;
-                }
+        // Each distinct value goes to numpy's bin with its whole count.
+        let edges = opts.histogram_bin_edges(Some((min as f64, max as f64)), dtype);
+        let mut counts = vec![0u64; edges.len() - 1];
+        let mut ascending = AscendingBins::new(&edges);
+        for (k, &c) in hist.iter().enumerate() {
+            if c == 0 {
+                continue;
             }
-            (counts, custom_edges.clone())
-        } else {
-            let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
-            let span = (h_max - h_min).max(1e-12);
-            let n_bins = opts.histogram_bins.clamp(1, 1000);
-            let mut counts = vec![0u64; n_bins];
-            for (k, &c) in hist.iter().enumerate() {
-                if c == 0 {
-                    continue;
-                }
-                let v = to_val(k) as f64;
-                let d = v - mean;
-                var_sum += d * d * (c as f64);
-                if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
-                    let bin = (((v - h_min) / span) * (n_bins as f64))
-                        .floor()
-                        .clamp(0.0, (n_bins - 1) as f64) as usize;
-                    counts[bin] += c;
-                }
+            let v = to_val(k) as f64;
+            let d = v - mean;
+            var_sum += d * d * (c as f64);
+            let bin = if reverse { bin_of(&edges, v) } else { ascending.bin_of(v) };
+            if let Some(bin) = bin {
+                counts[bin] += c;
             }
-            let edges: Vec<f64> = (0..=n_bins)
-                .map(|i| h_min + span * (i as f64 / n_bins as f64))
-                .collect();
-            (counts, edges)
-        };
+        }
         let std = (var_sum / (valid_px as f64)).sqrt();
         let mut obj = serde_json::Map::new();
         obj.insert("min".into(), serde_json::json!(min));
@@ -1931,6 +2009,12 @@ impl BandStatsAcc {
         serde_json::Value::Object(obj)
     }
 
+    /// The band's statistics. `dtype` is the type numpy would build the histogram's edges in;
+    /// `None` takes it from the accumulator (integer bands, or float32 when unscaled) or, for
+    /// `f32` values of unknown source, infers it from the values.
+    #[allow(clippy::too_many_arguments)]
+    // Runs once per band: keep it out of the caller that holds the per-tile accumulation loops.
+    #[inline(never)]
     fn finalize(
         self,
         denom_pixels: usize,
@@ -1940,6 +2024,7 @@ impl BandStatsAcc {
         nodata_override: Option<f32>,
         description: &str,
         opts: &StatsOptions,
+        dtype: Option<HistDtype>,
     ) -> serde_json::Value {
         match self {
             Self::HistU8(mut hist) => {
@@ -1956,6 +2041,7 @@ impl BandStatsAcc {
                     offset,
                     description,
                     opts,
+                    dtype.unwrap_or(HistDtype::for_sample_type(cogzilla_tiff::SampleType::Uint16, unscale)),
                 )
             }
             Self::HistU16(mut hist) => {
@@ -1972,6 +2058,7 @@ impl BandStatsAcc {
                     offset,
                     description,
                     opts,
+                    dtype.unwrap_or(HistDtype::for_sample_type(cogzilla_tiff::SampleType::Uint16, unscale)),
                 )
             }
             Self::Floats(mut vals) => {
@@ -1983,7 +2070,8 @@ impl BandStatsAcc {
                     0.0
                 };
                 if valid_px == 0 {
-                    return empty_band_stats_json(masked_px, description, opts);
+                    let dtype = dtype.unwrap_or(HistDtype::Float64);
+                    return empty_band_stats_json(masked_px, description, opts, dtype);
                 }
                 vals.sort_unstable_by(|a, b| a.total_cmp(b));
                 let min = vals[0];
@@ -2043,40 +2131,17 @@ impl BandStatsAcc {
                 }
                 let mean = sum / (valid_px as f64);
                 let mut var_sum = 0.0f64;
-                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
-                    && custom_edges.len() >= 2
-                {
-                    let mut counts = vec![0u64; custom_edges.len() - 1];
-                    for &v in &vals {
-                        let vf = v as f64;
-                        let d = vf - mean;
-                        var_sum += d * d;
-                        if let Some(bin) = bin_into_edges(custom_edges, vf) {
-                            counts[bin] += 1;
-                        }
-                    }
-                    (counts, custom_edges.clone())
-                } else {
-                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
-                    let span = (h_max - h_min).max(1e-12);
-                    let n_bins = opts.histogram_bins.clamp(1, 1000);
-                    let mut counts = vec![0u64; n_bins];
-                    for &v in &vals {
-                        let vf = v as f64;
-                        let d = vf - mean;
-                        var_sum += d * d;
-                        if opts.histogram_range.is_none() || (vf >= h_min && vf <= h_max) {
-                            let bin = (((vf - h_min) / span) * (n_bins as f64))
-                                .floor()
-                                .clamp(0.0, (n_bins - 1) as f64) as usize;
-                            counts[bin] += 1;
-                        }
-                    }
-                    let edges: Vec<f64> = (0..=n_bins)
-                        .map(|i| h_min + span * (i as f64 / n_bins as f64))
-                        .collect();
-                    (counts, edges)
-                };
+                for &v in &vals {
+                    let d = v as f64 - mean;
+                    var_sum += d * d;
+                }
+                // The values are sorted: each bin is a run of them.
+                let dtype = dtype.unwrap_or_else(|| HistDtype::infer(vals.iter().copied()));
+                let edges = opts.histogram_bin_edges(Some((min as f64, max as f64)), dtype);
+                let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v as f64)
+                    .iter()
+                    .map(|r| r.len() as u64)
+                    .collect();
                 let std = (var_sum / (valid_px as f64)).sqrt();
 
                 let med_idx = valid_px / 2;
@@ -2121,7 +2186,8 @@ impl BandStatsAcc {
                     0.0
                 };
                 if valid_px == 0 {
-                    return empty_band_stats_json(masked_px, description, opts);
+                    let dtype = dtype.unwrap_or(HistDtype::Float64);
+                    return empty_band_stats_json(masked_px, description, opts, dtype);
                 }
                 vals.sort_unstable_by(|a, b| a.total_cmp(b));
                 let min = vals[0];
@@ -2190,61 +2256,15 @@ impl BandStatsAcc {
                 let inv_var_scale = 1.0 / var_scale;
                 let mean_scaled = mean * inv_var_scale;
                 let mut var_sum = 0.0f64;
-                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
-                    && custom_edges.len() >= 2
-                {
-                    let mut counts = vec![0u64; custom_edges.len() - 1];
-                    for &v in &vals {
-                        let d = v * inv_var_scale - mean_scaled;
-                        var_sum += d * d;
-                        if let Some(bin) = bin_into_edges(custom_edges, v) {
-                            counts[bin] += 1;
-                        }
-                    }
-                    (counts, custom_edges.clone())
-                } else {
-                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min, max));
-                    let n_bins = opts.histogram_bins.clamp(1, 1000);
-                    let mut counts = vec![0u64; n_bins];
-                    let raw_span = h_max - h_min;
-                    let step = if raw_span.is_finite() {
-                        raw_span.max(1e-12) / (n_bins as f64)
-                    } else {
-                        (h_max / (n_bins as f64)) - (h_min / (n_bins as f64))
-                    };
-                    for &v in &vals {
-                        let d = v * inv_var_scale - mean_scaled;
-                        var_sum += d * d;
-                        if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
-                            let bin = if step.is_finite() && step > 0.0 {
-                                let off = if (v - h_min).is_finite() {
-                                    (v - h_min) / step
-                                } else {
-                                    (v / step) - (h_min / step)
-                                };
-                                off.floor().clamp(0.0, (n_bins - 1) as f64) as usize
-                            } else {
-                                0
-                            };
-                            counts[bin] += 1;
-                        }
-                    }
-                    let edges: Vec<f64> = (0..=n_bins)
-                        .map(|i| {
-                            if i == 0 {
-                                h_min
-                            } else if i == n_bins {
-                                h_max
-                            } else if raw_span.is_finite() {
-                                h_min + step * (i as f64)
-                            } else {
-                                let t = (i as f64) / (n_bins as f64);
-                                h_min * (1.0 - t) + h_max * t
-                            }
-                        })
-                        .collect();
-                    (counts, edges)
-                };
+                for &v in &vals {
+                    let d = v * inv_var_scale - mean_scaled;
+                    var_sum += d * d;
+                }
+                let edges = opts.histogram_bin_edges(Some((min, max)), dtype.unwrap_or(HistDtype::Float64));
+                let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v)
+                    .iter()
+                    .map(|r| r.len() as u64)
+                    .collect();
                 let std = (var_sum / n_f).sqrt() * var_scale;
 
                 let med_idx = valid_px / 2;
@@ -2596,6 +2616,7 @@ fn compute_statistics_cpu(
     sample_dims: Option<(usize, usize)>,
     fetched: StatsTiles,
     opts: &StatsOptions,
+    #[cfg(feature = "gpu")] gpu: Option<&crate::gpu_backend::GpuBackend>,
 ) -> serde_json::Value {
     let ifd = &cog.index.ifds[ifd_idx];
     let count = ifd.samples_per_pixel as usize;
@@ -2650,6 +2671,7 @@ fn compute_statistics_cpu(
     {
         return compute_expression_statistics_cpu(
             cog,
+            ifd_idx,
             ifd,
             poly_mask,
             unscale,
@@ -2662,7 +2684,118 @@ fn compute_statistics_cpu(
             fetched,
             opts,
             exprs,
+            #[cfg(feature = "gpu")]
+            gpu,
         );
+    }
+
+    // 1-pass fused GPU fast path for unmasked float/int `/cog/statistics`:
+    // skips CPU pixel extraction and per-band Vec<f32> allocations completely, and
+    // submits multi-band requests concurrently so GpuCoalescer packs all bands into 1 submit.
+    #[cfg(feature = "gpu")]
+    {
+        let tile_masks_none = match &fetched {
+            StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => {
+                tile_masks.is_none()
+            }
+        };
+        if poly_mask.is_none()
+            && tile_masks_none
+            && !opts.categorical
+            && opts.histogram_edges.is_none()
+            && !matches!(
+                ifd.sample_type,
+                cogzilla_tiff::SampleType::Uint8 | cogzilla_tiff::SampleType::Uint16
+            )
+            && !ifd.sample_type.needs_f64()
+            && let Some(gpu_ref) = gpu
+        {
+            let alpha_idx = cogzilla_codec::alpha_channel_index(count, &ifd.extra_samples);
+            let selected_bands: Option<&[u16]> = opts.bidx.as_deref().filter(|b| !b.is_empty());
+            let sel_bands: Vec<usize> = (0..count)
+                .filter(|&b| {
+                    let b1 = (b + 1) as u16;
+                    if let Some(sel) = selected_bands {
+                        sel.contains(&b1)
+                    } else {
+                        Some(b) != alpha_idx
+                    }
+                })
+                .collect();
+            let (u_cols, v_rows) = build_stats_separable_coords(ifd, step, &tile_xs, &tile_ys);
+            if !sel_bands.is_empty()
+                && u_cols.len().saturating_mul(v_rows.len()) == total_pixels
+                && !u_cols.is_empty()
+                && !v_rows.is_empty()
+            {
+                let coords = crate::gpu_backend::BboxCoordSource::Separable {
+                    u: &u_cols,
+                    v: &v_rows,
+                };
+                let hist_bins = opts.histogram_bins.clamp(1, 1000);
+                let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+                let eval_band = |b: usize| -> Option<(String, serde_json::Value)> {
+                    let blocks = stats_band_blocks(&fetched, n_tiles, b);
+                    let (sc, off) = if unscale {
+                        (
+                            cog.index.scales.get(b).copied().unwrap_or(1.0),
+                            cog.index.offsets.get(b).copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    let src = BandSource::new(
+                        ifd.width,
+                        ifd.height,
+                        ifd.tile_width,
+                        ifd.tile_height,
+                        0,
+                        0,
+                        ifd.tiles_across,
+                        ifd.tiles_down,
+                        &blocks,
+                    )
+                    .with_nodata_override(nodata_override)
+                    .with_scale_offset(sc, off);
+                    let gs = gpu_ref.try_render_bbox_single_band_stats(
+                        cog.id,
+                        ifd_idx,
+                        b as u16,
+                        coords,
+                        &src,
+                        ResampleMode::Nearest,
+                        hist_bins,
+                        opts.histogram_range,
+                        &opts.percentiles,
+                    )?;
+                    let bname = format!("b{}", b + 1);
+                    let dtype = HistDtype::for_sample_type(ifd.sample_type, unscale);
+                    let json = gpu_band_stats_to_json(&gs, total_pixels, &bname, opts, dtype, None);
+                    Some((bname, json))
+                };
+                let results: Vec<Option<(String, serde_json::Value)>> = if sel_bands.len() == 1 {
+                    vec![eval_band(sel_bands[0])]
+                } else {
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = sel_bands
+                            .iter()
+                            .map(|&b| s.spawn(move || eval_band(b)))
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().ok().flatten())
+                            .collect()
+                    })
+                };
+                if results.iter().all(Option::is_some) {
+                    let mut gpu_out = serde_json::Map::new();
+                    for item in results.into_iter().flatten() {
+                        gpu_out.insert(item.0, item.1);
+                    }
+                    return serde_json::Value::Object(gpu_out);
+                }
+            }
+        }
     }
 
     let mut per_band: Vec<BandStatsAcc> = (0..count)
@@ -2899,6 +3032,32 @@ fn compute_statistics_cpu(
         let scale = cog.index.scales.get(b).copied().unwrap_or(1.0);
         let offset = cog.index.offsets.get(b).copied().unwrap_or(0.0);
         let bname = format!("b{band_1based}");
+        #[cfg(feature = "gpu")]
+        if let BandStatsAcc::Floats(ref vals) = acc
+            && !opts.categorical
+            && opts.histogram_edges.is_none()
+            && let Some(gpu_ref) = gpu
+            && let Some(gs) = gpu_ref.try_reduce_f32_stats(
+                vals,
+                None,
+                opts.histogram_bins.clamp(1, 1000),
+                opts.histogram_range,
+                &opts.percentiles,
+            )
+        {
+            out.insert(
+                bname.clone(),
+                gpu_band_stats_to_json(
+                    &gs,
+                    denom_pixels,
+                    &bname,
+                    opts,
+                    HistDtype::for_sample_type(ifd.sample_type, unscale),
+                    Some(vals),
+                ),
+            );
+            continue;
+        }
         let val = acc.finalize(
             denom_pixels,
             unscale,
@@ -2907,6 +3066,7 @@ fn compute_statistics_cpu(
             nodata_override,
             &bname,
             opts,
+            Some(HistDtype::for_sample_type(ifd.sample_type, unscale)),
         );
         out.insert(bname, val);
     }
@@ -2914,9 +3074,80 @@ fn compute_statistics_cpu(
     serde_json::Value::Object(out)
 }
 
+#[cfg(feature = "gpu")]
+fn build_stats_separable_coords(
+    ifd: &cogzilla_tiff::IfdMeta,
+    step: usize,
+    tile_xs: &Option<Vec<Vec<usize>>>,
+    tile_ys: &Option<Vec<Vec<usize>>>,
+) -> (Vec<f32>, Vec<f32>) {
+    if let (Some(xs_all), Some(ys_all)) = (tile_xs, tile_ys) {
+        let mut u = Vec::new();
+        for (tx, xs) in xs_all.iter().enumerate() {
+            let base_x = tx as u32 * ifd.tile_width;
+            for &lx in xs {
+                u.push((base_x + lx as u32) as f32);
+            }
+        }
+        let mut v = Vec::new();
+        for (ty, ys) in ys_all.iter().enumerate() {
+            let base_y = ty as u32 * ifd.tile_height;
+            for &ly in ys {
+                v.push((base_y + ly as u32) as f32);
+            }
+        }
+        (u, v)
+    } else {
+        let st = step.max(1);
+        let u = (0..ifd.width as usize)
+            .step_by(st)
+            .map(|x| x as f32)
+            .collect();
+        let v = (0..ifd.height as usize)
+            .step_by(st)
+            .map(|y| y as f32)
+            .collect();
+        (u, v)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn stats_band_blocks<'a>(
+    fetched: &'a StatsTiles,
+    n_tiles: usize,
+    bi: usize,
+) -> Vec<Option<&'a cogzilla_codec::DecodedBand>> {
+    match fetched {
+        StatsTiles::Chunky { tiles, .. } => tiles
+            .iter()
+            .take(n_tiles)
+            .map(|o| {
+                o.as_ref()
+                    .and_then(|t| t.bands.get(bi))
+                    .filter(|tb| !tb.stats.all_nodata)
+            })
+            .collect(),
+        StatsTiles::Planar { band_tiles, .. } => {
+            if let Some(bt) = band_tiles.get(bi) {
+                bt.iter()
+                    .take(n_tiles)
+                    .map(|o| {
+                        o.as_ref()
+                            .and_then(|t| t.bands.first())
+                            .filter(|tb| !tb.stats.all_nodata)
+                    })
+                    .collect()
+            } else {
+                vec![None; n_tiles]
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_expression_statistics_cpu(
     cog: &OpenedCog,
+    ifd_idx: usize,
     ifd: &cogzilla_tiff::IfdMeta,
     poly_mask: Option<&PolygonMask>,
     unscale: bool,
@@ -2929,22 +3160,140 @@ fn compute_expression_statistics_cpu(
     fetched: StatsTiles,
     opts: &StatsOptions,
     exprs: &[(String, cogzilla_kernel::ExprProgram)],
+    #[cfg(feature = "gpu")] gpu: Option<&crate::gpu_backend::GpuBackend>,
 ) -> serde_json::Value {
+    #[cfg(not(feature = "gpu"))]
+    let _ = ifd_idx;
     let denom_pixels = if poly_mask.is_some() {
         mask_total_pixels
     } else {
         total_pixels
     };
+    let tile_masks = match &fetched {
+        StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
+    };
+
+    // 1-pass fused GPU fast path for unmasked `/cog/statistics?expression=...`:
+    // evaluates each expression + 3-stage histogram/percentile reduction directly on the GPU
+    // (12 KB readback, zero CPU pixel loop, zero 67 MB Vec<f32> alloc/upload).
+    #[cfg(feature = "gpu")]
+    if poly_mask.is_none()
+        && tile_masks.is_none()
+        && !opts.categorical
+        && opts.histogram_edges.is_none()
+        && let Some(gpu_ref) = gpu
+        && exprs
+            .iter()
+            .all(|(_, prog)| !prog.used_bands.is_empty() && prog.used_bands.len() <= 8)
+    {
+        let (u_cols, v_rows) = build_stats_separable_coords(ifd, step, tile_xs, tile_ys);
+        if u_cols.len().saturating_mul(v_rows.len()) == denom_pixels
+            && !u_cols.is_empty()
+            && !v_rows.is_empty()
+        {
+            let coords = crate::gpu_backend::BboxCoordSource::Separable {
+                u: &u_cols,
+                v: &v_rows,
+            };
+            let hist_bins = opts.histogram_bins.clamp(1, 1000);
+            let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
+            let eval_expr = |i: usize, expr_str: &str, prog: &cogzilla_kernel::ExprProgram| -> Option<(String, serde_json::Value)> {
+                let ref_vecs: Vec<(Vec<Option<&cogzilla_codec::DecodedBand>>, (f32, f32))> = prog
+                    .used_bands
+                    .iter()
+                    .map(|&b1| {
+                        let bi = b1.saturating_sub(1) as usize;
+                        let so = if unscale {
+                            (
+                                cog.index.scales.get(bi).copied().unwrap_or(1.0),
+                                cog.index.offsets.get(bi).copied().unwrap_or(0.0),
+                            )
+                        } else {
+                            (1.0, 0.0)
+                        };
+                        (stats_band_blocks(&fetched, n_tiles, bi), so)
+                    })
+                    .collect();
+                let srcs: Vec<BandSource<'_>> = ref_vecs
+                    .iter()
+                    .map(|(blocks, (sc, off))| {
+                        BandSource::new(
+                            ifd.width,
+                            ifd.height,
+                            ifd.tile_width,
+                            ifd.tile_height,
+                            0,
+                            0,
+                            ifd.tiles_across,
+                            ifd.tiles_down,
+                            blocks,
+                        )
+                        .with_nodata_override(nodata_override)
+                        .with_scale_offset(*sc, *off)
+                    })
+                    .collect();
+                let cache_key = crate::gpu_backend::GpuBackend::multiband_key(
+                    cog.id,
+                    ifd_idx,
+                    &prog.used_bands,
+                    &srcs,
+                );
+                let gs = gpu_ref.try_render_bbox_expr_stats(
+                    cache_key,
+                    coords,
+                    &srcs,
+                    prog,
+                    ResampleMode::Nearest,
+                    hist_bins,
+                    opts.histogram_range,
+                    &opts.percentiles,
+                )?;
+                Some((
+                    format!("b{}", i + 1),
+                    gpu_band_stats_to_json(
+                        &gs,
+                        denom_pixels,
+                        expr_str,
+                        opts,
+                        HistDtype::for_expression(
+                            expr_str,
+                            HistDtype::for_sample_type(ifd.sample_type, unscale),
+                        ),
+                        None,
+                    ),
+                ))
+            };
+            let results: Vec<Option<(String, serde_json::Value)>> = if exprs.len() == 1 {
+                vec![eval_expr(0, &exprs[0].0, &exprs[0].1)]
+            } else {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = exprs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (expr_str, prog))| s.spawn(move || eval_expr(i, expr_str, prog)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().ok().flatten())
+                        .collect()
+                })
+            };
+            if results.iter().all(Option::is_some) {
+                let mut gpu_out = serde_json::Map::new();
+                for item in results.into_iter().flatten() {
+                    gpu_out.insert(item.0, item.1);
+                }
+                return serde_json::Value::Object(gpu_out);
+            }
+        }
+    }
+
     let mut accs: Vec<Vec<f32>> = (0..exprs.len())
         .map(|_| Vec::with_capacity(denom_pixels.min(1 << 20)))
         .collect();
     let n_tiles = (ifd.tiles_across * ifd.tiles_down) as usize;
     let count = ifd.samples_per_pixel as usize;
     let tw = ifd.tile_width as usize;
-
-    let tile_masks = match &fetched {
-        StatsTiles::Chunky { tile_masks, .. } | StatsTiles::Planar { tile_masks, .. } => tile_masks,
-    };
 
     let has_where: Vec<bool> = exprs
         .iter()
@@ -3105,8 +3454,41 @@ fn compute_expression_statistics_cpu(
 
     let mut out = serde_json::Map::new();
     for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs.into_iter()).enumerate() {
+        #[cfg(feature = "gpu")]
+        if !opts.categorical
+            && opts.histogram_edges.is_none()
+            && let Some(gpu_ref) = gpu
+            && let Some(gs) = gpu_ref.try_reduce_f32_stats(
+                &vals,
+                None,
+                opts.histogram_bins.clamp(1, 1000),
+                opts.histogram_range,
+                &opts.percentiles,
+            )
+        {
+            out.insert(
+                format!("b{}", i + 1),
+                gpu_band_stats_to_json(
+                    &gs,
+                    denom_pixels,
+                    expr_str,
+                    opts,
+                    opts.hist_dtype.unwrap_or_else(|| {
+                        HistDtype::for_expression(
+                            expr_str,
+                            HistDtype::for_sample_type(ifd.sample_type, unscale),
+                        )
+                    }),
+                    Some(&vals),
+                ),
+            );
+            continue;
+        }
         let acc = BandStatsAcc::Floats(vals);
-        let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts);
+        let dtype = opts.hist_dtype.unwrap_or_else(|| {
+            HistDtype::for_expression(expr_str, HistDtype::for_sample_type(ifd.sample_type, unscale))
+        });
+        let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts, Some(dtype));
         out.insert(format!("b{}", i + 1), val);
     }
     serde_json::Value::Object(out)
@@ -3641,16 +4023,12 @@ pub async fn compute_statistics_with_options(
         };
         let cogs = [cog.clone()];
         let n_px = (out_w as usize) * (out_h as usize);
-        let feature_covered_px = pm
-            .rasterize_all_touched(
-                out_w as usize,
-                out_h as usize,
-                eff_bbox,
-                &cogzilla_proj::CrsModel::Geographic,
-            )
-            .iter()
-            .filter(|&&b| b)
-            .count();
+        let (_, feature_covered_px) = pm.rasterize_all_touched_bits(
+            out_w as usize,
+            out_h as usize,
+            eff_bbox,
+            &cogzilla_proj::CrsModel::Geographic,
+        );
         let patch_valid_percent = |mut stat: serde_json::Value| -> serde_json::Value {
             if feature_covered_px > 0
                 && let Some(obj) = stat.as_object_mut()
@@ -3672,7 +4050,14 @@ pub async fn compute_statistics_with_options(
                     rescale: (0.0, 1.0),
                     colormap: ColormapName::Grayscale,
                 };
-                let raw = match render_wgs84_bbox(
+                let expr_opts = StatsOptions {
+                    hist_dtype: opts.hist_dtype.or(Some(HistDtype::for_expression(
+                        desc,
+                        HistDtype::for_sample_type(full.sample_type, unscale),
+                    ))),
+                    ..opts.clone()
+                };
+                let stat = match render_wgs84_bbox_stats(
                     engine,
                     &cogs,
                     eff_bbox,
@@ -3681,28 +4066,20 @@ pub async fn compute_statistics_with_options(
                     Some(pm),
                     &bands,
                     ResampleMode::Nearest,
-                    OutputFormat::RawF32,
                     nodata_override,
-                    None,
-                    None,
-                    true,
                     unscale,
+                    desc,
+                    &expr_opts,
                 )
                 .await
                 {
-                    Ok(b) => b,
-                    Err(EngineError::NotFound(_)) => Bytes::new(),
+                    Ok(v) => v,
+                    Err(EngineError::NotFound(_)) => {
+                        compute_f32_band_stats_with_engine(engine, &[], desc, &expr_opts)
+                    }
                     Err(e) => return Err(e),
                 };
-                let pixels: Vec<f32> = raw
-                    .chunks_exact(4)
-                    .take(n_px)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                out.insert(
-                    format!("b{}", i + 1),
-                    patch_valid_percent(compute_f32_band_stats(&pixels, desc, opts)),
-                );
+                out.insert(format!("b{}", i + 1), patch_valid_percent(stat));
             }
             return Ok(serde_json::Value::Object(out));
         }
@@ -3713,17 +4090,56 @@ pub async fn compute_statistics_with_options(
                 .filter(|&b| Some((b - 1) as usize) != alpha_idx)
                 .collect(),
         };
+        // Plain bands: numpy builds the histogram's edges in the band's own type.
+        let band_opts = StatsOptions {
+            hist_dtype: opts
+                .hist_dtype
+                .or(Some(HistDtype::for_sample_type(full.sample_type, unscale))),
+            ..opts.clone()
+        };
         for chunk in sel_bands.chunks(15) {
-            let bands_req = if chunk.len() == 1 {
-                BandRequest::Single {
-                    band_1based: chunk[0],
+            if chunk.len() == 1 {
+                let b1 = chunk[0];
+                let bands_req = BandRequest::Single {
+                    band_1based: b1,
                     rescale: (0.0, 1.0),
                     colormap: ColormapName::Grayscale,
-                }
-            } else {
-                BandRequest::MultiBand {
-                    bands_1based: chunk.to_vec(),
-                }
+                };
+                let desc = cog
+                    .index
+                    .band_descriptions
+                    .get((b1 - 1) as usize)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("b{b1}"));
+                let stat = match render_wgs84_bbox_stats(
+                    engine,
+                    &cogs,
+                    eff_bbox,
+                    out_w,
+                    out_h,
+                    Some(pm),
+                    &bands_req,
+                    ResampleMode::Nearest,
+                    nodata_override,
+                    unscale,
+                    &desc,
+                    &band_opts,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(EngineError::NotFound(_)) => {
+                        compute_f32_band_stats_with_engine(engine, &[], &desc, &band_opts)
+                    }
+                    Err(e) => return Err(e),
+                };
+                out.insert(format!("b{b1}"), patch_valid_percent(stat));
+                continue;
+            }
+            let bands_req = BandRequest::MultiBand {
+                bands_1based: chunk.to_vec(),
             };
             let raw = match render_wgs84_bbox(
                 engine,
@@ -3765,7 +4181,9 @@ pub async fn compute_statistics_with_options(
                     .unwrap_or_else(|| format!("b{b1}"));
                 out.insert(
                     format!("b{b1}"),
-                    patch_valid_percent(compute_f32_band_stats(&pixels, &desc, opts)),
+                    patch_valid_percent(compute_f32_band_stats_with_engine(
+                        engine, &pixels, &desc, &band_opts,
+                    )),
                 );
             }
         }
@@ -4098,6 +4516,8 @@ pub async fn compute_statistics_with_options(
         let cog_owned = cog.clone();
         let pm_owned = poly_mask.cloned();
         let opts_owned = opts.clone();
+        #[cfg(feature = "gpu")]
+        let gpu_owned = engine.gpu.clone();
         let val = engine
             .store
             .run_heavy_cpu(move || {
@@ -4112,6 +4532,8 @@ pub async fn compute_statistics_with_options(
                     sample_dims,
                     fetched,
                     &opts_owned,
+                    #[cfg(feature = "gpu")]
+                    gpu_owned.as_deref(),
                 )
             })
             .await?;
@@ -4128,6 +4550,8 @@ pub async fn compute_statistics_with_options(
             sample_dims,
             fetched,
             opts,
+            #[cfg(feature = "gpu")]
+            engine.gpu.as_deref(),
         ))
     }
 }
@@ -4898,6 +5322,57 @@ impl PolygonMask {
         }
         mask
     }
+
+    /// Rasterize the polygon into a compact 1-bit-per-pixel `Vec<u32>` mask (64× smaller than
+    /// `Exact2D` `f32` coords) and return `(mask_bits, covered_pixel_count)`.
+    pub fn rasterize_all_touched_bits(
+        &self,
+        w: usize,
+        h: usize,
+        bbox: [f64; 4],
+        dst_crs: &cogzilla_proj::CrsModel,
+    ) -> (Vec<u32>, usize) {
+        let bools = self.rasterize_all_touched(w, h, bbox, dst_crs);
+        let n = bools.len();
+        let n_words = n.div_ceil(32);
+        let mut words = vec![0u32; n_words];
+        let pack_chunk = |word_start: usize, dst: &mut [u32]| -> usize {
+            let mut covered = 0usize;
+            for (i, w_out) in dst.iter_mut().enumerate() {
+                let base = (word_start + i) * 32;
+                let end = (base + 32).min(n);
+                let mut acc = 0u32;
+                for (bit, &b) in bools[base..end].iter().enumerate() {
+                    if b {
+                        acc |= 1u32 << bit;
+                    }
+                }
+                *w_out = acc;
+                covered += acc.count_ones() as usize;
+            }
+            covered
+        };
+        let covered = if n_words >= 4096 {
+            let threads = std::thread::available_parallelism()
+                .map(|p| p.get().clamp(2, 8))
+                .unwrap_or(4);
+            let words_per = n_words.div_ceil(threads);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = words
+                    .chunks_mut(words_per)
+                    .enumerate()
+                    .map(|(ci, chunk)| {
+                        let w0 = ci * words_per;
+                        s.spawn(move || pack_chunk(w0, chunk))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+            })
+        } else {
+            pack_chunk(0, &mut words)
+        };
+        (words, covered)
+    }
 }
 
 /// TiTiler auto-format encoder for extension-less routes: emits `image/jpeg` when all pixels
@@ -4933,6 +5408,30 @@ pub(crate) fn encode_rgba_output(
     format: OutputFormat,
     return_mask: bool,
 ) -> Bytes {
+    encode_rgba_output_as(w, h, rgba, format, return_mask, true)
+}
+
+/// [`encode_rgba_output`] for a picture known to be of three bands: it is written in
+/// colour whatever its pixels hold, where the other writes a grey picture when every
+/// pixel that is there happens to be grey (which an empty picture always is).
+pub(crate) fn encode_rgba_output_colour(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: OutputFormat,
+    return_mask: bool,
+) -> Bytes {
+    encode_rgba_output_as(w, h, rgba, format, return_mask, false)
+}
+
+fn encode_rgba_output_as(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: OutputFormat,
+    return_mask: bool,
+    grey_if_grey: bool,
+) -> Bytes {
     thread_local! {
         static PNG_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
             const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -4941,10 +5440,11 @@ pub(crate) fn encode_rgba_output(
     match format {
         OutputFormat::Png => {
             let pixels = w.saturating_mul(h);
-            let is_gray = rgba
-                .chunks_exact(4)
-                .take(pixels)
-                .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+            let is_gray = grey_if_grey
+                && rgba
+                    .chunks_exact(4)
+                    .take(pixels)
+                    .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
             let all_opaque = return_mask
                 && rgba.chunks_exact(4).take(pixels).all(|p| p[3] == 255);
             PNG_SCRATCH.with(|cell| {
@@ -5043,7 +5543,10 @@ pub(crate) fn encode_rgba_output(
                 encode_webp_rgba(w as u32, h as u32, rgba, quality)
             }
         }
-        OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
+        OutputFormat::Jpeg { quality } if grey_if_grey => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
+        OutputFormat::Jpeg { quality } => {
+            cogzilla_kernel::jpeg_fast::encode_jpeg_rgba_colour(w as u32, h as u32, rgba, quality)
+        }
         OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 | OutputFormat::RawRgba => {
             Bytes::copy_from_slice(rgba)
         }
@@ -5099,6 +5602,7 @@ pub async fn render_exact_f64_array(
     };
     let dlx = (bbox[2] - bbox[0]) / (w as f64);
     let dly = (bbox[3] - bbox[1]) / (h as f64);
+    let mut target_res: Option<(f64, f64)> = None;
     let ifd_idx = if native_preview {
         let full = cog.index.full_res();
         let rx0 = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d);
@@ -5131,12 +5635,28 @@ pub async fn render_exact_f64_array(
         let rx = (s1x - s0x).hypot(s1y - s0y);
         let ry = (s2x - s0x).hypot(s2y - s0y);
         if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+            target_res = Some((rx, ry));
             cog.index.select_ifd(rx, ry)
         } else {
             0
         }
     };
     let ifd = &cog.index.ifds[ifd_idx];
+    // Source-pixel footprint of one output pixel, for GDAL's widened bilinear when shrinking.
+    let (scale_x, scale_y) = if native_preview {
+        ((ifd.width as f64 / w as f64) as f32, (ifd.height as f64 / h as f64) as f32)
+    } else if let Some((rx, ry)) = target_res {
+        let ifd_rx = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+        let ifd_ry = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+        (
+            if ifd_rx > 0.0 { (rx / ifd_rx) as f32 } else { 1.0 },
+            if ifd_ry > 0.0 { (ry / ifd_ry) as f32 } else { 1.0 },
+        )
+    } else {
+        (1.0, 1.0)
+    };
+    let widen_kernel = resample != ResampleMode::Nearest
+        && cogzilla_kernel::kernel_widens(resample, scale_x, scale_y);
     let n_bands = bands_1based.len();
     for &b in bands_1based {
         if b == 0 || b > ifd.samples_per_pixel {
@@ -5254,10 +5774,18 @@ pub async fn render_exact_f64_array(
     }
     let mut out_f64 = vec![f64::NAN; n_bands * pixels];
     if min_u.is_finite() && min_v.is_finite() {
-        let c0 = (min_u.floor() as i32 - 1).clamp(0, ifd.width as i32 - 1) as u32;
-        let c1 = (max_u.ceil() as i32 + 1).clamp(0, ifd.width as i32 - 1) as u32;
-        let r0 = (min_v.floor() as i32 - 1).clamp(0, ifd.height as i32 - 1) as u32;
-        let r1 = (max_v.ceil() as i32 + 1).clamp(0, ifd.height as i32 - 1) as u32;
+        let (mx, my) = if widen_kernel {
+            (
+                cogzilla_kernel::widened_kernel_radius(resample, scale_x).ceil() as i32 + 1,
+                cogzilla_kernel::widened_kernel_radius(resample, scale_y).ceil() as i32 + 1,
+            )
+        } else {
+            (1, 1)
+        };
+        let c0 = (min_u.floor() as i32).saturating_sub(mx).clamp(0, ifd.width as i32 - 1) as u32;
+        let c1 = (max_u.ceil() as i32).saturating_add(mx).clamp(0, ifd.width as i32 - 1) as u32;
+        let r0 = (min_v.floor() as i32).saturating_sub(my).clamp(0, ifd.height as i32 - 1) as u32;
+        let r1 = (max_v.ceil() as i32).saturating_add(my).clamp(0, ifd.height as i32 - 1) as u32;
         let tx0 = c0 / ifd.tile_width;
         let tx1 = c1 / ifd.tile_width;
         let ty0 = r0 / ifd.tile_height;
@@ -5292,7 +5820,11 @@ pub async fn render_exact_f64_array(
                     }
                     let dst = &mut out_f64[bi * pixels..(bi + 1) * pixels];
                     for i in 0..pixels {
-                        dst[i] = cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample);
+                        dst[i] = if widen_kernel {
+                            cogzilla_kernel::sample_f64_kernel_widened(&src, us[i], vs[i], scale_x, scale_y, resample)
+                        } else {
+                            cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample)
+                        };
                     }
                 }
             }
@@ -5322,7 +5854,11 @@ pub async fn render_exact_f64_array(
                     }
                     let dst = &mut out_f64[bi * pixels..(bi + 1) * pixels];
                     for i in 0..pixels {
-                        dst[i] = cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample);
+                        dst[i] = if widen_kernel {
+                            cogzilla_kernel::sample_f64_kernel_widened(&src, us[i], vs[i], scale_x, scale_y, resample)
+                        } else {
+                            cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample)
+                        };
                     }
                 }
             }
@@ -5502,6 +6038,352 @@ pub async fn render_mercator_bbox(
     .await
 }
 
+enum BboxRenderOutput {
+    Bytes(Bytes),
+    #[cfg(feature = "gpu")]
+    Stats(serde_json::Value),
+}
+
+/// Source pixel coordinate representation for `render_bbox_core`.
+///
+/// Keeping separable 1D axes compact (`w + h` floats = 32 KB at 4096²) instead of eagerly
+/// broadcasting to 2D (`2 × w × h` floats = 128 MB) avoids 128 MB CPU allocations, 16.7M-pixel
+/// broadcast loops, and 128 MB PCIe `Exact2D` uploads on `/cog/preview`, `/cog/bbox`, `/cog/crop`,
+/// `WorldCRS84Quad`, and `WebMercatorQuad` renders — on both GPU and CPU-only deployments.
+enum BboxCoordMap {
+    Separable { u_cols: Vec<f32>, v_rows: Vec<f32> },
+    Grid2D { grid_u: [f32; 289], grid_v: [f32; 289] },
+    SeparableMasked { u_cols: Vec<f32>, v_rows: Vec<f32>, mask_bits: Vec<u32> },
+    Grid2DMasked { grid_u: [f32; 289], grid_v: [f32; 289], mask_bits: Vec<u32> },
+    Exact2D { u_map: Vec<f32>, v_map: Vec<f32> },
+}
+
+impl BboxCoordMap {
+    #[inline]
+    fn uv(&self, px: usize, py: usize, w: usize, h: usize) -> (f32, f32) {
+        match self {
+            Self::Exact2D { u_map, v_map } => {
+                let idx = py * w + px;
+                (u_map[idx], v_map[idx])
+            }
+            Self::Separable { u_cols, v_rows } => {
+                let uu = u_cols[px];
+                let vv = v_rows[py];
+                if uu.is_finite() && vv.is_finite() {
+                    (uu, vv)
+                } else {
+                    (f32::NAN, f32::NAN)
+                }
+            }
+            Self::SeparableMasked { u_cols, v_rows, mask_bits } => {
+                let idx = py * w + px;
+                if (mask_bits[idx >> 5] & (1u32 << (idx & 31))) == 0 {
+                    return (f32::NAN, f32::NAN);
+                }
+                let uu = u_cols[px];
+                let vv = v_rows[py];
+                if uu.is_finite() && vv.is_finite() {
+                    (uu, vv)
+                } else {
+                    (f32::NAN, f32::NAN)
+                }
+            }
+            Self::Grid2D { grid_u, grid_v } => Self::eval_grid2d(grid_u, grid_v, px, py, w, h),
+            Self::Grid2DMasked { grid_u, grid_v, mask_bits } => {
+                let idx = py * w + px;
+                if (mask_bits[idx >> 5] & (1u32 << (idx & 31))) == 0 {
+                    return (f32::NAN, f32::NAN);
+                }
+                Self::eval_grid2d(grid_u, grid_v, px, py, w, h)
+            }
+        }
+    }
+
+    #[inline]
+    fn eval_grid2d(
+        grid_u: &[f32; 289],
+        grid_v: &[f32; 289],
+        px: usize,
+        py: usize,
+        w: usize,
+        h: usize,
+    ) -> (f32, f32) {
+        let gy_f = (py as f32) * (16.0f32 / (h as f32));
+        let gy = (gy_f as usize).min(15);
+        let ty = gy_f - (gy as f32);
+        let r0 = gy * 17;
+        let r1 = (gy + 1) * 17;
+        let gx_f = (px as f32) * (16.0f32 / (w as f32));
+        let gx = (gx_f as usize).min(15);
+        let tx = gx_f - (gx as f32);
+        let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+        let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+        let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+        let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+        (u_l + (u_r - u_l) * tx, v_l + (v_r - v_l) * tx)
+    }
+
+    /// Visit every pixel `(idx, u, v)` in row-major order without materializing a dense 2D map.
+    /// Hoists the variant dispatch and per-row state out of the inner pixel loop.
+    #[inline]
+    fn for_each_uv(&self, w: usize, h: usize, mut f: impl FnMut(usize, f32, f32)) {
+        match self {
+            Self::Exact2D { u_map, v_map } => {
+                for i in 0..(w * h) {
+                    f(i, u_map[i], v_map[i]);
+                }
+            }
+            Self::Separable { u_cols, v_rows } => {
+                for py in 0..h {
+                    let vv = v_rows[py];
+                    let row_off = py * w;
+                    if !vv.is_finite() {
+                        for px in 0..w {
+                            f(row_off + px, f32::NAN, f32::NAN);
+                        }
+                        continue;
+                    }
+                    for px in 0..w {
+                        let uu = u_cols[px];
+                        if uu.is_finite() {
+                            f(row_off + px, uu, vv);
+                        } else {
+                            f(row_off + px, f32::NAN, f32::NAN);
+                        }
+                    }
+                }
+            }
+            Self::SeparableMasked { u_cols, v_rows, mask_bits } => {
+                for py in 0..h {
+                    let vv = v_rows[py];
+                    let row_off = py * w;
+                    if !vv.is_finite() {
+                        for px in 0..w {
+                            f(row_off + px, f32::NAN, f32::NAN);
+                        }
+                        continue;
+                    }
+                    for px in 0..w {
+                        let idx = row_off + px;
+                        if (mask_bits[idx >> 5] & (1u32 << (idx & 31))) != 0 {
+                            let uu = u_cols[px];
+                            if uu.is_finite() {
+                                f(idx, uu, vv);
+                                continue;
+                            }
+                        }
+                        f(idx, f32::NAN, f32::NAN);
+                    }
+                }
+            }
+            Self::Grid2D { grid_u, grid_v } => {
+                let inv_w = 16.0f32 / (w as f32);
+                let inv_h = 16.0f32 / (h as f32);
+                for py in 0..h {
+                    let gy_f = (py as f32) * inv_h;
+                    let gy = (gy_f as usize).min(15);
+                    let ty = gy_f - (gy as f32);
+                    let r0 = gy * 17;
+                    let r1 = (gy + 1) * 17;
+                    let row_off = py * w;
+                    for px in 0..w {
+                        let gx_f = (px as f32) * inv_w;
+                        let gx = (gx_f as usize).min(15);
+                        let tx = gx_f - (gx as f32);
+                        let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+                        let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+                        let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+                        let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+                        f(row_off + px, u_l + (u_r - u_l) * tx, v_l + (v_r - v_l) * tx);
+                    }
+                }
+            }
+            Self::Grid2DMasked { grid_u, grid_v, mask_bits } => {
+                let inv_w = 16.0f32 / (w as f32);
+                let inv_h = 16.0f32 / (h as f32);
+                for py in 0..h {
+                    let gy_f = (py as f32) * inv_h;
+                    let gy = (gy_f as usize).min(15);
+                    let ty = gy_f - (gy as f32);
+                    let r0 = gy * 17;
+                    let r1 = (gy + 1) * 17;
+                    let row_off = py * w;
+                    for px in 0..w {
+                        let idx = row_off + px;
+                        if (mask_bits[idx >> 5] & (1u32 << (idx & 31))) == 0 {
+                            f(idx, f32::NAN, f32::NAN);
+                            continue;
+                        }
+                        let gx_f = (px as f32) * inv_w;
+                        let gx = (gx_f as usize).min(15);
+                        let tx = gx_f - (gx as f32);
+                        let u_l = grid_u[r0 + gx] + (grid_u[r1 + gx] - grid_u[r0 + gx]) * ty;
+                        let u_r = grid_u[r0 + gx + 1] + (grid_u[r1 + gx + 1] - grid_u[r0 + gx + 1]) * ty;
+                        let v_l = grid_v[r0 + gx] + (grid_v[r1 + gx] - grid_v[r0 + gx]) * ty;
+                        let v_r = grid_v[r0 + gx + 1] + (grid_v[r1 + gx + 1] - grid_v[r0 + gx + 1]) * ty;
+                        f(idx, u_l + (u_r - u_l) * tx, v_l + (v_r - v_l) * tx);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn as_gpu_source(&self, w: usize, h: usize) -> crate::gpu_backend::BboxCoordSource<'_> {
+        match self {
+            Self::Separable { u_cols, v_rows } => {
+                crate::gpu_backend::BboxCoordSource::Separable {
+                    u: u_cols,
+                    v: v_rows,
+                }
+            }
+            Self::Grid2D { grid_u, grid_v } => crate::gpu_backend::BboxCoordSource::Grid2D {
+                dst_w: w,
+                dst_h: h,
+                grid_u,
+                grid_v,
+            },
+            Self::SeparableMasked {
+                u_cols,
+                v_rows,
+                mask_bits,
+            } => crate::gpu_backend::BboxCoordSource::SeparableMasked {
+                u: u_cols,
+                v: v_rows,
+                mask_bits,
+            },
+            Self::Grid2DMasked {
+                grid_u,
+                grid_v,
+                mask_bits,
+            } => crate::gpu_backend::BboxCoordSource::Grid2DMasked {
+                dst_w: w,
+                dst_h: h,
+                grid_u,
+                grid_v,
+                mask_bits,
+            },
+            Self::Exact2D { u_map, v_map } => crate::gpu_backend::BboxCoordSource::Exact2D {
+                dst_w: w,
+                dst_h: h,
+                u_map,
+                v_map,
+            },
+        }
+    }
+}
+
+/// 1-pass fused GPU (with seamless CPU/2-pass fallback) native-preview band/expression statistics.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_native_preview_stats(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    nodata_override: Option<f32>,
+    unscale: bool,
+    description: &str,
+    stats_opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let n_px = (width.clamp(1, 4096) as usize) * (height.clamp(1, 4096) as usize);
+    match Box::pin(render_bbox_core(
+        engine,
+        cogs,
+        bbox,
+        &cogzilla_proj::CrsModel::Geographic,
+        true,
+        width,
+        height,
+        None,
+        bands,
+        resample,
+        OutputFormat::RawF32,
+        nodata_override,
+        None,
+        None,
+        true,
+        unscale,
+        Some((stats_opts, description)),
+    ))
+    .await?
+    {
+        #[cfg(feature = "gpu")]
+        BboxRenderOutput::Stats(val) => Ok(val),
+        BboxRenderOutput::Bytes(raw) => {
+            let pixels: Vec<f32> = raw
+                .chunks_exact(4)
+                .take(n_px)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok(compute_f32_band_stats_with_engine(
+                engine,
+                &pixels,
+                description,
+                stats_opts,
+            ))
+        }
+    }
+}
+
+/// 1-pass fused GPU (with seamless CPU/2-pass fallback) WGS84 bbox / polygon-masked statistics.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_wgs84_bbox_stats(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    nodata_override: Option<f32>,
+    unscale: bool,
+    description: &str,
+    stats_opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let n_px = (width.clamp(1, 4096) as usize) * (height.clamp(1, 4096) as usize);
+    match Box::pin(render_bbox_core(
+        engine,
+        cogs,
+        bbox,
+        &cogzilla_proj::CrsModel::Geographic,
+        false,
+        width,
+        height,
+        poly_mask,
+        bands,
+        resample,
+        OutputFormat::RawF32,
+        nodata_override,
+        None,
+        None,
+        true,
+        unscale,
+        Some((stats_opts, description)),
+    ))
+    .await?
+    {
+        #[cfg(feature = "gpu")]
+        BboxRenderOutput::Stats(val) => Ok(val),
+        BboxRenderOutput::Bytes(raw) => {
+            let pixels: Vec<f32> = raw
+                .chunks_exact(4)
+                .take(n_px)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok(compute_f32_band_stats_with_engine(
+                engine,
+                &pixels,
+                description,
+                stats_opts,
+            ))
+        }
+    }
+}
+
 /// Three bands of band math painted as RGB: each channel's program evaluated a run of pixels
 /// at a time on the row VM (which works each value as the one-pixel VM does), each sampled at
 /// `(u_map, v_map)`, and rescaled by `rescale_min` and `inv`; a pixel with no place or a
@@ -5512,24 +6394,33 @@ fn paint_rgb_band_math(
     progs: &[cogzilla_kernel::ExprProgram; 3],
     all_srcs: &[Vec<BandSource<'_>>],
     sample: &impl Fn(&BandSource<'_>, f32, f32) -> f32,
-    u_map: &[f32],
-    v_map: &[f32],
+    coord_map: &BboxCoordMap,
+    w: usize,
+    h: usize,
     rescale_min: [f32; 3],
     inv: [f32; 3],
     rgba: &mut [u8],
 ) {
     const RUN: usize = 64;
-    let npix = u_map.len();
+    let npix = w * h;
     let mut rows = vec![[0.0f32; RUN]; 16];
     let mut scratch: Vec<[f32; RUN]> = Vec::new();
     let mut rgb = [[0.0f32; RUN]; 3];
+    let mut u_run = [0.0f32; RUN];
+    let mut v_run = [0.0f32; RUN];
     for start in (0..npix).step_by(RUN) {
         let n = RUN.min(npix - start);
+        for t in 0..n {
+            let i = start + t;
+            let (u, v) = coord_map.uv(i % w, i / w, w, h);
+            u_run[t] = u;
+            v_run[t] = v;
+        }
         for c in 0..3 {
             let srcs = &all_srcs[c];
             let nb = srcs.len().min(16);
             for t in 0..n {
-                let (u, v) = (u_map[start + t], v_map[start + t]);
+                let (u, v) = (u_run[t], v_run[t]);
                 for k in 0..nb {
                     rows[k][t] = if u.is_nan() { f32::NAN } else { sample(&srcs[k], u, v) };
                 }
@@ -5539,7 +6430,7 @@ fn paint_rgb_band_math(
         for t in 0..n {
             let i = start + t;
             let px = [rgb[0][t], rgb[1][t], rgb[2][t]];
-            if u_map[i].is_nan() || px.iter().any(|v| v.is_nan()) {
+            if u_run[t].is_nan() || px.iter().any(|v| v.is_nan()) {
                 continue;
             }
             for c in 0..3 {
@@ -5552,6 +6443,52 @@ fn paint_rgb_band_math(
 
 #[allow(clippy::too_many_arguments)]
 async fn render_bbox_impl(
+    engine: &TileEngine,
+    cogs: &[Arc<OpenedCog>],
+    bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    native_preview: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands: &BandRequest,
+    resample: ResampleMode,
+    format: OutputFormat,
+    nodata_override: Option<f32>,
+    custom_lut: Option<&CustomColormap>,
+    color_formula: Option<&ColorFormula>,
+    return_mask: bool,
+    unscale: bool,
+) -> Result<Bytes, EngineError> {
+    match Box::pin(render_bbox_core(
+        engine,
+        cogs,
+        bbox,
+        dst_crs,
+        native_preview,
+        width,
+        height,
+        poly_mask,
+        bands,
+        resample,
+        format,
+        nodata_override,
+        custom_lut,
+        color_formula,
+        return_mask,
+        unscale,
+        None,
+    ))
+    .await?
+    {
+        BboxRenderOutput::Bytes(b) => Ok(b),
+        #[cfg(feature = "gpu")]
+        BboxRenderOutput::Stats(_) => unreachable!("fused_stats is None"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_bbox_core(
     engine: &TileEngine,
     cogs: &[Arc<OpenedCog>],
     mut bbox: [f64; 4],
@@ -5568,7 +6505,8 @@ async fn render_bbox_impl(
     color_formula: Option<&ColorFormula>,
     return_mask: bool,
     unscale: bool,
-) -> Result<Bytes, EngineError> {
+    fused_stats: Option<(&StatsOptions, &str)>,
+) -> Result<BboxRenderOutput, EngineError> {
     if cogs.is_empty() || cogs.len() > 16 {
         return Err(EngineError::BadRequest(format!(
             "render_bbox supports 1..=16 assets, got {}",
@@ -5648,7 +6586,8 @@ async fn render_bbox_impl(
                 matches!(format, OutputFormat::RawF64),
                 false,
             )
-            .await;
+            .await
+            .map(BboxRenderOutput::Bytes);
         }
     }
     let w = width.clamp(1, 4096) as usize;
@@ -5757,7 +6696,8 @@ async fn render_bbox_impl(
             unscale,
             None,
         )
-        .await;
+        .await
+        .map(BboxRenderOutput::Bytes);
     }
     let ifd = &primary.index.ifds[ifd_idx];
 
@@ -5765,25 +6705,306 @@ async fn render_bbox_impl(
     // For native preview (`native_preview == true`), map directly in source pixel space without
     // reprojecting through an axis-aligned WGS84 bbox (matching `rio-tiler`'s `Reader.preview()`).
     // Otherwise use a coarse 16-px projection grid + bilinear interpolation.
-    let (u_map, v_map, min_u, max_u, min_v, max_v) = if native_preview {
-        let mut u_map = vec![0.0f32; w * h];
-        let mut v_map = vec![0.0f32; w * h];
+    let (coord_map, min_u, max_u, min_v, max_v) = if native_preview {
         let sx = (ifd.width as f64) / (w as f64);
         let sy = (ifd.height as f64) / (h as f64);
         let u_cols: Vec<f32> = (0..w).map(|px| ((px as f64 + 0.5) * sx - 0.5) as f32).collect();
-        for py in 0..h {
-            let vv = ((py as f64 + 0.5) * sy - 0.5) as f32;
-            let row_off = py * w;
-            u_map[row_off..row_off + w].copy_from_slice(&u_cols);
-            v_map[row_off..row_off + w].fill(vv);
-        }
+        let v_rows: Vec<f32> = (0..h).map(|py| ((py as f64 + 0.5) * sy - 0.5) as f32).collect();
         let min_u = u_cols.first().copied().unwrap_or(0.0);
         let max_u = u_cols.last().copied().unwrap_or(0.0);
-        let min_v = ((0.5 * sy) - 0.5) as f32;
-        let max_v = (((h as f64 - 0.5) * sy) - 0.5) as f32;
-        (u_map, v_map, min_u, max_u, min_v, max_v)
+        let min_v = v_rows.first().copied().unwrap_or(0.0);
+        let max_v = v_rows.last().copied().unwrap_or(0.0);
+        (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
     } else {
-        let build_uv_maps = {
+        let is_separable_fast = ifd.gcp_poly.is_none()
+            && ifd.crs_to_pixel.is_axis_aligned()
+            && matches!(
+                dst_crs,
+                cogzilla_proj::CrsModel::Geographic
+                    | cogzilla_proj::CrsModel::Epsg3857
+                    | cogzilla_proj::CrsModel::WorldMercator
+                    | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+            )
+            && matches!(
+                crs,
+                cogzilla_proj::CrsModel::Geographic
+                    | cogzilla_proj::CrsModel::Epsg3857
+                    | cogzilla_proj::CrsModel::WorldMercator
+                    | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+            );
+        if is_separable_fast {
+            // O(w + h) fast path: zero 2D allocation, zero spawn_blocking overhead, and
+            // enables 32 KB `BboxCoordSource::Separable` GPU uploads instead of 128 MB `Exact2D`.
+            let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+            let crs_to_pixel = ifd.crs_to_pixel;
+            let ifd_w_f = ifd.width as f32;
+            let ifd_h_f = ifd.height as f32;
+            let to_src_crs = |x: f64, y: f64| -> (f64, f64) {
+                let (mut sx, sy) = match dst_crs {
+                    cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                    cogzilla_proj::CrsModel::Geographic => {
+                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        crs.from_lonlat_deg(lon, y)
+                    }
+                    other => {
+                        let (lon, lat) = other.to_lonlat_deg(x, y);
+                        if lon.is_finite() && lat.is_finite() {
+                            crs.from_lonlat_deg(lon, lat)
+                        } else {
+                            (f64::NAN, f64::NAN)
+                        }
+                    }
+                };
+                if let Some(lo) = wrap_lo
+                    && sx.is_finite()
+                    && sx < lo
+                {
+                    sx += 360.0;
+                }
+                (sx, sy)
+            };
+            let (origin_x, origin_y) = match dst_crs {
+                cogzilla_proj::CrsModel::CylindricalEqualArea(cea) => {
+                    (cea.false_easting, cea.false_northing)
+                }
+                _ => (0.0, 0.0),
+            };
+            let mut u_cols = vec![f32::NAN; w];
+            let mut min_u = f32::INFINITY;
+            let mut max_u = f32::NEG_INFINITY;
+            for (px, slot) in u_cols.iter_mut().enumerate() {
+                let x_coord = bbox[0] + (px as f64 + 0.5) * dlx;
+                let (sx, _) = to_src_crs(x_coord, origin_y);
+                if sx.is_finite() {
+                    let uu = (crs_to_pixel.a * sx + crs_to_pixel.c - 0.5) as f32;
+                    if uu >= -1.0 && uu <= ifd_w_f {
+                        *slot = uu;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                    }
+                }
+            }
+            let mut v_rows = vec![f32::NAN; h];
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+            for (py, slot) in v_rows.iter_mut().enumerate() {
+                let y_coord = bbox[3] - (py as f64 + 0.5) * dly;
+                let (_, sy) = to_src_crs(origin_x, y_coord);
+                if sy.is_finite() {
+                    let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
+                    if vv >= -1.0 && vv <= ifd_h_f {
+                        *slot = vv;
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
+            }
+            if !min_u.is_finite() || !min_v.is_finite() {
+                min_u = f32::INFINITY;
+                max_u = f32::NEG_INFINITY;
+                min_v = f32::INFINITY;
+                max_v = f32::NEG_INFINITY;
+            }
+            if let Some(pm) = poly_mask {
+                let (mask_bits, covered) = pm.rasterize_all_touched_bits(w, h, bbox, dst_crs);
+                if covered == 0 {
+                    min_u = f32::INFINITY;
+                    max_u = f32::NEG_INFINITY;
+                    min_v = f32::INFINITY;
+                    max_v = f32::NEG_INFINITY;
+                }
+                (
+                    BboxCoordMap::SeparableMasked {
+                        u_cols,
+                        v_rows,
+                        mask_bits,
+                    },
+                    min_u,
+                    max_u,
+                    min_v,
+                    max_v,
+                )
+            } else {
+                (BboxCoordMap::Separable { u_cols, v_rows }, min_u, max_u, min_v, max_v)
+            }
+        } else {
+            // Try 17x17 coarse Grid2D fast path (2.3 KB vs 128 MB Exact2D!) for curved
+            // projections (UTM, Albers, LCC, Polar Stereo) when all 289 control knots are finite
+            // and 4 interior midpoint probes verify bilinear error < 0.05 source pixels.
+            let grid2d_fast = if ifd.gcp_poly.is_none() {
+                let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+                let crs_to_pixel = ifd.crs_to_pixel;
+                let ifd_w_f = ifd.width as f32;
+                let ifd_h_f = ifd.height as f32;
+                let project_px = |px_f: f64, py_f: f64| -> (f32, f32) {
+                    let x = bbox[0] + (px_f + 0.5) * dlx;
+                    let y = bbox[3] - (py_f + 0.5) * dly;
+                    let (mut sx, sy) = match dst_crs {
+                        cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                        cogzilla_proj::CrsModel::Geographic => {
+                            let lon = if x > 180.0 { x - 360.0 } else { x };
+                            crs.from_lonlat_deg(lon, y)
+                        }
+                        other => {
+                            let (lon, lat) = other.to_lonlat_deg(x, y);
+                            if lon.is_finite() && lat.is_finite() {
+                                crs.from_lonlat_deg(lon, lat)
+                            } else {
+                                (f64::NAN, f64::NAN)
+                            }
+                        }
+                    };
+                    if let Some(lo) = wrap_lo
+                        && sx.is_finite()
+                        && sx < lo
+                    {
+                        sx += 360.0;
+                    }
+                    if sx.is_finite() && sy.is_finite() {
+                        let (col, row) = crs_to_pixel.forward(sx, sy);
+                        ((col - 0.5) as f32, (row - 0.5) as f32)
+                    } else {
+                        (f32::NAN, f32::NAN)
+                    }
+                };
+                let mut grid_u = [0.0f32; 289];
+                let mut grid_v = [0.0f32; 289];
+                let mut all_finite = true;
+                let cell_x = (w as f64) / 16.0;
+                let cell_y = (h as f64) / 16.0;
+                'grid: for gy in 0..17usize {
+                    let py_f = (gy as f64) * cell_y;
+                    for gx in 0..17usize {
+                        let px_f = (gx as f64) * cell_x;
+                        let (uu, vv) = project_px(px_f, py_f);
+                        if !uu.is_finite() || !vv.is_finite() {
+                            all_finite = false;
+                            break 'grid;
+                        }
+                        grid_u[gy * 17 + gx] = uu;
+                        grid_v[gy * 17 + gx] = vv;
+                    }
+                }
+                if all_finite {
+                    // Verify curvature accuracy at 4 interior cell midpoints (< 0.05 px).
+                    let mut accurate = true;
+                    for (gx_i, gy_i) in [(3usize, 3usize), (11, 3), (3, 11), (11, 11)] {
+                        let (ex_u, ex_v) =
+                            project_px((gx_i as f64 + 0.5) * cell_x, (gy_i as f64 + 0.5) * cell_y);
+                        let i00 = gy_i * 17 + gx_i;
+                        let bi_u = 0.25
+                            * (grid_u[i00]
+                                + grid_u[i00 + 1]
+                                + grid_u[i00 + 17]
+                                + grid_u[i00 + 18]);
+                        let bi_v = 0.25
+                            * (grid_v[i00]
+                                + grid_v[i00 + 1]
+                                + grid_v[i00 + 17]
+                                + grid_v[i00 + 18]);
+                        if !ex_u.is_finite()
+                            || !ex_v.is_finite()
+                            || (ex_u - bi_u).abs() > 0.05
+                            || (ex_v - bi_v).abs() > 0.05
+                        {
+                            accurate = false;
+                            break;
+                        }
+                    }
+                    if accurate {
+                        let mut min_u = f32::INFINITY;
+                        let mut max_u = f32::NEG_INFINITY;
+                        let mut min_v = f32::INFINITY;
+                        let mut max_v = f32::NEG_INFINITY;
+                        let mut track = |uu: f32, vv: f32| {
+                            min_u = min_u.min(uu);
+                            max_u = max_u.max(uu);
+                            min_v = min_v.min(vv);
+                            max_v = max_v.max(vv);
+                        };
+                        for gy in 0..16usize {
+                            for gx in 0..16usize {
+                                track(grid_u[gy * 17 + gx], grid_v[gy * 17 + gx]);
+                            }
+                        }
+                        let tx_end = ((w.saturating_sub(1) as f32) * 16.0 / (w as f32) - 15.0)
+                            .clamp(0.0, 1.0);
+                        let ty_end = ((h.saturating_sub(1) as f32) * 16.0 / (h as f32) - 15.0)
+                            .clamp(0.0, 1.0);
+                        for gy in 0..16usize {
+                            let i0 = gy * 17 + 15;
+                            let i1 = gy * 17 + 16;
+                            track(
+                                grid_u[i0] + tx_end * (grid_u[i1] - grid_u[i0]),
+                                grid_v[i0] + tx_end * (grid_v[i1] - grid_v[i0]),
+                            );
+                        }
+                        for gx in 0..16usize {
+                            let i0 = 15 * 17 + gx;
+                            let i1 = 16 * 17 + gx;
+                            track(
+                                grid_u[i0] + ty_end * (grid_u[i1] - grid_u[i0]),
+                                grid_v[i0] + ty_end * (grid_v[i1] - grid_v[i0]),
+                            );
+                        }
+                        let c00 = 15 * 17 + 15;
+                        let c10 = 15 * 17 + 16;
+                        let c01 = 16 * 17 + 15;
+                        let c11 = 16 * 17 + 16;
+                        let u_t = grid_u[c00] + tx_end * (grid_u[c10] - grid_u[c00]);
+                        let u_b = grid_u[c01] + tx_end * (grid_u[c11] - grid_u[c01]);
+                        let v_t = grid_v[c00] + tx_end * (grid_v[c10] - grid_v[c00]);
+                        let v_b = grid_v[c01] + tx_end * (grid_v[c11] - grid_v[c01]);
+                        track(u_t + ty_end * (u_b - u_t), v_t + ty_end * (v_b - v_t));
+
+                        if max_u < -1.0 || min_u > ifd_w_f || max_v < -1.0 || min_v > ifd_h_f {
+                            min_u = f32::INFINITY;
+                            max_u = f32::NEG_INFINITY;
+                            min_v = f32::INFINITY;
+                            max_v = f32::NEG_INFINITY;
+                        }
+                        if let Some(pm) = poly_mask {
+                            let (mask_bits, covered) =
+                                pm.rasterize_all_touched_bits(w, h, bbox, dst_crs);
+                            if covered == 0 {
+                                min_u = f32::INFINITY;
+                                max_u = f32::NEG_INFINITY;
+                                min_v = f32::INFINITY;
+                                max_v = f32::NEG_INFINITY;
+                            }
+                            Some((
+                                BboxCoordMap::Grid2DMasked {
+                                    grid_u,
+                                    grid_v,
+                                    mask_bits,
+                                },
+                                min_u,
+                                max_u,
+                                min_v,
+                                max_v,
+                            ))
+                        } else {
+                            Some((
+                                BboxCoordMap::Grid2D { grid_u, grid_v },
+                                min_u,
+                                max_u,
+                                min_v,
+                                max_v,
+                            ))
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(res) = grid2d_fast {
+                res
+            } else {
+            let build_uv_maps = {
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
@@ -6121,7 +7342,9 @@ async fn render_bbox_impl(
     } else {
         build_uv_maps()
     };
-    (u_map, v_map, min_u, max_u, min_v, max_v)
+    (BboxCoordMap::Exact2D { u_map, v_map }, min_u, max_u, min_v, max_v)
+    }
+    }
     };
 
     // Empty check: zero source pixel centers mapped into the requested tile/bbox/feature.
@@ -6177,8 +7400,22 @@ async fn render_bbox_impl(
     let max_c = (ifd.width as i32 - 1).max(0);
     let max_r = (ifd.height as i32 - 1).max(0);
     let is_dem = matches!(bands, BandRequest::Dem { .. });
+    // GDAL-style widened kernel when the request shrinks the overview (bilinear/cubic/
+    // cubicspline/lanczos): the support grows to `radius * scale` source pixels.
+    let widen_kernel = resample != ResampleMode::Nearest
+        && cogzilla_kernel::kernel_widens(resample, footprint_sx, footprint_sy);
     let (c0, c1, r0, r1) = if empty_but_overlapping {
         (0u32, 0u32, 0u32, 0u32)
+    } else if widen_kernel {
+        let extra = if is_dem { 2 } else { 0 };
+        let hx = cogzilla_kernel::widened_kernel_radius(resample, footprint_sx).ceil() as i32 + extra;
+        let hy = cogzilla_kernel::widened_kernel_radius(resample, footprint_sy).ceil() as i32 + extra;
+        (
+            (min_u.floor() as i32).saturating_sub(hx).clamp(0, max_c) as u32,
+            (max_u.ceil() as i32).saturating_add(hx).clamp(0, max_c) as u32,
+            (min_v.floor() as i32).saturating_sub(hy).clamp(0, max_r) as u32,
+            (max_v.ceil() as i32).saturating_add(hy).clamp(0, max_r) as u32,
+        )
     } else if is_dem {
         let (lo, hi) = crate::engine::resample_fetch_margin(resample, true);
         (
@@ -6381,58 +7618,48 @@ async fn render_bbox_impl(
             .collect()
     };
 
-    let dst_is_merc = matches!(
-        dst_crs,
-        cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator
-    );
-    let dst_is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
-    let dst_unit_m = dst_crs.linear_unit_metres();
-    let dst_center_lat = if dst_is_merc {
-        dst_crs.to_lonlat_deg(cx, cy).1
-    } else {
-        0.5 * (bbox[1] + bbox[3])
-    };
     let native_dem_dxy: Option<(f32, f32)> = if native_preview {
         let full = primary.index.full_res();
         let rx = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d) * (full.width as f64) / (w as f64);
         let ry = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e) * (full.height as f64) / (h as f64);
-        let (dx_m, dy_m) = match &crs {
-            cogzilla_proj::CrsModel::Geographic => {
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                (
-                    (rx * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
-                    (ry * 111_320.0).max(1e-3) as f32,
-                )
-            }
-            cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator => {
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                let cos_lat = lat_rad.cos().max(0.05);
-                (
-                    (rx * cos_lat).max(1e-3) as f32,
-                    (ry * cos_lat).max(1e-3) as f32,
-                )
-            }
-            other => {
-                let unit_m = other.linear_unit_metres();
-                (
-                    (rx * unit_m).max(1e-3) as f32,
-                    (ry * unit_m).max(1e-3) as f32,
-                )
-            }
-        };
-        Some((dx_m, dy_m))
+        // In the raster's own units, as TiTiler divides by the transform's pixel size.
+        Some((rx.max(1e-9) as f32, ry.max(1e-9) as f32))
     } else {
         None
     };
-    let render_cpu = move |u_map: Vec<f32>,
-                           v_map: Vec<f32>,
+    // Shrinking convolution requests stay on the CPU, which widens the kernel like GDAL (the
+    // shaders keep the fixed taps).
+    #[cfg(feature = "gpu")]
+    let gpu_ctx = engine.gpu.as_ref().filter(|_| !widen_kernel).map(|g| {
+        let asset_ids: Vec<u64> = cogs.iter().map(|c| c.id).collect();
+        (Arc::clone(g), Arc::clone(&engine.stats), primary.id, asset_ids)
+    });
+    let render_cpu = move |coord_map: BboxCoordMap,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
                            bands: &BandRequest,
                            custom_lut: Option<&CustomColormap>,
-                           color_formula: Option<&ColorFormula>|
-          -> Bytes {
+                           color_formula: Option<&ColorFormula>,
+                           fused_stats: Option<(&StatsOptions, &str)>|
+          -> BboxRenderOutput {
+        #[cfg(not(feature = "gpu"))]
+        let _ = fused_stats;
         let ifd_w_i = ifd_width as i32;
         let ifd_h_i = ifd_height as i32;
+        // Same-CRS boxes and previews have separable maps: the widened sampler then filters each
+        // band's whole plane in two passes (`plane_of`), read directly by the common outputs.
+        let wide = widen_kernel.then(|| {
+            match &coord_map {
+                BboxCoordMap::Separable { u_cols, v_rows } => cogzilla_kernel::WidenedSampler::with_grid(
+                    resample,
+                    footprint_sx,
+                    footprint_sy,
+                    u_cols.clone(),
+                    v_rows.clone(),
+                ),
+                _ => None,
+            }
+            .unwrap_or_else(|| cogzilla_kernel::WidenedSampler::new_uncached(resample, footprint_sx, footprint_sy))
+        });
         let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
             if !u.is_finite() || !v.is_finite() {
                 return f32::NAN;
@@ -6451,6 +7678,14 @@ async fn render_bbox_impl(
                     } else {
                         src.sample_checked(xi, yi)
                     }
+                }
+                ResampleMode::Bilinear
+                | ResampleMode::Cubic
+                | ResampleMode::CubicSpline
+                | ResampleMode::Lanczos
+                    if widen_kernel =>
+                {
+                    wide.as_ref().map_or(f32::NAN, |w| w.sample(src, u, v))
                 }
                 ResampleMode::Cubic => cogzilla_kernel::sample_cubic(src, u, v),
                 ResampleMode::Bilinear => {
@@ -6497,7 +7732,7 @@ async fn render_bbox_impl(
                     }
                     if wsum > 1e-6 { sum / wsum } else { f32::NAN }
                 }
-                other => cogzilla_kernel::sample_general_scaled(
+                other => cogzilla_kernel::sample_general_unwidened(
                     src,
                     u,
                     v,
@@ -6507,6 +7742,8 @@ async fn render_bbox_impl(
                 ),
             }
         };
+        // The widened plane of a band on separable maps (`None` otherwise: sample per pixel).
+        let plane_of = |src: &BandSource<'_>| wide.as_ref().and_then(|wd| wd.grid_plane(src));
 
         let apply_source_unscale = unscale
             && (crate::engine::needs_source_unscale(bands, format)
@@ -6579,68 +7816,63 @@ async fn render_bbox_impl(
         // Sample a (w + 2) x (h + 2) elevation ring by linearly extrapolating (u, v) 1 px past
         // each edge so Horn 3x3 gradients stay seamless across adjacent tiles (WorldCRS84Quad /
         // render_mercator_bbox) and non-square bboxes.
-        let sample_dem_ring = |src: &BandSource<'_>| -> Vec<f32> {
+        let sample_dem_ring = |src: &BandSource<'_>, coord_map: &BboxCoordMap| -> Vec<f32> {
             let rw = w + 2;
             let rh = h + 2;
             let mut ring = vec![f32::NAN; rw * rh];
+            coord_map.for_each_uv(w, h, |i, u, v| {
+                let py = i / w;
+                let px = i % w;
+                ring[(py + 1) * rw + px + 1] = sample(src, u, v);
+            });
             for py in 0..h {
-                let row = py * w;
                 let rrow = (py + 1) * rw;
-                for px in 0..w {
-                    ring[rrow + px + 1] = sample(src, u_map[row + px], v_map[row + px]);
-                }
+                let (u0, v0) = coord_map.uv(0, py, w, h);
                 let (u_l, v_l) = if w >= 2 {
-                    (2.0 * u_map[row] - u_map[row + 1], 2.0 * v_map[row] - v_map[row + 1])
+                    let (u1, v1) = coord_map.uv(1, py, w, h);
+                    (2.0 * u0 - u1, 2.0 * v0 - v1)
                 } else {
-                    (u_map[row], v_map[row])
+                    (u0, v0)
                 };
+                let (ur0, vr0) = coord_map.uv(w - 1, py, w, h);
                 let (u_r, v_r) = if w >= 2 {
-                    (
-                        2.0 * u_map[row + w - 1] - u_map[row + w - 2],
-                        2.0 * v_map[row + w - 1] - v_map[row + w - 2],
-                    )
+                    let (ur1, vr1) = coord_map.uv(w - 2, py, w, h);
+                    (2.0 * ur0 - ur1, 2.0 * vr0 - vr1)
                 } else {
-                    (u_map[row + w - 1], v_map[row + w - 1])
+                    (ur0, vr0)
                 };
                 ring[rrow] = sample(src, u_l, v_l);
                 ring[rrow + w + 1] = sample(src, u_r, v_r);
             }
             let extrap_row = |src_y0: usize, src_y1: usize, dst_ry: usize, ring: &mut [f32]| {
-                let r0 = src_y0 * w;
-                let r1 = src_y1 * w;
                 let dr = dst_ry * rw;
                 for rx in 0..rw {
                     let px_signed = rx as isize - 1;
                     let (u0, v0, u1, v1) = if px_signed < 0 {
+                        let (a0, b0) = coord_map.uv(0, src_y0, w, h);
+                        let (a1, b1) = coord_map.uv(0, src_y1, w, h);
                         if w >= 2 {
-                            (
-                                2.0 * u_map[r0] - u_map[r0 + 1],
-                                2.0 * v_map[r0] - v_map[r0 + 1],
-                                2.0 * u_map[r1] - u_map[r1 + 1],
-                                2.0 * v_map[r1] - v_map[r1 + 1],
-                            )
+                            let (c0, d0) = coord_map.uv(1, src_y0, w, h);
+                            let (c1, d1) = coord_map.uv(1, src_y1, w, h);
+                            (2.0 * a0 - c0, 2.0 * b0 - d0, 2.0 * a1 - c1, 2.0 * b1 - d1)
                         } else {
-                            (u_map[r0], v_map[r0], u_map[r1], v_map[r1])
+                            (a0, b0, a1, b1)
                         }
                     } else if (px_signed as usize) >= w {
+                        let (a0, b0) = coord_map.uv(w - 1, src_y0, w, h);
+                        let (a1, b1) = coord_map.uv(w - 1, src_y1, w, h);
                         if w >= 2 {
-                            (
-                                2.0 * u_map[r0 + w - 1] - u_map[r0 + w - 2],
-                                2.0 * v_map[r0 + w - 1] - v_map[r0 + w - 2],
-                                2.0 * u_map[r1 + w - 1] - u_map[r1 + w - 2],
-                                2.0 * v_map[r1 + w - 1] - v_map[r1 + w - 2],
-                            )
+                            let (c0, d0) = coord_map.uv(w - 2, src_y0, w, h);
+                            let (c1, d1) = coord_map.uv(w - 2, src_y1, w, h);
+                            (2.0 * a0 - c0, 2.0 * b0 - d0, 2.0 * a1 - c1, 2.0 * b1 - d1)
                         } else {
-                            (
-                                u_map[r0 + w - 1],
-                                v_map[r0 + w - 1],
-                                u_map[r1 + w - 1],
-                                v_map[r1 + w - 1],
-                            )
+                            (a0, b0, a1, b1)
                         }
                     } else {
                         let p = px_signed as usize;
-                        (u_map[r0 + p], v_map[r0 + p], u_map[r1 + p], v_map[r1 + p])
+                        let (a0, b0) = coord_map.uv(p, src_y0, w, h);
+                        let (a1, b1) = coord_map.uv(p, src_y1, w, h);
+                        (a0, b0, a1, b1)
                     };
                     let (u, v) = if h >= 2 {
                         (2.0 * u0 - u1, 2.0 * v0 - v1)
@@ -6655,32 +7887,303 @@ async fn render_bbox_impl(
             ring
         };
 
-        let dem_inv_8dxy = || -> (f32, f32) {
-            let (dx_m, dy_m) = if let Some(dxy) = native_dem_dxy {
-                dxy
-            } else if dst_is_merc {
-                let cos_lat = dst_center_lat.to_radians().cos().max(0.05);
-                (
-                    (dlx.abs() * cos_lat).max(1e-3) as f32,
-                    (dly.abs() * cos_lat).max(1e-3) as f32,
-                )
-            } else if dst_is_geo {
-                let lat_rad = dst_center_lat.to_radians();
-                (
-                    (dlx.abs() * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
-                    (dly.abs() * 111_320.0).max(1e-3) as f32,
-                )
-            } else {
-                (
-                    (dlx.abs() * dst_unit_m).max(1e-3) as f32,
-                    (dly.abs() * dst_unit_m).max(1e-3) as f32,
-                )
-            };
-            (1.0 / (8.0 * dx_m), 1.0 / (8.0 * dy_m))
+        // The DEM grid's pixel size in its own system's units (degrees on a grid in degrees),
+        // as TiTiler's slope divides by the transform's pixel size.
+        let dem_dxy = || -> (f32, f32) {
+            native_dem_dxy.unwrap_or(((dlx.abs()).max(1e-9) as f32, (dly.abs()).max(1e-9) as f32))
         };
 
         // Real RawF32 / Npy output for single-band / expression / DEM / Terrain / RGB requests
         if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
+            #[cfg(feature = "gpu")]
+            if let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx {
+                let single_band_key = |b1: u16| -> (u64, u16) {
+                    if num_cogs > 1 {
+                        let slot = (b1.saturating_sub(1) as usize).min(asset_ids.len().saturating_sub(1));
+                        (asset_ids[slot], 0)
+                    } else {
+                        (primary_id, b1.saturating_sub(1))
+                    }
+                };
+                let mb_key = |b1s: &[u16], srcs: &[BandSource<'_>]| {
+                    (num_cogs == 1)
+                        .then(|| {
+                            crate::gpu_backend::GpuBackend::multiband_key(
+                                primary_id, ifd_idx, b1s, srcs,
+                            )
+                        })
+                        .flatten()
+                };
+                let coords = coord_map.as_gpu_source(w, h);
+                if format == OutputFormat::RawF32
+                    && let Some((sopts, desc)) = fused_stats
+                    && !sopts.categorical
+                    && sopts.histogram_edges.is_none()
+                {
+                    let hist_bins = sopts.histogram_bins.clamp(1, 1000);
+                    let dispatch_spectral_stats = |expr, b1s: &[u16]| {
+                        let ref_vecs: Vec<_> = b1s
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, &b)| get_band_refs(b, slot))
+                            .collect();
+                        let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                        gpu.try_render_bbox_spectral_stats(
+                            mb_key(b1s, &srcs),
+                            coords,
+                            &srcs,
+                            expr,
+                            resample,
+                            hist_bins,
+                            sopts.histogram_range,
+                            &sopts.percentiles,
+                        )
+                    };
+                    let gpu_stats: Option<cogzilla_gpu::GpuBandStats> = match bands {
+                        BandRequest::Single { band_1based, .. } => {
+                            let refs = get_band_refs(*band_1based, 0);
+                            let src = make_src!(&refs);
+                            let (cid, b0) = single_band_key(*band_1based);
+                            gpu.try_render_bbox_single_band_stats(
+                                cid,
+                                ifd_idx,
+                                b0,
+                                coords,
+                                &src,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::CustomExpr { prog, .. } => {
+                            let ref_vecs: Vec<_> = prog
+                                .used_bands
+                                .iter()
+                                .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                                .collect();
+                            let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                            gpu.try_render_bbox_expr_stats(
+                                mb_key(&prog.used_bands, &srcs),
+                                coords,
+                                &srcs,
+                                prog,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::Dem {
+                            band_1based,
+                            algorithm,
+                            ..
+                        } => {
+                            let refs = get_band_refs(*band_1based, 0);
+                            let src = make_src!(&refs);
+                            let (dx_m, dy_m) = dem_dxy();
+                            let (cid, b0) = single_band_key(*band_1based);
+                            gpu.try_render_bbox_dem_stats(
+                                cid,
+                                ifd_idx,
+                                b0,
+                                coords,
+                                &src,
+                                *algorithm,
+                                dx_m,
+                                dy_m,
+                                resample,
+                                hist_bins,
+                                sopts.histogram_range,
+                                &sopts.percentiles,
+                            )
+                        }
+                        BandRequest::Spectral1 {
+                            expr, band_1based, ..
+                        } => dispatch_spectral_stats(*expr, std::slice::from_ref(band_1based)),
+                        BandRequest::Spectral2 {
+                            expr, bands_1based, ..
+                        } => dispatch_spectral_stats(*expr, bands_1based),
+                        BandRequest::Spectral3 {
+                            expr, bands_1based, ..
+                        } => dispatch_spectral_stats(*expr, bands_1based),
+                        _ => None,
+                    };
+                    if let Some(gs) = gpu_stats {
+                        stats
+                            .gpu_dispatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return BboxRenderOutput::Stats(gpu_band_stats_to_json(
+                            &gs,
+                            w * h,
+                            desc,
+                            sopts,
+                            sopts.hist_dtype.unwrap_or(HistDtype::Float32),
+                            None,
+                        ));
+                    }
+                }
+                let dispatch_spectral_f32 = |expr, b1s: &[u16]| {
+                    let ref_vecs: Vec<_> = b1s
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, &b)| get_band_refs(b, slot))
+                        .collect();
+                    let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                    gpu.try_render_bbox_spectral_f32(
+                        mb_key(b1s, &srcs),
+                        coords,
+                        &srcs,
+                        expr,
+                        resample,
+                    )
+                };
+                let gpu_raw: Option<Bytes> = match bands {
+                    BandRequest::Single { band_1based, .. } => {
+                        let refs = get_band_refs(*band_1based, 0);
+                        let src = make_src!(&refs);
+                        let (cid, b0) = single_band_key(*band_1based);
+                        gpu.try_render_bbox_single_band_f32(
+                            cid,
+                            ifd_idx,
+                            b0,
+                            coords,
+                            &src,
+                            resample,
+                        )
+                    }
+                    BandRequest::Dem {
+                        band_1based,
+                        algorithm,
+                        ..
+                    } => {
+                        let refs = get_band_refs(*band_1based, 0);
+                        let src = make_src!(&refs);
+                        let (dx_m, dy_m) = dem_dxy();
+                        let (cid, b0) = single_band_key(*band_1based);
+                        gpu.try_render_bbox_dem_f32(
+                            cid,
+                            ifd_idx,
+                            b0,
+                            coords,
+                            &src,
+                            *algorithm,
+                            dx_m,
+                            dy_m,
+                            resample,
+                        )
+                    }
+                    BandRequest::CustomExpr { prog, .. } => {
+                        let ref_vecs: Vec<_> = prog
+                            .used_bands
+                            .iter()
+                            .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                            .collect();
+                        let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                        gpu.try_render_bbox_expr_f32(
+                            mb_key(&prog.used_bands, &srcs),
+                            coords,
+                            &srcs,
+                            prog,
+                            resample,
+                        )
+                    }
+                    BandRequest::Spectral1 {
+                        expr, band_1based, ..
+                    } => dispatch_spectral_f32(*expr, std::slice::from_ref(band_1based)),
+                    BandRequest::Spectral2 {
+                        expr, bands_1based, ..
+                    } => dispatch_spectral_f32(*expr, bands_1based),
+                    BandRequest::Spectral3 {
+                        expr, bands_1based, ..
+                    } => dispatch_spectral_f32(*expr, bands_1based),
+                    BandRequest::Rgb { bands_1based, .. } => {
+                        let r0 = get_band_refs(bands_1based[0], 0);
+                        let r1 = get_band_refs(bands_1based[1], 1);
+                        let r2 = get_band_refs(bands_1based[2], 2);
+                        let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                        gpu.try_render_bbox_multiband_f32(
+                            mb_key(bands_1based, &srcs),
+                            coords,
+                            &srcs,
+                            resample,
+                        )
+                    }
+                    BandRequest::MultiBand { bands_1based } => {
+                        if bands_1based.is_empty() || bands_1based.len() > 8 {
+                            None
+                        } else {
+                            let ref_vecs: Vec<_> = bands_1based
+                                .iter()
+                                .enumerate()
+                                .map(|(slot, &b)| get_band_refs(b, slot))
+                                .collect();
+                            let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                            gpu.try_render_bbox_multiband_f32(
+                                mb_key(bands_1based, &srcs),
+                                coords,
+                                &srcs,
+                                resample,
+                            )
+                        }
+                    }
+                    BandRequest::CustomExprRgb { progs, .. } => {
+                        let mut unique_bands: Vec<u16> = Vec::new();
+                        for prog in progs {
+                            for &b in &prog.used_bands {
+                                if !unique_bands.contains(&b) {
+                                    unique_bands.push(b);
+                                }
+                            }
+                        }
+                        if unique_bands.is_empty() || unique_bands.len() > 8 {
+                            None
+                        } else {
+                            let ref_vecs: Vec<_> = unique_bands
+                                .iter()
+                                .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                                .collect();
+                            let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                            gpu.try_render_bbox_expr_rgb_f32(
+                                mb_key(&unique_bands, &srcs),
+                                coords,
+                                &unique_bands,
+                                &srcs,
+                                progs,
+                                resample,
+                            )
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(raw) = gpu_raw {
+                    stats
+                        .gpu_dispatches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if format == OutputFormat::Npy {
+                        let nb = match bands {
+                            BandRequest::Rgb { .. }
+                            | BandRequest::SarRgb { .. }
+                            | BandRequest::Terrain { .. }
+                            | BandRequest::CustomExprRgb { .. } => 3,
+                            BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+                            BandRequest::CustomExprMulti { progs } => progs.len().max(1),
+                            _ => 1,
+                        };
+                        return BboxRenderOutput::Bytes(
+                            cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                                raw,
+                                nb,
+                                h as u32,
+                                w as u32,
+                                return_mask,
+                            ),
+                        );
+                    }
+                    return BboxRenderOutput::Bytes(raw);
+                }
+            }
+
             let mut out = BytesMut::with_capacity(w * h * 4);
             match bands {
                 BandRequest::Dem {
@@ -6690,28 +8193,16 @@ async fn render_bbox_impl(
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    let ring = sample_dem_ring(&src);
+                    let ring = sample_dem_ring(&src, &coord_map);
                     let rw = w + 2;
-                    let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                    let (dx_m, dy_m) = dem_dxy();
+                    let (inv_dx, inv_dy) = (1.0 / dx_m, 1.0 / dy_m);
                     for py in 0..h {
                         let r0 = py * rw;
                         let r1 = (py + 1) * rw;
                         let r2 = (py + 2) * rw;
                         for px in 0..w {
-                            let val = cogzilla_kernel::eval_horn_3x3_aniso(
-                                ring[r0 + px],
-                                ring[r0 + px + 1],
-                                ring[r0 + px + 2],
-                                ring[r1 + px],
-                                ring[r1 + px + 1],
-                                ring[r1 + px + 2],
-                                ring[r2 + px],
-                                ring[r2 + px + 1],
-                                ring[r2 + px + 2],
-                                inv_8dx,
-                                inv_8dy,
-                                *algorithm,
-                            );
+                            let val = cogzilla_kernel::eval_dem_stencil(ring[r0 + px + 1], ring[r1 + px], ring[r1 + px + 1], ring[r1 + px + 2], ring[r2 + px + 1], inv_dx, inv_dy, *algorithm);
                             out.put_slice(&val.to_le_bytes());
                         }
                     }
@@ -6719,8 +8210,14 @@ async fn render_bbox_impl(
                 BandRequest::Single { band_1based, .. } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    for i in 0..(w * h) {
-                        out.put_slice(&sample(&src, u_map[i], v_map[i]).to_le_bytes());
+                    if let Some(p) = plane_of(&src) {
+                        for v in &p[..w * h] {
+                            out.put_slice(&v.to_le_bytes());
+                        }
+                    } else {
+                        coord_map.for_each_uv(w, h, |_, u, v| {
+                            out.put_slice(&sample(&src, u, v).to_le_bytes());
+                        });
                     }
                 }
                 BandRequest::Terrain {
@@ -6731,8 +8228,8 @@ async fn render_bbox_impl(
                     let src = make_src!(&refs);
                     let mut g_plane = Vec::with_capacity(w * h * 4);
                     let mut b_plane = Vec::with_capacity(w * h * 4);
-                    for i in 0..(w * h) {
-                        let elev = sample(&src, u_map[i], v_map[i]);
+                    coord_map.for_each_uv(w, h, |_, u, v| {
+                        let elev = sample(&src, u, v);
                         if elev.is_nan() {
                             out.put_slice(&f32::NAN.to_le_bytes());
                             g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
@@ -6743,7 +8240,7 @@ async fn render_bbox_impl(
                             g_plane.extend_from_slice(&(g as f32).to_le_bytes());
                             b_plane.extend_from_slice(&(b as f32).to_le_bytes());
                         }
-                    }
+                    });
                     out.put_slice(&g_plane);
                     out.put_slice(&b_plane);
                 }
@@ -6756,16 +8253,16 @@ async fn render_bbox_impl(
                     let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
                     let mut vals = [0.0f32; 16];
                     let nb = srcs.len().min(16);
-                    for i in 0..(w * h) {
-                        if u_map[i].is_nan() {
+                    coord_map.for_each_uv(w, h, |_, u, v| {
+                        if u.is_nan() {
                             out.put_slice(&f32::NAN.to_le_bytes());
-                            continue;
+                            return;
                         }
                         for k in 0..nb {
-                            vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                            vals[k] = sample(&srcs[k], u, v);
                         }
                         out.put_slice(&prog.eval(&vals[..nb]).to_le_bytes());
-                    }
+                    });
                 }
                 BandRequest::CustomExprRgb { progs, .. } => {
                     for prog in progs {
@@ -6777,16 +8274,16 @@ async fn render_bbox_impl(
                         let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
                         let mut vals = [0.0f32; 16];
                         let nb = srcs.len().min(16);
-                        for i in 0..(w * h) {
-                            if u_map[i].is_nan() {
+                        coord_map.for_each_uv(w, h, |_, u, v| {
+                            if u.is_nan() {
                                 out.put_slice(&f32::NAN.to_le_bytes());
-                                continue;
+                                return;
                             }
                             for k in 0..nb {
-                                vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                                vals[k] = sample(&srcs[k], u, v);
                             }
                             out.put_slice(&prog.eval(&vals[..nb]).to_le_bytes());
-                        }
+                        });
                     }
                 }
                 BandRequest::Spectral1 {
@@ -6794,9 +8291,9 @@ async fn render_bbox_impl(
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    for i in 0..(w * h) {
-                        out.put_slice(&expr.eval1(sample(&src, u_map[i], v_map[i])).to_le_bytes());
-                    }
+                    coord_map.for_each_uv(w, h, |_, u, v| {
+                        out.put_slice(&expr.eval1(sample(&src, u, v)).to_le_bytes());
+                    });
                 }
                 BandRequest::Spectral2 {
                     expr, bands_1based, ..
@@ -6805,12 +8302,16 @@ async fn render_bbox_impl(
                     let r1 = get_band_refs(bands_1based[1], 1);
                     let s0 = make_src!(&r0);
                     let s1 = make_src!(&r1);
-                    for i in 0..(w * h) {
-                        let a = sample(&s0, u_map[i], v_map[i]);
-                        let b = sample(&s1, u_map[i], v_map[i]);
-                        let v = if a.is_nan() || b.is_nan() { f32::NAN } else { expr.eval2(a, b) };
-                        out.put_slice(&v.to_le_bytes());
-                    }
+                    coord_map.for_each_uv(w, h, |_, u, v| {
+                        let a = sample(&s0, u, v);
+                        let b = sample(&s1, u, v);
+                        let val = if a.is_nan() || b.is_nan() {
+                            f32::NAN
+                        } else {
+                            expr.eval2(a, b)
+                        };
+                        out.put_slice(&val.to_le_bytes());
+                    });
                 }
                 BandRequest::Spectral3 {
                     expr, bands_1based, ..
@@ -6821,17 +8322,17 @@ async fn render_bbox_impl(
                     let s0 = make_src!(&r0);
                     let s1 = make_src!(&r1);
                     let s2 = make_src!(&r2);
-                    for i in 0..(w * h) {
-                        let a = sample(&s0, u_map[i], v_map[i]);
-                        let b = sample(&s1, u_map[i], v_map[i]);
-                        let c = sample(&s2, u_map[i], v_map[i]);
-                        let v = if a.is_nan() || b.is_nan() || c.is_nan() {
+                    coord_map.for_each_uv(w, h, |_, u, v| {
+                        let a = sample(&s0, u, v);
+                        let b = sample(&s1, u, v);
+                        let c = sample(&s2, u, v);
+                        let val = if a.is_nan() || b.is_nan() || c.is_nan() {
                             f32::NAN
                         } else {
                             expr.eval3(a, b, c)
                         };
-                        out.put_slice(&v.to_le_bytes());
-                    }
+                        out.put_slice(&val.to_le_bytes());
+                    });
                 }
                 BandRequest::Rgb { bands_1based, .. } => {
                     let r0 = get_band_refs(bands_1based[0], 0);
@@ -6840,9 +8341,15 @@ async fn render_bbox_impl(
                     let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
                     out.reserve(w * h * 8);
                     for s in &srcs {
-                        for i in 0..(w * h) {
-                            out.put_slice(&sample(s, u_map[i], v_map[i]).to_le_bytes());
+                        if let Some(p) = plane_of(s) {
+                            for v in &p[..w * h] {
+                                out.put_slice(&v.to_le_bytes());
+                            }
+                            continue;
                         }
+                        coord_map.for_each_uv(w, h, |_, u, v| {
+                            out.put_slice(&sample(s, u, v).to_le_bytes());
+                        });
                     }
                 }
                 BandRequest::SarRgb { bands_1based, .. } => {
@@ -6853,13 +8360,13 @@ async fn render_bbox_impl(
                     let mut vh_plane = Vec::with_capacity(w * h * 4);
                     let mut diff_plane = Vec::with_capacity(w * h * 4);
                     out.reserve(w * h * 8);
-                    for i in 0..(w * h) {
-                        let vv = fast_db_from_power(sample(&s0, u_map[i], v_map[i]));
-                        let vh = fast_db_from_power(sample(&s1, u_map[i], v_map[i]));
+                    coord_map.for_each_uv(w, h, |_, u, v| {
+                        let vv = fast_db_from_power(sample(&s0, u, v));
+                        let vh = fast_db_from_power(sample(&s1, u, v));
                         out.put_slice(&vv.to_le_bytes());
                         vh_plane.extend_from_slice(&vh.to_le_bytes());
                         diff_plane.extend_from_slice(&(vv - vh).to_le_bytes());
-                    }
+                    });
                     out.put_slice(&vh_plane);
                     out.put_slice(&diff_plane);
                 }
@@ -6874,16 +8381,16 @@ async fn render_bbox_impl(
                         let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
                         let mut vals = [0.0f32; 16];
                         let nb = srcs.len().min(16);
-                        for i in 0..(w * h) {
-                            if u_map[i].is_nan() {
+                        coord_map.for_each_uv(w, h, |_, u, v| {
+                            if u.is_nan() {
                                 out.put_slice(&f32::NAN.to_le_bytes());
-                                continue;
+                                return;
                             }
                             for k in 0..nb {
-                                vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                                vals[k] = sample(&srcs[k], u, v);
                             }
                             out.put_slice(&prog.eval(&vals[..nb]).to_le_bytes());
-                        }
+                        });
                     }
                 }
                 BandRequest::MultiBand { bands_1based } => {
@@ -6891,9 +8398,9 @@ async fn render_bbox_impl(
                     for (slot, &b1) in bands_1based.iter().enumerate() {
                         let r = get_band_refs(b1, slot);
                         let s = make_src!(&r);
-                        for i in 0..(w * h) {
-                            out.put_slice(&sample(&s, u_map[i], v_map[i]).to_le_bytes());
-                        }
+                        coord_map.for_each_uv(w, h, |_, u, v| {
+                            out.put_slice(&sample(&s, u, v).to_le_bytes());
+                        });
                     }
                 }
             }
@@ -6908,15 +8415,15 @@ async fn render_bbox_impl(
                     BandRequest::CustomExprMulti { progs } => progs.len().max(1),
                     _ => 1,
                 };
-                return cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                return BboxRenderOutput::Bytes(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                     raw,
                     nb,
                     h as u32,
                     w as u32,
                     return_mask,
-                );
+                ));
             }
-            return raw;
+            return BboxRenderOutput::Bytes(raw);
         }
 
         let cf_single_lut: Option<[u8; 256]> = if custom_lut.is_none()
@@ -6954,6 +8461,303 @@ async fn render_bbox_impl(
             }
         };
 
+        #[cfg(feature = "gpu")]
+        if matches!(
+            format,
+            OutputFormat::Png
+                | OutputFormat::Webp { .. }
+                | OutputFormat::Jpeg { .. }
+                | OutputFormat::RawRgba
+        ) && let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx
+        {
+            let single_band_key = |b1: u16| -> (u64, u16) {
+                if num_cogs > 1 {
+                    let slot = (b1.saturating_sub(1) as usize).min(asset_ids.len().saturating_sub(1));
+                    (asset_ids[slot], 0)
+                } else {
+                    (primary_id, b1.saturating_sub(1))
+                }
+            };
+            let mb_key = |b1s: &[u16], srcs: &[BandSource<'_>]| {
+                (num_cogs == 1)
+                    .then(|| {
+                        crate::gpu_backend::GpuBackend::multiband_key(
+                            primary_id, ifd_idx, b1s, srcs,
+                        )
+                    })
+                    .flatten()
+            };
+            let coords = coord_map.as_gpu_source(w, h);
+            let dispatch_spectral_rgba = |expr, b1s: &[u16], rescale: (f32, f32), colormap| {
+                crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
+                    let ref_vecs: Vec<_> = b1s
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, &b)| get_band_refs(b, slot))
+                        .collect();
+                    let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_spectral_with_lut(
+                        mb_key(b1s, &srcs),
+                        coords,
+                        &srcs,
+                        expr,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                })
+            };
+            let gpu_out: Option<Bytes> = match bands {
+                BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    colormap,
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    let (cid, b0) = single_band_key(*band_1based);
+                    gpu.try_render_bbox_single_band_with_lut(
+                        cid,
+                        ifd_idx,
+                        b0,
+                        coords,
+                        &src,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
+                BandRequest::Dem {
+                    band_1based,
+                    algorithm,
+                    rescale,
+                    colormap,
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let (dx_m, dy_m) = dem_dxy();
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    let (cid, b0) = single_band_key(*band_1based);
+                    gpu.try_render_bbox_dem_with_lut(
+                        cid,
+                        ifd_idx,
+                        b0,
+                        coords,
+                        &src,
+                        *algorithm,
+                        dx_m,
+                        dy_m,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
+                BandRequest::Terrain {
+                    band_1based,
+                    encoding,
+                } if custom_lut.is_none() && color_formula.is_none() => {
+                    let refs = get_band_refs(*band_1based, 0);
+                    let src = make_src!(&refs);
+                    let (cid, b0) = single_band_key(*band_1based);
+                    gpu.try_render_bbox_terrain(
+                        cid,
+                        ifd_idx,
+                        b0,
+                        coords,
+                        &src,
+                        *encoding,
+                        resample,
+                        format,
+                        return_mask,
+                    )
+                }
+                BandRequest::CustomExpr {
+                    prog,
+                    rescale,
+                    colormap,
+                } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
+                    *colormap,
+                    custom_lut,
+                    color_formula,
+                )
+                .and_then(|rgb_lut| {
+                    let ref_vecs: Vec<_> = prog
+                        .used_bands
+                        .iter()
+                        .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                        .collect();
+                    let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                    let style = cogzilla_kernel::SingleBandStyle {
+                        rescale_min: rescale.0,
+                        rescale_max: rescale.1,
+                        colormap: *colormap,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_expr_with_lut(
+                        mb_key(&prog.used_bands, &srcs),
+                        coords,
+                        &srcs,
+                        prog,
+                        &style,
+                        &rgb_lut,
+                        return_mask,
+                    )
+                }),
+                BandRequest::CustomExprRgb {
+                    progs,
+                    rescale_min,
+                    rescale_max,
+                } if custom_lut.is_none() => {
+                    let mut unique_bands: Vec<u16> = Vec::new();
+                    for prog in progs {
+                        for &b in &prog.used_bands {
+                            if !unique_bands.contains(&b) {
+                                unique_bands.push(b);
+                            }
+                        }
+                    }
+                    if unique_bands.is_empty() || unique_bands.len() > 8 {
+                        None
+                    } else {
+                        let ref_vecs: Vec<_> = unique_bands
+                            .iter()
+                            .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
+                            .collect();
+                        let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
+                        let style = cogzilla_kernel::RgbStyle {
+                            rescale_min: *rescale_min,
+                            rescale_max: *rescale_max,
+                            resample,
+                            format,
+                        };
+                        gpu.try_render_bbox_expr_rgb(
+                            mb_key(&unique_bands, &srcs),
+                            coords,
+                            &unique_bands,
+                            &srcs,
+                            progs,
+                            &style,
+                            color_formula,
+                            return_mask,
+                        )
+                    }
+                }
+                BandRequest::Rgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } if custom_lut.is_none() => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let r2 = get_band_refs(bands_1based[2], 2);
+                    let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
+                    let style = cogzilla_kernel::RgbStyle {
+                        rescale_min: *rescale_min,
+                        rescale_max: *rescale_max,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_rgb(
+                        mb_key(bands_1based, &srcs),
+                        coords,
+                        &srcs,
+                        &style,
+                        color_formula,
+                        return_mask,
+                    )
+                }
+                BandRequest::SarRgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } if custom_lut.is_none() => {
+                    let r0 = get_band_refs(bands_1based[0], 0);
+                    let r1 = get_band_refs(bands_1based[1], 1);
+                    let srcs = [make_src!(&r0), make_src!(&r1)];
+                    let style = cogzilla_kernel::RgbStyle {
+                        rescale_min: *rescale_min,
+                        rescale_max: *rescale_max,
+                        resample,
+                        format,
+                    };
+                    gpu.try_render_bbox_sar_rgb(
+                        mb_key(bands_1based, &srcs),
+                        coords,
+                        &srcs,
+                        &style,
+                        color_formula,
+                        return_mask,
+                    )
+                }
+                BandRequest::Spectral1 {
+                    expr,
+                    band_1based,
+                    rescale,
+                    colormap,
+                } => dispatch_spectral_rgba(
+                    *expr,
+                    std::slice::from_ref(band_1based),
+                    *rescale,
+                    *colormap,
+                ),
+                BandRequest::Spectral2 {
+                    expr,
+                    bands_1based,
+                    rescale,
+                    colormap,
+                } => dispatch_spectral_rgba(*expr, bands_1based, *rescale, *colormap),
+                BandRequest::Spectral3 {
+                    expr,
+                    bands_1based,
+                    rescale,
+                    colormap,
+                } => dispatch_spectral_rgba(*expr, bands_1based, *rescale, *colormap),
+                _ => None,
+            };
+            if let Some(bytes) = gpu_out {
+                stats
+                    .gpu_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return BboxRenderOutput::Bytes(bytes);
+            }
+        }
+
         let mut rgba = vec![0u8; w * h * 4];
         match bands {
             BandRequest::Single {
@@ -6964,15 +8768,27 @@ async fn render_bbox_impl(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                for i in 0..(w * h) {
-                    let v = sample(&src, u_map[i], v_map[i]);
-                    if !v.is_nan() {
-                        let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
-                        rgba[i * 4] = r;
-                        rgba[i * 4 + 1] = g;
-                        rgba[i * 4 + 2] = b;
-                        rgba[i * 4 + 3] = a;
+                if let Some(p) = plane_of(&src) {
+                    for (i, &v) in p[..w * h].iter().enumerate() {
+                        if !v.is_nan() {
+                            let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
+                            rgba[i * 4] = r;
+                            rgba[i * 4 + 1] = g;
+                            rgba[i * 4 + 2] = b;
+                            rgba[i * 4 + 3] = a;
+                        }
                     }
+                } else {
+                    coord_map.for_each_uv(w, h, |i, u, v| {
+                        let val = sample(&src, u, v);
+                        if !val.is_nan() {
+                            let [r, g, b, a] = map_color(val, rescale.0, inv, *colormap);
+                            rgba[i * 4] = r;
+                            rgba[i * 4 + 1] = g;
+                            rgba[i * 4 + 2] = b;
+                            rgba[i * 4 + 3] = a;
+                        }
+                    });
                 }
             }
             BandRequest::Terrain {
@@ -6981,16 +8797,16 @@ async fn render_bbox_impl(
             } => {
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
-                for i in 0..(w * h) {
-                    let v = sample(&src, u_map[i], v_map[i]);
-                    if !v.is_nan() {
-                        let [r, g, b] = encoding.encode_rgb(v);
+                coord_map.for_each_uv(w, h, |i, u, v| {
+                    let val = sample(&src, u, v);
+                    if !val.is_nan() {
+                        let [r, g, b] = encoding.encode_rgb(val);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
                         rgba[i * 4 + 3] = 255;
                     }
-                }
+                });
             }
             BandRequest::Dem {
                 band_1based,
@@ -7001,28 +8817,16 @@ async fn render_bbox_impl(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                let ring = sample_dem_ring(&src);
+                let ring = sample_dem_ring(&src, &coord_map);
                 let rw = w + 2;
-                let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                let (dx_m, dy_m) = dem_dxy();
+                let (inv_dx, inv_dy) = (1.0 / dx_m, 1.0 / dy_m);
                 for py in 0..h {
                     let r0 = py * rw;
                     let r1 = (py + 1) * rw;
                     let r2 = (py + 2) * rw;
                     for px in 0..w {
-                        let v = cogzilla_kernel::eval_horn_3x3_aniso(
-                            ring[r0 + px],
-                            ring[r0 + px + 1],
-                            ring[r0 + px + 2],
-                            ring[r1 + px],
-                            ring[r1 + px + 1],
-                            ring[r1 + px + 2],
-                            ring[r2 + px],
-                            ring[r2 + px + 1],
-                            ring[r2 + px + 2],
-                            inv_8dx,
-                            inv_8dy,
-                            *algorithm,
-                        );
+                        let v = cogzilla_kernel::eval_dem_stencil(ring[r0 + px + 1], ring[r1 + px], ring[r1 + px + 1], ring[r1 + px + 2], ring[r2 + px + 1], inv_dx, inv_dy, *algorithm);
                         if !v.is_nan() {
                             let i = py * w + px;
                             let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
@@ -7050,16 +8854,29 @@ async fn render_bbox_impl(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
-                for i in 0..(w * h) {
-                    let r = sample(&s0, u_map[i], v_map[i]);
-                    let g = sample(&s1, u_map[i], v_map[i]);
-                    let b = sample(&s2, u_map[i], v_map[i]);
-                    if !r.is_nan() && !g.is_nan() && !b.is_nan() {
-                        rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 3] = 255;
+                if let (Some(p0), Some(p1), Some(p2)) = (plane_of(&s0), plane_of(&s1), plane_of(&s2)) {
+                    let n = w * h;
+                    let px = rgba[..n * 4].chunks_exact_mut(4);
+                    for (((o, &r), &g), &b) in px.zip(&p0[..n]).zip(&p1[..n]).zip(&p2[..n]) {
+                        if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                            o[0] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                            o[1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                            o[2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                            o[3] = 255;
+                        }
                     }
+                } else {
+                    coord_map.for_each_uv(w, h, |i, u, v| {
+                        let r = sample(&s0, u, v);
+                        let g = sample(&s1, u, v);
+                        let b = sample(&s2, u, v);
+                        if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                            rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                            rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                            rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                            rgba[i * 4 + 3] = 255;
+                        }
+                    });
                 }
             }
             BandRequest::SarRgb {
@@ -7076,9 +8893,9 @@ async fn render_bbox_impl(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
-                for i in 0..(w * h) {
-                    let vv = fast_db_from_power(sample(&s0, u_map[i], v_map[i]));
-                    let vh = fast_db_from_power(sample(&s1, u_map[i], v_map[i]));
+                coord_map.for_each_uv(w, h, |i, u, v| {
+                    let vv = fast_db_from_power(sample(&s0, u, v));
+                    let vh = fast_db_from_power(sample(&s1, u, v));
                     if !vv.is_nan() && !vh.is_nan() {
                         rgba[i * 4] = ((vv - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
                         rgba[i * 4 + 1] = ((vh - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
@@ -7086,7 +8903,7 @@ async fn render_bbox_impl(
                             (((vv - vh) - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
                         rgba[i * 4 + 3] = 255;
                     }
-                }
+                });
             }
             BandRequest::CustomExpr {
                 prog,
@@ -7102,22 +8919,22 @@ async fn render_bbox_impl(
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let mut vals = [0.0f32; 16];
                 let nb = srcs.len().min(16);
-                for i in 0..(w * h) {
-                    if u_map[i].is_nan() {
-                        continue;
+                coord_map.for_each_uv(w, h, |i, u, v| {
+                    if u.is_nan() {
+                        return;
                     }
                     for k in 0..nb {
-                        vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
+                        vals[k] = sample(&srcs[k], u, v);
                     }
-                    let v = prog.eval(&vals[..nb]);
-                    if !v.is_nan() {
-                        let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
+                    let val = prog.eval(&vals[..nb]);
+                    if !val.is_nan() {
+                        let [r, g, b, a] = map_color(val, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
                         rgba[i * 4 + 3] = a;
                     }
-                }
+                });
             }
             BandRequest::CustomExprRgb {
                 progs,
@@ -7142,7 +8959,17 @@ async fn render_bbox_impl(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
-                paint_rgb_band_math(progs, &all_srcs, &sample, &u_map, &v_map, *rescale_min, inv, &mut rgba);
+                paint_rgb_band_math(
+                    progs,
+                    &all_srcs,
+                    &sample,
+                    &coord_map,
+                    w,
+                    h,
+                    *rescale_min,
+                    inv,
+                    &mut rgba,
+                );
             }
             BandRequest::Spectral1 {
                 expr,
@@ -7153,16 +8980,16 @@ async fn render_bbox_impl(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                for i in 0..(w * h) {
-                    let v = expr.eval1(sample(&src, u_map[i], v_map[i]));
-                    if !v.is_nan() {
-                        let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
+                coord_map.for_each_uv(w, h, |i, u, v| {
+                    let val = expr.eval1(sample(&src, u, v));
+                    if !val.is_nan() {
+                        let [r, g, b, a] = map_color(val, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
                         rgba[i * 4 + 3] = a;
                     }
-                }
+                });
             }
             BandRequest::Spectral2 {
                 expr,
@@ -7175,22 +9002,22 @@ async fn render_bbox_impl(
                 let s0 = make_src!(&r0);
                 let s1 = make_src!(&r1);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                for i in 0..(w * h) {
-                    let a = sample(&s0, u_map[i], v_map[i]);
-                    let b = sample(&s1, u_map[i], v_map[i]);
-                    let v = if a.is_nan() || b.is_nan() {
+                coord_map.for_each_uv(w, h, |i, u, v| {
+                    let a = sample(&s0, u, v);
+                    let b = sample(&s1, u, v);
+                    let val = if a.is_nan() || b.is_nan() {
                         f32::NAN
                     } else {
                         expr.eval2(a, b)
                     };
-                    if !v.is_nan() {
-                        let [r, g, b, al] = map_color(v, rescale.0, inv, *colormap);
+                    if !val.is_nan() {
+                        let [r, g, b, al] = map_color(val, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
                         rgba[i * 4 + 3] = al;
                     }
-                }
+                });
             }
             BandRequest::Spectral3 {
                 expr,
@@ -7205,23 +9032,23 @@ async fn render_bbox_impl(
                 let s1 = make_src!(&r1);
                 let s2 = make_src!(&r2);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                for i in 0..(w * h) {
-                    let a = sample(&s0, u_map[i], v_map[i]);
-                    let b = sample(&s1, u_map[i], v_map[i]);
-                    let c = sample(&s2, u_map[i], v_map[i]);
-                    let v = if a.is_nan() || b.is_nan() || c.is_nan() {
+                coord_map.for_each_uv(w, h, |i, u, v| {
+                    let a = sample(&s0, u, v);
+                    let b = sample(&s1, u, v);
+                    let c = sample(&s2, u, v);
+                    let val = if a.is_nan() || b.is_nan() || c.is_nan() {
                         f32::NAN
                     } else {
                         expr.eval3(a, b, c)
                     };
-                    if !v.is_nan() {
-                        let [r, g, b, al] = map_color(v, rescale.0, inv, *colormap);
+                    if !val.is_nan() {
+                        let [r, g, b, al] = map_color(val, rescale.0, inv, *colormap);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
                         rgba[i * 4 + 3] = al;
                     }
-                }
+                });
             }
             BandRequest::MultiBand { .. } | BandRequest::CustomExprMulti { .. } => {}
         }
@@ -7232,7 +9059,7 @@ async fn render_bbox_impl(
             cf.apply_buffer_in_place(&mut rgba, 4);
         }
 
-        encode_rgba_output(w, h, &rgba, format, return_mask)
+        BboxRenderOutput::Bytes(encode_rgba_output(w, h, &rgba, format, return_mask))
     };
 
     // Offload large (>512x512) bbox renders to bounded spawn_blocking so giant previews/crops
@@ -7241,28 +9068,29 @@ async fn render_bbox_impl(
         let bands_owned = bands.clone();
         let lut_owned = custom_lut.cloned();
         let cf_owned = color_formula.cloned();
-        let bytes = engine
+        let stats_owned = fused_stats.map(|(o, d)| (o.clone(), d.to_string()));
+        let out = engine
             .store
             .run_heavy_cpu(move || {
                 render_cpu(
-                    u_map,
-                    v_map,
+                    coord_map,
                     cog_tiles,
                     &bands_owned,
                     lut_owned.as_ref(),
                     cf_owned.as_ref(),
+                    stats_owned.as_ref().map(|(o, d)| (o, d.as_str())),
                 )
             })
             .await?;
-        Ok(bytes)
+        Ok(out)
     } else {
         Ok(render_cpu(
-            u_map,
-            v_map,
+            coord_map,
             cog_tiles,
             bands,
             custom_lut,
             color_formula,
+            fused_stats,
         ))
     }
 }
