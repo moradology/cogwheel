@@ -2013,7 +2013,7 @@ pub(super) fn asset_entry_names(raw_query: &str) -> Option<Vec<String>> {
 /// Whether an `assets` option may be band math (`red|expression=b1*2`): a look at the
 /// decoded values that spares the requests without it a parse of their assets.
 pub(super) fn asset_math_asked(pairs: &[(String, String)]) -> bool {
-    pairs.iter().any(|(k, v)| k == "assets" && v.contains("expression="))
+    pairs.iter().any(|(k, v)| k == "assets" && v.split('|').skip(1).any(|option| option.starts_with("expression=")))
 }
 
 /// The item routes whose `/stac` handler reads an asset's band math as one expression over
@@ -8147,6 +8147,15 @@ mod tests {
         assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some((vec![Some("b1/2;b1".into())], "b2".into())));
         assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some((vec![Some("b1*2".into()), None], "b1-b2".into())));
         assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), None, "the results are the answer");
+    }
+
+    /// Band math is an `|expression=` option of an asset, not an option whose name ends so.
+    #[test]
+    fn asset_math_is_an_expression_option() {
+        assert!(asset_math_asked(&query_pairs("assets=red%7Cexpression%3Db1*2")));
+        assert!(asset_math_asked(&query_pairs("assets=visual%7Cbidx%3D1%7Cexpression%3Db1")));
+        assert!(!asset_math_asked(&query_pairs("assets=visual%7Ccustom_expression%3Db1*2%7Cbidx%3D3")));
+        assert!(!asset_math_asked(&query_pairs("assets=red&expression=b1*2")));
     }
 
     /// An item's point is read band by band and each asset's band math applied afterwards.
