@@ -2031,7 +2031,7 @@ impl BandStatsAcc {
         description: &str,
         opts: &StatsOptions,
         dtype: HistDtype,
-        cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+        sort_vals: impl FnOnce(&mut [T]),
     ) -> serde_json::Value
     where
         T: Copy + PartialEq + Into<f64> + serde::Serialize,
@@ -2046,7 +2046,7 @@ impl BandStatsAcc {
         if valid_px == 0 {
             return empty_band_stats_json(masked_px, description, opts, dtype);
         }
-        vals.sort_unstable_by(cmp);
+        sort_vals(&mut vals);
         let min = vals[0];
         let max = vals[valid_px - 1];
         let mut sum = 0.0f64;
@@ -2215,7 +2215,14 @@ impl BandStatsAcc {
                 } else {
                     dtype.unwrap_or_else(|| HistDtype::infer(vals.iter().copied()))
                 };
-                Self::finalize_sorted(vals, denom_pixels, description, opts, eff_dtype, f32::total_cmp)
+                Self::finalize_sorted(
+                    vals,
+                    denom_pixels,
+                    description,
+                    opts,
+                    eff_dtype,
+                    crate::zonal::sort_f32_radix,
+                )
             }
             Self::Floats64(vals) => Self::finalize_sorted(
                 vals,
@@ -2223,7 +2230,7 @@ impl BandStatsAcc {
                 description,
                 opts,
                 dtype.unwrap_or(HistDtype::Float64),
-                f64::total_cmp,
+                |s| s.sort_unstable_by(f64::total_cmp),
             ),
         }
     }
