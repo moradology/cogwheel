@@ -1030,7 +1030,7 @@ mod tests {
                 } else {
                     0.0
                 };
-                if i % 37 == 0 {
+                if i.is_multiple_of(37) {
                     b2[i] = f32::NAN;
                 } else {
                     b2[i] = 500.0 + ((i * 13) % 1500) as f32;

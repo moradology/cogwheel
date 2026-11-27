@@ -90,6 +90,7 @@ struct ExprParams {
 
 /// Owned coordinate plan for submission to `GpuCoalescer`.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Grid2D keeps 17x17 f32 control grids inline to avoid per-tile heap allocs
 pub enum OwnedCoordPlan {
     Separable1D { u: Vec<f32>, v: Vec<f32> },
     Grid2D { dst_w: usize, dst_h: usize, grid_u: [f32; 289], grid_v: [f32; 289] },
@@ -1840,8 +1841,8 @@ impl WorkerState {
                     continue;
                 }
             }
-            if let Some(quality) = jpeg_quality {
-                if prepared.len() > prev_len {
+            if let Some(quality) = jpeg_quality
+                && prepared.len() > prev_len {
                     if prepared.last().unwrap().output != CoalescedOutput::Rgba8 {
                         let bad = prepared.pop().unwrap();
                         total_staging_words -= bad.out_words;
@@ -1905,9 +1906,8 @@ impl WorkerState {
                     pj.jpeg_pass = Some((mcu_w, mcu_h, jpeg_bg));
                     total_staging_words += jpeg_words;
                 }
-            }
-            if let Some((nodata, num_bins, hist_range)) = stats_cfg {
-                if prepared.len() > prev_len {
+            if let Some((nodata, num_bins, hist_range)) = stats_cfg
+                && prepared.len() > prev_len {
                     let valid_inner = {
                         let last = prepared.last().unwrap();
                         last.output == CoalescedOutput::RawF32
@@ -1982,7 +1982,6 @@ impl WorkerState {
                     pj.stats_pass = Some((num_wg, stats_bg));
                     total_staging_words += stats_words;
                 }
-            }
         }
 
         if prepared.is_empty() {
@@ -2177,10 +2176,7 @@ impl WorkerState {
         }
         self.device.poll(wgpu::Maintain::Poll);
         let mut drained = 0usize;
-        loop {
-            let Some(&oldest_idx) = self.in_flight_order.front() else {
-                break;
-            };
+        while let Some(&oldest_idx) = self.in_flight_order.front() {
             let is_ready = self.frames[oldest_idx]
                 .in_flight
                 .as_ref()

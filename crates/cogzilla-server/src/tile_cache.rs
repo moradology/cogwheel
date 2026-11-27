@@ -279,25 +279,23 @@ impl TileCache {
         Fut: Future<Output = Result<(Bytes, &'static str), EngineError>>,
     {
         // 1. Fast path: encoded tile micro-cache hit
-        if self.max_bytes > 0 {
-            if let Some(entry) = self.ready.get(&key) {
+        if self.max_bytes > 0
+            && let Some(entry) = self.ready.get(&key) {
                 entry.last_used.store(self.tick(), Ordering::Relaxed);
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(entry.tile.clone());
             }
-        }
 
         // 2. Singleflight loop: either join an in-flight render or become the owner
         let mut render_opt = Some(render_fn);
         loop {
             // Re-check ready cache in case a previous owner just completed
-            if self.max_bytes > 0 {
-                if let Some(entry) = self.ready.get(&key) {
+            if self.max_bytes > 0
+                && let Some(entry) = self.ready.get(&key) {
                     entry.last_used.store(self.tick(), Ordering::Relaxed);
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(entry.tile.clone());
                 }
-            }
 
             let existing = {
                 use dashmap::mapref::entry::Entry;

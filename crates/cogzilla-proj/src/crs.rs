@@ -310,13 +310,11 @@ impl CrsModel {
         // Geographic CRS on a supported shifted datum (e.g. NAD27 4267, OSGB36 4277, Amersfoort 4289, CH1903 4149/4150).
         if gk.proj_coord_trans.is_none()
             && (gk.model_type == Some(2) || (gk.model_type.is_none() && gk.geographic_type.is_some()))
-        {
-            if let Some(gcs) = gk.geographic_type
+            && let Some(gcs) = gk.geographic_type
                 && let Some(model) = well_known_special_geographic_epsg(gcs)
             {
                 return Ok(model);
             }
-        }
 
         let sphere_ok = matches!(gk.proj_coord_trans, Some(7 | 10 | 17 | 24 | 28));
         let ellip = Self::wgs84_compatible_ellipsoid(gk, sphere_ok).map_err(unsupported)?;
@@ -840,7 +838,7 @@ impl CrsModel {
                 helmert.datum_to_wgs84_deg(dlon, dlat)
             }
         };
-        let norm_lon = if lon.is_finite() && (lon < -180.0 || lon > 180.0) {
+        let norm_lon = if lon.is_finite() && !(-180.0..=180.0).contains(&lon) {
             ((lon + 180.0).rem_euclid(360.0)) - 180.0
         } else {
             lon
@@ -974,11 +972,10 @@ impl CrsModel {
             let mut prev_lon: Option<f64> = None;
             for &(col, row) in pts {
                 if let Some((lon, lat)) = sample_pt(col, row) {
-                    if let Some(pl) = prev_lon {
-                        if (lon - pl).abs() > 180.0 {
+                    if let Some(pl) = prev_lon
+                        && (lon - pl).abs() > 180.0 {
                             crosses_antimeridian = true;
                         }
-                    }
                     prev_lon = Some(lon);
                     min_lon = min_lon.min(lon);
                     max_lon = max_lon.max(lon);
@@ -1122,11 +1119,10 @@ impl CrsModel {
                         _ => (wf, t * hf),
                     };
                     if let Some((mx, my)) = to_merc(col, row) {
-                        if let Some(px) = prev_x {
-                            if (mx - px).abs() > ORIGIN_SHIFT {
+                        if let Some(px) = prev_x
+                            && (mx - px).abs() > ORIGIN_SHIFT {
                                 crosses_antimeridian = true;
                             }
-                        }
                         prev_x = Some(mx);
                         min_x = min_x.min(mx);
                         max_x = max_x.max(mx);
@@ -1167,8 +1163,8 @@ impl CrsModel {
                         | Self::EqualEarth(_)
                         | Self::Equirectangular(_)
                         | Self::Mercator(_)
-                ) {
-                    if let Some(crs_to_pixel) = pixel_to_crs.invert() {
+                )
+                    && let Some(crs_to_pixel) = pixel_to_crs.invert() {
                         for &pole_lat in &[90.0_f64, -90.0_f64] {
                             let (px_crs, py_crs) = self.from_lonlat_deg(0.0, pole_lat);
                             if px_crs.is_finite() && py_crs.is_finite() {
@@ -1186,7 +1182,6 @@ impl CrsModel {
                             }
                         }
                     }
-                }
                 if pole_inside
                     && min_x.is_finite()
                     && max_x.is_finite()
@@ -1298,11 +1293,10 @@ impl CrsModel {
                         _ => (wf, t * hf),
                     };
                     if let Some((lon, lat)) = to_ll(col, row) {
-                        if let Some(pl) = prev_lon {
-                            if (lon - pl).abs() > 180.0 {
+                        if let Some(pl) = prev_lon
+                            && (lon - pl).abs() > 180.0 {
                                 crosses_antimeridian = true;
                             }
-                        }
                         prev_lon = Some(lon);
                         max_abs_lat = max_abs_lat.max(lat.abs());
                         min_x = min_x.min(lon);
@@ -1416,6 +1410,7 @@ pub const GRID_DIM: usize = 17;
 
 /// Precomputed coordinate mapping from output XYZ tile pixels -> source IFD pixel-center space
 /// `(u = col - 0.5, v = row - 0.5)` so `(0.0, 0.0)` samples 100% of source pixel `(0, 0)`.
+#[allow(clippy::large_enum_variant)] // Grid2D keeps 17x17 f32 control grids stack-inline on the tile hot path
 pub enum CoordPlan<const N: usize> {
     /// Separable 1D mapping (`EPSG:3857` and `EPSG:4326` with axis-aligned GeoTransform).
     /// Vertical weight and source row pointers are invariant across every output scanline!
@@ -2070,7 +2065,7 @@ impl<const N: usize> CoordPlan<N> {
                     min_u, max_u, min_v, max_v,
                 );
 
-                if xm + 1 <= x1 {
+                if xm < x1 {
                     let q10_00 = project_px(xm + 1, y0);
                     let q10_01 = project_px(xm + 1, ym);
                     let q10_11 = project_px(x1, ym);
@@ -2080,7 +2075,7 @@ impl<const N: usize> CoordPlan<N> {
                     );
                 }
 
-                if ym + 1 <= y1 {
+                if ym < y1 {
                     let q01_00 = project_px(x0, ym + 1);
                     let q01_10 = project_px(xm, ym + 1);
                     let q01_11 = project_px(xm, y1);
@@ -2090,7 +2085,7 @@ impl<const N: usize> CoordPlan<N> {
                     );
                 }
 
-                if xm + 1 <= x1 && ym + 1 <= y1 {
+                if xm < x1 && ym < y1 {
                     let q11_00 = project_px(xm + 1, ym + 1);
                     let q11_10 = project_px(x1, ym + 1);
                     let q11_01 = project_px(xm + 1, y1);

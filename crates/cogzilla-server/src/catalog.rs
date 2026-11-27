@@ -157,7 +157,7 @@ pub struct InMemoryCatalog {
 impl InMemoryCatalog {
     pub fn new(mut entries: Vec<SceneEntry>) -> Self {
         // Stable sort by descending priority so ties preserve input order.
-        entries.sort_by(|a, b| b.priority.cmp(&a.priority));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.priority));
 
         let mut uris = Vec::with_capacity(entries.len());
         let mut bboxes = Vec::with_capacity(entries.len());
@@ -607,23 +607,23 @@ impl SceneCatalog for MosaicJsonCatalog {
             0.0
         };
         let max_idx = (1i64 << qz) - 1;
-        let x0 = if min_x == max_x && min_x >= ORIGIN_SHIFT - 1e-6 && min_x <= ORIGIN_SHIFT + 1e-6 {
+        let x0 = if min_x == max_x && (ORIGIN_SHIFT - 1e-6..=ORIGIN_SHIFT + 1e-6).contains(&min_x) {
             max_idx
         } else {
             (((min_x + eps) + ORIGIN_SHIFT) / tile_span).floor() as i64
         };
-        let x1 = if min_x == max_x && min_x >= ORIGIN_SHIFT - 1e-6 && min_x <= ORIGIN_SHIFT + 1e-6 {
+        let x1 = if min_x == max_x && (ORIGIN_SHIFT - 1e-6..=ORIGIN_SHIFT + 1e-6).contains(&min_x) {
             max_idx
         } else {
             (((max_x - eps) + ORIGIN_SHIFT) / tile_span).floor() as i64
         };
         // WebMercator Y increases northwards while XYZ tile y increases southwards.
-        let y0 = if min_y == max_y && min_y >= -ORIGIN_SHIFT - 1e-6 && min_y <= -ORIGIN_SHIFT + 1e-6 {
+        let y0 = if min_y == max_y && (-ORIGIN_SHIFT - 1e-6..=-ORIGIN_SHIFT + 1e-6).contains(&min_y) {
             max_idx
         } else {
             ((ORIGIN_SHIFT - (max_y - eps)) / tile_span).floor() as i64
         };
-        let y1 = if min_y == max_y && min_y >= -ORIGIN_SHIFT - 1e-6 && min_y <= -ORIGIN_SHIFT + 1e-6 {
+        let y1 = if min_y == max_y && (-ORIGIN_SHIFT - 1e-6..=-ORIGIN_SHIFT + 1e-6).contains(&min_y) {
             max_idx
         } else {
             ((ORIGIN_SHIFT - (min_y + eps)) / tile_span).floor() as i64

@@ -230,8 +230,8 @@ fn resolve_input_bbox(
     if is_geo {
         // Symmetric ±2-turn longitude normalisation (matching point routes) before RFC 7946 §5.2
         // antimeridian unwrap: shift both bounds by the same whole multiple of 360° if needed.
-        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0) {
-            if let (Some(n0), Some(n2)) = (
+        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0)
+            && let (Some(n0), Some(n2)) = (
                 cogzilla_proj::normalize_geographic_lon(bbox[0]),
                 cogzilla_proj::normalize_geographic_lon(bbox[2]),
             ) {
@@ -241,7 +241,6 @@ fn resolve_input_bbox(
                     bbox[2] += shift;
                 }
             }
-        }
     }
     if bbox[0] > bbox[2] {
         if is_geo && bbox[0] >= -180.0 && bbox[0] <= 180.0 && bbox[2] >= -180.0 && bbox[2] <= 180.0
@@ -792,8 +791,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected a number");
                 }
             }
-            "quality" => {
-                if v != "lossless" {
+            "quality"
+                if v != "lossless" => {
                     if let Ok(qual) = v.parse::<f32>()
                         && qual.is_finite()
                     {
@@ -803,7 +802,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                         bad("expected a finite quality in 1..=100 or 'lossless'");
                     }
                 }
-            }
             "expr" | "expression" | "index" => {
                 // Standard HTTP clients (httpx, requests, URLSearchParams) form-encode spaces as `+`
                 // and literal plus as `%2B`, while raw CLI/browser URLs often write `(b1+b2)` directly.
@@ -1098,13 +1096,12 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     if let Some(e) = pq.errors.first() {
         return Err(e.clone());
     }
-    if let Some(alg) = pq.algorithm.as_deref() {
-        if !crate::titiler::is_supported_algorithm(alg) {
+    if let Some(alg) = pq.algorithm.as_deref()
+        && !crate::titiler::is_supported_algorithm(alg) {
             return Err(format!(
                 "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
             ));
         }
-    }
 
     // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html,
     // {family}/{tms}/WMTSCapabilities.xml
@@ -1129,13 +1126,12 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
                 _ => None,
             }
         };
-        if let Some(tms) = tms {
-            if crate::tms::lookup_tms(tms).is_none() {
+        if let Some(tms) = tms
+            && crate::tms::lookup_tms(tms).is_none() {
                 return Err(format!(
                     "tile matrix set '{tms}' is not supported (see /tileMatrixSets)"
                 ));
             }
-        }
     }
 
     let has = |names: &[&str]| pq.keys.iter().find(|k| names.contains(&k.as_str())).cloned();
@@ -1152,47 +1148,41 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     let is_tileset_meta = matches!(segs[0], "cog" | "stac" | "mosaicjson")
         && segs.get(1) == Some(&"tiles")
         && segs.len() <= 3;
-    if family != "colorMaps" {
-        if let Some(k) = has(&["orientation"]) {
+    if family != "colorMaps"
+        && let Some(k) = has(&["orientation"]) {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
-    }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics") || family == "colorMaps") {
-        if let Some(k) = has(&["width", "height"]) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics") || family == "colorMaps")
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, map, wms, statistics, and colorMaps routes"
             ));
         }
-    }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics")) {
-        if let Some(k) = has(&["dst_crs"]) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics"))
+        && let Some(k) = has(&["dst_crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, map, and statistics routes"
             ));
         }
-    }
-    if !(route("bounds") || route("info") || is_ogc_map || route("wms") || is_tileset_meta) {
-        if let Some(k) = has(&["crs"]) {
+    if !(route("bounds") || route("info") || is_ogc_map || route("wms") || is_tileset_meta)
+        && let Some(k) = has(&["crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on bounds, info, tiles, map, and wms routes"
             ));
         }
-    }
     if route("statistics") || route("asset_statistics") {
-        if let Some(k) = has(&["algorithm"]) {
-            if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
+        if let Some(k) = has(&["algorithm"])
+            && !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
                 return Err(format!(
                     "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
-        }
-        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
-            if let Some(k) = has(&["expression", "expr", "index"]) {
+        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics")))
+            && let Some(k) = has(&["expression", "expr", "index"]) {
                 return Err(format!(
                     "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
-        }
     } else if let Some(k) = has(&["p", "histogram_bins", "histogram_range", "categorical", "c"]) {
         return Err(format!("parameter '{k}' is only supported on statistics routes"));
     }
@@ -1200,21 +1190,18 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         if let Some(k) = has(&["algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on point routes"));
         }
-    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets"))) {
-        if let Some(k) = has(&["coord_crs"]) {
+    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets")))
+        && let Some(k) = has(&["coord_crs"]) {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
-    }
-    if route("bbox") && segs.len() >= 4 {
-        if let Some(k) = has(&["width", "height"]) {
+    if route("bbox") && segs.len() >= 4
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
-    }
-    if (route("preview") || route("feature")) && segs.len() >= 3 {
-        if let Some(k) = has(&["width", "height"]) {
+    if (route("preview") || route("feature")) && segs.len() >= 3
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
-    }
     let last_seg = segs.last().copied().unwrap_or("");
     if !matches!(last_seg, "tilejson.json" | "map.html" | "WMTSCapabilities.xml") && !is_tileset_meta {
         if let Some(k) = has(&["minzoom", "maxzoom", "tile_format", "tile_scale"]) {
@@ -2323,7 +2310,7 @@ fn wants_f32_geotiff(
         ),
         BandRequest::Single { .. } => {
             pq.unscale
-                || (!source_cog.is_some_and(|c| c.index.color_map.is_some())
+                || (source_cog.is_none_or(|c| c.index.color_map.is_none())
                     && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8))
         }
         BandRequest::Rgb { .. } => {
@@ -4632,7 +4619,7 @@ fn expand_stac_asset_bidx(
         if needs_per_asset {
             let mut expanded_cogs = Vec::new();
             let mut slot_bands = Vec::new();
-            for (name, cog) in names.iter().zip(cogs.into_iter()) {
+            for (name, cog) in names.iter().zip(cogs) {
                 let nb = cog.index.full_res().samples_per_pixel;
                 let sel: &[u16] = stac_asset_selected_bands(pq, name).unwrap_or(&[1]);
                 for &b in sel {
@@ -5939,6 +5926,43 @@ fn is_compressible_content_type(ct: &str) -> bool {
         || media.starts_with("text/")
 }
 
+const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Extract a valid caller-supplied `X-Request-Id` header (1..=128 printable non-whitespace ASCII
+/// bytes) or generate a compact lock-free hex ID (`<8-hex-process-seed>-<12-hex-seq>`).
+fn resolve_request_id(headers: &hyper::HeaderMap) -> HeaderValue {
+    if let Some(hv) = headers.get(&X_REQUEST_ID) {
+        let bytes = hv.as_bytes();
+        if !bytes.is_empty()
+            && bytes.len() <= 128
+            && bytes.iter().all(|&b| (0x21..=0x7E).contains(&b))
+        {
+            return hv.clone();
+        }
+    }
+    static SEED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seed = *SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        (nanos ^ (nanos >> 32) ^ (pid.wrapping_mul(0x9E37_79B9))) as u32
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) & 0x0000_FFFF_FFFF_FFFF;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 21];
+    for i in 0..8 {
+        buf[7 - i] = HEX[((seed >> (i * 4)) & 0xF) as usize];
+    }
+    buf[8] = b'-';
+    for i in 0..12 {
+        buf[20 - i] = HEX[((seq >> (i * 4)) & 0xF) as usize];
+    }
+    HeaderValue::from_bytes(&buf).expect("ASCII hex request id")
+}
+
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
     mut req: Request<B>,
@@ -5948,17 +5972,21 @@ where
     B::Error: std::fmt::Display,
 {
     let t0 = std::time::Instant::now();
-    let is_head = *req.method() == Method::HEAD;
-    let is_post = *req.method() == Method::POST;
-    let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
+    let req_id = resolve_request_id(req.headers());
+    let req_method = req.method().clone();
+    // O(1) `Bytes`-backed URI clone (zero heap allocation) for structured access logging.
+    let req_uri = req.uri().clone();
+    let is_head = req_method == Method::HEAD;
+    let is_post = req_method == Method::POST;
+    let is_get_or_head = matches!(req_method, Method::GET | Method::HEAD);
     let is_health_or_metrics =
-        matches!(req.uri().path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
+        matches!(req_uri.path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
     let is_control_plane = is_health_or_metrics
         || matches!(
-            req.uri().path(),
+            req_uri.path(),
             "/admin/clear-cache" | "/searches" | "/searches/list" | "/searches/register"
         );
-    let bypass_aimd = is_control_plane || *req.method() == Method::OPTIONS;
+    let bypass_aimd = is_control_plane || req_method == Method::OPTIONS;
     let mut aimd_permit = if bypass_aimd {
         None
     } else {
@@ -5981,6 +6009,22 @@ where
                     resp.headers_mut()
                         .insert(HeaderName::from_static("x-cogzilla-aimd-limit"), hv);
                 }
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    tracing::debug!(
+                        request_id = req_id.to_str().unwrap_or(""),
+                        method = %req_method,
+                        path = %req_uri.path(),
+                        status = 429u16,
+                        dur_ms = format_args!("{dur_ms:.2}"),
+                        "http request"
+                    );
+                }
+                resp.headers_mut().insert(X_REQUEST_ID, req_id);
+                resp.headers_mut().insert(
+                    hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static("X-Request-Id"),
+                );
                 return Ok(resp);
             }
         }
@@ -6003,9 +6047,17 @@ where
         .headers()
         .get(hyper::header::ACCEPT)
         .and_then(|v| v.to_str().ok());
+    let raw_q = req.uri().query().unwrap_or("");
+    let colormap_prefers_image = {
+        let mut parts = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty());
+        matches!((parts.next(), parts.next(), parts.next()), (Some("colorMaps"), Some(_), None))
+            && html::explicit_format(raw_q).is_none()
+            && accept_hdr.and_then(html::negotiate_colormap_accept).is_some()
+    };
     let as_page = (offers_page
-        && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
-    .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
+        && !colormap_prefers_image
+        && html::wants_html(raw_q, accept_hdr))
+    .then(|| (req.uri().path().to_string(), raw_q.to_string()));
     // Prevent a cached JSON ETag in `If-None-Match` from short-circuiting an HTML page request to 304.
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
@@ -6062,6 +6114,36 @@ where
             hv,
         );
     }
+    let status = resp.status();
+    if status.is_server_error() {
+        tracing::warn!(
+            request_id = req_id.to_str().unwrap_or(""),
+            method = %req_method,
+            path = %req_uri.path(),
+            status = status.as_u16(),
+            dur_ms = format_args!("{dur_ms:.2}"),
+            "http request failed"
+        );
+    } else if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            request_id = req_id.to_str().unwrap_or(""),
+            method = %req_method,
+            path = %req_uri.path(),
+            status = status.as_u16(),
+            dur_ms = format_args!("{dur_ms:.2}"),
+            "http request"
+        );
+    }
+    resp.headers_mut().insert(X_REQUEST_ID, req_id);
+    if !resp
+        .headers()
+        .contains_key(hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+    {
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("X-Request-Id"),
+        );
+    }
     if is_post {
         // RFC 9110: POST responses depend on the request body and must not carry public Cache-Control/ETag.
         resp.headers_mut().remove(CACHE_CONTROL);
@@ -6083,11 +6165,10 @@ where
             .is_some_and(is_compressible_content_type);
     if compressible {
         if let Some(existing) = resp.headers().get(hyper::header::VARY).and_then(|v| v.to_str().ok()) {
-            if !existing.to_ascii_lowercase().contains("accept-encoding") {
-                if let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
+            if !existing.to_ascii_lowercase().contains("accept-encoding")
+                && let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
                     resp.headers_mut().insert(hyper::header::VARY, hv);
                 }
-            }
         } else {
             resp.headers_mut()
                 .insert(hyper::header::VARY, HeaderValue::from_static("Accept-Encoding"));
@@ -6134,13 +6215,11 @@ where
 
     if is_head {
         let (mut parts, body) = resp.into_parts();
-        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT {
-            if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
-                if let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
+        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT
+            && let Some(len) = hyper::body::Body::size_hint(&body).exact()
+                && let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
                     parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
                 }
-            }
-        }
         return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
     }
     Ok(resp)
@@ -6235,7 +6314,7 @@ where
         );
         resp.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("Content-Type, If-None-Match, Authorization"),
+            HeaderValue::from_static("Content-Type, If-None-Match, Authorization, X-Request-Id"),
         );
         return Ok(resp);
     }
@@ -6980,7 +7059,7 @@ where
                 let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or({
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -7035,7 +7114,7 @@ where
                 let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or({
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -8042,46 +8121,54 @@ where
                 Bytes::from(list_colormaps_json(&host).to_string()),
                 "application/json",
             )),
-            ["colorMaps", id] => match pq.format_param.as_deref() {
-                None | Some("json") | Some("html") => {
-                    get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+            ["colorMaps", id] => {
+                let negotiated_fmt: Option<&str> = pq.format_param.as_deref().or_else(|| {
+                    req.headers()
+                        .get(hyper::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(html::negotiate_colormap_accept)
+                });
+                match negotiated_fmt {
+                    None | Some("json") | Some("html") => {
+                        get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+                    }
+                    Some("npy") => get_colormap_image(
+                        id,
+                        OutputFormat::Npy,
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "application/x-binary")),
+                    Some("png") => get_colormap_image(
+                        id,
+                        OutputFormat::Png,
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/png")),
+                    Some("jpg" | "jpeg") => get_colormap_image(
+                        id,
+                        OutputFormat::Jpeg { quality: pq.jpeg_quality },
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/jpeg")),
+                    Some("webp") => get_colormap_image(
+                        id,
+                        OutputFormat::Webp { quality: pq.webp_quality },
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/webp")),
+                    Some(other) => Err(EngineError::BadRequest(format!(
+                        "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
+                    ))),
                 }
-                Some("npy") => get_colormap_image(
-                    id,
-                    OutputFormat::Npy,
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "application/x-binary")),
-                Some("png") => get_colormap_image(
-                    id,
-                    OutputFormat::Png,
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/png")),
-                Some("jpg" | "jpeg") => get_colormap_image(
-                    id,
-                    OutputFormat::Jpeg { quality: pq.jpeg_quality },
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/jpeg")),
-                Some("webp") => get_colormap_image(
-                    id,
-                    OutputFormat::Webp { quality: pq.webp_quality },
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/webp")),
-                Some(other) => Err(EngineError::BadRequest(format!(
-                    "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
-                ))),
-            },
+            }
             _ => Err(EngineError::NotFound(path.clone())),
         };
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
@@ -8203,7 +8290,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut map = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
+                for (name, cog) in names.into_iter().zip(cogs) {
                     let mut info = build_cog_info(&engine, &cog)?;
                     if pq.bounds_crs.is_some() {
                         let crs = engine.get_or_build_crs(&cog)?;
@@ -8223,7 +8310,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut props = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
+                for (name, cog) in names.into_iter().zip(cogs) {
                     let mut info = build_cog_info(&engine, &cog)?;
                     if pq.bounds_crs.is_some() {
                         let crs = engine.get_or_build_crs(&cog)?;
@@ -8283,10 +8370,10 @@ where
                     ordered[idx] = Some(st);
                 }
                 let mut map = serde_json::Map::new();
-                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
+                for (name, st) in names.into_iter().zip(ordered) {
                     if let Some(mut st) = st {
-                        if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
-                            if let Some(obj) = st.as_object() {
+                        if let Some(sel) = stac_asset_selected_bands(&pq, &name)
+                            && let Some(obj) = st.as_object() {
                                 let mut filtered = serde_json::Map::new();
                                 for &b in sel {
                                     let k = format!("b{b}");
@@ -8296,7 +8383,6 @@ where
                                 }
                                 st = serde_json::Value::Object(filtered);
                             }
-                        }
                         map.insert(name, st);
                     }
                 }
@@ -8512,7 +8598,7 @@ where
                 }
                 let mut map = serde_json::Map::new();
                 let mut band_idx = 1usize;
-                for (name, slot) in names.iter().zip(ordered.into_iter()) {
+                for (name, slot) in names.iter().zip(ordered) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
                         let bands_iter: Vec<usize> = if stac_asset_expr(&pq, name).is_some() {
@@ -8815,7 +8901,7 @@ where
                         // Merge bands in numeric order 1..=nb across assets to match TiTiler's POST /stac/statistics.
                         let mut merged = serde_json::Map::new();
                         let mut b_counter = 1usize;
-                        for (name, slot) in names_c.iter().zip(ordered.into_iter()) {
+                        for (name, slot) in names_c.iter().zip(ordered) {
                             let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
                                 let bands_iter: Vec<usize> =
@@ -9477,7 +9563,7 @@ where
                 let single_asset_expr = names.len() == 1 && rewritten_expr.is_some();
                 let single_band_per_asset = (names.len() > 1 && rewritten_expr.is_some()) || pq.asset_as_band;
                 let mut used_asset_bidx = false;
-                for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
+                for (name, pt) in names.into_iter().zip(ordered) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         if !single_asset_expr
                             && let Some(expr_str) = stac_asset_expr(&pq, &name)
@@ -11864,7 +11950,7 @@ fn attach_tile_geo_headers_opts(
             .map(|sc| sc.saturating_mul(base_ts))
             .unwrap_or(if opts.has_explicit_ts { opts.tile_size } else { base_ts });
         if let Some(bbox) = tms_def.tile_bounds(z, x, y, opts.buffer, ts) {
-            let is_crs84 = matches!(tms, "WorldCRS84Quad" | "GNOSISGlobalGrid" | "WGS1984Quad");
+            let is_crs84 = tms == "WorldCRS84Quad";
             attach_geo_headers(resp, bbox, Some(tms_def.epsg), is_crs84);
         }
     }
@@ -11910,9 +11996,9 @@ fn binary_or_plain_response(
     if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
     if let Some(etag_hv) = etag {
-        if let Some(inm) = if_none_match {
-            if let Ok(etag_str) = etag_hv.to_str() {
-                if etag_matches(inm, etag_str) {
+        if let Some(inm) = if_none_match
+            && let Ok(etag_str) = etag_hv.to_str()
+                && etag_matches(inm, etag_str) {
                     engine
                         .stats
                         .http_304_not_modified
@@ -11926,8 +12012,6 @@ fn binary_or_plain_response(
                         .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
                     return resp;
                 }
-            }
-        }
         let mut resp = plain_resp(StatusCode::OK, bytes, content_type);
         resp.headers_mut().insert(ETAG, etag_hv);
         resp.headers_mut()
@@ -12530,10 +12614,12 @@ mod tests {
         );
 
         // 2. cog_standard_epsg returns None for user-defined projected CRS (32767) even with geographic_type=4326
-        let mut gk = cogzilla_tiff::GeoKeys::default();
-        gk.model_type = Some(1);
-        gk.projected_cs_type = Some(32767);
-        gk.geographic_type = Some(4326);
+        let mut gk = cogzilla_tiff::GeoKeys {
+            model_type: Some(1),
+            projected_cs_type: Some(32767),
+            geographic_type: Some(4326),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         assert_eq!(cog_standard_epsg(&gk), None);
 
         // Standard projected EPSG returns Some(32610)
@@ -12541,9 +12627,11 @@ mod tests {
         assert_eq!(cog_standard_epsg(&gk), Some(32610));
 
         // Pure geographic returns Some(4326)
-        let mut gk_geo = cogzilla_tiff::GeoKeys::default();
-        gk_geo.model_type = Some(2);
-        gk_geo.geographic_type = Some(4326);
+        let gk_geo = cogzilla_tiff::GeoKeys {
+            model_type: Some(2),
+            geographic_type: Some(4326),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         assert_eq!(cog_standard_epsg(&gk_geo), Some(4326));
 
         // 3. GEOTIFF_CONTENT_TYPE matches parse_ext_format("tif", ...)
@@ -13160,5 +13248,108 @@ mod tests {
         // Multi-header HTTP/1.1 & HTTP/2 Accept-Encoding lines
         assert_eq!(negotiate_encoding(["gzip", "br"]), PreferredEncoding::Brotli);
         assert_eq!(negotiate_encoding(["*", "gzip;q=0", "br;q=0"]), PreferredEncoding::None);
+    }
+
+    #[tokio::test]
+    async fn x_request_id_echoes_valid_generates_when_absent_or_invalid_and_on_429() {
+        let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+
+        // Absent -> generated 21-byte <8-hex>-<12-hex>, unique across calls.
+        let r1 = handle_request(
+            engine.clone(),
+            Request::builder().uri("/healthz").body(Full::new(Bytes::new())).unwrap(),
+        )
+        .await
+        .unwrap();
+        let r2 = handle_request(
+            engine.clone(),
+            Request::builder().uri("/healthz").body(Full::new(Bytes::new())).unwrap(),
+        )
+        .await
+        .unwrap();
+        let id1 = r1.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id2 = r2.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+        assert_eq!(id1.len(), 21);
+        assert_eq!(id1.as_bytes()[8], b'-');
+        assert!(id1[..8].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(id1[9..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_ne!(id1, id2);
+        assert_eq!(
+            r1.headers()
+                .get(hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|v| v.to_str().ok()),
+            Some("X-Request-Id")
+        );
+
+        // Valid caller-supplied X-Request-Id (including exact 128-byte boundary) is echoed verbatim.
+        let exact_128 = "a".repeat(128);
+        for valid in ["trace-abc-123_XYZ", exact_128.as_str()] {
+            let r_echo = handle_request(
+                engine.clone(),
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", valid)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                r_echo.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap(),
+                valid
+            );
+        }
+
+        // Invalid (empty, contains whitespace/tab, or >128 bytes) -> replaced with fresh generated ID.
+        for invalid in ["", "bad id with spaces", "bad\tid"] {
+            let r_bad = handle_request(
+                engine.clone(),
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", invalid)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let bad_out = r_bad.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+            assert_ne!(bad_out, invalid);
+            assert_eq!(bad_out.len(), 21);
+        }
+
+        let too_long = "a".repeat(129);
+        let r_long = handle_request(
+            engine.clone(),
+            Request::builder()
+                .uri("/healthz")
+                .header("x-request-id", &too_long)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_long.headers().get(&X_REQUEST_ID).unwrap().len(), 21);
+
+        // AIMD 429 shedding still carries X-Request-Id.
+        let tight = Arc::new(
+            TileEngine::new(8 * 1024 * 1024)
+                .with_aimd(crate::aimd::AimdLimiter::new(true, 1, 1, 1, 150)),
+        );
+        let _held = tight.aimd.try_acquire().unwrap();
+        let r_429 = handle_request(
+            tight.clone(),
+            Request::builder()
+                .uri("/cog/info")
+                .header("x-request-id", "shed-req-42")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_429.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            r_429.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap(),
+            "shed-req-42"
+        );
     }
 }

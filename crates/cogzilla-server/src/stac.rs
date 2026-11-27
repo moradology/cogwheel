@@ -180,11 +180,10 @@ pub fn stac_item_from_json(val: &serde_json::Value, item_uri: &str) -> StacItem 
     let mut assets = BTreeMap::new();
     if let Some(obj) = val.get("assets").and_then(|v| v.as_object()) {
         for (k, a) in obj {
-            if is_raster_asset(k, a) {
-                if let Some(href) = a.get("href").and_then(|v| v.as_str()) {
+            if is_raster_asset(k, a)
+                && let Some(href) = a.get("href").and_then(|v| v.as_str()) {
                     assets.insert(k.clone(), resolve_href(item_uri, href));
                 }
-            }
         }
     }
 
@@ -275,7 +274,7 @@ pub fn select_stac_asset_names(
     if names.is_empty() {
         if let Some(expr) = expr_raw {
             let mut known: Vec<&str> = item.assets.keys().map(|s| s.as_str()).collect();
-            known.sort_by(|a, b| b.len().cmp(&a.len()));
+            known.sort_by_key(|s| std::cmp::Reverse(s.len()));
             let mut seen = std::collections::HashSet::new();
             let bytes = expr.as_bytes();
             let mut i = 0usize;
@@ -415,7 +414,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
         .enumerate()
         .map(|(idx, n)| (idx + 1, n.as_str()))
         .collect();
-    ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    ordered.sort_by_key(|&(_, s)| std::cmp::Reverse(s.len()));
 
     let single_asset = names.len() == 1;
     let bytes = expr.as_bytes();
@@ -456,8 +455,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
                         && !bytes
                             .get(j)
                             .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
-                    {
-                        if let Ok(band_k) = expr[after + 2..j].parse::<usize>() {
+                        && let Ok(band_k) = expr[after + 2..j].parse::<usize>() {
                             if !single_asset && band_k != 1 {
                                 return Err(EngineError::BadRequest(format!(
                                     "multi-asset STAC expression '{name}_b{band_k}' with band != 1 is not supported; use band 1 ({name}_b1) or a single multi-band asset"
@@ -467,7 +465,6 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
                             matched_band_suffix = Some((target_band, j - i));
                             break;
                         }
-                    }
                 }
             }
             if let Some((target_band, consumed)) = matched_band_suffix {

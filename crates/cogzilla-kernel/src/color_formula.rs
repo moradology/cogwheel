@@ -1,4 +1,5 @@
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // Inline 3x256 LUT avoids pointer chasing per pixel
 enum ColorStage {
     Lut {
         r: [u8; 256],

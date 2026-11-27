@@ -108,12 +108,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Fails on clippy errors only; existing warnings are reported, not denied.
-      - run: cargo clippy --workspace --all-targets --locked
+      # Deny clippy warnings across the workspace. Allow `chunks_exact_to_as_chunks`
+      # (added in Rust 1.100) here rather than Cargo.toml so older local toolchains
+      # do not warn on an unknown lint name.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings -A clippy::chunks_exact_to_as_chunks
       - name: Check CPU-only server and Lambda builds
         run: |
-          cargo check -p cogzilla-server --no-default-features --locked
-          cargo check -p cogzilla-lambda --locked
+          cargo clippy -p cogzilla-server --no-default-features --all-targets --locked -- -D warnings -A clippy::chunks_exact_to_as_chunks
+          cargo clippy -p cogzilla-lambda --all-targets --locked -- -D warnings -A clippy::chunks_exact_to_as_chunks
 
   docker:
     name: Docker build

@@ -411,7 +411,7 @@ fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
                 return Err(invalid_param(
                     "query",
                     name,
-                    &format!("Input should be less than or equal to {max_allowed}"),
+                    format!("Input should be less than or equal to {max_allowed}"),
                 ));
             }
             // Zero is no limit given, as in titiler-pgstac: the default stands.
@@ -1326,7 +1326,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         .into_iter()
         .map(|(name, qs)| {
             // The tile size is the service's to choose, not the layer's.
-            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.split_once('=').is_some_and(|(k, _)| super::query_key(k) == "tilesize")).collect();
+            let qs: Vec<&str> = qs.split('&').filter(|kv| kv.split_once('=').is_none_or(|(k, _)| super::query_key(k) != "tilesize")).collect();
             (name, qs.join("&"), (source.minzoom, source.maxzoom))
         })
         .collect();
@@ -2705,6 +2705,35 @@ fn npy_array(
     cogzilla_kernel::encode_npy_typed(values, bands, height, width, kind, absent, mask)
 }
 
+/// Encode an RGBA buffer as a NumPy `|u1` array of shape `(C, H, W)` (or `(C + 1, H, W)` with mask),
+/// where `C` is `1` when `grey` is true and `3` otherwise. Short buffers are zero-padded to `H * W`.
+fn rgba_to_npy_u8(rgba: &[u8], width: usize, height: usize, grey: bool, return_mask: bool) -> Bytes {
+    let pixels = width.saturating_mul(height);
+    let shown = if grey { 1 } else { 3 };
+    let planes = shown + usize::from(return_mask);
+    let hdr = cogzilla_kernel::encode_npy_header("|u1", &[planes, height, width]);
+    let body = planes.saturating_mul(pixels);
+    let mut out = Vec::with_capacity(hdr.len().saturating_add(body));
+    out.extend_from_slice(&hdr);
+    for band in 0..shown {
+        out.extend(
+            rgba.chunks_exact(4)
+                .map(|px| px[band])
+                .chain(std::iter::repeat(0u8))
+                .take(pixels),
+        );
+    }
+    if return_mask {
+        out.extend(
+            rgba.chunks_exact(4)
+                .map(|px| if px[3] == 0 { 0 } else { 255 })
+                .chain(std::iter::repeat(0u8))
+                .take(pixels),
+        );
+    }
+    Bytes::from(out)
+}
+
 /// A colour map given in the request as JSON, read the way rio-tiler applies one.
 struct MosaicColormap {
     map: cogzilla_kernel::CustomColormap,
@@ -3268,7 +3297,7 @@ async fn part_image_of(
     // So is a `nodata` of the request's own: the renderer on this road reads the raster's.
     // And a NumPy array, which is written from planes in the data's own type.
     let array = matches!(ext.or(pq.format_param.as_deref()), Some("npy"));
-    let planes_needed = wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some() || array;
+    let planes_needed = wants_planes(&pq, &query) || custom.is_some() || pq.nodata.is_some() || (array && pq.algorithm.is_none());
     let planes_preferred = nearest && pq.algorithm.is_none() && planes_can;
     // The request's own band math, before an asset's is put in its place for the renderer.
     let expression = pq.expr_raw.clone();
@@ -3437,8 +3466,10 @@ async fn part_image_of(
         }
         let mut canvas: Vec<u8> = Vec::new();
         let (mut width, mut height) = (0usize, 0usize);
-        // With a pixel selection other than `first`: every scene's values, and how to colour them.
-        let mut selecting: Option<(Fold, Paint)> = None;
+        // With a pixel selection other than `first`, or raw `.npy` under `algorithm`: every scene's values,
+        // optional painter (not needed for raw `.npy`), and expected band count.
+        let mut selecting: Option<(Fold, Option<Paint>, usize)> = None;
+        let visual_array = pq.colormap_explicit || formula.is_some() || !pq.rescale.is_empty();
         // Degrees, or Web Mercator metres for a box drawn there.
         let drawn_in = if mercator { CrsModel::Epsg3857 } else { CrsModel::Geographic };
         // One band under a colour map, with a colour formula: drawn grey, coloured at the end.
@@ -3496,15 +3527,20 @@ async fn part_image_of(
                 (CrsModel::Geographic, false) | (CrsModel::Epsg3857, true) => query.resampling,
                 _ => query.reproject,
             };
-            if let Some(method) = query.selection.or(exact.then_some(Selection::First)) {
+            let raw_npy = array && !visual_array && !matches!(bands, BandRequest::Terrain { .. });
+            if let Some(method) = query.selection.or((exact || raw_npy).then_some(Selection::First)) {
                 // The scene's values rather than its colours; only `first` stops early.
                 let count = TileEngine::value_bands(&bands);
                 if n == 0 {
-                    let paint = Paint::of(&bands).ok_or_else(|| {
-                        EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
-                    })?;
+                    let paint = if raw_npy {
+                        None
+                    } else {
+                        Some(Paint::of(&bands).ok_or_else(|| {
+                            EngineError::BadRequest("pixel_selection other than 'first' cannot be used with a terrain encoding".into())
+                        })?)
+                    };
                     let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
-                    selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint));
+                    selecting = Some((fold_within_limits(method, scenes.len(), count, width * height, integer, false)?, paint, count));
                 }
                 let values = render_crs_bbox(
                     engine,
@@ -3524,7 +3560,7 @@ async fn part_image_of(
                     pq.unscale,
                 )
                 .await?;
-                if let Some((fold, _)) = &mut selecting
+                if let Some((fold, _, _)) = &mut selecting
                     && values.len() == count * width * height * 4
                 {
                     fold.add_le_bytes(&values);
@@ -3572,10 +3608,30 @@ async fn part_image_of(
                 break;
             }
         }
-        if let Some((fold, paint)) = selecting
-            && let Some(selected) = fold.finish()
-        {
-            canvas = paint.rgba(&selected, width * height);
+        if let Some((fold, paint, count)) = selecting {
+            if let Some(selected) = fold.finish() {
+                if array && !visual_array {
+                    let npy = npy_array(
+                        &selected.values,
+                        selected.bands,
+                        width,
+                        height,
+                        SampleType::Float32,
+                        pq.return_mask,
+                        None,
+                    );
+                    return Ok((npy, "application/x-binary"));
+                }
+                if let Some(paint) = paint {
+                    canvas = paint.rgba(&selected, width * height);
+                }
+            } else if array && !visual_array {
+                let empty = vec![f32::NAN; count.saturating_mul(width).saturating_mul(height)];
+                return Ok((
+                    npy_array(&empty, count, width, height, SampleType::Float32, pq.return_mask, None),
+                    "application/x-binary",
+                ));
+            }
         }
         match (&map_after, formula) {
             (Some(map_after), _) => map_after.colour(&mut canvas),
@@ -3589,6 +3645,11 @@ async fn part_image_of(
             }
             (None, None) => {}
         }
+        // One band, or a count, is a grey picture as on tiles: one channel, or two with the mask.
+        let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+        if array {
+            return Ok((rgba_to_npy_u8(&canvas, width, height, grey, pq.return_mask), "application/x-binary"));
+        }
         let (format, content_type) = match format {
             Some((f, ct)) => (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }),
             None => {
@@ -3596,8 +3657,6 @@ async fn part_image_of(
                 parse_ext_format(if opaque { "jpg" } else { "png" }, None, pq.jpeg_quality)?
             }
         };
-        // One band, or a count, is a grey picture as on tiles: one channel, or two with the mask.
-        let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
         let made = if grey {
             encode_picture(canvas, width, height, None, Some((format, content_type)), pq.jpeg_quality, pq.return_mask, true)?
         } else {
@@ -4437,7 +4496,7 @@ impl BandAlgorithm {
     fn apply(&self, bands: Vec<Vec<f64>>, whole: bool, width: usize, pixel: (f64, f64)) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
         let n = bands.len();
         let len = bands.first().map_or(0, Vec::len);
-        let height = if width == 0 { 0 } else { len / width };
+        let height = len.checked_div(width).unwrap_or(0);
         let across = |f: &dyn Fn(&mut Vec<f64>) -> f64| -> Vec<f64> {
             let mut values = Vec::with_capacity(n);
             (0..len)
@@ -4553,7 +4612,7 @@ impl BandAlgorithm {
                     return Err("Source data must be 1 band".into());
                 }
                 let lut = &ColormapName::from_str_opt("terrain").ok_or("no terrain colour map")?.lut().rgb;
-                let mut out = vec![Vec::with_capacity(len); 3];
+                let mut out: Vec<Vec<f64>> = (0..3).map(|_| Vec::with_capacity(len)).collect();
                 for v in &bands[0] {
                     let rgb = if v.is_nan() {
                         [f64::NAN; 3]
@@ -4962,7 +5021,7 @@ fn float32_bins(opts: &StatsOptions, band: &[f64]) -> StatsOptions {
                 .iter()
                 .filter(|v| v.is_finite())
                 .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v as f32), hi.max(v as f32)));
-            if !(lo < hi) {
+            if lo >= hi || lo.is_nan() || hi.is_nan() {
                 return out;
             }
             let step = (hi - lo) / count as f32;
@@ -5166,7 +5225,7 @@ async fn point_values(
     let (lon, lat) = if pq.coord_crs_3857 {
         mercator_to_lonlat_deg(x, y)
     } else {
-        if let Err(r) = check_coord_crs(&pq, pairs) {
+        if let Err(r) = check_coord_crs(pq, pairs) {
             return r;
         }
         (x, y)
@@ -5424,7 +5483,8 @@ async fn render_non_mercator_tms_tile(
             .transpose()
             .map_err(EngineError::BadRequest)?;
         let mut canvas = vec![0u8; dim * dim * 4];
-        let mut selecting: Option<(Fold, Paint)> = None;
+        let mut selecting: Option<(Fold, Option<Paint>, usize)> = None;
+        let visual_array = pq.colormap_explicit || formula.is_some() || !pq.rescale.is_empty();
         let mut map_after: Option<MapAfterFormula> = None;
         let mut one_grey = false;
         for (n, scene) in scenes.iter().enumerate() {
@@ -5456,19 +5516,25 @@ async fn render_non_mercator_tms_tile(
             let exact = formula.is_some() && one_grey_band(&bands) && (map_after.is_some() || one_grey);
             let same_crs = cogs[0].index.geo_keys.projected_cs_type == Some(tms_def.epsg);
             let resample = if same_crs { query.resampling } else { query.reproject };
-            let force_values = (want_array || (tiff && pq.algorithm.is_none())) && Paint::of(&bands).is_some();
-            if let Some(method) = query.selection.or((exact || force_values).then_some(Selection::First)) {
+            let raw_values = ((want_array && !visual_array) || (tiff && pq.algorithm.is_none()))
+                && !matches!(bands, BandRequest::Terrain { .. });
+            if let Some(method) = query.selection.or((exact || raw_values).then_some(Selection::First)) {
                 let count = TileEngine::value_bands(&bands);
                 if n == 0 {
-                    let paint = Paint::of(&bands).ok_or_else(|| {
-                        EngineError::BadRequest(
-                            "pixel_selection other than 'first' cannot be used with a terrain encoding".into(),
-                        )
-                    })?;
+                    let paint = if raw_values {
+                        None
+                    } else {
+                        Some(Paint::of(&bands).ok_or_else(|| {
+                            EngineError::BadRequest(
+                                "pixel_selection other than 'first' cannot be used with a terrain encoding".into(),
+                            )
+                        })?)
+                    };
                     let integer = super::reads_whole_numbers(pq.unscale, &bands, full.sample_type);
                     selecting = Some((
                         fold_within_limits(method, scenes.len(), count, dim * dim, integer, false)?,
                         paint,
+                        count,
                     ));
                 }
                 let values = render_crs_bbox(
@@ -5489,7 +5555,7 @@ async fn render_non_mercator_tms_tile(
                     pq.unscale,
                 )
                 .await?;
-                if let Some((fold, _)) = &mut selecting
+                if let Some((fold, _, _)) = &mut selecting
                     && values.len() == count * dim * dim * 4
                 {
                     fold.add_le_bytes(&values);
@@ -5537,41 +5603,58 @@ async fn render_non_mercator_tms_tile(
                 break;
             }
         }
-        if let Some((fold, paint)) = selecting
-            && let Some(selected) = fold.finish()
-        {
-            if want_array || tiff {
-                let npy = cogzilla_kernel::encode_npy_typed(
-                    &selected.values,
-                    selected.bands,
-                    dim,
-                    dim,
-                    cogzilla_tiff::SampleType::Float32,
-                    None,
-                    pq.return_mask,
+        let raw_output = (want_array && !visual_array) || (tiff && pq.algorithm.is_none());
+        if let Some((fold, paint, count)) = selecting {
+            if let Some(selected) = fold.finish() {
+                if raw_output {
+                    let npy = npy_array(
+                        &selected.values,
+                        selected.bands,
+                        dim,
+                        dim,
+                        SampleType::Float32,
+                        pq.return_mask,
+                        None,
+                    );
+                    let made = (npy, "application/x-binary");
+                    return Ok(as_geotiff(made, tiff, bbox, tms_def.epsg, pq.return_mask));
+                }
+                if let Some(paint) = paint {
+                    canvas = paint.rgba(&selected, dim * dim);
+                }
+            } else if raw_output {
+                let empty = vec![f32::NAN; count.saturating_mul(dim).saturating_mul(dim)];
+                let made = (
+                    npy_array(&empty, count, dim, dim, SampleType::Float32, pq.return_mask, None),
+                    "application/x-binary",
                 );
-                let made = (npy, "application/x-binary");
                 return Ok(as_geotiff(made, tiff, bbox, tms_def.epsg, pq.return_mask));
             }
-            canvas = paint.rgba(&selected, dim * dim);
-        } else if want_array {
-            return Err(EngineError::BadRequest(
-                "`.npy` is not supported with this algorithm on projected non-WebMercator tiles".into(),
-            ));
         }
-        if let Some(map_after) = &map_after {
-            map_after.colour(&mut canvas);
+        match (&map_after, formula) {
+            (Some(map_after), _) => map_after.colour(&mut canvas),
+            (None, Some(formula)) => {
+                let grey = one_grey && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+                formula.apply_buffer_in_place(&mut canvas, 4);
+                if grey {
+                    canvas.chunks_exact_mut(4).for_each(|p| (p[1], p[2]) = (p[0], p[0]));
+                }
+            }
+            (None, None) => {}
         }
         let grey = one_grey
             && canvas
                 .chunks_exact(4)
                 .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+        if want_array {
+            return Ok((rgba_to_npy_u8(&canvas, dim, dim, grey, pq.return_mask), "application/x-binary"));
+        }
         let asked = format.map(|(f, ct)| (f, if explicit.as_deref() == Some("jpg") { "image/jpg" } else { ct }));
         let made = encode_picture(
             canvas,
             dim,
             dim,
-            if map_after.is_some() { None } else { formula.as_ref() },
+            None,
             asked,
             pq.jpeg_quality,
             pq.return_mask,
@@ -5856,11 +5939,11 @@ async fn tile(
             };
             let pq: &ParsedQuery = &pq;
             let (mut treq, content_type) = build_tile_request(
-                Some(&engine),
+                Some(engine),
                 tile,
                 scale,
                 Some(explicit.as_str()),
-                &pq,
+                pq,
                 default_bands,
                 full.sample_type,
                 false,
@@ -5916,7 +5999,7 @@ async fn tile(
                 && formula.is_none()
                 && pq.algorithm.is_none()
                 && full.extra_samples.is_empty()
-                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+                && !super::has_embedded_palette(pq, &first, &treq.bands)
             {
                 let bands = TileEngine::value_bands(&treq.bands);
                 treq.format = OutputFormat::RawF32;
@@ -5966,7 +6049,7 @@ async fn tile(
             let exact = formula.is_some()
                 && !raw_array
                 && one_grey_band(&treq.bands)
-                && !super::has_embedded_palette(&pq, &first, &treq.bands);
+                && !super::has_embedded_palette(pq, &first, &treq.bands);
             let mut rgba = if let (None, true) = (selection, exact) {
                 let paint = Paint::of(&treq.bands).ok_or_else(|| EngineError::BadRequest("not a band of values".into()))?;
                 treq.format = OutputFormat::RawF32;
@@ -5991,7 +6074,7 @@ async fn tile(
                     && pq.expr_raw.is_none()
                     && pq.algorithm.is_none()
                     && full.extra_samples.is_empty()
-                    && !super::has_embedded_palette(&pq, &first, &treq.bands);
+                    && !super::has_embedded_palette(pq, &first, &treq.bands);
                 if raw_array && !array {
                     return Err(EngineError::BadRequest(
                         "raw array formats are not supported with pixel_selection other than 'first' yet".into(),
@@ -6081,7 +6164,7 @@ async fn tile(
             // So is one band drawn in grey, whichever scene it came from: a raster with a
             // palette of its own is one band too, and is not grey.
             let one_grey = matches!(Paint::of(&treq.bands), Some(Paint::Gray { colormap: ColormapName::Grayscale, .. }))
-                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+                && !super::has_embedded_palette(pq, &first, &treq.bands)
                 && rgba.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
             let grey = (one_grey || selection.is_some_and(|method| method == Selection::Count || TileEngine::value_bands(&treq.bands) == 1))
                 && !pq.colormap_explicit;
@@ -6388,10 +6471,7 @@ fn item_proj_grid(item: &Value, readable: &[String]) -> Option<ProjGrid> {
     for name in readable {
         let asset = &item["assets"][name];
         if let (Some(grid), Some(t)) = (proj_grid_of(asset), asset.get("proj:transform")) {
-            match proj_crs_string(asset).or_else(|| item_crs.clone()) {
-                Some(crs) => crs_strings.push(crs),
-                None => return None,
-            }
+            crs_strings.push(proj_crs_string(asset).or_else(|| item_crs.clone())?);
             let xres = t[0].as_f64().unwrap_or(0.0);
             let yres = t[4].as_f64().unwrap_or(0.0);
             grids.push((grid, xres, yres));
@@ -6533,8 +6613,12 @@ fn respelled(resp: Resp) -> Resp {
     };
     let epsg = if crs.contains("OGC/0/CRS84") || crs.contains("EPSG/0/4326") {
         4326
-    } else if crs.contains("EPSG/0/3857") {
-        3857
+    } else if let Some(rest) = crs.split("EPSG/0/").nth(1) {
+        let digits = rest.trim_end_matches(['>', ' ']);
+        match digits.parse::<u16>() {
+            Ok(code) => code,
+            Err(_) => return resp,
+        }
     } else {
         return resp;
     };
@@ -6546,9 +6630,8 @@ fn respelled(resp: Resp) -> Resp {
 }
 
 /// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
-/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in.
-/// Only degrees and Web Mercator are worked out here; a picture in any other system goes
-/// without the headers, and a preview or a posted shape is placed by [`item_drawn_placed`].
+/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in
+/// (for any supported CRS). A preview or a posted shape is placed by [`item_drawn_placed`].
 pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
@@ -6573,7 +6656,7 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             }
             // A buffered tile reaches past its bounds by an amount that depends on its
             // size: it goes without the headers sooner than with the wrong ones.
-            if asked("buffer").is_some_and(|b| b.parse::<f64>().map_or(true, |b| b != 0.0)) {
+            if asked("buffer").is_some_and(|b| b.parse::<f64>() != Ok(0.0)) {
                 return respelled(resp);
             }
             let (west, south, east, north) = tile_bounds_3857(TileCoord { z, x, y });
@@ -6584,32 +6667,40 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             let Some((bbox, _)) = super::parse_bbox4(seg) else {
                 return resp;
             };
-            // 4326 or 3857, or nothing for a system not placed here.
-            let system = |key: &str, default: u16| match asked(key).as_deref().map(super::parse_coord_crs_with_epsg) {
+            let parse_sys = |key: &str, default: (CrsModel, u16)| match asked(key)
+                .as_deref()
+                .map(super::parse_coord_crs_with_epsg)
+            {
                 None => Some(default),
-                Some(Ok((_, epsg @ (4326 | 3857)))) => Some(epsg),
-                Some(_) => None,
+                Some(Ok(pair)) => Some(pair),
+                Some(Err(_)) => None,
             };
-            let Some(given) = system("coord_crs", 4326) else {
+            let Some((given_crs, given_epsg)) = parse_sys("coord_crs", (CrsModel::Geographic, 4326)) else {
                 return resp;
             };
-            let Some(drawn) = system("dst_crs", given) else {
+            let Some((drawn_crs, drawn_epsg)) = parse_sys("dst_crs", (given_crs.clone(), given_epsg)) else {
                 return resp;
             };
-            let corners = |to: fn(f64, f64) -> (f64, f64)| {
-                let ((w, s), (e, n)) = (to(bbox[0], bbox[1]), to(bbox[2], bbox[3]));
-                [w, s, e, n]
+            let bounds = if given_epsg == drawn_epsg {
+                bbox
+            } else {
+                let Ok(wgs_bbox) = super::bbox_to_wgs84(bbox, Some(&given_crs)) else {
+                    return resp;
+                };
+                if drawn_epsg == 4326 {
+                    wgs_bbox
+                } else {
+                    let Ok(reproj) = super::reproject_wgs84_bounds(wgs_bbox, &drawn_crs) else {
+                        return resp;
+                    };
+                    reproj
+                }
             };
-            let bounds = match (given, drawn) {
-                (4326, 3857) => corners(cogzilla_proj::mercator::lonlat_deg_to_mercator),
-                (3857, 4326) => corners(mercator_to_lonlat_deg),
-                _ => bbox,
-            };
-            if bounds.iter().any(|c| !c.is_finite()) {
+            if bounds.iter().any(|c| !c.is_finite()) || bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
                 return resp;
             }
             let spelled = asked("dst_crs").or_else(|| asked("coord_crs"));
-            placed_as(resp, bounds, drawn, spelled.as_deref())
+            placed_as(resp, bounds, drawn_epsg, spelled.as_deref())
         }
         _ => resp,
     }
@@ -8908,10 +8999,11 @@ mod tests {
         );
         assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=EPSG%3A3857").unwrap().1, crs(3857));
         assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
-        // Systems not placed here, tiles that are not tiles, and other routes go without.
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:32631").unwrap().1, crs(32631));
+        assert_eq!(said(&["bbox", "765000,4832000,782000,4855000.png"], "coord_crs=epsg:32631").unwrap().1, crs(32631));
+        // Unsupported systems, tiles that are not tiles, and other routes go without.
         for (sub, query) in [
-            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:32631"),
-            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "coord_crs=epsg:32631"),
+            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:4275"),
             (&["tiles", "WebMercatorQuad", "1", "2", "0.png"][..], ""),
             (&["tiles", "WGS1984Quad", "0", "0", "0.png"][..], ""),
             (&["preview.png"][..], ""),
@@ -8930,6 +9022,48 @@ mod tests {
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
+        // `respelled` preserves arbitrary EPSG codes from upstream Content-Crs headers.
+        let utm_tile = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-bbox", "500000,4800000,510000,4810000")
+            .header("content-crs", "<http://www.opengis.net/def/crs/EPSG/0/32631>")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let respelled_utm = item_placed(utm_tile, &["tiles", "UTM31N", "0", "0", "0.png"], "");
+        assert_eq!(
+            respelled_utm.headers().get("content-crs").unwrap().to_str().unwrap(),
+            crs(32631)
+        );
+        assert_eq!(
+            respelled_utm.headers().get("content-bbox").unwrap().to_str().unwrap(),
+            "500000.0,4800000.0,510000.0,4810000.0"
+        );
+    }
+
+    #[test]
+    fn rgba_to_npy_u8_writes_chw_planes_and_optional_mask() {
+        // 2x1 RGBA image: pixel 0 opaque (10,20,30,255), pixel 1 transparent (40,50,60,0).
+        let rgba = [10u8, 20, 30, 255, 40, 50, 60, 0];
+        let with_mask = rgba_to_npy_u8(&rgba, 2, 1, false, true);
+        assert!(with_mask.starts_with(b"\x93NUMPY"));
+        let hdr_len = 10 + u16::from_le_bytes([with_mask[8], with_mask[9]]) as usize;
+        let hdr = std::str::from_utf8(&with_mask[10..hdr_len]).unwrap();
+        assert!(hdr.contains("'|u1'"));
+        assert!(hdr.contains("(4, 1, 2)"));
+        assert_eq!(&with_mask[hdr_len..], &[10, 40, 20, 50, 30, 60, 255, 0]);
+
+        let no_mask = rgba_to_npy_u8(&rgba, 2, 1, false, false);
+        let hdr_len2 = 10 + u16::from_le_bytes([no_mask[8], no_mask[9]]) as usize;
+        let hdr2 = std::str::from_utf8(&no_mask[10..hdr_len2]).unwrap();
+        assert!(hdr2.contains("(3, 1, 2)"));
+        assert_eq!(&no_mask[hdr_len2..], &[10, 40, 20, 50, 30, 60]);
+
+        // Grey 1-band + mask and short-buffer zero-padding safety.
+        let grey_short = rgba_to_npy_u8(&[77, 77, 77, 255], 2, 1, true, true);
+        let hdr_len3 = 10 + u16::from_le_bytes([grey_short[8], grey_short[9]]) as usize;
+        let hdr3 = std::str::from_utf8(&grey_short[10..hdr_len3]).unwrap();
+        assert!(hdr3.contains("(2, 1, 2)"));
+        assert_eq!(&grey_short[hdr_len3..], &[77, 0, 255, 0]);
     }
 
     #[test]

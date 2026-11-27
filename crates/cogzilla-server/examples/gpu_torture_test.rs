@@ -215,9 +215,11 @@ async fn main() {
     {
         let main_cogs = [Arc::clone(&main_cog)];
         let nan_cogs = [Arc::clone(&nan_cog)];
-        let mut opts = StatsOptions::default();
-        opts.percentiles = vec![2.0, 98.0];
-        opts.histogram_bins = 10;
+        let opts = StatsOptions {
+            percentiles: vec![2.0, 98.0],
+            histogram_bins: 10,
+            ..StatsOptions::default()
+        };
 
         for &(ew, eh) in &[(1u32, 1u32), (1, 4096), (4096, 1), (333, 777), (17, 19)] {
             let b = render_wgs84_bbox(
@@ -363,7 +365,7 @@ async fn main() {
         for c in 0..12usize {
             let p = tmp_dir.join(format!("thrash_{c}.tif"));
             std::fs::write(&p, build_cog_bytes(1024, 1024, false, c as f32 * 0.3)).unwrap();
-            cogs.push(store.register_local(&format!("thrash_{c}"), &p).unwrap());
+            cogs.push(store.register_local(format!("thrash_{c}"), &p).unwrap());
         }
         let cogs = Arc::new(cogs);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -590,12 +592,14 @@ async fn main() {
             let crs = Arc::clone(&crs);
             let zonal_n = Arc::clone(&zonal_n);
             hs.push(tokio::spawn(async move {
-                let mut opts = StatsOptions::default();
-                opts.area_weighted = true;
-                opts.expressions = Some(vec![
-                    ("(b1-b2)/(b1+b2)".into(), ExprProgram::compile("(b1-b2)/(b1+b2)").unwrap()),
-                    ("(b2-b3)/(b2+b3)".into(), ExprProgram::compile("(b2-b3)/(b2+b3)").unwrap()),
-                ]);
+                let opts = StatsOptions {
+                    area_weighted: true,
+                    expressions: Some(vec![
+                        ("(b1-b2)/(b1+b2)".into(), ExprProgram::compile("(b1-b2)/(b1+b2)").unwrap()),
+                        ("(b2-b3)/(b2+b3)".into(), ExprProgram::compile("(b2-b3)/(b2+b3)").unwrap()),
+                    ]),
+                    ..StatsOptions::default()
+                };
                 while Instant::now() < deadline {
                     let j = compute_native_exact_polygon_stats(
                         &eng, &cog, &crs, &pm, 2048, false, None, &opts,

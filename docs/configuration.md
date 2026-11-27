@@ -61,7 +61,7 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | `COGZILLA_GPU_COALESCE_US`, `COGZILLA_GPU_RING_DEPTH`, `COGZILLA_GPU_MAX_QUEUED` | `GpuCoalescer` tuning: micro-batch coalesce window in µs, continuous ring-buffer depth (default 2 unified / 3 discrete), and max queued GPU jobs (default `4096`). |
 | `COGZILLA_AIMD`, `COGZILLA_AIMD_TARGET_MS`, `COGZILLA_AIMD_MIN_LIMIT`, `COGZILLA_AIMD_MAX_LIMIT` | HTTP AIMD admission control (`429 Too Many Requests` overload shedding): set `COGZILLA_AIMD=off` to disable; target RTT default `150` ms, max concurrency ceiling default `4096`. Control-plane routes (`/healthz`, `/readyz`, `/metrics`, `/stats`, `/admin/clear-cache`, `/searches`, `/searches/list`, `/searches/register`) and `OPTIONS` bypass AIMD. |
 | `COGZILLA_SHUTDOWN_TIMEOUT_SECS` | Maximum seconds to wait for in-flight HTTP connections to drain on `SIGINT`/`SIGTERM` before forcing exit (default `15`). |
-| `RUST_LOG` | Log level, for example `info` (the default) or `debug`. |
+| `RUST_LOG` | Log level, for example `info` (the default) or `cogzilla_server=debug` for per-request structured access logs (`request_id`, `method`, `path`, `status`, `dur_ms`). `5xx` failures are always logged at `warn`, and every response carries `X-Request-Id` (echoing a valid caller header or generating one). |
 
 ### pgSTAC database
 
