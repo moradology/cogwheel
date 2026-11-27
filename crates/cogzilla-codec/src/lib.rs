@@ -54,6 +54,41 @@ pub fn compress_gzip(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Compress a byte slice into a zlib stream (RFC 1950) using `libdeflater` at default level.
+pub fn compress_zlib(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::default());
+    let max_sz = compressor.zlib_compress_bound(input.len());
+    let mut out = vec![0u8; max_sz];
+    let n = compressor
+        .zlib_compress(input, &mut out)
+        .map_err(|e| format!("zlib compress error: {e:?}"))?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Compress a byte slice into a Zstd frame at `level` (e.g. `3`).
+pub fn compress_zstd(input: &[u8], level: i32) -> Result<Vec<u8>, String> {
+    // SAFETY: `ZSTD_compressBound` is a pure size calculation.
+    let bound = unsafe { zstd_sys::ZSTD_compressBound(input.len()) };
+    let mut out = vec![0u8; bound];
+    // SAFETY: `out` has `out.len()` writable bytes and `input` has `input.len()` readable bytes.
+    let rc = unsafe {
+        zstd_sys::ZSTD_compress(
+            out.as_mut_ptr().cast(),
+            out.len(),
+            input.as_ptr().cast(),
+            input.len(),
+            level,
+        )
+    };
+    // SAFETY: `ZSTD_isError` inspects the return code only.
+    if unsafe { zstd_sys::ZSTD_isError(rc) } != 0 {
+        return Err(format!("zstd compress error: code {rc}"));
+    }
+    out.truncate(rc);
+    Ok(out)
+}
+
 /// Compress a byte slice into a Brotli stream (RFC 7932) at fast HTTP quality (level 4, lgwin 22).
 pub fn compress_brotli(input: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Write;
@@ -114,10 +149,10 @@ pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec
         .min(max_initial)
         .max(input.len().saturating_mul(2))
         .clamp(min_cap, max_out_bytes);
-    let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut out = vec![0u8; cap];
-        match decompressor.gzip_decompress(input, &mut out) {
+        let res = CODEC_STATE.with(|cell| cell.borrow_mut().deflate.gzip_decompress(input, &mut out));
+        match res {
             Ok(n) => {
                 out.truncate(n);
                 return Ok(out);
@@ -188,6 +223,126 @@ impl Drop for ThreadCodecState {
 
 thread_local! {
     static CODEC_STATE: RefCell<ThreadCodecState> = RefCell::new(ThreadCodecState::new());
+    static EXTERNAL_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512 * 512 * 4));
+}
+
+/// Framing wrapper for deflate decompression via [`inflate_into`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeflateWrapper {
+    /// RFC 1952 gzip stream.
+    Gzip,
+    /// RFC 1950 zlib stream.
+    Zlib,
+    /// RFC 1951 raw deflate stream.
+    Raw,
+}
+
+/// Reusable thread-local byte buffer exposed by [`with_codec_scratch`].
+pub struct CodecScratch<'a> {
+    buf: &'a mut Vec<u8>,
+}
+
+impl CodecScratch<'_> {
+    /// Resize the scratch buffer to `len` zero-initialized bytes and return it as a mutable slice.
+    pub fn resize_zeroed(&mut self, len: usize) -> &mut [u8] {
+        self.buf.clear();
+        self.buf.resize(len, 0);
+        self.buf.as_mut_slice()
+    }
+
+    /// Access the underlying reusable `Vec<u8>`.
+    pub fn as_vec_mut(&mut self) -> &mut Vec<u8> {
+        self.buf
+    }
+}
+
+/// Borrow a thread-local reusable byte scratch buffer without per-chunk heap allocation.
+///
+/// Safe to combine with [`inflate_into`] and [`zstd_into`] inside `f` (uses a separate
+/// thread-local cell from the codec context state).
+pub fn with_codec_scratch<R>(f: impl FnOnce(&mut CodecScratch<'_>) -> R) -> R {
+    EXTERNAL_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let mut scratch = CodecScratch { buf: &mut buf };
+        f(&mut scratch)
+    })
+}
+
+/// Decompress a gzip, zlib, or raw-deflate payload directly into `dst`, reusing the
+/// thread-local `libdeflater::Decompressor`.
+///
+/// Enforces the caller's exact `dst.len()` bound without growing or over-allocating.
+pub fn inflate_into(
+    src: &[u8],
+    dst: &mut [u8],
+    wrapper: DeflateWrapper,
+) -> Result<usize, CodecError> {
+    match wrapper {
+        DeflateWrapper::Gzip => {
+            if src.len() < 18 || src[0] != 0x1f || src[1] != 0x8b {
+                return Err(CodecError::Deflate(
+                    "invalid or truncated gzip header".into(),
+                ));
+            }
+        }
+        DeflateWrapper::Zlib => {
+            if src.len() < 6 {
+                return Err(CodecError::Deflate("truncated zlib stream".into()));
+            }
+        }
+        DeflateWrapper::Raw => {}
+    }
+    CODEC_STATE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let res = match wrapper {
+            DeflateWrapper::Gzip => state.deflate.gzip_decompress(src, dst),
+            DeflateWrapper::Zlib => state.deflate.zlib_decompress(src, dst),
+            DeflateWrapper::Raw => state.deflate.deflate_decompress(src, dst),
+        };
+        res.map_err(|e| CodecError::Deflate(format!("libdeflater {wrapper:?} error: {e:?}")))
+    })
+}
+
+/// Decompress a Zstd frame directly into `dst`, reusing the thread-local `ZSTD_DCtx`.
+///
+/// Validates `ZSTD_getFrameContentSize` against `dst.len()` before decompressing so hostile
+/// frames declaring more bytes than the expected chunk size fail immediately.
+pub fn zstd_into(src: &[u8], dst: &mut [u8]) -> Result<usize, CodecError> {
+    if src.len() < 4 {
+        return Err(CodecError::Deflate("truncated zstd frame".into()));
+    }
+    // SAFETY: `src.as_ptr()` is valid for `src.len()` readable bytes.
+    let content_size =
+        unsafe { zstd_sys::ZSTD_getFrameContentSize(src.as_ptr().cast(), src.len()) };
+    if content_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
+        return Err(CodecError::Deflate("corrupt zstd frame header".into()));
+    }
+    if content_size != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64 && content_size > dst.len() as u64
+    {
+        return Err(CodecError::SizeMismatch {
+            expected: dst.len(),
+            got: content_size as usize,
+        });
+    }
+    CODEC_STATE.with(|cell| {
+        let state = cell.borrow_mut();
+        // SAFETY: `state.zstd_dctx` is a valid thread-local `ZSTD_DCtx`, `dst` is writable
+        // for `dst.len()` bytes, and `src` is readable for `src.len()` bytes.
+        let rc = unsafe {
+            zstd_sys::ZSTD_decompressDCtx(
+                state.zstd_dctx,
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                src.as_ptr().cast(),
+                src.len(),
+            )
+        };
+        // SAFETY: `ZSTD_isError` inspects the return code only.
+        if unsafe { zstd_sys::ZSTD_isError(rc) } != 0 {
+            return Err(CodecError::Zstd(rc));
+        }
+        Ok(rc)
+    })
 }
 
 /// Hard upper bound on a single decoded TIFF tile/strip (128 MiB) to prevent integer wrap
@@ -1727,5 +1882,36 @@ mod tests {
         assert_eq!(decompress_brotli_limited(&br, payload.len()).unwrap(), payload);
         assert!(decompress_brotli_limited(&br, 16).is_err());
         assert!(decompress_brotli_limited(&br, 0).is_err());
+    }
+
+    #[test]
+    fn inflate_into_zstd_into_and_scratch_reuse_roundtrip_and_bounds() {
+        let payload: Vec<u8> = (0..1024u32).flat_map(|v| v.to_le_bytes()).collect();
+        let gz = compress_gzip(&payload).unwrap();
+        let zl = compress_zlib(&payload).unwrap();
+        let zs = compress_zstd(&payload, 3).unwrap();
+
+        with_codec_scratch(|scratch| {
+            let dst = scratch.resize_zeroed(payload.len());
+            let n_gz = inflate_into(&gz, dst, DeflateWrapper::Gzip).unwrap();
+            assert_eq!(&dst[..n_gz], payload.as_slice());
+
+            let dst = scratch.resize_zeroed(payload.len());
+            let n_zl = inflate_into(&zl, dst, DeflateWrapper::Zlib).unwrap();
+            assert_eq!(&dst[..n_zl], payload.as_slice());
+
+            let dst = scratch.resize_zeroed(payload.len());
+            let n_zs = zstd_into(&zs, dst).unwrap();
+            assert_eq!(&dst[..n_zs], payload.as_slice());
+
+            // Oversized frame must be refused before decompressing without over-allocating.
+            let tiny = scratch.resize_zeroed(16);
+            assert!(matches!(
+                zstd_into(&zs, tiny),
+                Err(CodecError::SizeMismatch { expected: 16, got }) if got == payload.len()
+            ));
+            assert!(inflate_into(&gz, tiny, DeflateWrapper::Gzip).is_err());
+            assert!(inflate_into(&zl, tiny, DeflateWrapper::Zlib).is_err());
+        });
     }
 }
