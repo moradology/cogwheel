@@ -3,6 +3,10 @@
 use cogzilla_tiff::SampleType;
 
 use super::dem::eval_hillshade_row_clean;
+use super::rgb::{
+    CleanRgbNearestPlan, bilinear_rgb_single_block_row, sample_rgb_bilinear_row_clean,
+    sample_rgb_nearest_row_clean,
+};
 use super::*;
 use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
 
