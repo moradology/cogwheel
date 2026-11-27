@@ -6037,6 +6037,9 @@ where
                     // and not seen by the routes' own checks of what each takes.
                     pq.errors.retain(|e| !pgstac::item_passes_over_error(&method, rest, e));
                     pq.keys.retain(|k| !pgstac::item_passes_over(&method, rest, k));
+                    if pgstac::item_passes_over(&method, rest, "algorithm") {
+                        (pq.algorithm, pq.algorithm_error, pq.algorithm_params_unread) = (None, None, None);
+                    }
                     pq.pixel_selection = Selection::First;
                     // Band math on an item's point is applied to the `/stac` answer by
                     // `pgstac::item_fixup`, with TiTiler's names: `/stac` must not apply it first.
