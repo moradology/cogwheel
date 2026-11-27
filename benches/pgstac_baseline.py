@@ -66,6 +66,9 @@ import psycopg
 import shapely
 from shapely.geometry import box
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle_lib import wait_ready
+
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "benches" / "results" / "pgstac"
 LOADED = ROOT / "benches" / "fixtures" / "pgstac" / "loaded.json"
@@ -255,18 +258,6 @@ def compare_pngs(a: bytes, b: bytes) -> dict:
         out["mae"] = round(float(abs(d).mean()), 2)
         out["psnr_db"] = 99.0 if mse < 1e-6 else round(20 * math.log10(255 / math.sqrt(mse)), 1)
     return out
-
-
-def wait_ready(url: str, timeout_s: float = 20.0) -> None:
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        try:
-            if httpx.get(url, timeout=1.0).status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.1)
-    raise RuntimeError(f"{url} did not become ready in {timeout_s}s")
 
 
 # ----------------------------------------------------------------------------

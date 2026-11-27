@@ -16,6 +16,9 @@ from pathlib import Path
 import numpy as np
 import zarr
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle_lib import compare_response, zonal_diff
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "zarr"
 
 
@@ -66,23 +69,27 @@ def main() -> int:
         assert abs(b1["max"] - float(valid.max())) < 1e-4
         assert abs(b1["mean"] - float(valid.mean())) < 1e-3
 
-    # 2. Byte-identical PNG tile between /zarr/tiles and /cog/tiles on geotiff_twin
+    # 2. Byte-identical + decoded PNG tile parity between /zarr/tiles and /cog/tiles on geotiff_twin
     def case_twin_tile_byte_identical():
-        z_st, z_png, _ = req_raw(
+        z_st, z_png, z_hdrs = req_raw(
             f"{base}/zarr/tiles/WebMercatorQuad/10/163/395.png?url={u('geotiff_twin.zarr')}&rescale=100,900&colormap_name=viridis&resampling=bilinear"
         )
         c_st, c_png, _ = req_raw(
             f"{base}/cog/tiles/WebMercatorQuad/10/163/395.png?url={u('geotiff_twin.tif')}&rescale=100,900&colormap_name=viridis&resampling=bilinear"
         )
         assert z_st == 200 and c_st == 200
-        assert z_png == c_png, "Zarr PNG tile diverged from COG twin"
+        ok, note = compare_response(z_hdrs.get("content-type", "image/png"), z_png, c_png)
+        assert ok, f"Zarr PNG tile diverged from COG twin: {note}"
+        assert z_png == c_png, f"Zarr PNG tile bytes diverged from COG twin ({note})"
 
-    # 3. Sharded vs unsharded tile parity
+    # 3. Sharded vs unsharded tile parity (decoded array + byte-identical)
     def case_sharded_vs_unsharded_tile():
-        s_st, s_npy, _ = req_raw(f"{base}/zarr/tiles/WebMercatorQuad/9/81/197.npy?url={u('v3_sharded.zarr')}")
+        s_st, s_npy, s_hdrs = req_raw(f"{base}/zarr/tiles/WebMercatorQuad/9/81/197.npy?url={u('v3_sharded.zarr')}")
         u_st, u_npy, _ = req_raw(f"{base}/zarr/tiles/WebMercatorQuad/9/81/197.npy?url={u('v3_unsharded.zarr')}")
         assert s_st == 200 and u_st == 200
-        assert s_npy == u_npy, "v3 sharded NPY tile diverged from unsharded"
+        ok, note = compare_response(s_hdrs.get("content-type", "application/x-binary"), s_npy, u_npy)
+        assert ok, f"v3 sharded NPY tile diverged from unsharded: {note}"
+        assert s_npy == u_npy, f"v3 sharded NPY bytes diverged from unsharded ({note})"
 
     # 4. 3-D CF noleap time coordinates + sel round-trip + out-of-range 400
     def case_3d_noleap_sel():
@@ -150,8 +157,12 @@ def main() -> int:
         assert z_st == 200 and c_st == 200
         zb1 = json.loads(z_b)["properties"]["statistics"]["b1"]
         cb1 = json.loads(c_b)["properties"]["statistics"]["b1"]
-        assert abs(zb1["count"] - cb1["count"]) < 1e-6
-        assert abs(zb1["mean"] - cb1["mean"]) < 1e-4
+        # Validate exact shared summary fields via oracle_lib.zonal_diff (plus area tolerance).
+        diff = zonal_diff(
+            {k: zb1[k] for k in ("count", "min", "max", "mean")},
+            {k: cb1[k] for k in ("count", "min", "max", "mean")},
+        )
+        assert diff is None, f"zonal stats diverged: {diff}"
         assert abs(zb1["area"] - cb1["area"]) < 1e-2
 
     run_case("zarr_twin_stats_numpy", case_twin_stats_numpy)

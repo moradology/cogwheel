@@ -32,8 +32,17 @@ import numpy as np
 from PIL import Image
 import rasterio
 from rasterio.crs import CRS
-from rasterio.io import MemoryFile
 from rasterio.transform import from_bounds
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle_lib import (
+    compare_geotiffs,
+    compare_images,
+    compare_npy,
+    compare_wmts_xml,
+    time_request,
+    wait_ready,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -207,95 +216,6 @@ def ensure_dtype_fixtures() -> dict[str, tuple[str, str]]:
                 dst.write(arr, 1)
         paths[dtype_name] = (str(p.resolve()), rescale)
     return paths
-
-
-def wait_ready(url: str, timeout_s: float = 15.0):
-    t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        try:
-            r = httpx.get(url, timeout=0.5)
-            if r.status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(0.1)
-    raise RuntimeError(f"Server at {url} did not become ready in {timeout_s}s")
-
-
-def time_request(client: httpx.Client, method: str, url: str, json_body=None, iters: int = 5):
-    for _ in range(1):
-        r = client.request(method, url, json=json_body)
-        if r.status_code != 200:
-            return r, 0.0
-    samples = []
-    last = None
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        last = client.request(method, url, json=json_body)
-        samples.append((time.perf_counter() - t0) * 1e3)
-    samples.sort()
-    return last, samples[len(samples) // 2]
-
-
-def compare_images(
-    cw_bytes: bytes,
-    tt_bytes: bytes,
-    min_mask_pct: float = 99.0,
-    min_psnr: float = 25.0,
-) -> tuple[bool, str]:
-    im_cw = np.array(Image.open(io.BytesIO(cw_bytes)).convert("RGBA"), dtype=np.float32)
-    im_tt = np.array(Image.open(io.BytesIO(tt_bytes)).convert("RGBA"), dtype=np.float32)
-    if im_cw.shape != im_tt.shape:
-        return False, f"SHAPE DIFF cw={im_cw.shape} vs tt={im_tt.shape}"
-    a_cw = im_cw[:, :, 3] > 0
-    a_tt = im_tt[:, :, 3] > 0
-    mask_pct = float(np.mean(a_cw == a_tt)) * 100.0
-    both = a_cw & a_tt
-    if np.any(both):
-        diff = im_cw[:, :, :3][both] - im_tt[:, :, :3][both]
-        mae = float(np.mean(np.abs(diff)))
-        mse = float(np.mean(diff * diff))
-        psnr = 99.0 if mse < 1e-6 else 20.0 * math.log10(255.0 / math.sqrt(mse))
-    else:
-        mae, psnr = 0.0, 99.0
-    ok = mask_pct >= min_mask_pct and psnr >= min_psnr
-    return ok, f"shape={im_cw.shape[:2]} mask={mask_pct:.2f}% MAE={mae:.2f} PSNR={psnr:.1f}dB"
-
-
-def compare_geotiffs(cw_bytes: bytes, tt_bytes: bytes) -> tuple[bool, str]:
-    with MemoryFile(cw_bytes) as mcw, mcw.open() as dcw, MemoryFile(tt_bytes) as mtt, mtt.open() as dtt:
-        if (dcw.height, dcw.width) != (dtt.height, dtt.width):
-            return False, f"shape cw={(dcw.height, dcw.width)} vs tt={(dtt.height, dtt.width)}"
-        cw_epsg = dcw.crs.to_epsg() if dcw.crs else None
-        tt_epsg = dtt.crs.to_epsg() if dtt.crs else None
-        if cw_epsg != tt_epsg:
-            return False, f"epsg cw={cw_epsg} vs tt={tt_epsg}"
-        b_err = max(abs(a - b) for a, b in zip(dcw.bounds, dtt.bounds))
-        scale = max(1.0, abs(dtt.bounds.right - dtt.bounds.left))
-        if b_err / scale > 1e-3:
-            return False, f"bounds_err={b_err:.4f} (rel={b_err/scale:.4f})"
-        return True, f"shape={(dcw.height, dcw.width)} epsg={cw_epsg} bands={dcw.count}/{dtt.count} dtype={dcw.dtypes[0]}/{dtt.dtypes[0]}"
-
-
-def compare_npy(cw_bytes: bytes, tt_bytes: bytes) -> tuple[bool, str]:
-    a_cw = np.load(io.BytesIO(cw_bytes))
-    a_tt = np.load(io.BytesIO(tt_bytes))
-    if a_cw.shape != a_tt.shape:
-        return False, f"shape cw={a_cw.shape} vs tt={a_tt.shape}"
-    return True, f"cw={a_cw.shape}:{a_cw.dtype} tt={a_tt.shape}:{a_tt.dtype}"
-
-
-def compare_wmts_xml(cw_bytes: bytes, tt_bytes: bytes) -> tuple[bool, str]:
-    rcw = ET.fromstring(cw_bytes)
-    rtt = ET.fromstring(tt_bytes)
-    ns = {"wmts": "http://www.opengis.net/wmts/1.0", "ows": "http://www.opengis.net/ows/1.1"}
-    cw_tms = [e.text for e in rcw.findall(".//wmts:TileMatrixSetLink/wmts:TileMatrixSet", ns)]
-    tt_tms = [e.text for e in rtt.findall(".//wmts:TileMatrixSetLink/wmts:TileMatrixSet", ns)]
-    if cw_tms != tt_tms:
-        return False, f"TMS link cw={cw_tms} vs tt={tt_tms}"
-    cw_mats = len(rcw.findall(".//wmts:TileMatrix", ns))
-    tt_mats = len(rtt.findall(".//wmts:TileMatrix", ns))
-    return True, f"tms={cw_tms} matrices=cw:{cw_mats}/tt:{tt_mats}"
 
 
 def main(argv: list[str] | None = None):

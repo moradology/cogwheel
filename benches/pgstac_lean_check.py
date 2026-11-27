@@ -38,6 +38,9 @@ import psycopg
 import shapely
 from shapely.geometry import box
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oracle_lib import wait_ready
+
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS = ROOT / "benches" / "results" / "pgstac"
 LOADED = ROOT / "benches" / "fixtures" / "pgstac" / "loaded.json"
@@ -85,18 +88,6 @@ def sample_tiles(bbox: list[float], z: int, n: int, rng: random.Random) -> list[
     tiles = list(mercantile.tiles(w + dx, s + dy, e - dx, nn - dy, [z]))
     rng.shuffle(tiles)
     return tiles[:n]
-
-
-def wait_ready(url: str, timeout_s: float = 20.0) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            if httpx.get(url, timeout=1).status_code == 200:
-                return
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.1)
-    raise RuntimeError(f"{url} did not come up")
 
 
 def timed_ids(client: httpx.Client, url: str, iters: int) -> tuple[float, list[str], int]:
