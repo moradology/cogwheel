@@ -1387,24 +1387,8 @@ pub fn compute_weighted_band_stats_with_geom(
     };
     let std = (var_acc / w_total).max(0.0).sqrt();
 
-    let (valid_percent, masked_pixels_out) = if let Some(poly_area) = total_geom_area_px
-        && poly_area > COV_EPS
-    {
-        let diff = (poly_area - count_cov).max(0.0);
-        if masked_pixels == 0 && diff <= 1e-6 * poly_area.max(1.0) {
-            (100.0, 0.0)
-        } else {
-            (((count_cov / poly_area) * 100.0).clamp(0.0, 100.0), diff)
-        }
-    } else {
-        let total_touched = valid_pixels + masked_pixels;
-        let vp = if total_touched > 0 {
-            ((valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-        (vp, masked_pixels as f64)
-    };
+    let (valid_percent, masked_pixels_out) =
+        weighted_valid_percent_and_masked(count_cov, valid_pixels, masked_pixels, total_geom_area_px);
 
     // Radix-sort once for weighted quantiles, unique count, majority/minority, and histogram.
     if all_unit {
@@ -1722,12 +1706,10 @@ pub fn compute_weighted_band_stats_with_geom(
         opts.percentiles.clone()
     };
     for p in pcts {
-        let key = if p.fract() == 0.0 {
-            format!("percentile_{}", p as i64)
-        } else {
-            format!("percentile_{p}")
-        };
-        obj.insert(key, serde_json::json!(weighted_quantile(p)));
+        obj.insert(
+            crate::titiler::percentile_key(p),
+            serde_json::json!(weighted_quantile(p)),
+        );
     }
     if !description.is_empty() {
         obj.insert("description".into(), serde_json::json!(description));
@@ -1735,81 +1717,50 @@ pub fn compute_weighted_band_stats_with_geom(
     serde_json::Value::Object(obj)
 }
 
-/// Compute exact analytical coverage-weighted & ellipsoidal area-weighted zonal statistics
-/// directly on the COG's native pixel grid (zero resampling).
-#[cfg(feature = "gpu")]
-fn weighted_gpu_stats_to_json(
-    gs: &cogzilla_gpu::GpuWeightedBandStats,
-    area_scale: f64,
-    total_poly_area_px: Option<f64>,
-    description: &str,
-    opts: &StatsOptions,
-) -> serde_json::Value {
-    let count_out = snap_near_int(gs.count_cov);
-    let poly_area = total_poly_area_px.unwrap_or(0.0).max(gs.count_cov);
-    let (valid_percent, masked_pixels) = if poly_area > 0.0 {
-        (
-            ((gs.count_cov / poly_area) * 100.0).clamp(0.0, 100.0),
-            (poly_area - gs.count_cov).max(0.0),
-        )
+/// Shared CPU+GPU polygon-relative `(valid_percent, masked_pixels)` computation.
+/// Snaps floating-point coverage sum drift (`<= 1e-6 * poly_area`) to `(100.0, 0.0)` when no
+/// pixels were masked so CPU and GPU agree identically on fully-valid polygons.
+fn weighted_valid_percent_and_masked(
+    count_cov: f64,
+    valid_pixels: usize,
+    masked_pixels: usize,
+    total_geom_area_px: Option<f64>,
+) -> (f64, f64) {
+    if let Some(poly_area) = total_geom_area_px
+        && poly_area > COV_EPS
+    {
+        let diff = (poly_area - count_cov).max(0.0);
+        if masked_pixels == 0 && diff <= 1e-6 * poly_area.max(1.0) {
+            (100.0, 0.0)
+        } else {
+            (((count_cov / poly_area) * 100.0).clamp(0.0, 100.0), diff)
+        }
     } else {
-        let total_touched = gs.valid_pixels + gs.masked_pixels;
+        let total_touched = valid_pixels + masked_pixels;
         let vp = if total_touched > 0 {
-            ((gs.valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+            ((valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
         } else {
             0.0
         };
-        (vp, gs.masked_pixels as f64)
-    };
-    let mut obj = serde_json::Map::new();
-    obj.insert("min".into(), serde_json::json!(gs.min));
-    obj.insert("max".into(), serde_json::json!(gs.max));
-    obj.insert("mean".into(), serde_json::json!(gs.mean));
-    obj.insert("count".into(), serde_json::json!(count_out));
-    obj.insert("sum".into(), serde_json::json!(gs.sum_cov));
-    obj.insert("std".into(), serde_json::json!(gs.std));
-    obj.insert("median".into(), serde_json::json!(gs.median));
-    obj.insert("majority".into(), serde_json::json!(gs.majority));
-    obj.insert("minority".into(), serde_json::json!(gs.minority));
-    obj.insert("unique".into(), serde_json::json!(gs.unique_bins as f64));
-    obj.insert(
-        "histogram".into(),
-        serde_json::json!([gs.hist_counts, gs.hist_edges]),
-    );
-    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
-    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
-    obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels as f64));
-    obj.insert("area".into(), serde_json::json!(gs.area_valid_m2 * area_scale));
-    for &(p, val) in &gs.percentiles {
-        let key = if p.fract() == 0.0 {
-            format!("percentile_{}", p as i64)
-        } else {
-            format!("percentile_{p}")
-        };
-        obj.insert(key, serde_json::json!(val));
+        (vp, masked_pixels as f64)
     }
-    let _ = opts;
-    if !description.is_empty() {
-        obj.insert("description".into(), serde_json::json!(description));
-    }
-    serde_json::Value::Object(obj)
 }
 
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
-fn try_gpu_weighted_polygon_bands(
-    gpu: &crate::gpu_backend::GpuBackend,
-    bands: &[(&str, &[f32])],
+struct GpuZonalWeights {
+    row_areas: Vec<f32>,
+    area_scale: f64,
+    cov_f32: Vec<f32>,
+    pcts: Vec<f64>,
+}
+
+#[cfg(feature = "gpu")]
+fn prepare_gpu_zonal_weights(
     cov: &[f64],
-    win_w: usize,
     win_h: usize,
     area_model: &PixelAreaModel,
-    total_poly_area_px: Option<f64>,
     opts: &StatsOptions,
-) -> Option<Vec<serde_json::Value>> {
-    if opts.categorical || opts.histogram_edges.is_some() || bands.is_empty() {
-        return None;
-    }
+) -> Option<GpuZonalWeights> {
     let (row_areas, area_scale): (Vec<f32>, f64) = match area_model {
         PixelAreaModel::Constant(a) => {
             let scale = if *a > 0.0 { *a } else { 1.0 };
@@ -1844,23 +1795,93 @@ fn try_gpu_weighted_polygon_bands(
     } else {
         cov.iter().map(|&c| c as f32).collect()
     };
-    let slices: Vec<&[f32]> = bands.iter().map(|&(_, s)| s).collect();
     let pcts: Vec<f64> = if opts.percentiles.is_empty() {
         vec![2.0, 98.0]
     } else {
         opts.percentiles.clone()
     };
+    Some(GpuZonalWeights {
+        row_areas,
+        area_scale,
+        cov_f32,
+        pcts,
+    })
+}
+
+/// Compute exact analytical coverage-weighted & ellipsoidal area-weighted zonal statistics
+/// directly on the COG's native pixel grid (zero resampling).
+#[cfg(feature = "gpu")]
+fn weighted_gpu_stats_to_json(
+    gs: &cogzilla_gpu::GpuWeightedBandStats,
+    area_scale: f64,
+    total_poly_area_px: Option<f64>,
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let count_out = snap_near_int(gs.count_cov);
+    let (valid_percent, masked_pixels) = weighted_valid_percent_and_masked(
+        gs.count_cov,
+        gs.valid_pixels,
+        gs.masked_pixels,
+        total_poly_area_px,
+    );
+    let mut obj = serde_json::Map::new();
+    obj.insert("min".into(), serde_json::json!(gs.min));
+    obj.insert("max".into(), serde_json::json!(gs.max));
+    obj.insert("mean".into(), serde_json::json!(gs.mean));
+    obj.insert("count".into(), serde_json::json!(count_out));
+    obj.insert("sum".into(), serde_json::json!(gs.sum_cov));
+    obj.insert("std".into(), serde_json::json!(gs.std));
+    obj.insert("median".into(), serde_json::json!(gs.median));
+    obj.insert("majority".into(), serde_json::json!(gs.majority));
+    obj.insert("minority".into(), serde_json::json!(gs.minority));
+    obj.insert("unique".into(), serde_json::json!(gs.unique_bins as f64));
+    obj.insert(
+        "histogram".into(),
+        serde_json::json!([gs.hist_counts, gs.hist_edges]),
+    );
+    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
+    obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels as f64));
+    obj.insert("area".into(), serde_json::json!(gs.area_valid_m2 * area_scale));
+    for &(p, val) in &gs.percentiles {
+        obj.insert(crate::titiler::percentile_key(p), serde_json::json!(val));
+    }
+    let _ = opts;
+    if !description.is_empty() {
+        obj.insert("description".into(), serde_json::json!(description));
+    }
+    serde_json::Value::Object(obj)
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_weighted_polygon_bands(
+    gpu: &crate::gpu_backend::GpuBackend,
+    bands: &[(&str, &[f32])],
+    cov: &[f64],
+    win_w: usize,
+    win_h: usize,
+    area_model: &PixelAreaModel,
+    total_poly_area_px: Option<f64>,
+    opts: &StatsOptions,
+) -> Option<Vec<serde_json::Value>> {
+    if opts.categorical || opts.histogram_edges.is_some() || bands.is_empty() {
+        return None;
+    }
+    let weights = prepare_gpu_zonal_weights(cov, win_h, area_model, opts)?;
+    let slices: Vec<&[f32]> = bands.iter().map(|&(_, s)| s).collect();
     let gs_list = gpu.try_reduce_weighted_zonal_stats(
         &slices,
-        &cov_f32,
+        &weights.cov_f32,
         win_w,
-        &row_areas,
+        &weights.row_areas,
         opts.area_weighted,
         COV_EPS as f32,
         PIXEL_SET_EPS as f32,
         opts.histogram_bins.clamp(1, 1000),
         opts.histogram_range,
-        &pcts,
+        &weights.pcts,
     )?;
     // If any band hit 0 valid_pixels (e.g. microscopic sub-pixel polygon), fall back to CPU.
     if gs_list.iter().any(|gs| gs.valid_pixels == 0) {
@@ -1871,7 +1892,7 @@ fn try_gpu_weighted_polygon_bands(
             .iter()
             .zip(bands.iter())
             .map(|(gs, &(desc, _))| {
-                weighted_gpu_stats_to_json(gs, area_scale, total_poly_area_px, desc, opts)
+                weighted_gpu_stats_to_json(gs, weights.area_scale, total_poly_area_px, desc, opts)
             })
             .collect(),
     )
@@ -1901,21 +1922,6 @@ fn try_gpu_weighted_polygon_exprs(
     {
         return None;
     }
-    let (row_areas, area_scale): (Vec<f32>, f64) = match area_model {
-        PixelAreaModel::Constant(a) => {
-            let scale = if *a > 0.0 { *a } else { 1.0 };
-            (vec![(*a / scale) as f32; win_h], scale)
-        }
-        PixelAreaModel::PerRow(rows) => {
-            if rows.len() != win_h {
-                return None;
-            }
-            let max_a = rows.iter().copied().fold(0.0_f64, f64::max);
-            let scale = if max_a > 0.0 { max_a } else { 1.0 };
-            (rows.iter().map(|&a| (a / scale) as f32).collect(), scale)
-        }
-        PixelAreaModel::Lattice { .. } => return None,
-    };
 
     // Compile each expression to GPU bytecode and remap LoadBand(local_slot) -> shared raw_bands index.
     let mut compiled: Vec<(Vec<cogzilla_gpu::GpuInstr>, u32)> = Vec::with_capacity(exprs.len());
@@ -1937,48 +1943,24 @@ fn try_gpu_weighted_polygon_exprs(
         compiled.push((instrs, band_mask));
     }
 
-    let cov_f32: Vec<f32> = if cov.len() >= 256 * 256 {
-        let mut out = vec![0.0f32; cov.len()];
-        let threads = std::thread::available_parallelism()
-            .map(|p| p.get().clamp(2, 8))
-            .unwrap_or(4);
-        let chunk = cov.len().div_ceil(threads);
-        std::thread::scope(|s| {
-            for (dst, src) in out.chunks_mut(chunk).zip(cov.chunks(chunk)) {
-                s.spawn(move || {
-                    for (d, &c) in dst.iter_mut().zip(src.iter()) {
-                        *d = c as f32;
-                    }
-                });
-            }
-        });
-        out
-    } else {
-        cov.iter().map(|&c| c as f32).collect()
-    };
-
+    let weights = prepare_gpu_zonal_weights(cov, win_h, area_model, opts)?;
     let raw_slices: Vec<&[f32]> = band_bufs.iter().map(|(_, b)| b.as_slice()).collect();
     let expr_refs: Vec<(&[cogzilla_gpu::GpuInstr], u32)> = compiled
         .iter()
         .map(|(ins, mask)| (ins.as_slice(), *mask))
         .collect();
-    let pcts: Vec<f64> = if opts.percentiles.is_empty() {
-        vec![2.0, 98.0]
-    } else {
-        opts.percentiles.clone()
-    };
     let gs_list = gpu.try_reduce_weighted_zonal_expr_stats(
         &raw_slices,
         &expr_refs,
-        &cov_f32,
+        &weights.cov_f32,
         win_w,
-        &row_areas,
+        &weights.row_areas,
         opts.area_weighted,
         COV_EPS as f32,
         PIXEL_SET_EPS as f32,
         opts.histogram_bins.clamp(1, 1000),
         opts.histogram_range,
-        &pcts,
+        &weights.pcts,
     )?;
     if gs_list.iter().any(|gs| gs.valid_pixels == 0) {
         return None;
@@ -1988,7 +1970,7 @@ fn try_gpu_weighted_polygon_exprs(
             .iter()
             .zip(exprs.iter())
             .map(|(gs, (desc, _))| {
-                weighted_gpu_stats_to_json(gs, area_scale, total_poly_area_px, desc, opts)
+                weighted_gpu_stats_to_json(gs, weights.area_scale, total_poly_area_px, desc, opts)
             })
             .collect(),
     )
@@ -2302,7 +2284,7 @@ pub async fn compute_native_exact_polygon_stats(
                        off: f32|
      -> Vec<f32> {
         let mut pixels = vec![f32::NAN; n_px];
-        let nd_finite = eff_nodata.filter(|nd| nd.is_finite());
+        let scale_off = unscale.then_some((sc, off));
         for (bi, tile_opt) in tiles.iter().enumerate() {
             let Some(tile) = tile_opt else { continue };
             let Some(band) = tile.bands.get(band_in_tile) else { continue };
@@ -2314,102 +2296,23 @@ pub async fn compute_native_exact_polygon_stats(
             let rx1 = c1.min(tile_x0 + tw);
             let ry0 = r0.max(tile_y0);
             let ry1 = r1.min(tile_y0 + th);
-            let span = rx1 - rx0;
-            let lx0 = rx0 - tile_x0;
-            let dst_x0 = rx0 - c0;
-            match &band.data {
-                cogzilla_codec::BandData::F32(slab)
-                    if !unscale && nd_finite.is_none() =>
-                {
-                    let src_slice = slab.as_slice();
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        pixels[d0..d0 + span].copy_from_slice(&src_slice[s0..s0 + span]);
-                    }
-                }
-                cogzilla_codec::BandData::F32(slab) => {
-                    let src_slice = slab.as_slice();
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        let dst = &mut pixels[d0..d0 + span];
-                        for (d, &raw) in dst.iter_mut().zip(&src_slice[s0..s0 + span]) {
-                            if !raw.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = nd_finite
-                                && raw == nd
-                            {
-                                continue;
-                            }
-                            *d = if unscale { raw * sc + off } else { raw };
-                        }
-                    }
-                }
-                cogzilla_codec::BandData::U16 { data, nodata } => {
-                    let nd_internal = *nodata;
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        let dst = &mut pixels[d0..d0 + span];
-                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
-                            if nd_internal == Some(raw) {
-                                continue;
-                            }
-                            let v = raw as f32;
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            *d = if unscale { v * sc + off } else { v };
-                        }
-                    }
-                }
-                cogzilla_codec::BandData::U8 { data, nodata } => {
-                    let nd_internal = *nodata;
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        let dst = &mut pixels[d0..d0 + span];
-                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
-                            if nd_internal == Some(raw) {
-                                continue;
-                            }
-                            let v = raw as f32;
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            *d = if unscale { v * sc + off } else { v };
-                        }
-                    }
-                }
-                _ => {
-                    for row in ry0..ry1 {
-                        let ly = row - tile_y0;
-                        let dst_row = (row - r0) * win_w;
-                        for col in rx0..rx1 {
-                            let lx = col - tile_x0;
-                            let mut v = band.data.get_f32(ly * tw + lx);
-                            if !v.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            if unscale {
-                                v = v * sc + off;
-                            }
-                            pixels[dst_row + (col - c0)] = v;
-                        }
-                    }
-                }
-            }
+            let copy_w = rx1.saturating_sub(rx0);
+            let copy_h = ry1.saturating_sub(ry0);
+            cogzilla_kernel::copy_band_data_rect_to_f32(
+                &band.data,
+                tw,
+                rx0 - tile_x0,
+                ry0 - tile_y0,
+                copy_w,
+                copy_h,
+                &mut pixels,
+                win_w,
+                rx0 - c0,
+                ry0 - r0,
+                eff_nodata,
+                scale_off,
+                true,
+            );
         }
         pixels
     };
@@ -3144,18 +3047,13 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         let asset_ifd = &asset_cog.index.ifds[ifd_idx];
         let asset_tw = asset_ifd.tile_width as usize;
         let asset_th = asset_ifd.tile_height as usize;
-        let eff_nodata = nodata_override.or_else(|| asset_cog.index.nodata.map(|v| v as f32));
-        let nd_finite = eff_nodata.filter(|nd| nd.is_finite());
-        let sc = if unscale {
-            asset_cog.index.scales.first().copied().unwrap_or(1.0)
-        } else {
-            1.0
-        };
-        let off = if unscale {
-            asset_cog.index.offsets.first().copied().unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        let eff_nodata = nodata_override.or(asset_cog.index.nodata);
+        let scale_off = unscale.then(|| {
+            (
+                asset_cog.index.scales.first().copied().unwrap_or(1.0),
+                asset_cog.index.offsets.first().copied().unwrap_or(0.0),
+            )
+        });
         let mut pixels = vec![f32::NAN; n_px];
         for (bi, tile_opt) in tiles.iter().enumerate() {
             let Some(tile) = tile_opt else { continue };
@@ -3168,105 +3066,23 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             let rx1 = c1.min(tile_x0 + asset_tw);
             let ry0 = r0.max(tile_y0);
             let ry1 = r1.min(tile_y0 + asset_th);
-            let span = rx1.saturating_sub(rx0);
-            if span == 0 || ry1 <= ry0 {
-                continue;
-            }
-            let lx0 = rx0 - tile_x0;
-            let dst_x0 = rx0 - c0;
-            match &band.data {
-                cogzilla_codec::BandData::F32(slab)
-                    if !unscale && nd_finite.is_none() =>
-                {
-                    let src_slice = slab.as_slice();
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * asset_tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        pixels[d0..d0 + span].copy_from_slice(&src_slice[s0..s0 + span]);
-                    }
-                }
-                cogzilla_codec::BandData::F32(slab) => {
-                    let src_slice = slab.as_slice();
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * asset_tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        let dst = &mut pixels[d0..d0 + span];
-                        for (d, &v) in dst.iter_mut().zip(&src_slice[s0..s0 + span]) {
-                            if !v.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            *d = if unscale { v * sc + off } else { v };
-                        }
-                    }
-                }
-                cogzilla_codec::BandData::U16 { data, nodata } => {
-                    let nd_internal = *nodata;
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * asset_tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        let dst = &mut pixels[d0..d0 + span];
-                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
-                            if nd_internal == Some(raw) {
-                                continue;
-                            }
-                            let v = raw as f32;
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            *d = if unscale { v * sc + off } else { v };
-                        }
-                    }
-                }
-                cogzilla_codec::BandData::U8 { data, nodata } => {
-                    let nd_internal = *nodata;
-                    for row in ry0..ry1 {
-                        let s0 = (row - tile_y0) * asset_tw + lx0;
-                        let d0 = (row - r0) * win_w + dst_x0;
-                        let dst = &mut pixels[d0..d0 + span];
-                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
-                            if nd_internal == Some(raw) {
-                                continue;
-                            }
-                            let v = raw as f32;
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            *d = if unscale { v * sc + off } else { v };
-                        }
-                    }
-                }
-                _ => {
-                    for row in ry0..ry1 {
-                        let ly = row - tile_y0;
-                        let dst_row = (row - r0) * win_w;
-                        for col in rx0..rx1 {
-                            let lx = col - tile_x0;
-                            let mut v = band.data.get_f32(ly * asset_tw + lx);
-                            if !v.is_finite() {
-                                continue;
-                            }
-                            if let Some(nd) = nd_finite
-                                && v == nd
-                            {
-                                continue;
-                            }
-                            if unscale {
-                                v = v * sc + off;
-                            }
-                            pixels[dst_row + (col - c0)] = v;
-                        }
-                    }
-                }
-            }
+            let copy_w = rx1.saturating_sub(rx0);
+            let copy_h = ry1.saturating_sub(ry0);
+            cogzilla_kernel::copy_band_data_rect_to_f32(
+                &band.data,
+                asset_tw,
+                rx0 - tile_x0,
+                ry0 - tile_y0,
+                copy_w,
+                copy_h,
+                &mut pixels,
+                win_w,
+                rx0 - c0,
+                ry0 - r0,
+                eff_nodata,
+                scale_off,
+                true,
+            );
         }
         pixels
     };

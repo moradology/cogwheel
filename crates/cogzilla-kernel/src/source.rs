@@ -507,6 +507,217 @@ impl<'a> BandSource<'a> {
     }
 }
 
+/// Copy a rectangular sub-region `(lx0..lx0+copy_w, ly0..ly0+copy_h)` from a decoded `BandData`
+/// tile into a destination `f32` buffer at `(dst_x0, dst_y0)` with `dst_stride`, applying both
+/// internal `GDAL_NODATA` and optional `nodata_override` + `(scale, offset)` using hoisted
+/// dtype-specialized loops.
+///
+/// When `reject_non_finite` is `true`, `±Inf` values are masked to `f32::NAN` (used by zonal
+/// statistics); otherwise `F32` tiles without overrides copy via fast `copy_from_slice`.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_band_data_rect_to_f32(
+    data: &cogzilla_codec::BandData,
+    src_stride: usize,
+    lx0: usize,
+    ly0: usize,
+    copy_w: usize,
+    copy_h: usize,
+    dst: &mut [f32],
+    dst_stride: usize,
+    dst_x0: usize,
+    dst_y0: usize,
+    nodata_override: Option<f32>,
+    scale_offset: Option<(f32, f32)>,
+    reject_non_finite: bool,
+) {
+    use cogzilla_codec::BandData;
+
+    if copy_w == 0 || copy_h == 0 {
+        return;
+    }
+    let nd_ovr = nodata_override.filter(|nd| nd.is_finite());
+
+    match data {
+        BandData::F32(slab) => {
+            let sdata = slab.as_slice();
+            if nd_ovr.is_none() && scale_offset.is_none() && !reject_non_finite {
+                for dy in 0..copy_h {
+                    let s0 = (ly0 + dy) * src_stride + lx0;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    dst[d0..d0 + copy_w].copy_from_slice(&sdata[s0..s0 + copy_w]);
+                }
+            } else {
+                for dy in 0..copy_h {
+                    let s0 = (ly0 + dy) * src_stride + lx0;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let srow = &sdata[s0..s0 + copy_w];
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (d, &v) in drow.iter_mut().zip(srow) {
+                        if reject_non_finite && !v.is_finite() {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        if let Some(nd) = nd_ovr
+                            && v == nd
+                        {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        *d = match scale_offset {
+                            Some((sc, off)) if !v.is_nan() => v * sc + off,
+                            _ => v,
+                        };
+                    }
+                }
+            }
+        }
+        BandData::F64(sdata) => {
+            for dy in 0..copy_h {
+                let s0 = (ly0 + dy) * src_stride + lx0;
+                let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                let srow = &sdata[s0..s0 + copy_w];
+                let drow = &mut dst[d0..d0 + copy_w];
+                for (d, &v64) in drow.iter_mut().zip(srow) {
+                    let v = v64 as f32;
+                    if reject_non_finite && !v.is_finite() {
+                        *d = f32::NAN;
+                        continue;
+                    }
+                    if let Some(nd) = nd_ovr
+                        && v == nd
+                    {
+                        *d = f32::NAN;
+                        continue;
+                    }
+                    *d = match scale_offset {
+                        Some((sc, off)) if !v.is_nan() => v * sc + off,
+                        _ => v,
+                    };
+                }
+            }
+        }
+        BandData::U16 { data: sdata, nodata } => {
+            let nd_u16 = *nodata;
+            if nd_u16.is_none() && nd_ovr.is_none() && scale_offset.is_none() {
+                for dy in 0..copy_h {
+                    let s0 = (ly0 + dy) * src_stride + lx0;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let srow = &sdata[s0..s0 + copy_w];
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (d, &s) in drow.iter_mut().zip(srow) {
+                        *d = s as f32;
+                    }
+                }
+            } else {
+                for dy in 0..copy_h {
+                    let s0 = (ly0 + dy) * src_stride + lx0;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let srow = &sdata[s0..s0 + copy_w];
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (d, &s) in drow.iter_mut().zip(srow) {
+                        if nd_u16 == Some(s) {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        let v = s as f32;
+                        if let Some(nd) = nd_ovr
+                            && v == nd
+                        {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        *d = match scale_offset {
+                            Some((sc, off)) => v * sc + off,
+                            None => v,
+                        };
+                    }
+                }
+            }
+        }
+        BandData::U8 { data: sdata, nodata } => {
+            let nd_u8 = *nodata;
+            if nd_u8.is_none() && nd_ovr.is_none() && scale_offset.is_none() {
+                for dy in 0..copy_h {
+                    let s0 = (ly0 + dy) * src_stride + lx0;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let srow = &sdata[s0..s0 + copy_w];
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (d, &s) in drow.iter_mut().zip(srow) {
+                        *d = s as f32;
+                    }
+                }
+            } else {
+                for dy in 0..copy_h {
+                    let s0 = (ly0 + dy) * src_stride + lx0;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let srow = &sdata[s0..s0 + copy_w];
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (d, &s) in drow.iter_mut().zip(srow) {
+                        if nd_u8 == Some(s) {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        let v = s as f32;
+                        if let Some(nd) = nd_ovr
+                            && v == nd
+                        {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        *d = match scale_offset {
+                            Some((sc, off)) => v * sc + off,
+                            None => v,
+                        };
+                    }
+                }
+            }
+        }
+        BandData::RgbU8Channel {
+            rgb,
+            channel,
+            nodata,
+        } => {
+            let ch = *channel as usize;
+            let nd_u8 = *nodata;
+            let raw: &[u8] = rgb;
+            if nd_u8.is_none() && nd_ovr.is_none() && scale_offset.is_none() {
+                for dy in 0..copy_h {
+                    let s_base = ((ly0 + dy) * src_stride + lx0) * 3 + ch;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (i, d) in drow.iter_mut().enumerate() {
+                        *d = raw[s_base + i * 3] as f32;
+                    }
+                }
+            } else {
+                for dy in 0..copy_h {
+                    let s_base = ((ly0 + dy) * src_stride + lx0) * 3 + ch;
+                    let d0 = (dst_y0 + dy) * dst_stride + dst_x0;
+                    let drow = &mut dst[d0..d0 + copy_w];
+                    for (i, d) in drow.iter_mut().enumerate() {
+                        let s = raw[s_base + i * 3];
+                        if nd_u8 == Some(s) {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        let v = s as f32;
+                        if let Some(nd) = nd_ovr
+                            && v == nd
+                        {
+                            *d = f32::NAN;
+                            continue;
+                        }
+                        *d = match scale_offset {
+                            Some((sc, off)) => v * sc + off,
+                            None => v,
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
