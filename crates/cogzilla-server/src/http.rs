@@ -2414,7 +2414,11 @@ fn attach_x_assets(resp: &mut Response<Full<Bytes>>, assets: &[String]) {
     if assets.is_empty() || !resp.status().is_success() {
         return;
     }
-    let joined = assets.join(",");
+    let joined = assets
+        .iter()
+        .map(|u| cogzilla_io::redact_http_url(u))
+        .collect::<Vec<_>>()
+        .join(",");
     if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
         resp.headers_mut().insert("x-assets", hv);
     }
@@ -5638,19 +5642,24 @@ where
                 .map(|s| s.to_ascii_lowercase())
         })
         .unwrap_or_else(|| "http".to_string());
+    let valid_host = |s: &&str| {
+        !s.is_empty()
+            && !s.contains('@')
+            && s.parse::<hyper::http::uri::Authority>().is_ok()
+    };
     let host_raw = req
         .headers()
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .filter(valid_host)
         .or_else(|| {
             req.headers()
                 .get("host")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
+                .filter(valid_host)
         })
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("127.0.0.1:8080");
@@ -5662,6 +5671,7 @@ where
         .filter(|s| {
             !s.is_empty()
                 && s.starts_with('/')
+                && !s.contains("//")
                 && !s.contains("..")
                 && s.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~'))
@@ -12346,5 +12356,46 @@ mod tests {
         let ifd_am = make_ifd(512, 512, (x1 - x0) / 512.0, (y1 - y0) / 512.0, x0, y0);
         let (aw, ah) = native_bbox_dims_in_crs(&ifd_am, &utm60, &geo, [179.0, -1.0, 181.0, 1.0], [179.0, -1.0, 181.0, 1.0]);
         assert!((450..=580).contains(&aw) && (450..=580).contains(&ah), "got ({aw}, {ah})");
+    }
+
+    #[test]
+    fn attach_x_assets_redacts_secrets_and_preserves_plain_names() {
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        attach_x_assets(
+            &mut resp,
+            &[
+                "https://user:secret@example.com/a.tif?X-Amz-Signature=deadbeef&sig=123".to_string(),
+                "red".to_string(),
+                "B04".to_string(),
+            ],
+        );
+        let hv = resp.headers().get("x-assets").unwrap().to_str().unwrap();
+        assert_eq!(hv, "https://example.com/a.tif,red,B04");
+        assert!(!hv.contains("secret") && !hv.contains("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn forwarded_prefix_rejects_protocol_relative_and_invalid_host() {
+        let engine = Arc::new(TileEngine::new(4 * 1024 * 1024));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/docs")
+            .header("x-forwarded-prefix", "//evil.com")
+            .header("x-forwarded-host", "attacker@evil.com/bad")
+            .header("host", "127.0.0.1:8080")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(!html.contains("//evil.com"), "protocol-relative prefix leaked into HTML: {html}");
+        assert!(!html.contains("attacker@"), "invalid forwarded host leaked into HTML: {html}");
     }
 }
