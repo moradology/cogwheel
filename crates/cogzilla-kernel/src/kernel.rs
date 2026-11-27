@@ -2522,21 +2522,6 @@ pub fn npy_descr(kind: SampleType) -> &'static str {
     }
 }
 
-/// A `.npy` array of `bands` planes of `height` by `width`, written in the dtype of `kind`
-/// from CHW float32 `values` in which NaN marks a value that is not there.
-///
-/// A value that is not there is written as `absent`, or as zero without one. Integers take
-/// the value truncated toward zero and held to the type's range (a NaN `absent` is zero);
-/// the float types hold an infinity to their largest finite number. With `mask`, one more
-/// plane follows the bands, as rio-tiler's `ImageData.mask` is: the type's largest number
-/// (`255` for `u1`, `65535` for `u2`, `f32::MAX` for `f4`, ...) where any band has a value,
-/// and its smallest elsewhere (`0` for the unsigned types, `-32768` for `i2`, `f32::MIN`
-/// for `f4`, ...). Only the first
-/// `bands * height * width` of `values` are written, and a shorter slice makes a shorter
-/// body under a header that still names every plane.
-///
-/// This is not the float32 path of [`wrap_raw_f32_as_npy_with_mask`], which copies its
-/// planes as they are, counts an infinity as absent and writes `255.0` in its mask.
 fn write_npy_typed_planes(
     out: &mut Vec<u8>,
     kind: SampleType,
@@ -2574,6 +2559,21 @@ fn write_npy_typed_planes(
     }
 }
 
+/// A `.npy` array of `bands` planes of `height` by `width`, written in the dtype of `kind`
+/// from CHW float32 `values` in which NaN marks a value that is not there.
+///
+/// A value that is not there is written as `absent`, or as zero without one. Integers take
+/// the value truncated toward zero and held to the type's range (a NaN `absent` is zero);
+/// the float types hold an infinity to their largest finite number. With `mask`, one more
+/// plane follows the bands, as rio-tiler's `ImageData.mask` is: the type's largest number
+/// (`255` for `u1`, `65535` for `u2`, `f32::MAX` for `f4`, ...) where any band has a value,
+/// and its smallest elsewhere (`0` for the unsigned types, `-32768` for `i2`, `f32::MIN`
+/// for `f4`, ...). Only the first
+/// `bands * height * width` of `values` are written, and a shorter slice makes a shorter
+/// body under a header that still names every plane.
+///
+/// This is not the float32 path of [`wrap_raw_f32_as_npy_with_mask`], which copies its
+/// planes as they are, counts an infinity as absent and writes `255.0` in its mask.
 pub fn encode_npy_typed(
     values: &[f32],
     bands: usize,
