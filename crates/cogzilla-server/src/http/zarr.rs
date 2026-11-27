@@ -263,6 +263,22 @@ pub enum ServerZarrStore {
     },
 }
 
+fn zarr_http_client() -> Result<&'static reqwest::Client, ZarrError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| ZarrError::UpstreamError {
+            key: "http-client".into(),
+            detail: e.clone(),
+        })
+}
+
 impl ServerZarrStore {
     pub fn from_url(raw_url: &str) -> Result<Self, ZarrError> {
         let trimmed = raw_url.trim();
@@ -279,13 +295,7 @@ impl ServerZarrStore {
             });
         }
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|e| ZarrError::UpstreamError {
-                    key: trimmed.to_string(),
-                    detail: e.to_string(),
-                })?;
+            let client = zarr_http_client()?.clone();
             return Ok(Self::Http {
                 base_url: trimmed.trim_end_matches('/').to_string(),
                 client,
@@ -537,8 +547,9 @@ impl ZarrQuery {
         };
         for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = percent_decode(k);
             let val = percent_decode(v);
-            match k {
+            match key.as_str() {
                 "url" => q.url = Some(val),
                 "variable" => q.variable = Some(val),
                 "group" => q.group = Some(val),
