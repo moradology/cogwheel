@@ -4889,6 +4889,20 @@ async fn compute_mosaic_statistics_with_fold(
                 EngineError::NotFound("no readable mosaic scenes intersect requested bounds".into())
             }));
         }
+        let mut exact_opts = stats_opts.clone();
+        if exact_opts.hist_dtype.is_none() {
+            let band_dtype = crate::histogram::HistDtype::for_sample_type(
+                opened[0].1.index.full_res().sample_type,
+                pq.unscale,
+            );
+            exact_opts.hist_dtype = Some(if method == Selection::Count {
+                crate::histogram::HistDtype::Float64
+            } else if let Some(expr) = pq.expr_raw.as_deref() {
+                crate::histogram::HistDtype::for_expression(expr, band_dtype)
+            } else {
+                band_dtype
+            });
+        }
         if let Some(exact) = crate::zonal::compute_native_exact_mosaic_fold_stats(
             engine,
             &opened,
@@ -4898,7 +4912,7 @@ async fn compute_mosaic_statistics_with_fold(
             pq.nodata,
             method,
             MAX_MEDIAN_BUFFER_BYTES,
-            stats_opts,
+            &exact_opts,
         )
         .await?
         {
@@ -4908,6 +4922,7 @@ async fn compute_mosaic_statistics_with_fold(
 
     let mut eff_bbox = wgs_bbox;
     let mut out_dims: Option<(u32, u32)> = None;
+    let mut first_sample_type: Option<cogzilla_tiff::SampleType> = None;
     let mut selected_bidx: Vec<u16> = Vec::new();
     let mut band_descs: Vec<String> = Vec::new();
     let mut fold: Option<Fold> = None;
@@ -4932,6 +4947,7 @@ async fn compute_mosaic_statistics_with_fold(
         };
         let cogs = [cog];
         let full = cogs[0].index.full_res();
+        first_sample_type.get_or_insert(full.sample_type);
         let (out_w, out_h) = match out_dims {
             Some(d) => d,
             None => {
@@ -5121,6 +5137,19 @@ async fn compute_mosaic_statistics_with_fold(
             (nb, vec![f32::NAN; nb * total_px])
         }
     };
+    let mut eff_opts = stats_opts.clone();
+    if eff_opts.hist_dtype.is_none()
+        && let Some(st) = first_sample_type
+    {
+        let band_dtype = crate::histogram::HistDtype::for_sample_type(st, pq.unscale);
+        eff_opts.hist_dtype = Some(if method == Selection::Count {
+            crate::histogram::HistDtype::Float64
+        } else if let Some(expr) = pq.expr_raw.as_deref() {
+            crate::histogram::HistDtype::for_expression(expr, band_dtype)
+        } else {
+            band_dtype
+        });
+    }
     if let Some(mask) = poly_mask {
         let mut keys_descs: Vec<(String, String)> = Vec::with_capacity(out_nb);
         for bi in 0..out_nb {
@@ -5154,7 +5183,7 @@ async fn compute_mosaic_statistics_with_fold(
             out_w as usize,
             out_h as usize,
             mask,
-            stats_opts,
+            &eff_opts,
         );
         return Ok((json, used_assets));
     }
@@ -5173,7 +5202,7 @@ async fn compute_mosaic_statistics_with_fold(
         } else {
             band_descs.get(bi).cloned().unwrap_or_else(|| key.clone())
         };
-        out.insert(key, compute_f32_band_stats(plane, &desc, stats_opts));
+        out.insert(key, compute_f32_band_stats(plane, &desc, &eff_opts));
     }
     Ok((serde_json::Value::Object(out), used_assets))
 }
