@@ -2371,7 +2371,7 @@ impl GpuCoalescer {
         let max_pending = std::env::var("COGZILLA_GPU_MAX_QUEUED")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(256)
+            .unwrap_or(2048)
             .max(max_batch);
 
         let (tx, rx) = mpsc::channel::<PendingRequest>();
