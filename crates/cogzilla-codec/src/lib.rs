@@ -245,114 +245,16 @@ pub fn decode_tile_rows_exact(
         && ifd.predictor == Predictor::None
         && compressed.len() >= expected_bytes
     {
-        let mut bands = match ifd.sample_type {
-            SampleType::Float32 => predictor::reconstruct_predictor1(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                recon_nodata,
-            ),
-            SampleType::Uint16 => predictor::reconstruct_u16(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                false,
-                recon_nodata,
-            ),
-            SampleType::Int16 => predictor::reconstruct_i16(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                false,
-                recon_nodata,
-            ),
-            SampleType::Uint8 => predictor::reconstruct_u8(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                false,
-                recon_nodata,
-            ),
-            SampleType::Int8 => predictor::reconstruct_i8(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                false,
-                recon_nodata,
-            ),
-            SampleType::Uint32 => predictor::reconstruct_int32(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                false,
-                false,
-                recon_nodata_f64,
-            ),
-            SampleType::Int32 => predictor::reconstruct_int32(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                true,
-                false,
-                recon_nodata_f64,
-            ),
-            SampleType::Uint1 => predictor::reconstruct_subbyte(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                1,
-                recon_nodata,
-            ),
-            SampleType::Uint4 => predictor::reconstruct_subbyte(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                4,
-                recon_nodata,
-            ),
-            SampleType::Uint64 => predictor::reconstruct_int64(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                false,
-                false,
-                recon_nodata_f64,
-            ),
-            SampleType::Int64 => predictor::reconstruct_int64(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                true,
-                false,
-                recon_nodata_f64,
-            ),
-            SampleType::Float64 => predictor::reconstruct_f64_uncompressed(
-                &compressed[..expected_bytes],
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                byte_order,
-                recon_nodata_f64,
-            ),
-        };
+        let mut bands = reconstruct_bands(
+            RawTileBuf::Shared(&compressed[..expected_bytes]),
+            ifd,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            Predictor::None,
+            recon_nodata,
+            recon_nodata_f64,
+        );
         apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
         return Ok(DecodedTile { bands });
     }
@@ -861,148 +763,16 @@ pub fn decode_tile_rows_exact(
             (byte_order, ifd.predictor)
         };
 
-        let mut bands = match (ifd.sample_type, eff_predictor) {
-            (SampleType::Float32, Predictor::None) => predictor::reconstruct_predictor1(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                recon_nodata,
-            ),
-            (SampleType::Float32, Predictor::HorizontalInt) => predictor::reconstruct_predictor2(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                recon_nodata,
-            ),
-            (SampleType::Float32, Predictor::FloatingPoint) => predictor::reconstruct_predictor3(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                recon_nodata,
-            ),
-            (SampleType::Uint16, Predictor::None) => predictor::reconstruct_u16(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                false,
-                recon_nodata,
-            ),
-            (SampleType::Uint16, Predictor::HorizontalInt) => predictor::reconstruct_u16(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                true,
-                recon_nodata,
-            ),
-            (SampleType::Uint16, Predictor::FloatingPoint) => predictor::reconstruct_u16(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                false,
-                recon_nodata,
-            ),
-            (SampleType::Int16, p) => predictor::reconstruct_i16(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                p == Predictor::HorizontalInt,
-                recon_nodata,
-            ),
-            (SampleType::Uint8, p) => predictor::reconstruct_u8(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                p == Predictor::HorizontalInt,
-                recon_nodata,
-            ),
-            (SampleType::Int8, p) => predictor::reconstruct_i8(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                p == Predictor::HorizontalInt,
-                recon_nodata,
-            ),
-            (SampleType::Uint32, p) => predictor::reconstruct_int32(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                false,
-                p == Predictor::HorizontalInt,
-                recon_nodata_f64,
-            ),
-            (SampleType::Int32, p) => predictor::reconstruct_int32(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                true,
-                p == Predictor::HorizontalInt,
-                recon_nodata_f64,
-            ),
-            (SampleType::Uint1, _) => predictor::reconstruct_subbyte(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                1,
-                recon_nodata,
-            ),
-            (SampleType::Uint4, _) => predictor::reconstruct_subbyte(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                4,
-                recon_nodata,
-            ),
-            (SampleType::Uint64, p) => predictor::reconstruct_int64(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                false,
-                p == Predictor::HorizontalInt,
-                recon_nodata_f64,
-            ),
-            (SampleType::Int64, p) => predictor::reconstruct_int64(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                true,
-                p == Predictor::HorizontalInt,
-                recon_nodata_f64,
-            ),
-            (SampleType::Float64, p) => predictor::reconstruct_f64(
-                raw_slice,
-                ifd.tile_width,
-                tile_h,
-                bands_in_tile,
-                eff_byte_order,
-                p,
-                recon_nodata_f64,
-            ),
-        };
+        let mut bands = reconstruct_bands(
+            RawTileBuf::Mut(raw_slice),
+            ifd,
+            tile_h,
+            bands_in_tile,
+            eff_byte_order,
+            eff_predictor,
+            recon_nodata,
+            recon_nodata_f64,
+        );
 
         apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
         let mut tile = DecodedTile { bands };
@@ -1141,54 +911,10 @@ fn apply_rgba_alpha_if_present(
             if idx == alpha_idx {
                 continue;
             }
-            if let BandData::F64(ref mut slice) = b.data {
-                let mut all_nd = true;
-                let mut no_nd = true;
-                let mut mn = f64::INFINITY;
-                let mut mx = f64::NEG_INFINITY;
-                for v in slice.iter_mut() {
-                    if v.is_nan() || (!nd_f64.is_nan() && *v == nd_f64) {
-                        *v = f64::NAN;
-                        no_nd = false;
-                    } else {
-                        all_nd = false;
-                        if *v < mn { mn = *v; }
-                        if *v > mx { mx = *v; }
-                    }
-                }
-                b.stats = BlockStats {
-                    all_nodata: all_nd,
-                    no_nodata: no_nd,
-                    min: if all_nd { f32::NAN } else { (mn as f32).clamp(f32::MIN, f32::MAX) },
-                    max: if all_nd { f32::NAN } else { (mx as f32).clamp(f32::MIN, f32::MAX) },
-                };
-                continue;
-            }
-            let slice = b.data.make_f32_mut();
-            let mut all_nd = true;
-            let mut no_nd = true;
-            let mut mn = f32::INFINITY;
-            let mut mx = f32::NEG_INFINITY;
-            for v in slice.iter_mut() {
-                if v.is_nan() || (!nd_f32.is_nan() && *v == nd_f32) {
-                    *v = f32::NAN;
-                    no_nd = false;
-                } else {
-                    all_nd = false;
-                    if *v < mn {
-                        mn = *v;
-                    }
-                    if *v > mx {
-                        mx = *v;
-                    }
-                }
-            }
-            b.stats = BlockStats {
-                all_nodata: all_nd,
-                no_nodata: no_nd,
-                min: if all_nd { f32::NAN } else { mn },
-                max: if all_nd { f32::NAN } else { mx },
-            };
+            let is_f64 = matches!(b.data, BandData::F64(_));
+            let nd_cmp = if is_f64 { nd_f64 } else { f64::from(nd_f32) };
+            let limit = b.data.len();
+            mask_band_where(b, limit, |_, v| !nd_cmp.is_nan() && v == nd_cmp);
         }
     }
 
@@ -1208,6 +934,237 @@ fn apply_rgba_alpha_if_present(
     }
 }
 
+enum RawTileBuf<'a> {
+    Shared(&'a [u8]),
+    Mut(&'a mut [u8]),
+}
+
+impl RawTileBuf<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Shared(s) => s,
+            Self::Mut(s) => s,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_bands(
+    raw: RawTileBuf<'_>,
+    ifd: &IfdMeta,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    pred: Predictor,
+    recon_nodata: Option<f32>,
+    recon_nodata_f64: Option<f64>,
+) -> Vec<DecodedBand> {
+    let horiz = pred == Predictor::HorizontalInt;
+    match (ifd.sample_type, pred, raw) {
+        (SampleType::Float32, Predictor::None, r) => predictor::reconstruct_predictor1(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            recon_nodata,
+        ),
+        (SampleType::Float32, Predictor::HorizontalInt, r) => predictor::reconstruct_predictor2(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            recon_nodata,
+        ),
+        (SampleType::Float32, Predictor::FloatingPoint, RawTileBuf::Mut(r)) => {
+            predictor::reconstruct_predictor3(r, ifd.tile_width, tile_h, bands_in_tile, recon_nodata)
+        }
+        (SampleType::Float32, Predictor::FloatingPoint, RawTileBuf::Shared(_)) => {
+            unreachable!("Predictor::FloatingPoint always uses scratch buffer")
+        }
+        (SampleType::Uint16, _, r) => predictor::reconstruct_u16(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            horiz,
+            recon_nodata,
+        ),
+        (SampleType::Int16, _, r) => predictor::reconstruct_i16(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            horiz,
+            recon_nodata,
+        ),
+        (SampleType::Uint8, _, r) => predictor::reconstruct_u8(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            horiz,
+            recon_nodata,
+        ),
+        (SampleType::Int8, _, r) => predictor::reconstruct_i8(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            horiz,
+            recon_nodata,
+        ),
+        (SampleType::Uint32, _, r) => predictor::reconstruct_int32(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            false,
+            horiz,
+            recon_nodata_f64,
+        ),
+        (SampleType::Int32, _, r) => predictor::reconstruct_int32(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            true,
+            horiz,
+            recon_nodata_f64,
+        ),
+        (SampleType::Uint1, _, r) => predictor::reconstruct_subbyte(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            1,
+            recon_nodata,
+        ),
+        (SampleType::Uint4, _, r) => predictor::reconstruct_subbyte(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            4,
+            recon_nodata,
+        ),
+        (SampleType::Uint64, _, r) => predictor::reconstruct_int64(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            false,
+            horiz,
+            recon_nodata_f64,
+        ),
+        (SampleType::Int64, _, r) => predictor::reconstruct_int64(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            true,
+            horiz,
+            recon_nodata_f64,
+        ),
+        (SampleType::Float64, Predictor::None, r) => predictor::reconstruct_f64_uncompressed(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            recon_nodata_f64,
+        ),
+        (SampleType::Float64, p, RawTileBuf::Mut(r)) => predictor::reconstruct_f64(
+            r,
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            p,
+            recon_nodata_f64,
+        ),
+        (SampleType::Float64, _, RawTileBuf::Shared(_)) => {
+            unreachable!("Float64 with predictor always uses scratch buffer")
+        }
+    }
+}
+
+/// Mask pixels in `b` where `is_masked(i, value)` returns `true` (setting them to `NaN`)
+/// and recompute `b.stats` in a single pass across both `BandData::F64` and `f32` storage.
+fn mask_band_where(b: &mut DecodedBand, limit: usize, mut is_masked: impl FnMut(usize, f64) -> bool) {
+    if let BandData::F64(ref mut slice) = b.data {
+        let n = slice.len().min(limit);
+        let mut all_nd = true;
+        let mut no_nd = true;
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for (i, slot) in slice[..n].iter_mut().enumerate() {
+            let v = *slot;
+            if v.is_nan() || is_masked(i, v) {
+                *slot = f64::NAN;
+                no_nd = false;
+            } else {
+                all_nd = false;
+                if v < mn {
+                    mn = v;
+                }
+                if v > mx {
+                    mx = v;
+                }
+            }
+        }
+        b.stats = BlockStats {
+            all_nodata: all_nd,
+            no_nodata: no_nd,
+            min: if all_nd {
+                f32::NAN
+            } else {
+                (mn as f32).clamp(f32::MIN, f32::MAX)
+            },
+            max: if all_nd {
+                f32::NAN
+            } else {
+                (mx as f32).clamp(f32::MIN, f32::MAX)
+            },
+        };
+        return;
+    }
+    let slice = b.data.make_f32_mut();
+    let n = slice.len().min(limit);
+    let mut all_nd = true;
+    let mut no_nd = true;
+    let mut mn = f32::INFINITY;
+    let mut mx = f32::NEG_INFINITY;
+    for (i, slot) in slice[..n].iter_mut().enumerate() {
+        let v = *slot;
+        if v.is_nan() || is_masked(i, f64::from(v)) {
+            *slot = f32::NAN;
+            no_nd = false;
+        } else {
+            all_nd = false;
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+        }
+    }
+    b.stats = BlockStats {
+        all_nodata: all_nd,
+        no_nodata: no_nd,
+        min: if all_nd { f32::NAN } else { mn },
+        max: if all_nd { f32::NAN } else { mx },
+    };
+}
+
 /// Mask transparent pixels (`alpha == 0` or `NaN`) to `f32::NAN` in a single-band decoded tile
 /// (used for `PlanarConfig::Planar` Gray+Alpha / RGBA COGs where the alpha channel lives in a separate plane).
 pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
@@ -1224,73 +1181,7 @@ pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
 }
 
 fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
-    let n = alpha.len();
-    if let BandData::F64(ref mut slice) = b.data {
-        let mut all_nd = true;
-        let mut no_nd = true;
-        let mut mn = f64::INFINITY;
-        let mut mx = f64::NEG_INFINITY;
-        for i in 0..n.min(slice.len()) {
-            let a = alpha.get_f32(i);
-            if !(a > 0.0) {
-                slice[i] = f64::NAN;
-                no_nd = false;
-            } else {
-                let v = slice[i];
-                if v.is_nan() {
-                    no_nd = false;
-                } else {
-                    all_nd = false;
-                    if v < mn { mn = v; }
-                    if v > mx { mx = v; }
-                }
-            }
-        }
-        b.stats.all_nodata = all_nd;
-        b.stats.no_nodata = no_nd;
-        if all_nd {
-            b.stats.min = f32::NAN;
-            b.stats.max = f32::NAN;
-        } else {
-            b.stats.min = (mn as f32).clamp(f32::MIN, f32::MAX);
-            b.stats.max = (mx as f32).clamp(f32::MIN, f32::MAX);
-        }
-        return;
-    }
-    let slice = b.data.make_f32_mut();
-    let mut all_nd = true;
-    let mut no_nd = true;
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
-    for i in 0..n.min(slice.len()) {
-        let a = alpha.get_f32(i);
-        if !(a > 0.0) {
-            slice[i] = f32::NAN;
-            no_nd = false;
-        } else {
-            let v = slice[i];
-            if v.is_nan() {
-                no_nd = false;
-            } else {
-                all_nd = false;
-                if v < mn {
-                    mn = v;
-                }
-                if v > mx {
-                    mx = v;
-                }
-            }
-        }
-    }
-    b.stats.all_nodata = all_nd;
-    b.stats.no_nodata = no_nd;
-    if all_nd {
-        b.stats.min = f32::NAN;
-        b.stats.max = f32::NAN;
-    } else {
-        b.stats.min = mn;
-        b.stats.max = mx;
-    }
+    mask_band_where(b, alpha.len(), |i, _| !(alpha.get_f32(i) > 0.0));
 }
 
 /// Decompress a 1-bit (packed MSB-first per row) or 8-bit internal transparency mask tile
@@ -1432,72 +1323,7 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
         return;
     }
     for b in &mut tile.bands {
-        if let BandData::F64(ref mut slice) = b.data {
-            let n = slice.len().min(mask.len());
-            let mut all_nd = true;
-            let mut no_nd = true;
-            let mut mn = f64::INFINITY;
-            let mut mx = f64::NEG_INFINITY;
-            for i in 0..n {
-                if mask[i] == 0 {
-                    slice[i] = f64::NAN;
-                    no_nd = false;
-                } else {
-                    let v = slice[i];
-                    if v.is_nan() {
-                        no_nd = false;
-                    } else {
-                        all_nd = false;
-                        if v < mn { mn = v; }
-                        if v > mx { mx = v; }
-                    }
-                }
-            }
-            b.stats.all_nodata = all_nd;
-            b.stats.no_nodata = no_nd;
-            if all_nd {
-                b.stats.min = f32::NAN;
-                b.stats.max = f32::NAN;
-            } else {
-                b.stats.min = (mn as f32).clamp(f32::MIN, f32::MAX);
-                b.stats.max = (mx as f32).clamp(f32::MIN, f32::MAX);
-            }
-            continue;
-        }
-        let slice = b.data.make_f32_mut();
-        let n = slice.len().min(mask.len());
-        let mut all_nd = true;
-        let mut no_nd = true;
-        let mut mn = f32::INFINITY;
-        let mut mx = f32::NEG_INFINITY;
-        for i in 0..n {
-            if mask[i] == 0 {
-                slice[i] = f32::NAN;
-                no_nd = false;
-            } else {
-                let v = slice[i];
-                if v.is_nan() {
-                    no_nd = false;
-                } else {
-                    all_nd = false;
-                    if v < mn {
-                        mn = v;
-                    }
-                    if v > mx {
-                        mx = v;
-                    }
-                }
-            }
-        }
-        b.stats.all_nodata = all_nd;
-        b.stats.no_nodata = no_nd;
-        if all_nd {
-            b.stats.min = f32::NAN;
-            b.stats.max = f32::NAN;
-        } else {
-            b.stats.min = mn;
-            b.stats.max = mx;
-        }
+        mask_band_where(b, mask.len(), |i, _| mask[i] == 0);
     }
 }
 
