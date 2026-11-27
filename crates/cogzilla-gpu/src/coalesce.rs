@@ -310,6 +310,16 @@ type ReplyFn = Box<dyn FnOnce(Result<Vec<u8>, GpuError>) + Send>;
 struct PendingRequest {
     job: CoalescedJob,
     reply: ReplyFn,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl PendingRequest {
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Acquire))
+    }
 }
 
 struct StatsSlotBuffers {
@@ -2336,6 +2346,7 @@ pub struct GpuCoalescer {
     jobs_executed: Arc<AtomicU64>,
     max_batch_seen: Arc<AtomicUsize>,
     pending_count: Arc<AtomicUsize>,
+    max_pending: usize,
 }
 
 impl GpuCoalescer {
@@ -2356,6 +2367,12 @@ impl GpuCoalescer {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(default_depth)
             .clamp(1, 4);
+
+        let max_pending = std::env::var("COGZILLA_GPU_MAX_QUEUED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256)
+            .max(max_batch);
 
         let (tx, rx) = mpsc::channel::<PendingRequest>();
         let batches_submitted = Arc::new(AtomicU64::new(0));
@@ -2386,19 +2403,27 @@ impl GpuCoalescer {
                         continue;
                     }
 
-                    // 3. Acquire the next job (or drain remaining in-flight frames if queue empty).
+                    let push_if_live = |batch: &mut Vec<PendingRequest>, req: PendingRequest| {
+                        if req.is_cancelled() {
+                            (req.reply)(Err(GpuError::BufferMap("cancelled".into())));
+                        } else {
+                            batch.push(req);
+                        }
+                    };
+
+                    // 3. Acquire the next live job (skipping any requests cancelled while queued).
                     batch.clear();
                     if state.in_flight_order.is_empty() {
                         if disconnected {
                             break;
                         }
                         match rx.recv() {
-                            Ok(first) => batch.push(first),
+                            Ok(first) => push_if_live(&mut batch, first),
                             Err(_) => break,
                         }
                     } else {
                         match rx.try_recv() {
-                            Ok(first) => batch.push(first),
+                            Ok(first) => push_if_live(&mut batch, first),
                             Err(mpsc::TryRecvError::Empty) => {
                                 // No new job ready yet; wait for oldest in-flight frame to finish.
                                 state.drain_completed(true);
@@ -2412,16 +2437,22 @@ impl GpuCoalescer {
                         }
                     }
 
-                    // 4. Immediately scoop any other jobs already sitting in the channel.
+                    // 4. Immediately scoop any other live jobs already sitting in the channel.
                     while batch.len() < max_batch {
                         match rx.try_recv() {
-                            Ok(next) => batch.push(next),
+                            Ok(next) => push_if_live(&mut batch, next),
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 disconnected = true;
                                 break;
                             }
                         }
+                    }
+
+                    // If every drained request had already been cancelled by disconnected clients,
+                    // loop without burning a GPU submit.
+                    if batch.is_empty() {
+                        continue;
                     }
 
                     // 5. Adaptive coalescing window: only wait briefly if the batch isn't full and
@@ -2444,7 +2475,7 @@ impl GpuCoalescer {
                             }
                             let slice_wait = (deadline - now).min(Duration::from_micros(100));
                             match rx.recv_timeout(slice_wait) {
-                                Ok(next) => batch.push(next),
+                                Ok(next) => push_if_live(&mut batch, next),
                                 Err(mpsc::RecvTimeoutError::Timeout) => {
                                     if Instant::now() >= deadline {
                                         break;
@@ -2489,6 +2520,7 @@ impl GpuCoalescer {
             jobs_executed,
             max_batch_seen,
             pending_count,
+            max_pending,
         }
     }
 
@@ -2500,9 +2532,33 @@ impl GpuCoalescer {
         job: CoalescedJob,
         on_done: impl FnOnce(Result<Vec<u8>, GpuError>) + Send + 'static,
     ) -> Result<(), GpuError> {
+        self.submit_inner(job, None, on_done)
+    }
+
+    /// Submit a cancellable job asynchronously. If `cancelled` becomes `true` before the worker
+    /// encodes the job into a GPU command buffer (e.g. an HTTP client disconnected or timed out),
+    /// the job is discarded immediately without consuming GPU work.
+    pub fn submit_cancellable(
+        &self,
+        job: CoalescedJob,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        on_done: impl FnOnce(Result<Vec<u8>, GpuError>) + Send + 'static,
+    ) -> Result<(), GpuError> {
+        self.submit_inner(job, Some(cancelled), on_done)
+    }
+
+    fn submit_inner(
+        &self,
+        job: CoalescedJob,
+        cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+        on_done: impl FnOnce(Result<Vec<u8>, GpuError>) + Send + 'static,
+    ) -> Result<(), GpuError> {
         let Some(ref tx) = self.tx else {
             return Err(GpuError::BufferMap("coalescer shut down".into()));
         };
+        if self.pending_count.load(Ordering::Relaxed) >= self.max_pending {
+            return Err(GpuError::BufferMap("coalescer queue full".into()));
+        }
         let pending = Arc::clone(&self.pending_count);
         pending.fetch_add(1, Ordering::AcqRel);
         let send_res = tx.send(PendingRequest {
@@ -2511,6 +2567,7 @@ impl GpuCoalescer {
                 pending.fetch_sub(1, Ordering::AcqRel);
                 on_done(res);
             }),
+            cancelled,
         });
         if send_res.is_err() {
             self.pending_count.fetch_sub(1, Ordering::AcqRel);

@@ -820,9 +820,17 @@ impl GpuBackend {
     }
 
     async fn submit_coalesced_async(&self, job: CoalescedJob) -> Option<Vec<u8>> {
+        struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cancel_guard = CancelOnDrop(Arc::clone(&cancelled));
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.coalescer
-            .submit_with_callback(job, move |res| {
+            .submit_cancellable(job, cancelled, move |res| {
                 let _ = tx.send(res);
             })
             .ok()?;

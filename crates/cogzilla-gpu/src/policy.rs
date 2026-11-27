@@ -58,18 +58,19 @@ impl GpuProfile {
     pub fn calibrate(ctx: &GpuContext) -> Self {
         let resampler = GpuResampler::new(ctx);
 
-        // 1. Measure dispatch + poll(Wait) floor
+        // 1. Measure dispatch + poll(Wait) floor (take p20 of 7 samples so a noisy neighbor
+        //    spiking the GPU during startup does not permanently inflate the dispatch floor).
         for _ in 0..2 {
             resampler.noop_dispatch_sync();
         }
-        let mut noop_samples = Vec::with_capacity(5);
-        for _ in 0..5 {
+        let mut noop_samples = Vec::with_capacity(7);
+        for _ in 0..7 {
             let t0 = Instant::now();
             resampler.noop_dispatch_sync();
             noop_samples.push(t0.elapsed());
         }
         noop_samples.sort();
-        let dispatch_floor_us = (noop_samples[2].as_secs_f64() * 1e6).max(50.0);
+        let dispatch_floor_us = (noop_samples[1].as_secs_f64() * 1e6).max(50.0);
 
         // 2. Measure 4 MiB upload + readback bandwidth
         let probe_bytes: usize = 4 * 1024 * 1024;
