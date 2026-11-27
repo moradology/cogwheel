@@ -177,6 +177,10 @@ pub struct OpenedCog {
     /// `id` of the opened source the URI cache holds: `id` itself, but a `?nodata=` view's
     /// parent's, so a source found changed through a view evicts the parent.
     pub source_id: u64,
+    /// A `?nodata=` view's value for tiles the file leaves unwritten (`byte_count == 0`), when
+    /// that value is data under the view's nodata: GDAL reads such tiles as the file's own
+    /// nodata (or 0 with none), which the override makes valid. `None` keeps them no data.
+    pub sparse_fill: Option<f64>,
     pub uri: String,
     pub index: CogIndex,
     pub source: CogSource,
@@ -268,6 +272,8 @@ pub struct CogStore {
     datasets_by_uri: DashMap<String, OpenSlot, ahash::RandomState>,
     /// `?nodata=` views keyed by `(parent OpenedCog::id, override bits)`; see [`CogStore::with_nodata`].
     nodata_views: DashMap<(u64, u32), Arc<OpenedCog>, ahash::RandomState>,
+    /// Unwritten tiles of `nodata_views` with a `sparse_fill`, per `(view id, IFD)`.
+    sparse_tiles: DashMap<(u64, u16), Arc<DecodedTile>, ahash::RandomState>,
     max_open_uris: usize,
     uri_clock: AtomicU64,
     evicting_uris: AtomicBool,
@@ -417,6 +423,7 @@ impl CogStore {
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
             datasets_by_uri: DashMap::with_hasher(ahash::RandomState::new()),
             nodata_views: DashMap::with_hasher(ahash::RandomState::new()),
+            sparse_tiles: DashMap::with_hasher(ahash::RandomState::new()),
             max_open_uris: max_open_uris.max(1),
             uri_clock: AtomicU64::new(0),
             evicting_uris: AtomicBool::new(false),
@@ -576,6 +583,7 @@ impl CogStore {
         let cog = Arc::new(OpenedCog {
             id,
             source_id: id,
+            sparse_fill: None,
             uri: uri.clone(),
             index,
             source,
@@ -620,19 +628,69 @@ impl CogStore {
         }
         if self.nodata_views.len() >= MAX_NODATA_VIEWS {
             self.nodata_views.clear();
+            self.sparse_tiles.clear();
         }
+        // GDAL fills an unwritten tile with the file's nodata (0 with none); under the override
+        // that is data unless it is NaN or the override itself. A mask or alpha band still
+        // leaves such tiles transparent, so they are left as no data there.
+        let fill = cog.index.nodata_f64.or(cog.index.nodata.map(f64::from)).unwrap_or(0.0);
+        let masked = cog.index.ifds.iter().any(|ifd| ifd.mask_ifd.is_some() || !ifd.extra_samples.is_empty());
+        let sparse_fill = (!fill.is_nan() && fill != f64::from(nd) && !masked).then_some(fill);
         let mut index = cog.index.clone();
         index.nodata = Some(nd);
         index.nodata_f64 = Some(f64::from(nd));
         let view = Arc::new(OpenedCog {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             source_id: cog.source_id,
+            sparse_fill,
             uri: cog.uri.clone(),
             index,
             source: cog.source.clone(),
             freshness: cog.freshness.snapshot(),
         });
         self.nodata_views.entry(key).or_insert(view).clone()
+    }
+
+    /// The block of an unwritten tile of `cog`'s IFD `ifd_idx`: `None` (no data), or for a
+    /// `?nodata=` view with a [`OpenedCog::sparse_fill`], a tile of that value, made once per
+    /// view and IFD.
+    fn sparse_tile(&self, cog: &OpenedCog, ifd_idx: usize) -> Option<Arc<DecodedTile>> {
+        let fill = cog.sparse_fill?;
+        let key = (cog.id, ifd_idx as u16);
+        if let Some(t) = self.sparse_tiles.get(&key) {
+            return Some(t.clone());
+        }
+        let ifd = &cog.index.ifds[ifd_idx];
+        let bands = match ifd.planar_config {
+            PlanarConfig::Chunky => ifd.samples_per_pixel.max(1) as usize,
+            _ => 1,
+        };
+        let px = (ifd.tile_width as usize) * (ifd.tile_height as usize);
+        let wide = matches!(
+            ifd.sample_type,
+            cogzilla_tiff::SampleType::Uint32
+                | cogzilla_tiff::SampleType::Int32
+                | cogzilla_tiff::SampleType::Uint64
+                | cogzilla_tiff::SampleType::Int64
+                | cogzilla_tiff::SampleType::Float64
+        );
+        let band = || cogzilla_codec::DecodedBand {
+            data: if wide {
+                BandData::F64(vec![fill; px].into_boxed_slice())
+            } else {
+                BandData::F32(cogzilla_codec::AlignedF32Slab::filled(px, fill as f32))
+            },
+            width: ifd.tile_width,
+            height: ifd.tile_height,
+            stats: cogzilla_codec::BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: fill as f32,
+                max: fill as f32,
+            },
+        };
+        let tile = Arc::new(DecodedTile { bands: (0..bands).map(|_| band()).collect() });
+        Some(self.sparse_tiles.entry(key).or_insert(tile).clone())
     }
 
     pub fn get_registered(&self, name: &str) -> Option<Arc<OpenedCog>> {
@@ -665,6 +723,7 @@ impl CogStore {
         self.datasets_by_uri
             .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
         self.nodata_views.clear();
+        self.sparse_tiles.clear();
         self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(ref dc) = self.disk_cache {
             dc.clear();
@@ -1018,6 +1077,7 @@ impl CogStore {
                 Ok(Arc::new(OpenedCog {
                     id,
                     source_id: id,
+                    sparse_fill: None,
                     uri: uri.to_string(),
                     index,
                     source,
@@ -1094,7 +1154,7 @@ impl CogStore {
                 .copied()
                 .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if count == 0 {
-                out.push(None);
+                out.push(self.sparse_tile(cog, ifd_idx));
                 continue;
             }
             let key = BlockKey {
@@ -1316,6 +1376,7 @@ impl CogStore {
                 .copied()
                 .ok_or_else(|| IoError::Tiff(TiffError::Corrupt("tile index out of bounds")))?;
             if count == 0 {
+                results[slot] = self.sparse_tile(cog, ifd_idx);
                 continue;
             }
             if seen_owned.contains_key(&tile_idx) {

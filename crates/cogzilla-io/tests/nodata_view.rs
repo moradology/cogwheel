@@ -34,3 +34,80 @@ async fn nodata_view_shares_the_parent_and_keeps_its_source() {
     assert!(!Arc::ptr_eq(&after, &view), "cleared with the open rasters");
     assert_eq!(after.source_id, cog.id);
 }
+
+/// A tiled uint16 TIFF of two 16x16 tiles with `GDAL_NODATA=0`: the first left unwritten
+/// (`TileByteCounts` 0), the second all 7s.
+fn write_sparse_u16(path: &std::path::Path) {
+    let entries: [(u16, u16, u32, u32); 12] = [
+        (256, 3, 1, 32),  // ImageWidth
+        (257, 3, 1, 16),  // ImageLength
+        (258, 3, 1, 16),  // BitsPerSample
+        (259, 3, 1, 1),   // Compression: none
+        (262, 3, 1, 1),   // MinIsBlack
+        (277, 3, 1, 1),   // SamplesPerPixel
+        (284, 3, 1, 1),   // PlanarConfiguration: chunky
+        (322, 3, 1, 16),  // TileWidth
+        (323, 3, 1, 16),  // TileLength
+        (324, 4, 2, 0),   // TileOffsets (filled below)
+        (325, 4, 2, 0),   // TileByteCounts (filled below)
+        (42113, 2, 2, u32::from_le_bytes([b'0', 0, 0, 0])), // GDAL_NODATA "0"
+    ];
+    let ifd_len = 2 + entries.len() * 12 + 4;
+    let offsets_at = 8 + ifd_len as u32;
+    let counts_at = offsets_at + 8;
+    let data_at = counts_at + 8;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"II");
+    buf.extend_from_slice(&42u16.to_le_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes());
+    buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, ty, count, val) in entries {
+        let val = match tag {
+            324 => offsets_at,
+            325 => counts_at,
+            _ => val,
+        };
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(&ty.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    for v in [0u32, data_at, 0, 16 * 16 * 2] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for _ in 0..16 * 16 {
+        buf.extend_from_slice(&7u16.to_le_bytes());
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+/// GDAL reads an unwritten tile as the file's nodata; once `?nodata=` names another value that
+/// is data, as the stored pixels equal to the file's nodata are.
+#[tokio::test]
+async fn nodata_view_reads_unwritten_tiles_as_the_files_nodata() {
+    let dir = std::env::temp_dir().join(format!("cogzilla_sparse_view_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sparse_u16.tif");
+    write_sparse_u16(&path);
+    let store = CogStore::new(16 * 1024 * 1024);
+    let cog = store.register_local("sparse", &path).unwrap();
+    let tiles = [Some(0), Some(1)];
+
+    let own = store.get_blocks(&cog, 0, &tiles).await.unwrap();
+    assert!(own[0].is_none(), "the file's read: the unwritten tile is no data");
+    assert_eq!(own[1].as_ref().unwrap().bands[0].data.get_f32(0), 7.0);
+
+    let view = store.with_nodata(&cog, Some(7.0));
+    assert_eq!(view.sparse_fill, Some(0.0));
+    let blocks = store.get_blocks(&view, 0, &tiles).await.unwrap();
+    let fill = &blocks[0].as_ref().expect("the unwritten tile is the file's nodata, now data").bands[0];
+    assert!(fill.stats.no_nodata && !fill.stats.all_nodata);
+    assert_eq!((fill.width, fill.height, fill.data.get_f32(0), fill.data.get_f32(255)), (16, 16, 0.0, 0.0));
+    let sevens = &blocks[1].as_ref().unwrap().bands[0];
+    assert!(sevens.data.get_f32(0).is_nan(), "7 is the view's nodata");
+
+    // A NaN nodata on integers masks nothing: the file's 0s, written or not, are data.
+    assert_eq!(store.with_nodata(&cog, Some(f32::NAN)).sparse_fill, Some(0.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}

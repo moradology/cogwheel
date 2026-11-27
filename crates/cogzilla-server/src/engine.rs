@@ -3557,6 +3557,7 @@ mod tests {
         let cog = OpenedCog {
             id: 999_999,
             source_id: 999_999,
+            sparse_fill: None,
             uri: tmp_path.to_string_lossy().into_owned(),
             index,
             source,
