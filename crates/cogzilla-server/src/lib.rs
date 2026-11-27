@@ -3,6 +3,7 @@
 pub mod aimd;
 pub mod algorithms;
 pub mod catalog;
+pub mod config;
 pub mod engine;
 #[cfg(feature = "gpu")]
 pub mod gpu_backend;
@@ -17,6 +18,7 @@ pub mod tms;
 pub mod zonal;
 
 pub use aimd::{AimdLimiter, AimdPermit, AimdSnapshot};
+pub use config::{Config, ConfigWarning};
 
 pub use catalog::{
     InMemoryCatalog, MosaicJsonCatalog, SceneCatalog, SceneEntry, load_catalog_json_file,

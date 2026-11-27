@@ -151,33 +151,8 @@ pub(crate) fn clear_zarr_cache() {
     ZARR_REMOTE_CHUNK_CACHE_BYTES.store(0, Ordering::Relaxed);
 }
 
-fn zarr_cache_ttl() -> Duration {
-    let secs = std::env::var("COGZILLA_CACHE_TTL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5);
-    Duration::from_secs(secs)
-}
-
-fn zarr_max_open_uris() -> usize {
-    std::env::var("COGZILLA_MAX_OPEN_URIS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(4096)
-}
-
-fn zarr_cache_control_header() -> HeaderValue {
-    let max_age = std::env::var("COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60);
-    if max_age == 0 {
-        HeaderValue::from_static("no-cache")
-    } else {
-        HeaderValue::from_str(&format!("public, max-age={max_age}"))
-            .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=60"))
-    }
+fn zarr_cache_control_header() -> &'static HeaderValue {
+    crate::config::Config::global().zarr_cache_control_header()
 }
 
 fn local_store_validator(root: &std::path::Path) -> String {
@@ -618,7 +593,7 @@ fn binary_ok_with_etag(
 ) -> Response<Full<Bytes>> {
     let etag_hdr = crate::tile_cache::compute_keyed_etag(etag_key, &body);
     let etag = etag_hdr.to_str().unwrap_or("");
-    let cc = zarr_cache_control_header();
+    let cc = zarr_cache_control_header().clone();
     if let Some(inm) = if_none_match {
         let matched = inm.trim() == "*"
             || inm
@@ -839,7 +814,7 @@ async fn open_store_and_hierarchy(
             }
             let hierarchy = Arc::new(ZarrHierarchy::open(&store).await?);
             ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
-            if cache.len() >= zarr_max_open_uris() {
+            if cache.len() >= io.max_open_uris() {
                 cache.clear();
             }
             cache.insert(
@@ -853,7 +828,7 @@ async fn open_store_and_hierarchy(
             Ok((store, hierarchy, validator))
         }
         ServerZarrStore::Remote { base_uri, io } => {
-            let ttl = zarr_cache_ttl();
+            let ttl = io.remote_cache_ttl();
             if ttl > Duration::ZERO
                 && let Some(entry) = cache.get(url)
                 && entry.fetched_at.elapsed() < ttl
@@ -880,7 +855,7 @@ async fn open_store_and_hierarchy(
 
             let hierarchy = Arc::new(ZarrHierarchy::open(&store).await?);
             ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
-            if cache.len() >= zarr_max_open_uris() {
+            if cache.len() >= io.max_open_uris() {
                 cache.clear();
             }
             let validator = if remote_validator.is_empty() {

@@ -91,10 +91,7 @@ where
     // Close the listening socket immediately so load balancers get ECONNREFUSED instead of
     // queueing new handshakes in the kernel backlog while in-flight connections drain.
     drop(listener);
-    let drain_secs = std::env::var("COGZILLA_SHUTDOWN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(15);
+    let drain_secs = crate::config::Config::global().shutdown_timeout_secs;
     match tokio::time::timeout(
         std::time::Duration::from_secs(drain_secs),
         graceful.shutdown(),

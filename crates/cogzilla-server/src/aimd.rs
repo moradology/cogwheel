@@ -71,13 +71,7 @@ impl AimdLimiter {
     /// - `COGZILLA_AIMD_MIN_LIMIT` sets the minimum concurrency floor.
     /// - `COGZILLA_AIMD_MAX_LIMIT` sets the maximum concurrency ceiling (default `4096`).
     pub fn from_env(has_gpu: bool) -> Self {
-        let enabled = std::env::var("COGZILLA_AIMD")
-            .ok()
-            .map(|v| {
-                let s = v.trim().to_ascii_lowercase();
-                !matches!(s.as_str(), "0" | "off" | "false" | "disabled" | "none")
-            })
-            .unwrap_or(true);
+        let cfg = crate::config::Config::global();
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -87,22 +81,15 @@ impl AimdLimiter {
         } else {
             (cores * 4).clamp(16, 128)
         };
-        let target_ms = std::env::var("COGZILLA_AIMD_TARGET_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(150)
-            .max(10);
-        let min_limit = std::env::var("COGZILLA_AIMD_MIN_LIMIT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(default_min)
-            .max(1);
-        let max_limit = std::env::var("COGZILLA_AIMD_MAX_LIMIT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4096)
-            .max(min_limit);
-        Self::new(enabled, default_init, min_limit, max_limit, target_ms)
+        let min_limit = cfg.aimd_min_limit.unwrap_or(default_min).max(1);
+        let max_limit = cfg.aimd_max_limit.max(min_limit);
+        Self::new(
+            cfg.aimd_enabled,
+            default_init,
+            min_limit,
+            max_limit,
+            cfg.aimd_target_ms,
+        )
     }
 
     pub fn new(
