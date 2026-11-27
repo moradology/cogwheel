@@ -33,7 +33,7 @@ use super::{
 use super::array_type::{band_math_type, wider_type};
 use super::paint::{Paint, formula_levels, rescale_byte};
 use super::pixel_selection::{Fold, Selected, Selection};
-use super::point_expr::Program;
+use super::point_expr::{Kind, Program};
 use super::zonal::{self, Bins, StatsOptions};
 use crate::engine::{BandRequest, EngineError, MOSAIC_SCENES_AHEAD, TileEngine};
 use crate::stac::{StacItem, stac_item_from_json};
@@ -4638,8 +4638,9 @@ async fn feature_statistics(
                             "pixel_selection by the last band needs at least two bands".into(),
                         ));
                     }
-                    // Whole numbers only when the values are the first raster's own.
-                    let integer = program.is_none()
+                    // Whole numbers when the values are the first raster's own, or band math
+                    // over them that numexpr keeps whole (`b1*2`, not `b1/2`).
+                    let integer = program.as_ref().is_none_or(|p| p.kind() == Kind::Whole)
                         && !req.unscale
                         && assets.iter().all(|a| a.expression.is_none())
                         && !matches!(cogs[0].index.full_res().sample_type, SampleType::Float32 | SampleType::Float64);
@@ -4709,8 +4710,12 @@ async fn feature_statistics(
             return Ok(None);
         }
         if let Some(selected) = fold.and_then(Fold::finish) {
+            // Comparisons are bools in numpy, which a mean or a median is cast back to: true
+            // where it is not 0. A whole number cast back has no sign at 0 (-0.5 is 0).
+            let bools = program.as_ref().is_some_and(|p| p.kind() == Kind::Bool);
+            let cast = |v: f64| if bools && v.is_finite() { f64::from(u8::from(v != 0.0)) } else { v + 0.0 };
             // `count` leaves one band, described as the first.
-            canvas = selected.values.chunks(width * height).map(<[f64]>::to_vec).collect();
+            canvas = selected.values.chunks(width * height).map(|band| band.iter().map(|&v| cast(v)).collect()).collect();
             descriptions.truncate(selected.bands);
         }
         if let Some(algorithm) = &req.algorithm {
