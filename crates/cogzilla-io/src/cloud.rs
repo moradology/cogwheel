@@ -1,4 +1,3 @@
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -8,7 +7,6 @@ use sha2::Sha256;
 
 use crate::backend::{IoError, IoMetrics};
 use crate::limiter::AimdLimiter;
-use crate::s3::{is_retryable_status, is_retryable_transport_error, retry_backoff_duration};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -674,11 +672,7 @@ impl GcsConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3)
-            .min(10);
+        let max_retries = crate::retry::RetryPolicy::from_env().max_retries;
         Self {
             endpoint,
             no_sign,
@@ -729,11 +723,7 @@ impl AzureConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .or(conn.account_key);
-        let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3)
-            .min(10);
+        let max_retries = crate::retry::RetryPolicy::from_env().max_retries;
         Self {
             endpoint_override,
             no_sign,
@@ -854,149 +844,69 @@ async fn fetch_gcs_inner(
         token_cache.get_bearer(client).await
     };
 
-    for attempt in 0..=cfg.max_retries {
-        let permit = limiter.acquire().await;
-        metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-
-        let mut req = client.get(&url);
-        if let Some(rh) = &range_hdr {
-            req = req.header("Range", rh);
-        }
-        if let Some(tok) = &bearer {
-            req = req.header("Authorization", format!("Bearer {tok}"));
-        } else if let Some((ak, sk)) = hmac_pair {
-            let (scheme, after_scheme) = cfg
-                .endpoint
-                .split_once("://")
-                .unwrap_or(("https", cfg.endpoint.as_str()));
-            let (raw_host, ep_path) = match after_scheme.find('/') {
-                Some(i) => (&after_scheme[..i], after_scheme[i..].trim_end_matches('/')),
-                None => (after_scheme, ""),
-            };
-            let host_lower = raw_host.to_ascii_lowercase();
-            let norm_host = if (scheme.eq_ignore_ascii_case("https") && host_lower.ends_with(":443"))
-                || (scheme.eq_ignore_ascii_case("http") && host_lower.ends_with(":80"))
+    let redacted_url = crate::backend::redact_http_url(&url);
+    crate::retry::execute_get_bytes_with_retry(
+        || {
+            let mut req = client.get(&url);
+            if let Some(rh) = &range_hdr {
+                req = req.header("Range", rh);
+            }
+            if let Some(tok) = &bearer {
+                req = req.header("Authorization", format!("Bearer {tok}"));
+            } else if let Some((ak, sk)) = hmac_pair {
+                let (scheme, after_scheme) = cfg
+                    .endpoint
+                    .split_once("://")
+                    .unwrap_or(("https", cfg.endpoint.as_str()));
+                let (raw_host, ep_path) = match after_scheme.find('/') {
+                    Some(i) => (&after_scheme[..i], after_scheme[i..].trim_end_matches('/')),
+                    None => (after_scheme, ""),
+                };
+                let host_lower = raw_host.to_ascii_lowercase();
+                let norm_host = if (scheme.eq_ignore_ascii_case("https")
+                    && host_lower.ends_with(":443"))
+                    || (scheme.eq_ignore_ascii_case("http") && host_lower.ends_with(":80"))
+                {
+                    host_lower
+                        .rsplit_once(':')
+                        .map(|(h, _)| h)
+                        .unwrap_or(&host_lower)
+                } else {
+                    host_lower.as_str()
+                };
+                let full_canonical = format!("{ep_path}{canonical_uri}");
+                let sig_headers = crate::s3::sign_s3_get(
+                    ak,
+                    sk,
+                    None,
+                    "auto",
+                    norm_host,
+                    &full_canonical,
+                    range_hdr.as_deref(),
+                    false,
+                );
+                for (k, v) in sig_headers {
+                    req = req.header(k, v);
+                }
+            }
+            // GCS XML API forbids mixing `x-amz-*` (HMAC SigV4) with `x-goog-*` headers.
+            if hmac_pair.is_none()
+                && let Some(proj) = &cfg.user_project
             {
-                host_lower.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_lower)
-            } else {
-                host_lower.as_str()
-            };
-            let full_canonical = format!("{ep_path}{canonical_uri}");
-            let sig_headers = crate::s3::sign_s3_get(
-                ak,
-                sk,
-                None,
-                "auto",
-                norm_host,
-                &full_canonical,
-                range_hdr.as_deref(),
-                false,
-            );
-            for (k, v) in sig_headers {
-                req = req.header(k, v);
+                req = req.header("x-goog-user-project", proj);
             }
-        }
-        // GCS XML API forbids mixing `x-amz-*` (HMAC SigV4) with `x-goog-*` headers.
-        if hmac_pair.is_none()
-            && let Some(proj) = &cfg.user_project
-        {
-            req = req.header("x-goog-user-project", proj);
-        }
-
-        let send_res = req.send().await;
-        let resp = match send_res {
-            Ok(r) => r,
-            Err(e) => {
-                if is_retryable_transport_error(&e) {
-                    permit.on_throttle();
-                    if attempt < cfg.max_retries {
-                        tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
-                        continue;
-                    }
-                }
-                return Err(IoError::Http(e.without_url()));
-            }
-        };
-        let status = resp.status().as_u16();
-        if is_retryable_status(status) {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok());
-            permit.on_throttle();
-            if attempt < cfg.max_retries {
-                tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
-                continue;
-            }
-            return Err(IoError::HttpStatus {
-                status,
-                url: crate::backend::redact_http_url(&url),
-            });
-        }
-        if status == 200
-            && let Some((start, end)) = range
-            && (start > 0
-                || resp
-                    .content_length()
-                    .is_some_and(|cl| cl > end.saturating_sub(start).min(64 * 1024 * 1024)))
-        {
-            return Err(IoError::RangeNotSupported {
-                url: crate::backend::redact_http_url(&url),
-            });
-        }
-        if status == 206
-            && let Some((start, _)) = range
-            && !crate::backend::validate_content_range_start(&resp, start)
-        {
-            return Err(IoError::RangeNotSupported {
-                url: crate::backend::redact_http_url(&url),
-            });
-        }
-        if status != 200 && status != 206 {
-            return Err(IoError::HttpStatus {
-                status,
-                url: crate::backend::redact_http_url(&url),
-            });
-        }
-        let eff_cap = max_bytes.or_else(|| {
-            range.map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
-        });
-        let body_res = if let Some(cap) = eff_cap {
-            read_response_capped(resp, cap).await
-        } else {
-            resp.bytes().await.map_err(IoError::Http)
-        };
-        match body_res {
-            Ok(data) => {
-                permit.on_success();
-                metrics
-                    .remote_bytes_fetched
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-                return Ok(data);
-            }
-            Err(IoError::ResponseTooLarge { .. }) if status == 200 && range.is_some() => {
-                return Err(IoError::RangeNotSupported {
-                    url: crate::backend::redact_http_url(&url),
-                });
-            }
-            Err(IoError::Http(e)) => {
-                if is_retryable_transport_error(&e) {
-                    permit.on_throttle();
-                    if attempt < cfg.max_retries {
-                        tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
-                        continue;
-                    }
-                }
-                return Err(IoError::Http(e.without_url()));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(IoError::HttpStatus {
-        status: 503,
-        url: crate::backend::redact_http_url(&url),
-    })
+            Ok((req, redacted_url.clone()))
+        },
+        crate::retry::FetchSpec {
+            range,
+            max_bytes,
+            validator: None,
+            max_retries: cfg.max_retries,
+        },
+        limiter,
+        metrics,
+    )
+    .await
 }
 
 /// Compute Azure Blob SharedKey `Authorization` header (`SharedKey {account}:{b64_hmac_sha256}`).
@@ -1082,125 +992,46 @@ async fn fetch_azure_inner(
         None
     };
 
-    for attempt in 0..=cfg.max_retries {
-        let permit = limiter.acquire().await;
-        metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-
-        let mut req = client.get(&url).header("x-ms-version", AZURE_API_VERSION);
-        if let Some(rh) = &range_hdr {
-            req = req.header("Range", rh);
-        }
-
-        if !cfg.no_sign && cfg.sas_token.is_none() {
-            if let Some(tok) = cfg.bearer_token.as_deref().or(managed_bearer.as_deref()) {
-                req = req.header("Authorization", format!("Bearer {tok}"));
-            } else if let Some(key) = &cfg.access_key {
-                let date_hdr = format_rfc1123_now();
-                req = req.header("x-ms-date", &date_hdr);
-                let Some(auth) = sign_azure_shared_key(
-                    &target.account,
-                    &target.container,
-                    &target.blob,
-                    range_hdr.as_deref().unwrap_or(""),
-                    &date_hdr,
-                    key,
-                ) else {
-                    return Err(IoError::InvalidUri(
-                        "invalid base64 AZURE_STORAGE_ACCESS_KEY".to_string(),
-                    ));
-                };
-                req = req.header("Authorization", auth);
+    crate::retry::execute_get_bytes_with_retry(
+        || {
+            let mut req = client.get(&url).header("x-ms-version", AZURE_API_VERSION);
+            if let Some(rh) = &range_hdr {
+                req = req.header("Range", rh);
             }
-        }
 
-        let send_res = req.send().await;
-        let resp = match send_res {
-            Ok(r) => r,
-            Err(e) => {
-                if is_retryable_transport_error(&e) {
-                    permit.on_throttle();
-                    if attempt < cfg.max_retries {
-                        tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
-                        continue;
-                    }
+            if !cfg.no_sign && cfg.sas_token.is_none() {
+                if let Some(tok) = cfg.bearer_token.as_deref().or(managed_bearer.as_deref()) {
+                    req = req.header("Authorization", format!("Bearer {tok}"));
+                } else if let Some(key) = &cfg.access_key {
+                    let date_hdr = format_rfc1123_now();
+                    req = req.header("x-ms-date", &date_hdr);
+                    let Some(auth) = sign_azure_shared_key(
+                        &target.account,
+                        &target.container,
+                        &target.blob,
+                        range_hdr.as_deref().unwrap_or(""),
+                        &date_hdr,
+                        key,
+                    ) else {
+                        return Err(IoError::InvalidUri(
+                            "invalid base64 AZURE_STORAGE_ACCESS_KEY".to_string(),
+                        ));
+                    };
+                    req = req.header("Authorization", auth);
                 }
-                return Err(IoError::Http(e.without_url()));
             }
-        };
-        let status = resp.status().as_u16();
-        if is_retryable_status(status) {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok());
-            permit.on_throttle();
-            if attempt < cfg.max_retries {
-                tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
-                continue;
-            }
-            return Err(IoError::HttpStatus {
-                status,
-                url: clean_url,
-            });
-        }
-        if status == 200
-            && let Some((start, end)) = range
-            && (start > 0
-                || resp
-                    .content_length()
-                    .is_some_and(|cl| cl > end.saturating_sub(start).min(64 * 1024 * 1024)))
-        {
-            return Err(IoError::RangeNotSupported { url: clean_url });
-        }
-        if status == 206
-            && let Some((start, _)) = range
-            && !crate::backend::validate_content_range_start(&resp, start)
-        {
-            return Err(IoError::RangeNotSupported { url: clean_url });
-        }
-        if status != 200 && status != 206 {
-            return Err(IoError::HttpStatus {
-                status,
-                url: clean_url,
-            });
-        }
-        let eff_cap = max_bytes.or_else(|| {
-            range.map(|(s, e)| e.saturating_sub(s).min(64 * 1024 * 1024) as usize)
-        });
-        let body_res = if let Some(cap) = eff_cap {
-            read_response_capped(resp, cap).await
-        } else {
-            resp.bytes().await.map_err(|e| IoError::Http(e.without_url()))
-        };
-        match body_res {
-            Ok(data) => {
-                permit.on_success();
-                metrics
-                    .remote_bytes_fetched
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
-                return Ok(data);
-            }
-            Err(IoError::ResponseTooLarge { .. }) if status == 200 && range.is_some() => {
-                return Err(IoError::RangeNotSupported { url: clean_url });
-            }
-            Err(IoError::Http(e)) => {
-                if is_retryable_transport_error(&e) {
-                    permit.on_throttle();
-                    if attempt < cfg.max_retries {
-                        tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
-                        continue;
-                    }
-                }
-                return Err(IoError::Http(e.without_url()));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(IoError::HttpStatus {
-        status: 503,
-        url: clean_url,
-    })
+            Ok((req, clean_url.clone()))
+        },
+        crate::retry::FetchSpec {
+            range,
+            max_bytes,
+            validator: None,
+            max_retries: cfg.max_retries,
+        },
+        limiter,
+        metrics,
+    )
+    .await
 }
 
 fn encode_path(path: &str) -> String {
@@ -1353,6 +1184,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use http_body_util::Full;
     use hyper::service::service_fn;
     use hyper::{Request, Response, StatusCode};
