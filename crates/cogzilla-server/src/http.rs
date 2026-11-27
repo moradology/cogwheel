@@ -3501,6 +3501,11 @@ fn build_tile_request_for_tms(
     ))
 }
 
+/// The range of an integer sample type (`None` for floats), for the statistics read.
+pub(crate) fn array_type_range(kind: cogzilla_tiff::SampleType) -> Option<(f64, f64)> {
+    array_type::integer_range(kind)
+}
+
 fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
     build_stats_options_with_bands(pq, allow_expr, 0)
 }
@@ -3510,7 +3515,7 @@ fn build_stats_options_with_bands(
     allow_expr: bool,
     default_bands: u16,
 ) -> Result<StatsOptions, EngineError> {
-    let mut opts = StatsOptions::default();
+    let mut opts = StatsOptions { resample: pq.resample, ..StatsOptions::default() };
     if !pq.percentiles.is_empty() {
         opts.percentiles = pq.percentiles.clone();
     }

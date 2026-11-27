@@ -3,6 +3,7 @@
 //! math. The renderers work in single precision; an array they write is rewritten in this
 //! type before it is answered.
 
+use cogzilla_kernel::ResampleMode;
 use cogzilla_tiff::SampleType;
 
 use super::ParsedQuery;
@@ -150,16 +151,35 @@ pub(crate) fn astype(kind: SampleType, v: f64) -> f64 {
     }
 }
 
+/// Round to the nearest and hold to `kind`'s range, as GDAL puts a resampled value into an
+/// integer type (where [`astype`] would wrap a cubic kernel's undershoot around).
+fn round_into(kind: SampleType) -> fn(f64) -> f64 {
+    use SampleType as T;
+    match kind {
+        T::Uint1 => |v: f64| v.round().clamp(0.0, 1.0),
+        T::Uint4 => |v: f64| v.round().clamp(0.0, 15.0),
+        T::Uint8 => |v: f64| v.round().clamp(0.0, 255.0),
+        T::Int8 => |v: f64| v.round().clamp(-128.0, 127.0),
+        T::Uint16 => |v: f64| v.round().clamp(0.0, 65_535.0),
+        T::Int16 => |v: f64| v.round().clamp(-32_768.0, 32_767.0),
+        T::Uint32 => |v: f64| v.round().clamp(0.0, 4_294_967_295.0),
+        T::Int32 => |v: f64| v.round().clamp(-2_147_483_648.0, 2_147_483_647.0),
+        _ => f64::round,
+    }
+}
+
 /// What decides the type of a `/cog` or `/stac` array, read from the request.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ArrayRule {
     /// The bands as they were read, in the type that holds them all; float32 once unscaled.
-    Data { unscale: bool },
+    /// `resampled`: read with a resampling other than nearest, so a value may fall between
+    /// whole numbers.
+    Data { unscale: bool, resampled: bool },
     /// Band math over them.
     Math { unscale: bool },
     /// An algorithm's output, typed as TiTiler's algorithm types it: its name, lowercase,
     /// and for `cast` the type asked (`None` when what was asked is not a type).
-    Algorithm { name: String, cast: Option<SampleType>, unscale: bool },
+    Algorithm { name: String, cast: Option<SampleType>, unscale: bool, resampled: bool },
 }
 
 impl ArrayRule {
@@ -170,13 +190,14 @@ impl ArrayRule {
         if shown(pq) || !pq.asset_exprs.is_empty() {
             return None;
         }
+        let resampled = pq.resample != ResampleMode::Nearest || pq.reproject != ResampleMode::Nearest;
         if let Some(name) = &pq.algorithm {
             let cast = cast_type(pq.cast_dtype.as_deref());
-            return Some(Self::Algorithm { name: name.clone(), cast, unscale: pq.unscale });
+            return Some(Self::Algorithm { name: name.clone(), cast, unscale: pq.unscale, resampled });
         }
         Some(match pq.expr_raw {
             Some(_) => Self::Math { unscale: pq.unscale },
-            None => Self::Data { unscale: pq.unscale },
+            None => Self::Data { unscale: pq.unscale, resampled },
         })
     }
 
@@ -184,7 +205,7 @@ impl ArrayRule {
     /// (`b1`, `b2`, ... after any asset names are rewritten), several separated by `;`.
     pub(super) fn kind(&self, reads: &[SampleType], expression: Option<&str>) -> Option<SampleType> {
         let (unscale, math) = match self {
-            Self::Data { unscale } => (*unscale, false),
+            Self::Data { unscale, .. } => (*unscale, false),
             Self::Math { unscale } => (*unscale, true),
             Self::Algorithm { unscale, .. } => (*unscale, false),
         };
@@ -200,16 +221,25 @@ impl ArrayRule {
         Some(band_math_type(expressions.iter(), read))
     }
 
-    /// How an algorithm rounds each number before it is put in `kind`: TiTiler's `cast`
-    /// truncates (`astype`), `ceil` and `floor` round up and down first, and all three wrap
-    /// around the range of a small integer type ([`astype`]). `None` for anything else.
+    /// How each number is rounded before it is put in `kind`: TiTiler's `cast` truncates
+    /// (`astype`), `ceil` and `floor` round up and down first, and all three wrap around the
+    /// range of a small integer type ([`astype`]). The bands as read with a resampling, and
+    /// their `min` and `max`, round to the nearest: GDAL puts a resampled value into an
+    /// integer band's type that way (a value read with nearest is whole already, and is put
+    /// as it is). `None` for anything else.
     pub(super) fn rounding(&self, kind: SampleType) -> Option<fn(f64) -> f64> {
-        let Self::Algorithm { name, .. } = self else { return None };
         integer_range(kind)?;
-        match name.as_str() {
-            "cast" => Some(f64::trunc),
-            "ceil" => Some(f64::ceil),
-            "floor" => Some(f64::floor),
+        match self {
+            Self::Data { unscale: false, resampled: true } => Some(round_into(kind)),
+            Self::Algorithm { name, unscale: false, resampled: true, .. } if matches!(name.as_str(), "min" | "max") => {
+                Some(round_into(kind))
+            }
+            Self::Algorithm { name, .. } => match name.as_str() {
+                "cast" => Some(f64::trunc),
+                "ceil" => Some(f64::ceil),
+                "floor" => Some(f64::floor),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -277,20 +307,20 @@ mod tests {
     #[test]
     fn a_request_says_which_rule_its_array_follows() {
         let rule = |q: &str| ArrayRule::of(&super::super::parse_query(Some(q)));
-        assert_eq!(rule("url=a.tif"), Some(ArrayRule::Data { unscale: false }));
-        assert_eq!(rule("url=a.tif&unscale=true"), Some(ArrayRule::Data { unscale: true }));
+        assert_eq!(rule("url=a.tif"), Some(ArrayRule::Data { unscale: false, resampled: false }));
+        assert_eq!(rule("url=a.tif&unscale=true"), Some(ArrayRule::Data { unscale: true, resampled: false }));
         assert_eq!(rule("url=a.tif&expression=b1*2"), Some(ArrayRule::Math { unscale: false }));
         for shown in ["rescale=0,100", "colormap_name=viridis", "color_formula=gamma%20r%202", "algorithm=hillshade&rescale=0,1", "assets=a%7Cexpression=b1*2"] {
             assert_eq!(rule(&format!("url=a.tif&{shown}")), None, "{shown}");
         }
         use SampleType as T;
-        assert_eq!(ArrayRule::Data { unscale: false }.kind(&[T::Uint16], None), Some(T::Uint16));
-        assert_eq!(ArrayRule::Data { unscale: false }.kind(&[T::Uint8, T::Uint16, T::Int16], None), Some(T::Int32));
-        assert_eq!(ArrayRule::Data { unscale: true }.kind(&[T::Int16], None), Some(T::Float32));
+        assert_eq!(ArrayRule::Data { unscale: false, resampled: false }.kind(&[T::Uint16], None), Some(T::Uint16));
+        assert_eq!(ArrayRule::Data { unscale: false, resampled: false }.kind(&[T::Uint8, T::Uint16, T::Int16], None), Some(T::Int32));
+        assert_eq!(ArrayRule::Data { unscale: true, resampled: false }.kind(&[T::Int16], None), Some(T::Float32));
         assert_eq!(ArrayRule::Math { unscale: false }.kind(&[T::Uint16, T::Uint16], Some("b1+b2;b1*2")), Some(T::Int32));
         assert_eq!(ArrayRule::Math { unscale: false }.kind(&[T::Uint16], Some("(b2-b1)/(b2+b1)")), Some(T::Float64));
         assert_eq!(ArrayRule::Math { unscale: false }.kind(&[T::Uint16], None), None);
-        assert_eq!(ArrayRule::Data { unscale: false }.kind(&[], None), None);
+        assert_eq!(ArrayRule::Data { unscale: false, resampled: false }.kind(&[], None), None);
     }
 
     #[test]
@@ -335,7 +365,17 @@ mod tests {
         assert_eq!(put("floor", -0.5), 255.0);
         assert_eq!(astype(T::Int16, 40_000.0), -25_536.0);
         assert_eq!(astype(T::Int8, 200.0), -56.0);
+        // A read, and its min and max, round as GDAL rounds a resampled value into the type.
         assert!(rule("min").rounding(T::Uint8).is_none());
+        let resampled = ArrayRule::of(&super::super::parse_query(Some("url=a.tif&algorithm=min&resampling=bilinear"))).unwrap();
+        assert_eq!(resampled.rounding(T::Uint8).unwrap()(2.5), 3.0);
+        assert_eq!(ArrayRule::Data { unscale: false, resampled: true }.rounding(T::Uint16).unwrap()(17836.6), 17837.0);
+        assert!(ArrayRule::Data { unscale: false, resampled: true }.rounding(T::Float32).is_none());
+        assert!(ArrayRule::Data { unscale: false, resampled: false }.rounding(T::Uint16).is_none());
+        // Held to the type's range, not wrapped: a cubic undershoot beside nodata 0 is 0.
+        assert_eq!(ArrayRule::Data { unscale: false, resampled: true }.rounding(T::Uint16).unwrap()(-4.6), 0.0);
+        assert_eq!(ArrayRule::Data { unscale: false, resampled: true }.rounding(T::Uint8).unwrap()(255.7), 255.0);
+        assert!(rule("mean").rounding(T::Uint8).is_none());
         assert!(rule("cast").rounding(T::Float32).is_none());
     }
 }
