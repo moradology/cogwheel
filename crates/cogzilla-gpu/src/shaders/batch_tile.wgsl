@@ -25,28 +25,8 @@ struct BatchParams {
 /// Contiguous per-tile output words (tile_idx * tile_words + local_word)
 @group(0) @binding(5) var<storage, read_write> dst_words: array<u32>;
 
-fn sample_nearest(u: f32, v: f32) -> f32 {
-    if (!is_finite_f32(u) || !is_finite_f32(v)
-        || u < -0.5 || v < -0.5
-        || u > f32(params.src_w) - 0.5
-        || v > f32(params.src_h) - 0.5) {
-        return nan_f32();
-    }
-    let xi = clamp(i32(floor(u + 0.5)), 0, i32(params.src_w) - 1);
-    let yi = clamp(i32(floor(v + 0.5)), 0, i32(params.src_h) - 1);
-    return sample_checked(xi, yi);
-}
-
 fn sample_mode(u: f32, v: f32) -> f32 {
-    if (params.mode == 3u) {
-        return sample_nearest(u, v);
-    } else if (params.mode == 0u) {
-        return sample_bilinear(u, v);
-    } else if (params.mode == 1u) {
-        return sample_cubic(u, v);
-    } else {
-        return sample_lanczos3(u, v);
-    }
+    return sample_mode_1band(params.mode, u, v);
 }
 
 @compute @workgroup_size(16, 16, 1)

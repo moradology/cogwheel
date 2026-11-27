@@ -59,6 +59,16 @@ fn percent_decode(input: &str) -> String {
     percent_decode_opts(input, true)
 }
 
+/// A query key as Starlette reads it: percent-decoded (`dst%5Fcrs` is `dst_crs`), borrowed
+/// when there is nothing to decode.
+pub(crate) fn query_key(k: &str) -> std::borrow::Cow<'_, str> {
+    if k.contains('%') {
+        std::borrow::Cow::Owned(percent_decode(k))
+    } else {
+        std::borrow::Cow::Borrowed(k)
+    }
+}
+
 fn percent_decode_opts(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -447,6 +457,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
+        let k = query_key(k);
+        let k = k.as_ref();
         pq.keys.push(k.to_string());
         let mut bad = |what: &str| pq_errors.push(format!("invalid {k}={}: {what}", percent_decode(v)));
         match k {
@@ -1021,30 +1033,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     pq
 }
 
-const SUPPORTED_ALGORITHMS: &[&str] = &[
-    "hillshade",
-    "slope",
-    "aspect",
-    "terrarium",
-    "terrainrgb",
-    "terrain-rgb",
-    "mapbox",
-    "normalizedindex",
-    "cast",
-    "ceil",
-    "floor",
-    "min",
-    "max",
-    "median",
-    "mean",
-    "std",
-    "var",
-    "sum",
-    "grayscale",
-    "bitonal",
-    "contours",
-];
-
 fn parse_resample_mode(raw: &str) -> Option<ResampleMode> {
     match raw {
         "nearest" => Some(ResampleMode::Nearest),
@@ -1112,7 +1100,7 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         return Err(e.clone());
     }
     if let Some(alg) = pq.algorithm.as_deref() {
-        if !SUPPORTED_ALGORITHMS.contains(&alg) {
+        if !crate::titiler::is_supported_algorithm(alg) {
             return Err(format!(
                 "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
             ));
@@ -1268,10 +1256,10 @@ fn filter_tile_template_query(raw_query: &str) -> String {
     raw_query
         .split('&')
         .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or("");
+            let k = query_key(pair.split('=').next().unwrap_or(""));
             !pair.is_empty()
                 && !matches!(
-                    k,
+                    k.as_ref(),
                     "minzoom" | "maxzoom" | "tile_format" | "tile_scale" | "use_epsg" | "zooms"
                 )
         })
@@ -1297,8 +1285,8 @@ fn apply_tilejson_overrides(
     let filtered_query: String = raw_query
         .split('&')
         .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or("");
-            !pair.is_empty() && !matches!(k, "minzoom" | "maxzoom" | "tile_format" | "tile_scale")
+            let k = query_key(pair.split('=').next().unwrap_or(""));
+            !pair.is_empty() && !matches!(k.as_ref(), "minzoom" | "maxzoom" | "tile_format" | "tile_scale")
         })
         .collect::<Vec<_>>()
         .join("&");
@@ -2339,7 +2327,7 @@ async fn cog_array_in_its_type(
     let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else {
         return data;
     };
-    let Ok(cogs) = open_query_urls(engine, urls).await else {
+    let Ok(cogs) = open_query_urls(engine, urls, None).await else {
         return data;
     };
     apply_array_asked(Some(asked), &cogs, None, data)
@@ -2362,7 +2350,7 @@ async fn stac_array_in_its_type(
         ArrayAsked::Shown(pq) => (pq.assets.clone(), pq.expr_raw.clone()),
     };
     let Ok((_, cogs, expression)) =
-        resolve_stac_assets(engine, item, &assets, expression.as_deref()).await
+        resolve_stac_assets(engine, item, &assets, expression.as_deref(), None).await
     else {
         return data;
     };
@@ -3014,7 +3002,7 @@ fn build_ogc_tileset_json(
     };
     let tile_q: String = filter_tile_template_query(raw_query)
         .split('&')
-        .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("crs"))
+        .filter(|pair| !pair.is_empty() && query_key(pair.split('=').next().unwrap_or("")) != "crs")
         .collect::<Vec<_>>()
         .join("&");
     let tile_q_suffix = if tile_q.is_empty() {
@@ -3502,6 +3490,11 @@ fn build_tile_request_for_tms(
     ))
 }
 
+/// The range of an integer sample type (`None` for floats), for the statistics read.
+pub(crate) fn array_type_range(kind: cogzilla_tiff::SampleType) -> Option<(f64, f64)> {
+    array_type::integer_range(kind)
+}
+
 fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
     build_stats_options_with_bands(pq, allow_expr, 0)
 }
@@ -3511,7 +3504,7 @@ fn build_stats_options_with_bands(
     allow_expr: bool,
     default_bands: u16,
 ) -> Result<StatsOptions, EngineError> {
-    let mut opts = StatsOptions::default();
+    let mut opts = StatsOptions { resample: pq.resample, ..StatsOptions::default() };
     if !pq.percentiles.is_empty() {
         opts.percentiles = pq.percentiles.clone();
     }
@@ -3725,7 +3718,7 @@ async fn render_mosaic_tile_pixel_selection(
         if scene_i > 0 {
             tokio::task::consume_budget().await;
         }
-        let cog = match engine.store.open_uri(url).await {
+        let cog = match engine.store.open_uri(url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
             Ok(c) => c,
             Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                 return Err(EngineError::Io(e));
@@ -4048,7 +4041,7 @@ async fn render_mosaic_tile_styled(
                 if scene_i > 0 {
                     tokio::task::consume_budget().await;
                 }
-                let cog = match engine.store.open_uri(url).await {
+                let cog = match engine.store.open_uri(url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                     Ok(c) => c,
                     Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                         return Err(EngineError::Io(e));
@@ -4177,7 +4170,7 @@ async fn render_mosaic_tile_styled(
             if scene_i > 0 {
                 tokio::task::consume_budget().await;
             }
-            let cog = match engine.store.open_uri(url).await {
+            let cog = match engine.store.open_uri(url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                 Ok(c) => c,
                 Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                     return Err(EngineError::Io(e));
@@ -4519,7 +4512,7 @@ async fn render_mosaic_bbox_composite(
         if scene_i > 0 {
             tokio::task::consume_budget().await;
         }
-        let cog = match engine.store.open_uri(u).await {
+        let cog = match engine.store.open_uri(u).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
             Ok(c) => c,
             Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                 return Err(EngineError::Io(e));
@@ -4877,7 +4870,7 @@ async fn compute_mosaic_statistics_with_fold(
             Vec::with_capacity(urls.len());
         let mut open_err: Option<EngineError> = None;
         for u in urls {
-            match engine.store.open_uri(u).await {
+            match engine.store.open_uri(u).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                 Ok(c) => opened.push((u.clone(), c)),
                 Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                     return Err(EngineError::Io(e));
@@ -4890,6 +4883,20 @@ async fn compute_mosaic_statistics_with_fold(
                 EngineError::NotFound("no readable mosaic scenes intersect requested bounds".into())
             }));
         }
+        let mut exact_opts = stats_opts.clone();
+        if exact_opts.hist_dtype.is_none() {
+            let band_dtype = crate::histogram::HistDtype::for_sample_type(
+                opened[0].1.index.full_res().sample_type,
+                pq.unscale,
+            );
+            exact_opts.hist_dtype = Some(if method == Selection::Count {
+                crate::histogram::HistDtype::Float64
+            } else if let Some(expr) = pq.expr_raw.as_deref() {
+                crate::histogram::HistDtype::for_expression(expr, band_dtype)
+            } else {
+                band_dtype
+            });
+        }
         if let Some(exact) = crate::zonal::compute_native_exact_mosaic_fold_stats(
             engine,
             &opened,
@@ -4899,7 +4906,7 @@ async fn compute_mosaic_statistics_with_fold(
             pq.nodata,
             method,
             MAX_MEDIAN_BUFFER_BYTES,
-            stats_opts,
+            &exact_opts,
         )
         .await?
         {
@@ -4909,6 +4916,7 @@ async fn compute_mosaic_statistics_with_fold(
 
     let mut eff_bbox = wgs_bbox;
     let mut out_dims: Option<(u32, u32)> = None;
+    let mut first_sample_type: Option<cogzilla_tiff::SampleType> = None;
     let mut selected_bidx: Vec<u16> = Vec::new();
     let mut band_descs: Vec<String> = Vec::new();
     let mut fold: Option<Fold> = None;
@@ -4921,7 +4929,7 @@ async fn compute_mosaic_statistics_with_fold(
         if scene_i > 0 {
             tokio::task::consume_budget().await;
         }
-        let cog = match engine.store.open_uri(u).await {
+        let cog = match engine.store.open_uri(u).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
             Ok(c) => c,
             Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
                 return Err(EngineError::Io(e));
@@ -4933,6 +4941,7 @@ async fn compute_mosaic_statistics_with_fold(
         };
         let cogs = [cog];
         let full = cogs[0].index.full_res();
+        first_sample_type.get_or_insert(full.sample_type);
         let (out_w, out_h) = match out_dims {
             Some(d) => d,
             None => {
@@ -5122,6 +5131,19 @@ async fn compute_mosaic_statistics_with_fold(
             (nb, vec![f32::NAN; nb * total_px])
         }
     };
+    let mut eff_opts = stats_opts.clone();
+    if eff_opts.hist_dtype.is_none()
+        && let Some(st) = first_sample_type
+    {
+        let band_dtype = crate::histogram::HistDtype::for_sample_type(st, pq.unscale);
+        eff_opts.hist_dtype = Some(if method == Selection::Count {
+            crate::histogram::HistDtype::Float64
+        } else if let Some(expr) = pq.expr_raw.as_deref() {
+            crate::histogram::HistDtype::for_expression(expr, band_dtype)
+        } else {
+            band_dtype
+        });
+    }
     if let Some(mask) = poly_mask {
         let mut keys_descs: Vec<(String, String)> = Vec::with_capacity(out_nb);
         for bi in 0..out_nb {
@@ -5155,7 +5177,7 @@ async fn compute_mosaic_statistics_with_fold(
             out_w as usize,
             out_h as usize,
             mask,
-            stats_opts,
+            &eff_opts,
         );
         return Ok((json, used_assets));
     }
@@ -5174,7 +5196,7 @@ async fn compute_mosaic_statistics_with_fold(
         } else {
             band_descs.get(bi).cloned().unwrap_or_else(|| key.clone())
         };
-        out.insert(key, compute_f32_band_stats(plane, &desc, stats_opts));
+        out.insert(key, compute_f32_band_stats(plane, &desc, &eff_opts));
     }
     Ok((serde_json::Value::Object(out), used_assets))
 }
@@ -5350,6 +5372,80 @@ fn fc_worker_count(n: usize) -> usize {
         .min(n)
 }
 
+/// Shared worker pool for `POST /*/statistics` on GeoJSON `FeatureCollection` payloads.
+/// Parses every feature's polygon mask against `fc_crs`, runs `compute` across bounded
+/// tokio workers, inserts each feature's `"statistics"` property, and returns per-feature
+/// sidecar outputs `T` (e.g. used asset lists for `X-Assets`).
+async fn run_feature_collection_stats<T, F, Fut>(
+    geojson: &mut serde_json::Value,
+    fc_crs: Option<&cogzilla_proj::CrsModel>,
+    compute: F,
+) -> Result<Vec<T>, EngineError>
+where
+    T: Send + 'static,
+    F: Fn(Arc<PolygonMask>, [f64; 4]) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(serde_json::Value, T), EngineError>> + Send + 'static,
+{
+    let features = geojson
+        .get_mut("features")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| EngineError::BadRequest("FeatureCollection missing 'features' array".into()))?;
+    check_feature_collection_len(features.len())?;
+    let n_feats = features.len();
+    let mut parsed = Vec::with_capacity(n_feats);
+    for (idx, feat) in features.iter().enumerate() {
+        let (mask, bbox) = parse_feature_mask_or_null(feat, fc_crs)
+            .map_err(|e| wrap_feature_error(idx, feat, e))?;
+        parsed.push((Arc::new(mask), bbox));
+    }
+    let mut extras = Vec::with_capacity(n_feats);
+    if n_feats <= 1 {
+        for (idx, (mask, bbox)) in parsed.into_iter().enumerate() {
+            let (stats, extra) = compute(mask, bbox)
+                .await
+                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
+            insert_feature_stats(&mut features[idx], stats);
+            extras.push(extra);
+        }
+    } else {
+        let parsed = Arc::new(parsed);
+        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers = fc_worker_count(n_feats);
+        let compute = Arc::new(compute);
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..workers {
+            let parsed_c = parsed.clone();
+            let next_c = next_idx.clone();
+            let compute_c = compute.clone();
+            set.spawn(async move {
+                let mut local = Vec::new();
+                loop {
+                    let idx = next_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= parsed_c.len() {
+                        break;
+                    }
+                    let (ref mask, bbox) = parsed_c[idx];
+                    let (stats, extra) = compute_c(mask.clone(), bbox)
+                        .await
+                        .map_err(|e| (idx, e))?;
+                    local.push((idx, stats, extra));
+                }
+                Ok::<_, (usize, EngineError)>(local)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let batch = joined
+                .map_err(|e| EngineError::BadRequest(format!("statistics worker failed: {e}")))?
+                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
+            for (idx, stats, extra) in batch {
+                insert_feature_stats(&mut features[idx], stats);
+                extras.push(extra);
+            }
+        }
+    }
+    Ok(extras)
+}
+
 async fn read_limited_body_with_timeout<B>(body: B, timeout_secs: u64) -> Result<Bytes, EngineError>
 where
     B: hyper::body::Body,
@@ -5421,9 +5517,12 @@ async fn open_first_mosaic_cog(
     }))
 }
 
+/// Open the `?url=` rasters; `nodata` (the request's `?nodata=`) replaces each file's own
+/// nodata, as GDAL's override does (see [`cogzilla_io::CogStore::with_nodata`]).
 async fn open_query_urls(
     engine: &TileEngine,
     urls: &[String],
+    nodata: Option<f32>,
 ) -> Result<Vec<Arc<cogzilla_io::OpenedCog>>, EngineError> {
     if urls.is_empty() {
         return Err(EngineError::BadRequest(
@@ -5437,7 +5536,8 @@ async fn open_query_urls(
         )));
     }
     if urls.len() == 1 {
-        return Ok(vec![engine.store.open_uri(&urls[0]).await?]);
+        let cog = engine.store.open_uri(&urls[0]).await?;
+        return Ok(vec![engine.store.with_nodata(&cog, nodata)]);
     }
     let mut js = tokio::task::JoinSet::new();
     for (idx, u) in urls.iter().enumerate() {
@@ -5454,7 +5554,7 @@ async fn open_query_urls(
         })??;
         slots[idx] = Some(cog);
     }
-    Ok(slots.into_iter().map(|s| s.unwrap()).collect())
+    Ok(slots.into_iter().map(|s| engine.store.with_nodata(&s.unwrap(), nodata)).collect())
 }
 
 /// Convenience entry point for serverless / embedded runtimes (such as AWS Lambda)
@@ -6328,7 +6428,7 @@ where
                         async move {
                             if mask.is_empty() {
                                 if let Some(first_url) = mj_c.first_asset() {
-                                    match eng.store.open_uri(first_url).await {
+                                    match eng.store.open_uri(first_url).await.map(|c| eng.store.with_nodata(&c, pq_c.nodata)) {
                                         Ok(cog) => {
                                             let stats = compute_statistics_with_options(
                                                 &eng,
@@ -6373,75 +6473,17 @@ where
                     })
                 };
                 if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
-                    let features = geojson
-                        .get_mut("features")
-                        .and_then(|v| v.as_array_mut())
-                        .ok_or_else(|| {
-                            EngineError::BadRequest(
-                                "FeatureCollection missing 'features' array".into(),
-                            )
-                        })?;
-                    check_feature_collection_len(features.len())?;
-                    let n_feats = features.len();
-                    let mut parsed = Vec::with_capacity(n_feats);
-                    for (idx, feat) in features.iter().enumerate() {
-                        let (mask, bbox) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
-                            .map_err(|e| wrap_feature_error(idx, feat, e))?;
-                        parsed.push((mask, bbox));
-                    }
+                    let used_batches = run_feature_collection_stats(
+                        &mut geojson,
+                        fc_crs.as_ref(),
+                        move |mask, bbox| compute_for_mask((*mask).clone(), bbox),
+                    )
+                    .await?;
                     let mut seen_assets = std::collections::HashSet::new();
-                    if n_feats <= 1 {
-                        for (idx, (mask, bbox)) in parsed.into_iter().enumerate() {
-                            let (stats, used) = compute_for_mask(mask, bbox)
-                                .await
-                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
-                            for a in used {
-                                if seen_assets.insert(a.clone()) {
-                                    x_assets.push(a);
-                                }
-                            }
-                            insert_feature_stats(&mut features[idx], stats);
-                        }
-                    } else {
-                        let parsed = Arc::new(parsed);
-                        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                        let workers = fc_worker_count(n_feats);
-                        let mut set = tokio::task::JoinSet::new();
-                        for _ in 0..workers {
-                            let parsed_c = parsed.clone();
-                            let next_c = next_idx.clone();
-                            let compute_c = compute_for_mask.clone();
-                            set.spawn(async move {
-                                let mut local = Vec::new();
-                                loop {
-                                    let idx = next_c
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if idx >= parsed_c.len() {
-                                        break;
-                                    }
-                                    let (ref mask, bbox) = parsed_c[idx];
-                                    let (stats, used) =
-                                        compute_c(mask.clone(), bbox).await.map_err(|e| (idx, e))?;
-                                    local.push((idx, stats, used));
-                                }
-                                Ok::<_, (usize, EngineError)>(local)
-                            });
-                        }
-                        while let Some(joined) = set.join_next().await {
-                            let batch = joined
-                                .map_err(|e| {
-                                    EngineError::BadRequest(format!(
-                                        "statistics worker failed: {e}"
-                                    ))
-                                })?
-                                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
-                            for (idx, stats, used) in batch {
-                                for a in used {
-                                    if seen_assets.insert(a.clone()) {
-                                        x_assets.push(a);
-                                    }
-                                }
-                                insert_feature_stats(&mut features[idx], stats);
+                    for used in used_batches {
+                        for a in used {
+                            if seen_assets.insert(a.clone()) {
+                                x_assets.push(a);
                             }
                         }
                     }
@@ -6812,7 +6854,7 @@ where
                 let mut opened_any = false;
                 let mut last_open_err: Option<EngineError> = None;
                 for asset_url in urls.into_iter().take(16) {
-                    let cog = match engine.store.open_uri(&asset_url).await {
+                    let cog = match engine.store.open_uri(&asset_url).await.map(|c| engine.store.with_nodata(&c, pq.nodata)) {
                         Ok(c) => {
                             opened_any = true;
                             c
@@ -7837,7 +7879,7 @@ where
                     b
                 } else {
                     let (_, cogs, _) =
-                        resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                        resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                     let mut acc = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
                     for cog in &cogs {
                         let crs = engine.get_or_build_crs(cog)?;
@@ -7867,7 +7909,7 @@ where
             (Method::GET, ["info"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut map = serde_json::Map::new();
                 for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
                     let mut info = build_cog_info(&engine, &cog)?;
@@ -7887,7 +7929,7 @@ where
             (Method::GET, ["info.geojson"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut props = serde_json::Map::new();
                 for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
                     let mut info = build_cog_info(&engine, &cog)?;
@@ -7919,7 +7961,7 @@ where
             (Method::GET, ["asset_statistics"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, _) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, None).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, None, pq.nodata).await?;
                 let n = names.len();
                 let stats_opts = build_stats_options(&pq, false)?;
                 let mut set = tokio::task::JoinSet::new();
@@ -7973,7 +8015,7 @@ where
             (Method::GET, ["statistics"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 if stac_prefix != "stac"
                     && let Some(expression) = pq.expr_raw.as_deref()
                 {
@@ -8221,7 +8263,7 @@ where
                 let body_bytes = read_limited_body(req.into_body()).await?;
                 // (An item's posted statistics are the search routes', and never come here.)
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
 
@@ -8528,67 +8570,16 @@ where
                         Some(c) => Some(c.clone()),
                         None => crate::titiler::extract_geojson_crs(&geojson)?,
                     };
-                    let features = geojson
-                        .get_mut("features")
-                        .and_then(|v| v.as_array_mut())
-                        .ok_or_else(|| {
-                            EngineError::BadRequest("FeatureCollection missing 'features' array".into())
-                        })?;
-                    check_feature_collection_len(features.len())?;
-                    let n_feats = features.len();
-                    let mut parsed = Vec::with_capacity(n_feats);
-                    for (idx, feat) in features.iter().enumerate() {
-                        let (mask, poly_bbox) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
-                            .map_err(|e| wrap_feature_error(idx, feat, e))?;
-                        parsed.push((Arc::new(mask), poly_bbox));
-                    }
-                    if n_feats <= 1 {
-                        for (idx, (mask, poly_bbox)) in parsed.into_iter().enumerate() {
-                            let stats = compute_stac_merged_stats(mask, poly_bbox)
-                                .await
-                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
-                            insert_feature_stats(&mut features[idx], stats);
-                        }
-                    } else {
-                        let parsed = Arc::new(parsed);
-                        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                        let workers = fc_worker_count(n_feats);
-                        let compute_shared = Arc::new(compute_stac_merged_stats);
-                        let mut set = tokio::task::JoinSet::new();
-                        for _ in 0..workers {
-                            let parsed_c = parsed.clone();
-                            let next_c = next_idx.clone();
+                    let compute_shared = Arc::new(compute_stac_merged_stats);
+                    run_feature_collection_stats(
+                        &mut geojson,
+                        fc_crs.as_ref(),
+                        move |mask, poly_bbox| {
                             let compute_c = compute_shared.clone();
-                            set.spawn(async move {
-                                let mut local = Vec::new();
-                                loop {
-                                    let idx = next_c
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if idx >= parsed_c.len() {
-                                        break;
-                                    }
-                                    let (ref mask, poly_bbox) = parsed_c[idx];
-                                    let stats = compute_c(mask.clone(), poly_bbox)
-                                        .await
-                                        .map_err(|e| (idx, e))?;
-                                    local.push((idx, stats));
-                                }
-                                Ok::<_, (usize, EngineError)>(local)
-                            });
-                        }
-                        while let Some(joined) = set.join_next().await {
-                            let batch = joined
-                                .map_err(|e| {
-                                    EngineError::BadRequest(format!(
-                                        "statistics worker failed: {e}"
-                                    ))
-                                })?
-                                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
-                            for (idx, stats) in batch {
-                                insert_feature_stats(&mut features[idx], stats);
-                            }
-                        }
-                    }
+                            async move { Ok((compute_c(mask, poly_bbox).await?, ())) }
+                        },
+                    )
+                    .await?;
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                 } else {
                     let (mask, poly_bbox) =
@@ -8672,7 +8663,7 @@ where
                 let tms = if sub.len() == 2 { sub[0] } else { "WebMercatorQuad" };
                 let item = stac_source.load(&engine).await?;
                 let (_, cogs, _) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), None).await?;
                 let mut tj = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
                 apply_tilejson_overrides(&mut tj, &pq, &host, &stac_prefix, tms, &raw_query);
                 tj["name"] = serde_json::json!(item.id);
@@ -8749,7 +8740,7 @@ where
             (Method::GET, ["map"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -8820,7 +8811,7 @@ where
                     }
                     let item = stac_source.load(&engine).await?;
                     let (_, cogs, _) =
-                        resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref())
+                        resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), None)
                             .await?;
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
@@ -8919,6 +8910,7 @@ where
                             &item,
                             &pq.assets,
                             pq.expr_raw.as_deref(),
+                            pq.nodata,
                         )
                         .await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
@@ -9167,7 +9159,7 @@ where
             (Method::GET, ["point", coord]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let Some((x, y)) = parse_point_coord(coord) else {
                     return Err(EngineError::BadRequest("expected /stac/point/{lon},{lat}".into()));
                 };
@@ -9292,7 +9284,7 @@ where
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9379,7 +9371,7 @@ where
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9462,7 +9454,7 @@ where
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9558,7 +9550,7 @@ where
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9642,7 +9634,7 @@ where
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9702,7 +9694,7 @@ where
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9868,7 +9860,7 @@ where
         let res: Result<(Bytes, &'static str), EngineError> = match (method.clone(), sub) {
             // 1. GET /cog/info
             (Method::GET, ["info"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let mut json = build_cog_info(&engine, &cogs[0])?;
                 if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
@@ -9889,7 +9881,7 @@ where
 
             // 2. GET /cog/info.geojson
             (Method::GET, ["info.geojson"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let mut json = build_cog_info_geojson(&engine, &cogs[0])?;
                 if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
@@ -9910,7 +9902,7 @@ where
 
             // Alias: GET /cog/bounds
             (Method::GET, ["bounds"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bounds = crs.wgs84_bounds_with_gcp(
@@ -9931,7 +9923,7 @@ where
 
             // GET /cog/validate?url=...&strict=false
             (Method::GET, ["validate"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let url = pq.urls.first().map(String::as_str).unwrap_or("");
                 let json = build_cog_validate(&engine, &cogs[0], url, pq.strict)?;
                 Ok((Bytes::from(json.to_string()), "application/json"))
@@ -9940,7 +9932,7 @@ where
 
             // 3. GET / POST /cog/statistics (POST supports GeoJSON Polygon clipping!)
             (Method::GET, ["statistics"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let db = data_band_count(full);
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
@@ -10051,7 +10043,7 @@ where
             .await,
             (Method::POST, ["statistics"]) => async {
                 let body_bytes = read_limited_body(req.into_body()).await?;
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let db = data_band_count(cogs[0].index.full_res());
                 let stats_opts = build_stats_options_with_bands(&pq, true, db)?;
                 if body_bytes.is_empty() {
@@ -10074,90 +10066,35 @@ where
                             Some(c) => Some(c.clone()),
                             None => crate::titiler::extract_geojson_crs(&geojson)?,
                         };
-                        let features = geojson
-                            .get_mut("features")
-                            .and_then(|v| v.as_array_mut())
-                            .ok_or_else(|| {
-                                EngineError::BadRequest(
-                                    "FeatureCollection missing 'features' array".into(),
-                                )
-                            })?;
-                        check_feature_collection_len(features.len())?;
-                        let n_feats = features.len();
-                        let mut masks = Vec::with_capacity(n_feats);
-                        for (idx, feat) in features.iter().enumerate() {
-                            let (mask, _) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
-                                .map_err(|e| wrap_feature_error(idx, feat, e))?;
-                            masks.push(mask);
-                        }
-                        if n_feats <= 1 {
-                            for (idx, mask) in masks.into_iter().enumerate() {
-                                let stats = compute_statistics_with_options(
-                                    &engine,
-                                    &cogs[0],
-                                    pq.max_size,
-                                    Some(&mask),
-                                    pq.unscale,
-                                    pq.nodata,
-                                    &stats_opts,
-                                )
-                                .await
-                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
-                                insert_feature_stats(&mut features[idx], stats);
-                            }
-                        } else {
-                            let masks = Arc::new(masks);
-                            let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                            let workers = fc_worker_count(n_feats);
-                            let mut set = tokio::task::JoinSet::new();
-                            for _ in 0..workers {
-                                let eng_c = engine.clone();
-                                let cog_c = cogs[0].clone();
-                                let masks_c = masks.clone();
-                                let next_c = next_idx.clone();
-                                let opts_c = stats_opts.clone();
-                                let max_size = pq.max_size;
-                                let unscale = pq.unscale;
-                                let nodata = pq.nodata;
-                                set.spawn(async move {
-                                    let mut local = Vec::new();
-                                    loop {
-                                        let idx = next_c
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if idx >= masks_c.len() {
-                                            break;
-                                        }
-                                        let stats = compute_statistics_with_options(
-                                            &eng_c,
-                                            &cog_c,
-                                            max_size,
-                                            Some(&masks_c[idx]),
-                                            unscale,
-                                            nodata,
-                                            &opts_c,
-                                        )
-                                        .await
-                                        .map_err(|e| (idx, e))?;
-                                        local.push((idx, stats));
-                                    }
-                                    Ok::<_, (usize, EngineError)>(local)
-                                });
-                            }
-                            while let Some(joined) = set.join_next().await {
-                                let batch = joined
-                                    .map_err(|e| {
-                                        EngineError::BadRequest(format!(
-                                            "statistics worker failed: {e}"
-                                        ))
-                                    })?
-                                    .map_err(|(idx, e)| {
-                                        wrap_feature_error(idx, &features[idx], e)
-                                    })?;
-                                for (idx, stats) in batch {
-                                    insert_feature_stats(&mut features[idx], stats);
+                        let eng_c = engine.clone();
+                        let cog_c = cogs[0].clone();
+                        let opts_c = stats_opts.clone();
+                        let max_size = pq.max_size;
+                        let unscale = pq.unscale;
+                        let nodata = pq.nodata;
+                        run_feature_collection_stats(
+                            &mut geojson,
+                            fc_crs.as_ref(),
+                            move |mask, _| {
+                                let eng_c = eng_c.clone();
+                                let cog_c = cog_c.clone();
+                                let opts_c = opts_c.clone();
+                                async move {
+                                    let stats = compute_statistics_with_options(
+                                        &eng_c,
+                                        &cog_c,
+                                        max_size,
+                                        Some(&mask),
+                                        unscale,
+                                        nodata,
+                                        &opts_c,
+                                    )
+                                    .await?;
+                                    Ok((stats, ()))
                                 }
-                            }
-                        }
+                            },
+                        )
+                        .await?;
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                     } else {
                         let (mask, _) =
@@ -10200,7 +10137,7 @@ where
             // 4. GET /cog/tiles (OGC Tiles list)
             (Method::GET, ["tiles"]) => async {
                 let bounds = if !pq.urls.is_empty() {
-                    match open_query_urls(&engine, &pq.urls).await {
+                    match open_query_urls(&engine, &pq.urls, None).await {
                         Ok(cogs) => engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
                             let full = cogs[0].index.full_res();
                             crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
@@ -10232,7 +10169,7 @@ where
                 let tms_def = crate::tms::lookup_tms(tms)
                     .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")))?;
                 let (bounds, minz, maxz) = if !pq.urls.is_empty() {
-                    match open_query_urls(&engine, &pq.urls).await {
+                    match open_query_urls(&engine, &pq.urls, None).await {
                         Ok(cogs) => {
                             if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
                                 let full = cogs[0].index.full_res();
@@ -10294,7 +10231,7 @@ where
                 let cached = engine
                     .tile_cache
                     .get_or_render(cache_key, || cog_tile_in_its_type(&engine, cog_array.clone(), &cog_urls, async {
-                        let cogs = open_query_urls(&engine, &pq.urls).await?;
+                        let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                         let (Some(z), Some(x), Some((y, sc, ext))) = (
                             parse_u8_like(zs),
                             parse_u32_like(xs),
@@ -10503,14 +10440,14 @@ where
 
             // 8. GET /cog/{tileMatrixSetId}/tilejson.json & /cog/tilejson.json
             (Method::GET, [tms, "tilejson.json"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let mut json = build_tilejson(&engine, &cogs[0], &host, tms, &raw_query)?;
                 apply_tilejson_overrides(&mut json, &pq, &host, "cog", tms, &raw_query);
                 Ok((Bytes::from(json.to_string()), "application/json"))
             }
             .await,
             (Method::GET, ["tilejson.json"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let mut json =
                     build_tilejson(&engine, &cogs[0], &host, "WebMercatorQuad", &raw_query)?;
                 apply_tilejson_overrides(&mut json, &pq, &host, "cog", "WebMercatorQuad", &raw_query);
@@ -10526,7 +10463,7 @@ where
             }
             // GET /cog/stac — build a STAC 1.1.0 Item JSON from a COG (matching TiTiler / rio-stac)
             (Method::GET, ["stac"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let cog = &cogs[0];
                 let (crs, native_epsg, native_bounds) =
                     dataset_native_crs_and_bounds(&engine, cog)?;
@@ -10554,7 +10491,7 @@ where
                 for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
                     if let Some((k, v)) = pair.split_once('=') {
                         let dec = percent_decode(v);
-                        match k {
+                        match query_key(k).as_ref() {
                             "id" if !dec.is_empty() => q_id = Some(dec),
                             "collection" if !dec.is_empty() => q_collection = Some(dec),
                             "collection_url" if !dec.is_empty() => q_collection_url = Some(dec),
@@ -10762,7 +10699,7 @@ where
             .await,
             // GET /cog/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let (native_crs, native_epsg, native_bounds) =
                     dataset_native_crs_and_bounds(&engine, &cogs[0])?;
                 let full = cogs[0].index.full_res();
@@ -10883,7 +10820,7 @@ where
                     {
                         return Err(EngineError::NotFound(format!("unknown TileMatrixSet '{tms}'")));
                     }
-                    let cogs = open_query_urls(&engine, &pq.urls).await?;
+                    let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                     let crs = engine.get_or_build_crs(&cogs[0])?;
                     let full = cogs[0].index.full_res();
                     let bounds = crs.wgs84_bounds_with_gcp(
@@ -10956,7 +10893,7 @@ where
 
             // 10. GET /cog/point/{lon},{lat} (supports coord_crs=EPSG:3857)
             (Method::GET, ["point", coord]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let Some((x, y)) = parse_point_coord(coord) else {
                     return Err(EngineError::BadRequest("expected /cog/point/{lon},{lat}".into()));
                 };
@@ -10978,7 +10915,7 @@ where
                 let ext = ext_opt
                     .or(pq.format_param.as_deref())
                     .unwrap_or("png");
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let is_georef = cogs[0].index.is_georeferenced;
                 if !is_georef && pq.dst_crs.is_some() {
@@ -11079,7 +11016,7 @@ where
             .await,
             (Method::GET, ["preview", dims_ext]) => async {
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let is_georef = cogs[0].index.is_georeferenced;
                 if !is_georef && pq.dst_crs.is_some() {
@@ -11177,7 +11114,7 @@ where
                 };
                 let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(
@@ -11261,7 +11198,7 @@ where
                 };
                 let bbox = resolve_input_bbox(raw_bbox, pq.coord_crs.as_ref())?;
                 let (out_w, out_h, ext_opt) = parse_wxh_ext(dims_ext).map_err(EngineError::BadRequest)?;
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
@@ -11337,7 +11274,7 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
@@ -11395,7 +11332,7 @@ where
                 let geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let (mask, bbox) = PolygonMask::from_geojson_in_crs(&geojson, pq.coord_crs.as_ref())?;
-                let cogs = open_query_urls(&engine, &pq.urls).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let full = cogs[0].index.full_res();
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");

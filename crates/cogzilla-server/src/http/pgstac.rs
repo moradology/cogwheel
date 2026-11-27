@@ -177,6 +177,8 @@ fn query_pairs(raw_query: &str) -> Vec<(String, String)> {
 pub(super) fn plain_numbers(raw_query: &str) -> String {
     let plain = |part: &str| -> Option<String> {
         let (key, value) = part.split_once('=')?;
+        let key = super::query_key(key);
+        let key = key.as_ref();
         let value = percent_decode(value);
         let written = match key {
             "tilesize" | "padding" | "items_limit" | "scan_limit" | "time_limit" | "width" | "height" | "max_size"
@@ -195,7 +197,7 @@ pub(super) fn plain_numbers(raw_query: &str) -> String {
     // A size of zero is a size not given, as rio-tiler reads it: the pair is dropped.
     let unset = |part: &str| {
         part.split_once('=').is_some_and(|(key, value)| {
-            matches!(key, "width" | "height" | "max_size") && py_whole(&percent_decode(value)) && py_number(&percent_decode(value)) == Some(0.0)
+            matches!(super::query_key(key).as_ref(), "width" | "height" | "max_size") && py_whole(&percent_decode(value)) && py_number(&percent_decode(value)) == Some(0.0)
         })
     };
     let parts: Vec<String> =
@@ -1294,7 +1296,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         .into_iter()
         .map(|(name, qs)| {
             // The tile size is the service's to choose, not the layer's.
-            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.starts_with("tilesize=")).collect();
+            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.split_once('=').is_some_and(|(k, _)| super::query_key(k) == "tilesize")).collect();
             (name, qs.join("&"), (source.minzoom, source.maxzoom))
         })
         .collect();
@@ -1763,8 +1765,6 @@ fn resample_method(parameter: &str, method: &str) -> Option<ResampleMode> {
         "max" | "min" | "med" | "q1" | "q3" | "sum" if !of_the_warp => None,
         // A spelling the shared routes take and rasterio has not.
         "cubicspline" => None,
-        // Drawn with the cubic kernel on these routes.
-        "cubic_spline" | "lanczos" => Some(ResampleMode::Cubic),
         _ => super::parse_resample_mode(method),
     }
 }
@@ -2147,7 +2147,7 @@ impl Window {
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
         let (bbox, mercator, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
-                let cog = engine.store.open_uri(href).await?;
+                let cog = engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, nodata))?;
                 let crs = engine.get_or_build_crs(&cog)?;
                 let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
                 let Some(res) = warped_resolution(&crs, &cog, true).filter(|_| resample == ResampleMode::Nearest) else {
@@ -2176,7 +2176,7 @@ impl Window {
                         };
                         return Ok((in_raster_type(planes, full.sample_type, request.unscale), full.sample_type));
                     }
-                    let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject).await?;
+                    let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject, nodata).await?;
                     return Ok((in_raster_type(planes, sample_type, request.unscale), sample_type));
                 };
                 // The way GDAL's warp reads a tile: from the overview it would pick for
@@ -2208,7 +2208,7 @@ impl Window {
             }
             Window::Part { bbox, mercator, width, height, size, mask, unscale } => (*bbox, *mercator, *width, *height, *size, mask, *unscale),
         };
-        let cog = engine.store.open_uri(href).await?;
+        let cog = engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, nodata))?;
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
         let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
@@ -3258,7 +3258,7 @@ async fn part_image_of(
         // Assets that do not lie on one grid cannot be read as the bands of one image.
         let mut first = Vec::with_capacity(scenes[0].len());
         for href in &scenes[0] {
-            first.push(engine.store.open_uri(href).await?);
+            first.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, pq.nodata))?);
         }
         // A raster with an alpha band is the renderer's too: it reads the alpha as the mask.
         // So is one of two bands, or four and more, asked for plainly: it draws the first,
@@ -3330,7 +3330,7 @@ async fn part_image_of(
         for (n, scene) in scenes.iter().enumerate() {
             let mut cogs = Vec::with_capacity(scene.len());
             for href in scene {
-                cogs.push(engine.store.open_uri(href).await?);
+                cogs.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, pq.nodata))?);
             }
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
@@ -4571,7 +4571,7 @@ async fn feature_statistics(
         for (name, hrefs) in scenes {
             let mut cogs = Vec::with_capacity(hrefs.len());
             for href in &hrefs {
-                cogs.push(engine.store.open_uri(href).await?);
+                cogs.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, req.nodata))?);
             }
             let mut planes: Vec<Vec<f64>> = Vec::new();
             let mut names: Vec<String> = Vec::new();
@@ -5097,7 +5097,7 @@ async fn point_values(
             let mut values = Vec::new();
             let mut descriptions = Vec::new();
             for (spec, href) in &hrefs {
-                let cog = engine.store.open_uri(href).await?;
+                let cog = engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, nodata))?;
                 let pt = match query_point(&engine, &cog, lon, lat, unscale, nodata).await {
                     Ok(pt) => pt,
                     // The item's footprint holds the point but this raster does not.
@@ -6132,14 +6132,14 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
     }
-    // A parameter as the handlers that drew the picture read it: by its key as written,
-    // not percent-decoded, and the last one given.
+    // A parameter as the handlers that drew the picture read it: by its key, percent-decoded
+    // as Starlette decodes it, and the last one given.
     let asked = |key: &str| {
         raw_query
             .split('&')
             .rev()
             .filter_map(|pair| pair.split_once('='))
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| super::query_key(k) == key)
             .map(|(_, v)| super::percent_decode(v))
     };
     match sub {
@@ -6770,7 +6770,8 @@ pub(super) async fn item_route(
         let query: String = query
             .split('&')
             .filter(|part| {
-                let name = part.split('=').next().unwrap_or(part);
+                let name = super::query_key(part.split('=').next().unwrap_or(part));
+                let name = name.as_ref();
                 !CHECKED.contains(&name) || item_route_reads(method, rest, name)
             })
             .collect::<Vec<_>>()
@@ -6784,11 +6785,12 @@ pub(super) async fn item_route(
 /// A query string without the parameters only a search's routes read: how its items are
 /// chosen among and how many are looked for.
 fn without_search_options(raw_query: &str) -> String {
-    let algorithm = raw_query.split('&').any(|part| part.starts_with("algorithm="));
+    let algorithm = raw_query.split('&').any(|part| part.split_once('=').is_some_and(|(k, _)| super::query_key(k) == "algorithm"));
     let kept: Vec<&str> = raw_query
         .split('&')
         .filter(|part| {
-            let name = part.split('=').next().unwrap_or(part);
+            let name = super::query_key(part.split('=').next().unwrap_or(part));
+            let name = name.as_ref();
             !matches!(name, "pixel_selection" | "items_limit" | "scan_limit" | "time_limit" | "exitwhenfull" | "skipcovered")
                 && (algorithm || name != "algorithm_params")
         })
@@ -7250,6 +7252,19 @@ async fn mosaic_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_resampling_method_is_its_own_kernel() {
+        // `cubic_spline` and `lanczos` are drawn with their own kernels, as rasterio's are.
+        for parameter in ["resampling", "reproject"] {
+            assert_eq!(resample_method(parameter, "cubic_spline"), Some(ResampleMode::CubicSpline));
+            assert_eq!(resample_method(parameter, "lanczos"), Some(ResampleMode::Lanczos));
+            assert_eq!(resample_method(parameter, "cubic"), Some(ResampleMode::Cubic));
+            assert_eq!(resample_method(parameter, "cubicspline"), None, "not rasterio's spelling");
+        }
+        assert_eq!(resample_method("reproject", "gauss"), None);
+        assert_eq!(resample_method("resampling", "sum"), None);
+    }
 
     #[test]
     fn complaints_are_matched_by_the_parameter_they_name() {
@@ -8455,8 +8470,8 @@ mod tests {
         ] {
             assert_eq!(said(sub, query), None, "{sub:?} {query}");
         }
-        // A key the handlers do not read as that parameter is not read as it here either.
-        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857").unwrap().1, crs(4326));
+        // A percent-encoded key is the key it spells, as the handlers read it.
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857").unwrap().1, crs(3857));
         assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
         // Degrees asked for as CRS84 are named so; a buffered tile is not placed.
         let ogc = "<http://www.opengis.net/def/crs/OGC/0/CRS84>";

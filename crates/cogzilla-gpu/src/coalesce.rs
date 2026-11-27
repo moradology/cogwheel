@@ -601,6 +601,25 @@ impl JobSlot {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PipeKind {
+    CmRgba8,
+    CmIndexed,
+    CmF32,
+    TrRgba8,
+    TrIndexed,
+    TrF32,
+    TrRgb,
+    ExprRgba8,
+    ExprIndexed,
+    ExprF32,
+    RgbFormula,
+    SarRgbFormula,
+    ExprRgbFormula,
+    MbResampleF32,
+    ExprRgbF32,
+}
+
 struct PreparedJob {
     slot_idx: usize,
     dst_w: usize,
@@ -612,7 +631,7 @@ struct PreparedJob {
     wg_x: u32,
     wg_y: u32,
     wg_z: u32,
-    pipe_kind: u8,
+    pipe_kind: PipeKind,
     bind_group: wgpu::BindGroup,
     jpeg_pass: Option<(u32, u32, wgpu::BindGroup)>,
     stats_pass: Option<(u32, wgpu::BindGroup)>,
@@ -939,12 +958,8 @@ impl WorkerState {
                     let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
-                    let range = rescale_max - rescale_min;
-                    let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-                        range
-                    } else {
-                        1.0
-                    };
+                    let (inv_range_255, inv_range_254) =
+                        crate::wgpu_util::safe_inv_ranges(rescale_min, rescale_max);
                     let params = ColormapParams {
                         src_w: slab.width,
                         src_h: slab.height,
@@ -953,8 +968,8 @@ impl WorkerState {
                         dst_h: dst_h as u32,
                         mode: mode.as_u32(),
                         rescale_min,
-                        inv_range_255: 255.0 / safe_range,
-                        inv_range_254: 254.0 / safe_range,
+                        inv_range_255,
+                        inv_range_254,
                         coord_mode,
                         _pad1: 0,
                         _pad2: 0,
@@ -1000,17 +1015,21 @@ impl WorkerState {
                     });
 
                     let (pipe_kind, wg_x, wg_y) = match output {
-                        CoalescedOutput::Rgba8 => {
-                            (0u8, (dst_w as u32).div_ceil(16), (dst_h as u32).div_ceil(16))
-                        }
+                        CoalescedOutput::Rgba8 => (
+                            PipeKind::CmRgba8,
+                            (dst_w as u32).div_ceil(16),
+                            (dst_h as u32).div_ceil(16),
+                        ),
                         CoalescedOutput::IndexedU8 => (
-                            1u8,
+                            PipeKind::CmIndexed,
                             (words_per_row as u32).div_ceil(16),
                             (dst_h as u32).div_ceil(16),
                         ),
-                        CoalescedOutput::RawF32 => {
-                            (2u8, (dst_w as u32).div_ceil(16), (dst_h as u32).div_ceil(16))
-                        }
+                        CoalescedOutput::RawF32 => (
+                            PipeKind::CmF32,
+                            (dst_w as u32).div_ceil(16),
+                            (dst_h as u32).div_ceil(16),
+                        ),
                     };
                     let staging_byte_off = (total_staging_words * 4) as u64;
                     total_staging_words += out_words;
@@ -1093,12 +1112,8 @@ impl WorkerState {
                     let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
-                    let range = rescale_max - rescale_min;
-                    let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-                        range
-                    } else {
-                        1.0
-                    };
+                    let (inv_range_255, inv_range_254) =
+                        crate::wgpu_util::safe_inv_ranges(rescale_min, rescale_max);
                     let params = TerrainParams {
                         src_w: slab.width,
                         src_h: slab.height,
@@ -1115,8 +1130,8 @@ impl WorkerState {
                         sun_n,
                         sun_u,
                         rescale_min,
-                        inv_range_255: 255.0 / safe_range,
-                        inv_range_254: 254.0 / safe_range,
+                        inv_range_255,
+                        inv_range_254,
                         _pad1: 0.0,
                         _pad2: 0.0,
                         _pad3: 0.0,
@@ -1162,12 +1177,12 @@ impl WorkerState {
                     });
 
                     let pipe_kind = if is_terrain_rgb {
-                        6u8
+                        PipeKind::TrRgb
                     } else {
                         match eff_output {
-                            CoalescedOutput::Rgba8 => 3u8,
-                            CoalescedOutput::IndexedU8 => 4u8,
-                            CoalescedOutput::RawF32 => 5u8,
+                            CoalescedOutput::Rgba8 => PipeKind::TrRgba8,
+                            CoalescedOutput::IndexedU8 => PipeKind::TrIndexed,
+                            CoalescedOutput::RawF32 => PipeKind::TrF32,
                         }
                     };
                     let staging_byte_off = (total_staging_words * 4) as u64;
@@ -1222,12 +1237,8 @@ impl WorkerState {
                     let slot = &mut frame.slots[slot_idx];
                     slot.ensure_caps(&self.device, u_slice.len() / 4, v_slice.len() / 4, out_words);
 
-                    let range = rescale_max - rescale_min;
-                    let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-                        range
-                    } else {
-                        1.0
-                    };
+                    let (inv_range_255, inv_range_254) =
+                        crate::wgpu_util::safe_inv_ranges(rescale_min, rescale_max);
                     let params = ExprParams {
                         src_w: slab.width,
                         src_h: slab.height,
@@ -1242,8 +1253,8 @@ impl WorkerState {
                         coord_mode,
                         _pad1: 0,
                         rescale_min,
-                        inv_range_255: 255.0 / safe_range,
-                        inv_range_254: 254.0 / safe_range,
+                        inv_range_255,
+                        inv_range_254,
                         saturation: 1.0,
                         rgb_min: [0.0; 4],
                         rgb_inv_255: [1.0; 4],
@@ -1297,9 +1308,11 @@ impl WorkerState {
                     let staging_byte_off = (total_staging_words * 4) as u64;
                     total_staging_words += out_words;
                     let (wg_x, pipe_kind) = match output {
-                        CoalescedOutput::Rgba8 => ((dst_w as u32).div_ceil(16), 7u8),
-                        CoalescedOutput::IndexedU8 => ((words_per_row as u32).div_ceil(16), 8u8),
-                        CoalescedOutput::RawF32 => ((dst_w as u32).div_ceil(16), 9u8),
+                        CoalescedOutput::Rgba8 => ((dst_w as u32).div_ceil(16), PipeKind::ExprRgba8),
+                        CoalescedOutput::IndexedU8 => {
+                            ((words_per_row as u32).div_ceil(16), PipeKind::ExprIndexed)
+                        }
+                        CoalescedOutput::RawF32 => ((dst_w as u32).div_ceil(16), PipeKind::ExprF32),
                     };
                     prepared.push(PreparedJob {
                         slot_idx,
@@ -1452,7 +1465,11 @@ impl WorkerState {
                         wg_x: (dst_w as u32).div_ceil(16),
                         wg_y: (dst_h as u32).div_ceil(16),
                         wg_z: 1,
-                        pipe_kind: if is_sar { 11u8 } else { 10u8 },
+                        pipe_kind: if is_sar {
+                            PipeKind::SarRgbFormula
+                        } else {
+                            PipeKind::RgbFormula
+                        },
                         bind_group,
                         jpeg_pass: None,
                         stats_pass: None,
@@ -1593,7 +1610,7 @@ impl WorkerState {
                         wg_x: (dst_w as u32).div_ceil(16),
                         wg_y: (dst_h as u32).div_ceil(16),
                         wg_z: 1,
-                        pipe_kind: 12u8,
+                        pipe_kind: PipeKind::ExprRgbFormula,
                         bind_group,
                         jpeg_pass: None,
                         stats_pass: None,
@@ -1692,7 +1709,7 @@ impl WorkerState {
                         wg_x: (dst_w as u32).div_ceil(16),
                         wg_y: (dst_h as u32).div_ceil(16),
                         wg_z: slab.num_bands,
-                        pipe_kind: 13u8,
+                        pipe_kind: PipeKind::MbResampleF32,
                         bind_group,
                         jpeg_pass: None,
                         stats_pass: None,
@@ -1809,7 +1826,7 @@ impl WorkerState {
                         wg_x: (dst_w as u32).div_ceil(16),
                         wg_y: (dst_h as u32).div_ceil(16),
                         wg_z: 1,
-                        pipe_kind: 14u8,
+                        pipe_kind: PipeKind::ExprRgbF32,
                         bind_group,
                         jpeg_pass: None,
                         stats_pass: None,
@@ -1994,21 +2011,21 @@ impl WorkerState {
             });
             for job in &prepared {
                 let pipe = match job.pipe_kind {
-                    0 => &self.cm_rgba8,
-                    1 => &self.cm_indexed,
-                    2 => &self.cm_f32,
-                    3 => &self.tr_rgba8,
-                    4 => &self.tr_indexed,
-                    5 => &self.tr_f32,
-                    6 => &self.tr_rgb,
-                    7 => &self.expr_rgba8,
-                    8 => &self.expr_indexed,
-                    9 => &self.expr_f32,
-                    10 => &self.rgb_formula,
-                    11 => &self.sar_rgb_formula,
-                    12 => &self.expr_rgb_formula,
-                    13 => &self.mb_resample_f32,
-                    _ => &self.expr_rgb_f32,
+                    PipeKind::CmRgba8 => &self.cm_rgba8,
+                    PipeKind::CmIndexed => &self.cm_indexed,
+                    PipeKind::CmF32 => &self.cm_f32,
+                    PipeKind::TrRgba8 => &self.tr_rgba8,
+                    PipeKind::TrIndexed => &self.tr_indexed,
+                    PipeKind::TrF32 => &self.tr_f32,
+                    PipeKind::TrRgb => &self.tr_rgb,
+                    PipeKind::ExprRgba8 => &self.expr_rgba8,
+                    PipeKind::ExprIndexed => &self.expr_indexed,
+                    PipeKind::ExprF32 => &self.expr_f32,
+                    PipeKind::RgbFormula => &self.rgb_formula,
+                    PipeKind::SarRgbFormula => &self.sar_rgb_formula,
+                    PipeKind::ExprRgbFormula => &self.expr_rgb_formula,
+                    PipeKind::MbResampleF32 => &self.mb_resample_f32,
+                    PipeKind::ExprRgbF32 => &self.expr_rgb_f32,
                 };
                 pass.set_pipeline(pipe);
                 pass.set_bind_group(0, &job.bind_group, &[]);
@@ -2215,21 +2232,12 @@ impl WorkerState {
                             let bytes = &mapped[start..start + len];
                             let out = match job.output {
                                 CoalescedOutput::Rgba8 | CoalescedOutput::RawF32 => bytes.to_vec(),
-                                CoalescedOutput::IndexedU8 => {
-                                    if job.dst_w % 4 == 0 {
-                                        bytes.to_vec()
-                                    } else {
-                                        let row_bytes = job.words_per_row * 4;
-                                        let mut unpacked =
-                                            Vec::with_capacity(job.dst_w * job.dst_h);
-                                        for py in 0..job.dst_h {
-                                            let rs = py * row_bytes;
-                                            unpacked
-                                                .extend_from_slice(&bytes[rs..rs + job.dst_w]);
-                                        }
-                                        unpacked
-                                    }
-                                }
+                                CoalescedOutput::IndexedU8 => crate::wgpu_util::unpack_indexed_u8(
+                                    bytes,
+                                    job.dst_w,
+                                    job.dst_h,
+                                    job.words_per_row,
+                                ),
                             };
                             (job.reply)(Ok(out));
                         }

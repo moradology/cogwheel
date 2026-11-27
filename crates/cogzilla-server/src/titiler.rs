@@ -516,7 +516,7 @@ pub fn build_cog_validate(
     }))
 }
 
-const SUPPORTED_ALGORITHMS: &[&str] = &[
+pub const SUPPORTED_ALGORITHMS: &[&str] = &[
     "hillshade",
     "slope",
     "aspect",
@@ -537,6 +537,15 @@ const SUPPORTED_ALGORITHMS: &[&str] = &[
     "bitonal",
     "contours",
 ];
+
+/// Returns true if `name` (case-insensitive) matches any supported TiTiler algorithm or alias.
+pub fn is_supported_algorithm(name: &str) -> bool {
+    name.eq_ignore_ascii_case("terrain-rgb")
+        || name.eq_ignore_ascii_case("mapbox")
+        || SUPPORTED_ALGORITHMS
+            .iter()
+            .any(|alg| alg.eq_ignore_ascii_case(name))
+}
 
 /// TiTiler 2.4 `AlgorithmFactory` `GET /algorithms` response.
 pub fn list_algorithms_json(host: &str) -> serde_json::Value {
@@ -1634,6 +1643,9 @@ pub struct StatsOptions {
     /// The type numpy builds the histogram's bin edges in, for paths that only see `f32` values;
     /// `None` infers it from the values (see [`HistDtype::infer`]).
     pub hist_dtype: Option<HistDtype>,
+    /// `resampling`: how a whole raster's statistics read it at a size between its levels
+    /// (rio-tiler reads its preview with it). Nearest picks the pixel under each centre.
+    pub resample: ResampleMode,
 }
 
 impl StatsOptions {
@@ -1665,6 +1677,7 @@ impl Default for StatsOptions {
             max_size_explicit: false,
             area_weighted: true,
             hist_dtype: None,
+            resample: ResampleMode::Nearest,
         }
     }
 }
@@ -1803,6 +1816,14 @@ fn gpu_band_stats_to_json(
     serde_json::Value::Object(obj)
 }
 
+/// The rank rio-tiler takes a quantile `q` (0 to 1) at among `n` sorted values: with every
+/// pixel's weight 1, `numpy.searchsorted(cumsum, q * n)` is the first value whose count reaches
+/// `q * n`, so an even count's median is the lower of its two middle values.
+pub(crate) fn quantile_rank(n: usize, q: f64) -> usize {
+    let target = q * n as f64;
+    (target.ceil() as usize).saturating_sub(1).min(n.saturating_sub(1))
+}
+
 pub(crate) fn percentile_key(p: f64) -> String {
     if p.fract() == 0.0 {
         format!("percentile_{}", p as i64)
@@ -1811,7 +1832,7 @@ pub(crate) fn percentile_key(p: f64) -> String {
     }
 }
 
-fn format_category_key(v: f64) -> String {
+pub(crate) fn format_category_key(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
@@ -1894,11 +1915,11 @@ impl BandStatsAcc {
                 k as f32
             }
         };
-        let rank_med = valid_px / 2;
+        let rank_med = quantile_rank(valid_px, 0.5);
         let p_ranks: Vec<usize> = opts
             .percentiles
             .iter()
-            .map(|&p| (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize).min(valid_px - 1))
+            .map(|&p| quantile_rank(valid_px, p.clamp(0.0, 100.0) / 100.0))
             .collect();
         let mut p_vals: Vec<f32> = vec![f32::NAN; p_ranks.len()];
 
@@ -1979,34 +2000,161 @@ impl BandStatsAcc {
             }
         }
         let std = (var_sum / (valid_px as f64)).sqrt();
-        let mut obj = serde_json::Map::new();
-        obj.insert("min".into(), serde_json::json!(min));
-        obj.insert("max".into(), serde_json::json!(max));
-        obj.insert("mean".into(), serde_json::json!(mean));
-        obj.insert("count".into(), serde_json::json!(valid_px));
-        obj.insert("sum".into(), serde_json::json!(sum));
-        obj.insert("std".into(), serde_json::json!(std));
-        obj.insert("median".into(), serde_json::json!(median));
-        obj.insert("majority".into(), serde_json::json!(maj_val));
-        obj.insert("minority".into(), serde_json::json!(min_val));
-        obj.insert("unique".into(), serde_json::json!(unique));
-        obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
-        obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
-        obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
-        for (&p, &pv) in opts.percentiles.iter().zip(p_vals.iter()) {
-            obj.insert(percentile_key(p), serde_json::json!(pv));
-        }
-        if let Some(cats) = categories {
-            obj.insert(
-                "histogram".into(),
-                build_categorical_histogram(&cat_observed, &opts.categories),
-            );
-            obj.insert("categories".into(), serde_json::Value::Object(cats));
+        build_band_stats_json(
+            min,
+            max,
+            mean,
+            valid_px,
+            masked_px,
+            valid_pct,
+            sum,
+            std,
+            median,
+            maj_val,
+            min_val,
+            unique,
+            &opts.percentiles,
+            &p_vals,
+            categories,
+            &cat_observed,
+            &counts,
+            &edges,
+            description,
+            opts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_sorted<T>(
+        mut vals: Vec<T>,
+        denom_pixels: usize,
+        description: &str,
+        opts: &StatsOptions,
+        dtype: HistDtype,
+        cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+    ) -> serde_json::Value
+    where
+        T: Copy + PartialEq + Into<f64> + serde::Serialize,
+    {
+        let valid_px = vals.len();
+        let masked_px = denom_pixels.saturating_sub(valid_px);
+        let valid_pct = if denom_pixels > 0 {
+            (valid_px as f64 / denom_pixels as f64) * 100.0
         } else {
-            obj.insert("histogram".into(), serde_json::json!([counts, edges]));
+            0.0
+        };
+        if valid_px == 0 {
+            return empty_band_stats_json(masked_px, description, opts, dtype);
         }
-        obj.insert("description".into(), serde_json::json!(description));
-        serde_json::Value::Object(obj)
+        vals.sort_unstable_by(cmp);
+        let min = vals[0];
+        let max = vals[valid_px - 1];
+        let mut sum = 0.0f64;
+        let mut unique = 0usize;
+        let mut maj_val = min;
+        let mut maj_cnt = 0usize;
+        let mut min_val = min;
+        let mut min_cnt = usize::MAX;
+        let mut run_val = min;
+        let mut run_cnt = 0usize;
+        let mut categories = if opts.categorical {
+            Some(serde_json::Map::new())
+        } else {
+            None
+        };
+        let mut cat_observed: Vec<(f64, u64)> = Vec::new();
+        for &v in &vals {
+            sum += v.into();
+            if v == run_val {
+                run_cnt += 1;
+            } else {
+                unique += 1;
+                if let Some(ref mut cats) = categories {
+                    let vf: f64 = run_val.into();
+                    cat_observed.push((vf, run_cnt as u64));
+                    if matches_category_filter(vf, &opts.categories) {
+                        cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
+                    }
+                }
+                if run_cnt > maj_cnt {
+                    maj_cnt = run_cnt;
+                    maj_val = run_val;
+                }
+                if run_cnt < min_cnt {
+                    min_cnt = run_cnt;
+                    min_val = run_val;
+                }
+                run_val = v;
+                run_cnt = 1;
+            }
+        }
+        unique += 1;
+        if let Some(ref mut cats) = categories {
+            let vf: f64 = run_val.into();
+            cat_observed.push((vf, run_cnt as u64));
+            if matches_category_filter(vf, &opts.categories) {
+                cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
+            }
+        }
+        if run_cnt > maj_cnt {
+            maj_val = run_val;
+        }
+        if run_cnt < min_cnt {
+            min_val = run_val;
+        }
+        let n_f = valid_px as f64;
+        let mean = if sum.is_finite() {
+            sum / n_f
+        } else {
+            vals.iter().map(|&v| v.into() / n_f).sum::<f64>()
+        };
+        let min_f: f64 = min.into();
+        let max_f: f64 = max.into();
+        // Scale variance accumulation when values exceed ~1e150 so `(v - mean)^2` never
+        // overflows `f64::MAX` to `+inf` (which JSON serializes as `null`).
+        let max_abs = min_f.abs().max(max_f.abs());
+        let var_scale = if max_abs > 1e150 { max_abs } else { 1.0 };
+        let inv_var_scale = 1.0 / var_scale;
+        let mean_scaled = mean * inv_var_scale;
+        let mut var_sum = 0.0f64;
+        for &v in &vals {
+            let d = v.into() * inv_var_scale - mean_scaled;
+            var_sum += d * d;
+        }
+        let edges = opts.histogram_bin_edges(Some((min_f, max_f)), dtype);
+        let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v.into())
+            .iter()
+            .map(|r| r.len() as u64)
+            .collect();
+        let std = (var_sum / n_f).sqrt() * var_scale;
+        let median = vals[quantile_rank(valid_px, 0.5)];
+        let p_vals: Vec<T> = opts
+            .percentiles
+            .iter()
+            .map(|&p| vals[quantile_rank(valid_px, p.clamp(0.0, 100.0) / 100.0)])
+            .collect();
+        build_band_stats_json(
+            min,
+            max,
+            mean,
+            valid_px,
+            masked_px,
+            valid_pct,
+            sum,
+            std,
+            median,
+            maj_val,
+            min_val,
+            unique,
+            &opts.percentiles,
+            &p_vals,
+            categories,
+            &cat_observed,
+            &counts,
+            &edges,
+            description,
+            opts,
+        )
     }
 
     /// The band's statistics. `dtype` is the type numpy would build the histogram's edges in;
@@ -2061,247 +2209,80 @@ impl BandStatsAcc {
                     dtype.unwrap_or(HistDtype::for_sample_type(cogzilla_tiff::SampleType::Uint16, unscale)),
                 )
             }
-            Self::Floats(mut vals) => {
-                let valid_px = vals.len();
-                let masked_px = denom_pixels.saturating_sub(valid_px);
-                let valid_pct = if denom_pixels > 0 {
-                    (valid_px as f64 / denom_pixels as f64) * 100.0
+            Self::Floats(vals) => {
+                let eff_dtype = if vals.is_empty() {
+                    dtype.unwrap_or(HistDtype::Float64)
                 } else {
-                    0.0
+                    dtype.unwrap_or_else(|| HistDtype::infer(vals.iter().copied()))
                 };
-                if valid_px == 0 {
-                    let dtype = dtype.unwrap_or(HistDtype::Float64);
-                    return empty_band_stats_json(masked_px, description, opts, dtype);
-                }
-                vals.sort_unstable_by(|a, b| a.total_cmp(b));
-                let min = vals[0];
-                let max = vals[valid_px - 1];
-                let mut sum = 0.0f64;
-                let mut unique = 0usize;
-                let mut maj_val = min;
-                let mut maj_cnt = 0usize;
-                let mut min_val = min;
-                let mut min_cnt = usize::MAX;
-                let mut run_val = min;
-                let mut run_cnt = 0usize;
-                let mut categories = if opts.categorical {
-                    Some(serde_json::Map::new())
-                } else {
-                    None
-                };
-                let mut cat_observed: Vec<(f64, u64)> = Vec::new();
-                for &v in &vals {
-                    sum += v as f64;
-                    if v == run_val {
-                        run_cnt += 1;
-                    } else {
-                        unique += 1;
-                        if let Some(ref mut cats) = categories {
-                            let vf = run_val as f64;
-                            cat_observed.push((vf, run_cnt as u64));
-                            if matches_category_filter(vf, &opts.categories) {
-                                cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
-                            }
-                        }
-                        if run_cnt > maj_cnt {
-                            maj_cnt = run_cnt;
-                            maj_val = run_val;
-                        }
-                        if run_cnt < min_cnt {
-                            min_cnt = run_cnt;
-                            min_val = run_val;
-                        }
-                        run_val = v;
-                        run_cnt = 1;
-                    }
-                }
-                unique += 1;
-                if let Some(ref mut cats) = categories {
-                    let vf = run_val as f64;
-                    cat_observed.push((vf, run_cnt as u64));
-                    if matches_category_filter(vf, &opts.categories) {
-                        cats.insert(format_category_key(vf), serde_json::json!(run_cnt));
-                    }
-                }
-                if run_cnt > maj_cnt {
-                    maj_val = run_val;
-                }
-                if run_cnt < min_cnt {
-                    min_val = run_val;
-                }
-                let mean = sum / (valid_px as f64);
-                let mut var_sum = 0.0f64;
-                for &v in &vals {
-                    let d = v as f64 - mean;
-                    var_sum += d * d;
-                }
-                // The values are sorted: each bin is a run of them.
-                let dtype = dtype.unwrap_or_else(|| HistDtype::infer(vals.iter().copied()));
-                let edges = opts.histogram_bin_edges(Some((min as f64, max as f64)), dtype);
-                let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v as f64)
-                    .iter()
-                    .map(|r| r.len() as u64)
-                    .collect();
-                let std = (var_sum / (valid_px as f64)).sqrt();
-
-                let med_idx = valid_px / 2;
-                let median = vals[med_idx];
-                let mut obj = serde_json::Map::new();
-                obj.insert("min".into(), serde_json::json!(min));
-                obj.insert("max".into(), serde_json::json!(max));
-                obj.insert("mean".into(), serde_json::json!(mean));
-                obj.insert("count".into(), serde_json::json!(valid_px));
-                obj.insert("sum".into(), serde_json::json!(sum));
-                obj.insert("std".into(), serde_json::json!(std));
-                obj.insert("median".into(), serde_json::json!(median));
-                obj.insert("majority".into(), serde_json::json!(maj_val));
-                obj.insert("minority".into(), serde_json::json!(min_val));
-                obj.insert("unique".into(), serde_json::json!(unique));
-                obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
-                obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
-                obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
-                for &p in &opts.percentiles {
-                    let idx = (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize)
-                        .min(valid_px - 1);
-                    obj.insert(percentile_key(p), serde_json::json!(vals[idx]));
-                }
-                if let Some(cats) = categories {
-                    obj.insert(
-                        "histogram".into(),
-                        build_categorical_histogram(&cat_observed, &opts.categories),
-                    );
-                    obj.insert("categories".into(), serde_json::Value::Object(cats));
-                } else {
-                    obj.insert("histogram".into(), serde_json::json!([counts, edges]));
-                }
-                obj.insert("description".into(), serde_json::json!(description));
-                serde_json::Value::Object(obj)
+                Self::finalize_sorted(vals, denom_pixels, description, opts, eff_dtype, f32::total_cmp)
             }
-            Self::Floats64(mut vals) => {
-                let valid_px = vals.len();
-                let masked_px = denom_pixels.saturating_sub(valid_px);
-                let valid_pct = if denom_pixels > 0 {
-                    (valid_px as f64 / denom_pixels as f64) * 100.0
-                } else {
-                    0.0
-                };
-                if valid_px == 0 {
-                    let dtype = dtype.unwrap_or(HistDtype::Float64);
-                    return empty_band_stats_json(masked_px, description, opts, dtype);
-                }
-                vals.sort_unstable_by(|a, b| a.total_cmp(b));
-                let min = vals[0];
-                let max = vals[valid_px - 1];
-                let mut sum = 0.0f64;
-                let mut unique = 0usize;
-                let mut maj_val = min;
-                let mut maj_cnt = 0usize;
-                let mut min_val = min;
-                let mut min_cnt = usize::MAX;
-                let mut run_val = min;
-                let mut run_cnt = 0usize;
-                let mut categories = if opts.categorical {
-                    Some(serde_json::Map::new())
-                } else {
-                    None
-                };
-                let mut cat_observed: Vec<(f64, u64)> = Vec::new();
-                for &v in &vals {
-                    sum += v;
-                    if v == run_val {
-                        run_cnt += 1;
-                    } else {
-                        unique += 1;
-                        if let Some(ref mut cats) = categories {
-                            cat_observed.push((run_val, run_cnt as u64));
-                            if matches_category_filter(run_val, &opts.categories) {
-                                cats.insert(format_category_key(run_val), serde_json::json!(run_cnt));
-                            }
-                        }
-                        if run_cnt > maj_cnt {
-                            maj_cnt = run_cnt;
-                            maj_val = run_val;
-                        }
-                        if run_cnt < min_cnt {
-                            min_cnt = run_cnt;
-                            min_val = run_val;
-                        }
-                        run_val = v;
-                        run_cnt = 1;
-                    }
-                }
-                unique += 1;
-                if let Some(ref mut cats) = categories {
-                    cat_observed.push((run_val, run_cnt as u64));
-                    if matches_category_filter(run_val, &opts.categories) {
-                        cats.insert(format_category_key(run_val), serde_json::json!(run_cnt));
-                    }
-                }
-                if run_cnt > maj_cnt {
-                    maj_val = run_val;
-                }
-                if run_cnt < min_cnt {
-                    min_val = run_val;
-                }
-                let n_f = valid_px as f64;
-                let mean = if sum.is_finite() {
-                    sum / n_f
-                } else {
-                    vals.iter().map(|&v| v / n_f).sum::<f64>()
-                };
-                // Scale variance accumulation when values exceed ~1e150 so `(v - mean)^2` never
-                // overflows `f64::MAX` to `+inf` (which JSON serializes as `null`).
-                let max_abs = min.abs().max(max.abs());
-                let var_scale = if max_abs > 1e150 { max_abs } else { 1.0 };
-                let inv_var_scale = 1.0 / var_scale;
-                let mean_scaled = mean * inv_var_scale;
-                let mut var_sum = 0.0f64;
-                for &v in &vals {
-                    let d = v * inv_var_scale - mean_scaled;
-                    var_sum += d * d;
-                }
-                let edges = opts.histogram_bin_edges(Some((min, max)), dtype.unwrap_or(HistDtype::Float64));
-                let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v)
-                    .iter()
-                    .map(|r| r.len() as u64)
-                    .collect();
-                let std = (var_sum / n_f).sqrt() * var_scale;
-
-                let med_idx = valid_px / 2;
-                let median = vals[med_idx];
-                let mut obj = serde_json::Map::new();
-                obj.insert("min".into(), serde_json::json!(min));
-                obj.insert("max".into(), serde_json::json!(max));
-                obj.insert("mean".into(), serde_json::json!(mean));
-                obj.insert("count".into(), serde_json::json!(valid_px));
-                obj.insert("sum".into(), serde_json::json!(sum));
-                obj.insert("std".into(), serde_json::json!(std));
-                obj.insert("median".into(), serde_json::json!(median));
-                obj.insert("majority".into(), serde_json::json!(maj_val));
-                obj.insert("minority".into(), serde_json::json!(min_val));
-                obj.insert("unique".into(), serde_json::json!(unique));
-                obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
-                obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
-                obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
-                for &p in &opts.percentiles {
-                    let idx = (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize)
-                        .min(valid_px - 1);
-                    obj.insert(percentile_key(p), serde_json::json!(vals[idx]));
-                }
-                if let Some(cats) = categories {
-                    obj.insert(
-                        "histogram".into(),
-                        build_categorical_histogram(&cat_observed, &opts.categories),
-                    );
-                    obj.insert("categories".into(), serde_json::Value::Object(cats));
-                } else {
-                    obj.insert("histogram".into(), serde_json::json!([counts, edges]));
-                }
-                obj.insert("description".into(), serde_json::json!(description));
-                serde_json::Value::Object(obj)
-            }
+            Self::Floats64(vals) => Self::finalize_sorted(
+                vals,
+                denom_pixels,
+                description,
+                opts,
+                dtype.unwrap_or(HistDtype::Float64),
+                f64::total_cmp,
+            ),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_band_stats_json<T: serde::Serialize>(
+    min: T,
+    max: T,
+    mean: f64,
+    valid_px: usize,
+    masked_px: usize,
+    valid_pct: f64,
+    sum: f64,
+    std: f64,
+    median: T,
+    maj_val: T,
+    min_val: T,
+    unique: usize,
+    percentiles: &[f64],
+    p_vals: &[T],
+    categories: Option<serde_json::Map<String, serde_json::Value>>,
+    cat_observed: &[(f64, u64)],
+    counts: &[u64],
+    edges: &[f64],
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("min".into(), serde_json::json!(min));
+    obj.insert("max".into(), serde_json::json!(max));
+    obj.insert("mean".into(), serde_json::json!(mean));
+    obj.insert("count".into(), serde_json::json!(valid_px));
+    obj.insert("sum".into(), serde_json::json!(sum));
+    obj.insert("std".into(), serde_json::json!(std));
+    obj.insert("median".into(), serde_json::json!(median));
+    obj.insert("majority".into(), serde_json::json!(maj_val));
+    obj.insert("minority".into(), serde_json::json!(min_val));
+    obj.insert("unique".into(), serde_json::json!(unique));
+    obj.insert(
+        "valid_percent".into(),
+        serde_json::json!((valid_pct * 100.0).round() / 100.0),
+    );
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
+    obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
+    for (&p, pv) in percentiles.iter().zip(p_vals.iter()) {
+        obj.insert(percentile_key(p), serde_json::json!(pv));
+    }
+    if let Some(cats) = categories {
+        obj.insert(
+            "histogram".into(),
+            build_categorical_histogram(cat_observed, &opts.categories),
+        );
+        obj.insert("categories".into(), serde_json::Value::Object(cats));
+    } else {
+        obj.insert("histogram".into(), serde_json::json!([counts, edges]));
+    }
+    obj.insert("description".into(), serde_json::json!(description));
+    serde_json::Value::Object(obj)
 }
 
 /// Zero-allocation 4×3 probe fast-reject before allocating per-tile polygon grids/masks.
@@ -3494,6 +3475,142 @@ fn compute_expression_statistics_cpu(
     serde_json::Value::Object(out)
 }
 
+/// A whole raster's statistics read at `out_w`×`out_h` with a resampling other than nearest,
+/// as rio-tiler takes them: from its preview, which GDAL reads with that resampling. The read
+/// is the one `/preview` draws (GDAL's kernels, widened when shrinking); a resampled value
+/// is put into an integer band's type as GDAL puts it, rounded to the nearest and held to
+/// the type's range, and one that lands on the nodata value is masked, as rio-tiler masks
+/// it (a cubic kernel's undershoot beside nodata 0); then scales and offsets (`unscale`) and
+/// band math are applied to those values, as rio-tiler applies them after the read.
+#[allow(clippy::too_many_arguments)]
+async fn compute_resampled_statistics(
+    engine: &TileEngine,
+    cog: &Arc<OpenedCog>,
+    crs: &cogzilla_proj::CrsModel,
+    out_w: usize,
+    out_h: usize,
+    unscale: bool,
+    nodata_override: Option<f32>,
+    opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let full = cog.index.full_res();
+    let count = full.samples_per_pixel;
+    let alpha_idx = cogzilla_codec::alpha_channel_index(count as usize, &full.extra_samples);
+    let read_bands: Vec<u16> = if let Some(exprs) = &opts.expressions {
+        let mut used: Vec<u16> = exprs.iter().flat_map(|(_, prog)| prog.used_bands.iter().copied()).collect();
+        used.sort_unstable();
+        used.dedup();
+        used
+    } else if let Some(bidx) = opts.bidx.as_ref().filter(|b| !b.is_empty()) {
+        bidx.clone()
+    } else {
+        (1..=count).filter(|&b| Some((b - 1) as usize) != alpha_idx).collect()
+    };
+    if read_bands.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    let bbox = crs.wgs84_bounds_with_gcp(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
+    let request = BandRequest::MultiBand { bands_1based: read_bands.clone() };
+    let raw = render_native_preview(
+        engine,
+        std::slice::from_ref(cog),
+        bbox,
+        out_w as u32,
+        out_h as u32,
+        &request,
+        opts.resample,
+        OutputFormat::RawF32,
+        nodata_override,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await?;
+    let n_px = out_w * out_h;
+    if raw.len() < n_px * 4 * read_bands.len() {
+        return Err(EngineError::BadRequest("statistics read returned fewer bands than asked".into()));
+    }
+    // An integer band's range, as GDAL holds a resampled value to it.
+    let whole = crate::http::array_type_range(full.sample_type);
+    let nodata = nodata_override.map(f64::from).or(cog.index.nodata_f64).or(cog.index.nodata.map(f64::from));
+    let opts = opts.clone();
+    let sample_type = full.sample_type;
+    let scales: Vec<(f64, f64)> = read_bands
+        .iter()
+        .map(|&b| {
+            let i = (b - 1) as usize;
+            (
+                f64::from(cog.index.scales.get(i).copied().unwrap_or(1.0)),
+                f64::from(cog.index.offsets.get(i).copied().unwrap_or(0.0)),
+            )
+        })
+        .collect();
+    let compute = move || -> serde_json::Value {
+        // Each band as read: GDAL rounds a resampled value into an integer type; NaN is masked.
+        let planes: Vec<Vec<f32>> = raw
+            .chunks_exact(n_px * 4)
+            .take(read_bands.len())
+            .zip(&scales)
+            .map(|(plane, &(scale, offset))| {
+                plane
+                    .chunks_exact(4)
+                    .map(|c| {
+                        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        let v = match whole {
+                            Some((lo, hi)) if v.is_finite() => {
+                                let r = f64::from(v).round().clamp(lo, hi);
+                                if nodata == Some(r) { f32::NAN } else { r as f32 }
+                            }
+                            _ => v,
+                        };
+                        if unscale && v.is_finite() { (f64::from(v) * scale + offset) as f32 } else { v }
+                    })
+                    .collect()
+            })
+            .collect();
+        let band_dtype = HistDtype::for_sample_type(sample_type, unscale);
+        let finish = |values: Vec<f32>, desc: &str, dtype: HistDtype| {
+            BandStatsAcc::Floats(values.into_iter().filter(|v| v.is_finite()).collect())
+                .finalize(n_px, false, 1.0, 0.0, None, desc, &opts, Some(opts.hist_dtype.unwrap_or(dtype)))
+        };
+        let mut out = serde_json::Map::new();
+        if let Some(exprs) = &opts.expressions {
+            let slot = |b: u16| read_bands.iter().position(|&r| r == b);
+            for (i, (expr_str, prog)) in exprs.iter().enumerate() {
+                let width = prog.used_bands.iter().copied().max().unwrap_or(1) as usize;
+                let mut px = vec![f32::NAN; width];
+                let values: Vec<f32> = (0..n_px)
+                    .map(|p| {
+                        for &b in &prog.used_bands {
+                            px[(b - 1) as usize] = slot(b).map_or(f32::NAN, |s| planes[s][p]);
+                        }
+                        if prog.used_bands.iter().any(|&b| px[(b - 1) as usize].is_nan()) {
+                            f32::NAN
+                        } else {
+                            prog.eval(&px)
+                        }
+                    })
+                    .collect();
+                let dtype = HistDtype::for_expression(expr_str, band_dtype);
+                out.insert(format!("b{}", i + 1), finish(values, expr_str, dtype));
+            }
+        } else {
+            for (plane, &b) in planes.into_iter().zip(&read_bands) {
+                let name = format!("b{b}");
+                let val = finish(plane, &name, band_dtype);
+                out.insert(name, val);
+            }
+        }
+        serde_json::Value::Object(out)
+    };
+    if n_px > 256 * 256 {
+        Ok(engine.store.run_heavy_cpu(compute).await?)
+    } else {
+        Ok(compute())
+    }
+}
+
 /// Encode an RGBA buffer as a spec-compliant uncompressed Classic GeoTIFF (`EPSG:3857` or `EPSG:4326`).
 pub fn encode_geotiff_rgba(
     width: u32,
@@ -4268,6 +4385,9 @@ pub async fn compute_statistics_with_options(
         } else {
             Some((out_w, out_h))
         };
+        if dims.is_some() && opts.resample != ResampleMode::Nearest {
+            return compute_resampled_statistics(engine, cog, &crs, out_w, out_h, unscale, nodata_override, opts).await;
+        }
         (idx, 1usize, dims, out_w * out_h, 0usize)
     };
     let ifd = &cog.index.ifds[ifd_idx];
@@ -9969,4 +10089,24 @@ async fn render_mixed_grid_bbox(
         cf.apply_buffer_in_place(&mut rgba, 4);
     }
     Ok(encode_rgba_output(w, h, &rgba, format, return_mask))
+}
+
+#[cfg(test)]
+mod quantile_rank_tests {
+    use super::quantile_rank;
+
+    #[test]
+    fn ranks_are_rio_tilers() {
+        // An even count's median is its lower middle value; an odd count's, its middle one.
+        assert_eq!(quantile_rank(4, 0.5), 1);
+        assert_eq!(quantile_rank(5, 0.5), 2);
+        assert_eq!(quantile_rank(65536, 0.5), 32767);
+        // A whole `q * n` is that many values in: the last of them.
+        assert_eq!(quantile_rank(100, 0.02), 1);
+        assert_eq!(quantile_rank(65536, 0.25), 16383);
+        // Otherwise the value whose count first passes it.
+        assert_eq!(quantile_rank(50577, 0.02), 1011);
+        assert_eq!(quantile_rank(50577, 0.98), 49565);
+        assert_eq!((quantile_rank(1, 0.5), quantile_rank(0, 0.5), quantile_rank(7, 0.0), quantile_rank(7, 1.0)), (0, 0, 0, 6));
+    }
 }

@@ -81,11 +81,6 @@ var<workgroup> sh_hist: array<atomic<u32>, 1024>;
 var<workgroup> sh_cdf: array<atomic<u32>, 1024>;
 var<workgroup> sh_var: array<f32, 256>;
 
-fn is_finite_f32(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    return (bits & 0x7f800000u) != 0x7f800000u;
-}
-
 @compute @workgroup_size(256, 1, 1)
 fn wstats_reduce_pass1(
     @builtin(workgroup_id) wgid: vec3<u32>,

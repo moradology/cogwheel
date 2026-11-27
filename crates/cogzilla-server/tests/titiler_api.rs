@@ -6406,3 +6406,138 @@ async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Statistics at a size between a raster's levels are those of its preview read with the
+/// resampling asked for, as rio-tiler takes them; a uint16 band's resampled values are whole
+/// numbers, as GDAL rounds them into the band's type, in the statistics and the array alike.
+#[tokio::test]
+async fn statistics_follow_the_resampling_of_the_preview() {
+    let path = fixture("landsat_c2_B4.tif");
+    if !path.exists() {
+        eprintln!("fixtures not generated; skipping");
+        return;
+    }
+    let url = path.canonicalize().unwrap().to_string_lossy().to_string();
+    let engine = Arc::new(TileEngine::new(128 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let get = |q: String| {
+        let client = client.clone();
+        async move {
+            let resp = client.get(q).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            resp.bytes().await.unwrap()
+        }
+    };
+    let mut means = Vec::new();
+    for resampling in ["nearest", "bilinear", "average"] {
+        let q = format!("url={url}&max_size=300&resampling={resampling}");
+        let stats: serde_json::Value = serde_json::from_slice(&get(format!("{base}/cog/statistics?{q}")).await).unwrap();
+        let npy = get(format!("{base}/cog/preview.npy?{q}")).await;
+        let values = decode_npy_f32(&npy);
+        let (data, mask) = values.split_at(values.len() / 2);
+        let valid: Vec<f64> = data.iter().zip(mask).filter(|(_, m)| **m > 0.0).map(|(v, _)| f64::from(*v)).collect();
+        assert!(valid.iter().all(|v| v.fract() == 0.0), "{resampling}: a uint16 read is whole");
+        let mean = valid.iter().sum::<f64>() / valid.len() as f64;
+        let b1 = &stats["b1"];
+        assert_eq!(b1["count"].as_f64().unwrap(), valid.len() as f64, "{resampling}");
+        assert!((b1["mean"].as_f64().unwrap() - mean).abs() < 1e-6 * mean, "{resampling}: {} vs {mean}", b1["mean"]);
+        means.push(mean);
+    }
+    assert!(means[0] != means[1] && means[1] != means[2], "the resampling changes the numbers: {means:?}");
+}
+
+/// `?nodata=` replaces the raster's own nodata, as GDAL's override (and so TiTiler's) does:
+/// pixels equal to the file's nodata become data and pixels equal to the request's are masked.
+#[tokio::test]
+async fn nodata_query_replaces_the_rasters_own() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_nodata_override_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // GDAL_NODATA=0, the left half 0 and the right half 7 in both bands.
+    let path = tmp.join("u16_nodata0.tif");
+    write_synthetic_u16_2band_4326_geotiff(&path, 64, 64, [10.0, 40.0, 10.64, 40.64], 7, 7, Some("left"));
+    let url = path.to_string_lossy().to_string();
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let stats = |q: &'static str| {
+        let (client, base, url) = (client.clone(), base.clone(), url.clone());
+        async move {
+            let resp = client.get(format!("{base}/cog/statistics?url={url}{q}")).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{q}");
+            let v: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+            (v["b1"]["count"].as_f64().unwrap(), v["b1"]["min"].as_f64().unwrap(), v["b1"]["max"].as_f64().unwrap())
+        }
+    };
+    let half = (64 * 32) as f64;
+    assert_eq!(stats("").await, (half, 7.0, 7.0));
+    assert_eq!(stats("&nodata=0").await, (half, 7.0, 7.0), "the file's own value changes nothing");
+    assert_eq!(stats("&nodata=7").await, (half, 0.0, 0.0), "the file's 0 is data, the request's 7 is not");
+    assert_eq!(stats("&nodata=5").await, (2.0 * half, 0.0, 7.0), "nothing equals 5: every pixel is data");
+    // The preview's mask says the same, and the file's own read is not changed by the override's.
+    for (q, valid) in [("&nodata=7", half), ("", half), ("&nodata=5", 2.0 * half)] {
+        let npy = client.get(format!("{base}/cog/preview.npy?url={url}&bidx=1{q}")).send().await.unwrap().bytes().await.unwrap();
+        let values = decode_npy_f32(&npy);
+        let (data, mask) = values.split_at(values.len() / 2);
+        assert_eq!(mask.iter().filter(|m| **m > 0.0).count() as f64, valid, "{q}");
+        let want = if q == "&nodata=7" { 0.0 } else { 7.0 };
+        assert!(data.iter().zip(mask).any(|(v, m)| *m > 0.0 && *v == want), "{q}");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A percent-encoded query key is read as the key it spells (`max%5Fsize` is `max_size`), as
+/// Starlette reads it; and one band of a mosaic is a grey picture, as TiTiler writes it.
+#[tokio::test]
+async fn encoded_query_keys_and_grey_mosaic_tiles() {
+    let (b4, b3) = (fixture("landsat_c2_B4.tif"), fixture("landsat_c2_B3.tif"));
+    if !b4.exists() || !b3.exists() {
+        eprintln!("fixtures not generated; skipping");
+        return;
+    }
+    let (b4, b3) = (b4.canonicalize().unwrap(), b3.canonicalize().unwrap());
+    let (b4, b3) = (b4.to_string_lossy(), b3.to_string_lossy());
+    let engine = Arc::new(TileEngine::new(128 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let get = |u: String| {
+        let client = client.clone();
+        async move {
+            let resp = client.get(&u).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{u}");
+            resp.bytes().await.unwrap()
+        }
+    };
+    let png_size = |b: &[u8]| (u32::from_be_bytes(b[16..20].try_into().unwrap()), u32::from_be_bytes(b[20..24].try_into().unwrap()));
+    for key in ["max_size", "max%5Fsize", "max%5fsize"] {
+        let png = get(format!("{base}/cog/preview.png?url={b4}&{key}=64&rescale=0,30000")).await;
+        assert_eq!(png_size(&png).0.max(png_size(&png).1), 64, "{key}");
+    }
+    let tile = |q: &str| format!("{base}/mosaic/tiles/WebMercatorQuad/12/653/1583.png?url={b4}&url={b3}&rescale=0,30000{q}");
+    // PNG colour type: 0 grey, 4 grey and alpha; 2 and 6 colour, 3 a palette.
+    for q in ["", "&resampling=bilinear"] {
+        let png = get(tile(q)).await;
+        assert!(matches!(png[25], 0 | 4), "one band in grey{q}: colour type {}", png[25]);
+    }
+    let mapped = get(tile("&colormap_name=viridis")).await;
+    assert!(matches!(mapped[25], 2 | 3 | 6), "a colour map is colour: {}", mapped[25]);
+    let jpg = get(tile("").replace(".png", ".jpg")).await;
+    // The frame header's component count: one for grey.
+    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0 | 0xC1 | 0xC2)).unwrap();
+    assert_eq!(jpg[sof + 9], 1, "a grey JPEG");
+}

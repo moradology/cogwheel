@@ -29,7 +29,7 @@ pub(crate) fn explicit_format(query: &str) -> Option<String> {
     query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
-        .rfind(|(k, _)| *k == "f" || *k == "format")
+        .rfind(|(k, _)| matches!(super::query_key(k).as_ref(), "f" | "format"))
         .map(|(_, v)| super::percent_decode(v))
 }
 
@@ -135,7 +135,7 @@ pub(crate) fn append_vary_accept(headers: &mut hyper::HeaderMap) {
 fn query_with_format(query: &str, format: &str) -> String {
     let mut out: Vec<String> = query
         .split('&')
-        .filter(|kv| !kv.is_empty() && kv.split_once('=').map_or(*kv, |(k, _)| k) != "f")
+        .filter(|kv| !kv.is_empty() && super::query_key(kv.split_once('=').map_or(*kv, |(k, _)| k)) != "f")
         .map(str::to_string)
         .collect();
     out.push(format!("f={format}"));

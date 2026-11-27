@@ -22,13 +22,6 @@ struct ExprParams {
     rgb_inv_255: vec4<f32>,
 }
 
-struct GpuInstr {
-    opcode: u32,
-    imm_u32: u32,
-    imm_f32: f32,
-    _pad: u32,
-}
-
 @group(0) @binding(0) var<uniform> params: ExprParams;
 /// Stacked planar f32 slabs: band b at offset b * params.band_stride
 @group(0) @binding(1) var<storage, read> bands_slab: array<f32>;
@@ -38,8 +31,6 @@ struct GpuInstr {
 /// 256 packed RGBA8 u32 entries (for expr colormap) OR 256 packed RGB-LUT u32 entries (r_lut | g_lut<<8 | b_lut<<16)
 @group(0) @binding(5) var<storage, read> lut_u32: array<u32>;
 @group(0) @binding(6) var<storage, read_write> dst_words: array<u32>;
-
-const INV_LN10: f32 = 0.4342944819032518;
 
 fn sample_checked(band: u32, x: i32, y: i32) -> f32 {
     if (x < 0 || y < 0 || x >= i32(params.src_w) || y >= i32(params.src_h)) {
@@ -174,197 +165,6 @@ fn sample_band(band: u32, u: f32, v: f32) -> f32 {
     } else {
         return sample_lanczos3(band, u, v);
     }
-}
-
-fn eval_expr_vm_range(
-    bvals: ptr<function, array<f32, 8>>,
-    pc_start: u32,
-    pc_end: u32,
-) -> f32 {
-    var stack: array<f32, 32>;
-    var sp: u32 = 0u;
-
-    for (var pc: u32 = pc_start; pc < pc_end; pc = pc + 1u) {
-        let ins = instrs[pc];
-        switch ins.opcode {
-            case 0u: { // PushConst
-                stack[sp] = ins.imm_f32;
-                sp += 1u;
-            }
-            case 1u: { // LoadBand
-                stack[sp] = (*bvals)[ins.imm_u32 & 7u];
-                sp += 1u;
-            }
-            case 2u: { // Add
-                sp -= 1u;
-                stack[sp - 1u] = stack[sp - 1u] + stack[sp];
-            }
-            case 3u: { // Sub
-                sp -= 1u;
-                stack[sp - 1u] = stack[sp - 1u] - stack[sp];
-            }
-            case 4u: { // Mul
-                sp -= 1u;
-                stack[sp - 1u] = stack[sp - 1u] * stack[sp];
-            }
-            case 5u: { // Div
-                sp -= 1u;
-                let denom = stack[sp];
-                if (abs(denom) < 1e-12 || is_nan_f32(denom)) {
-                    stack[sp - 1u] = nan_f32();
-                } else {
-                    stack[sp - 1u] = stack[sp - 1u] / denom;
-                }
-            }
-            case 6u: { // Pow (safe for a <= 0.0, matching f32::powf)
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                if (is_nan_f32(a) || is_nan_f32(b)) {
-                    stack[sp - 1u] = nan_f32();
-                } else if (b == 0.0) {
-                    stack[sp - 1u] = 1.0;
-                } else if (a > 0.0) {
-                    stack[sp - 1u] = pow(a, b);
-                } else if (a == 0.0) {
-                    stack[sp - 1u] = select(nan_f32(), 0.0, b > 0.0);
-                } else if (trunc(b) == b) {
-                    let mag = pow(-a, b);
-                    let is_odd = abs(b - 2.0 * floor(b * 0.5)) >= 0.5;
-                    stack[sp - 1u] = select(mag, -mag, is_odd);
-                } else {
-                    stack[sp - 1u] = nan_f32();
-                }
-            }
-            case 7u: { // Neg
-                stack[sp - 1u] = -stack[sp - 1u];
-            }
-            case 8u: { // Log10
-                let x = stack[sp - 1u];
-                stack[sp - 1u] = select(nan_f32(), log(x) * INV_LN10, x > 0.0);
-            }
-            case 9u: { // Ln
-                let x = stack[sp - 1u];
-                stack[sp - 1u] = select(nan_f32(), log(x), x > 0.0);
-            }
-            case 10u: { // Log2
-                let x = stack[sp - 1u];
-                stack[sp - 1u] = select(nan_f32(), log2(x), x > 0.0);
-            }
-            case 11u: { // Db (10 * log10(x) for x > 0 else NaN)
-                let x = stack[sp - 1u];
-                stack[sp - 1u] = select(nan_f32(), 10.0 * log(x) * INV_LN10, x > 0.0);
-            }
-            case 12u: { // Exp
-                stack[sp - 1u] = exp(stack[sp - 1u]);
-            }
-            case 13u: { // Sqrt
-                let x = stack[sp - 1u];
-                stack[sp - 1u] = select(nan_f32(), sqrt(x), x >= 0.0);
-            }
-            case 14u: { // Abs
-                stack[sp - 1u] = abs(stack[sp - 1u]);
-            }
-            case 15u: { // Sin
-                stack[sp - 1u] = sin(stack[sp - 1u]);
-            }
-            case 16u: { // Cos
-                stack[sp - 1u] = cos(stack[sp - 1u]);
-            }
-            case 17u: { // Tan
-                stack[sp - 1u] = tan(stack[sp - 1u]);
-            }
-            case 18u: { // Min (NaN-propagating)
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(min(a, b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 19u: { // Max (NaN-propagating)
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(max(a, b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 20u: { // Clip (val, lo, hi) — NaN-propagating, handles lo > hi
-                sp -= 2u;
-                let x = stack[sp - 1u];
-                let lo = stack[sp];
-                let hi = stack[sp + 1u];
-                if (is_nan_f32(x) || is_nan_f32(lo) || is_nan_f32(hi)) {
-                    stack[sp - 1u] = nan_f32();
-                } else {
-                    let a = min(lo, hi);
-                    let b = max(lo, hi);
-                    stack[sp - 1u] = clamp(x, a, b);
-                }
-            }
-            case 21u: { // Lt
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(select(0.0, 1.0, a < b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 22u: { // Le
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(select(0.0, 1.0, a <= b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 23u: { // Gt
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(select(0.0, 1.0, a > b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 24u: { // Ge
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(select(0.0, 1.0, a >= b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 25u: { // Eq
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(select(0.0, 1.0, a == b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 26u: { // Ne
-                sp -= 1u;
-                let a = stack[sp - 1u];
-                let b = stack[sp];
-                stack[sp - 1u] = select(select(0.0, 1.0, a != b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
-            }
-            case 27u: { // Where (cond, a, b)
-                sp -= 2u;
-                let cond = stack[sp - 1u];
-                let a = stack[sp];
-                let b = stack[sp + 1u];
-                if (is_nan_f32(cond)) {
-                    stack[sp - 1u] = nan_f32();
-                } else if (cond != 0.0) {
-                    stack[sp - 1u] = a;
-                } else {
-                    stack[sp - 1u] = b;
-                }
-            }
-            case 28u: { // Ceil
-                stack[sp - 1u] = ceil(stack[sp - 1u]);
-            }
-            case 29u: { // Floor
-                stack[sp - 1u] = floor(stack[sp - 1u]);
-            }
-            case 30u: { // Round
-                stack[sp - 1u] = round(stack[sp - 1u]);
-            }
-            default: {}
-        }
-    }
-
-    if (sp == 0u) {
-        return nan_f32();
-    }
-    return stack[sp - 1u];
 }
 
 fn eval_expr_vm(u: f32, v: f32) -> f32 {
@@ -505,6 +305,26 @@ fn apply_lch_sat(r: u32, g: u32, b: u32, sat: f32) -> vec3<u32> {
     return vec3<u32>(lin_to_srgb_u32(rl2), lin_to_srgb_u32(gl2), lin_to_srgb_u32(bl2));
 }
 
+fn pack_rgb_formula(vr: f32, vg: f32, vb: f32) -> u32 {
+    var r = u32(clamp((vr - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
+    var g = u32(clamp((vg - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
+    var b = u32(clamp((vb - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
+
+    if ((params.formula_flags & 1u) != 0u) {
+        r = lut_u32[r] & 0xffu;
+        g = (lut_u32[g] >> 8u) & 0xffu;
+        b = (lut_u32[b] >> 16u) & 0xffu;
+    }
+    if ((params.formula_flags & 2u) != 0u) {
+        let sat_rgb = apply_lch_sat(r, g, b, params.saturation);
+        r = sat_rgb.x;
+        g = sat_rgb.y;
+        b = sat_rgb.z;
+    }
+
+    return r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+}
+
 /// Fused 3-band RGB resample -> per-channel rescale -> Gamma/Sigmoidal LUT -> LCH Saturation -> RGBA8.
 @compute @workgroup_size(16, 16, 1)
 fn rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -525,23 +345,7 @@ fn rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    var r = u32(clamp((vr - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
-    var g = u32(clamp((vg - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
-    var b = u32(clamp((vb - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
-
-    if ((params.formula_flags & 1u) != 0u) {
-        r = lut_u32[r] & 0xffu;
-        g = (lut_u32[g] >> 8u) & 0xffu;
-        b = (lut_u32[b] >> 16u) & 0xffu;
-    }
-    if ((params.formula_flags & 2u) != 0u) {
-        let sat_rgb = apply_lch_sat(r, g, b, params.saturation);
-        r = sat_rgb.x;
-        g = sat_rgb.y;
-        b = sat_rgb.z;
-    }
-
-    dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+    dst_words[out_idx] = pack_rgb_formula(vr, vg, vb);
 }
 
 /// Fused Dual-Pol SAR False-Color RGB ([VV_dB, VH_dB, VV_dB - VH_dB]) -> rescale ->
@@ -568,23 +372,7 @@ fn sar_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vh = 10.0 * log(p_vh) * INV_LN10;
     let diff = vv - vh;
 
-    var r = u32(clamp((vv - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
-    var g = u32(clamp((vh - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
-    var b = u32(clamp((diff - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
-
-    if ((params.formula_flags & 1u) != 0u) {
-        r = lut_u32[r] & 0xffu;
-        g = (lut_u32[g] >> 8u) & 0xffu;
-        b = (lut_u32[b] >> 16u) & 0xffu;
-    }
-    if ((params.formula_flags & 2u) != 0u) {
-        let sat_rgb = apply_lch_sat(r, g, b, params.saturation);
-        r = sat_rgb.x;
-        g = sat_rgb.y;
-        b = sat_rgb.z;
-    }
-
-    dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+    dst_words[out_idx] = pack_rgb_formula(vv, vh, diff);
 }
 
 /// Fused 3-expression CustomExprRgb (`[prog_r, prog_g, prog_b]`) -> rescale ->
@@ -622,23 +410,7 @@ fn expr_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    var r = u32(clamp((vr - params.rgb_min.x) * params.rgb_inv_255.x, 0.0, 255.0));
-    var g = u32(clamp((vg - params.rgb_min.y) * params.rgb_inv_255.y, 0.0, 255.0));
-    var b = u32(clamp((vb - params.rgb_min.z) * params.rgb_inv_255.z, 0.0, 255.0));
-
-    if ((params.formula_flags & 1u) != 0u) {
-        r = lut_u32[r] & 0xffu;
-        g = (lut_u32[g] >> 8u) & 0xffu;
-        b = (lut_u32[b] >> 16u) & 0xffu;
-    }
-    if ((params.formula_flags & 2u) != 0u) {
-        let sat_rgb = apply_lch_sat(r, g, b, params.saturation);
-        r = sat_rgb.x;
-        g = sat_rgb.y;
-        b = sat_rgb.z;
-    }
-
-    dst_words[out_idx] = r | (g << 8u) | (b << 16u) | (0xffu << 24u);
+    dst_words[out_idx] = pack_rgb_formula(vr, vg, vb);
 }
 
 /// Multi-band planar `(num_bands, dst_h, dst_w)` Float32 resampling for scientific `.npy` / `.tif`

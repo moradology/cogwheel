@@ -429,8 +429,9 @@ pub struct CogIndex {
     /// Optional embedded TIFF palette (Tag 320 `ColorMap`) as RGBA entries `[r, g, b, 255]`.
     pub color_map: Option<Vec<[u8; 4]>>,
     pub geo_keys: GeoKeys,
-    /// IFDs sorted from highest resolution (index 0) to lowest resolution overview.
-    pub ifds: Vec<IfdMeta>,
+    /// IFDs sorted from highest resolution (index 0) to lowest resolution overview. Shared, so a
+    /// clone of the index (a `?nodata=` view of the raster) does not copy the tile tables.
+    pub ifds: std::sync::Arc<[IfdMeta]>,
 }
 
 impl CogIndex {

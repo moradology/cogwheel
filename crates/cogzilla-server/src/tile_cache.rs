@@ -9,6 +9,17 @@ use tokio::sync::Notify;
 
 use crate::engine::EngineError;
 
+fn atomic_saturating_sub(atom: &AtomicUsize, delta: usize) -> usize {
+    let mut cur = atom.load(Ordering::Acquire);
+    loop {
+        let next = cur.saturating_sub(delta);
+        match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return next,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// Fast, deterministic weak ETag (`W/"cgz-<ahash64>-<len>"`) for rendered tile bytes.
 pub fn compute_tile_etag(bytes: &[u8]) -> HeaderValue {
     let hasher = ahash::RandomState::with_seeds(
@@ -123,11 +134,7 @@ impl TileCache {
             false
         });
         if removed > 0 {
-            let _ = self
-                .current_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    Some(c.saturating_sub(removed))
-                });
+            atomic_saturating_sub(&self.current_bytes, removed);
         }
     }
 
@@ -161,13 +168,7 @@ impl TileCache {
             .unwrap_or(0);
 
         if old_len > 0 {
-            now = self
-                .current_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                    Some(c.saturating_sub(old_len))
-                })
-                .unwrap_or(0)
-                .saturating_sub(old_len);
+            now = atomic_saturating_sub(&self.current_bytes, old_len);
         }
         if now > self.max_bytes {
             self.evict_some();
@@ -216,11 +217,7 @@ impl TileCache {
                     let mut dropped = 0usize;
                     for (_, k, _) in candidates {
                         if let Some((_, entry)) = self.ready.remove(&k) {
-                            let _ = self.current_bytes.fetch_update(
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                                |c| Some(c.saturating_sub(entry.byte_len)),
-                            );
+                            atomic_saturating_sub(&self.current_bytes, entry.byte_len);
                             dropped += entry.byte_len;
                             dropped_any = true;
                             if dropped >= target_drop {

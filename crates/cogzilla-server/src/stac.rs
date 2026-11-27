@@ -355,13 +355,14 @@ pub fn select_stac_asset_names(
 }
 
 /// Resolve requested STAC asset names (or extract them from a STAC `?expression=`) and open all
-/// referenced COGs concurrently via `CogStore`.
-/// Also rewrites asset-name identifiers in `expr_raw` (e.g. `(red-green)/(red+green)` -> `(b1-b2)/(b1+b2)`).
+/// referenced COGs concurrently via `CogStore`; `nodata` (`?nodata=`) replaces each asset's own
+/// nodata, as GDAL's override does. Also rewrites asset-name identifiers in `expr_raw` (e.g. `(red-green)/(red+green)` -> `(b1-b2)/(b1+b2)`).
 pub async fn resolve_stac_assets(
     engine: &TileEngine,
     item: &StacItem,
     requested_assets: &[String],
     expr_raw: Option<&str>,
+    nodata: Option<f32>,
 ) -> Result<(Vec<String>, Vec<Arc<OpenedCog>>, Option<String>), EngineError> {
     let names = select_stac_asset_names(item, requested_assets, expr_raw)?;
 
@@ -385,7 +386,7 @@ pub async fn resolve_stac_assets(
                 .open_uri(&href)
                 .await
                 .map_err(|e| crate::engine::asset_fetch_error(&href, e))?;
-            Ok::<_, EngineError>((idx, cog))
+            Ok::<_, EngineError>((idx, store.with_nodata(&cog, nodata)))
         });
     }
     let mut opened: Vec<Option<Arc<OpenedCog>>> = vec![None; names.len()];

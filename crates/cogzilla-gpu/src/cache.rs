@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use crate::context::GpuError;
@@ -25,14 +26,14 @@ pub struct GpuCacheStats {
     pub evictions: u64,
 }
 
-struct CacheEntry {
-    slab: Arc<GpuSlab>,
+struct LruEntry<V> {
+    value: Arc<V>,
     bytes: usize,
     last_used: u64,
 }
 
-struct Inner {
-    map: HashMap<SlabKey, CacheEntry>,
+struct LruInner<K, V> {
+    map: HashMap<K, LruEntry<V>>,
     used_bytes: usize,
     max_bytes: usize,
     tick: u64,
@@ -41,18 +42,14 @@ struct Inner {
     evictions: u64,
 }
 
-/// Thread-safe byte-bounded LRU cache of GPU-resident `GpuSlab` buffers.
-///
-/// Uploading a decoded COG block once and keeping it resident in VRAM / unified memory
-/// eliminates host->device copy overhead across overlapping tiles, zoom levels, and styling changes.
-pub struct GpuSlabCache {
-    inner: Mutex<Inner>,
+struct LruByteCache<K, V> {
+    inner: Mutex<LruInner<K, V>>,
 }
 
-impl GpuSlabCache {
-    pub fn new(max_bytes: usize) -> Self {
+impl<K: Eq + Hash + Copy, V> LruByteCache<K, V> {
+    fn new(max_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            inner: Mutex::new(LruInner {
                 map: HashMap::new(),
                 used_bytes: 0,
                 max_bytes: max_bytes.max(1024 * 1024),
@@ -64,8 +61,8 @@ impl GpuSlabCache {
         }
     }
 
-    pub fn stats(&self) -> GpuCacheStats {
-        let g = self.inner.lock().expect("slab cache mutex poisoned");
+    fn stats(&self) -> GpuCacheStats {
+        let g = self.inner.lock().expect("gpu LRU cache mutex poisoned");
         GpuCacheStats {
             entries: g.map.len(),
             used_bytes: g.used_bytes,
@@ -76,58 +73,92 @@ impl GpuSlabCache {
         }
     }
 
-    pub fn get(&self, key: &SlabKey) -> Option<Arc<GpuSlab>> {
-        let mut g = self.inner.lock().expect("slab cache mutex poisoned");
+    fn get(&self, key: &K) -> Option<Arc<V>> {
+        let mut g = self.inner.lock().expect("gpu LRU cache mutex poisoned");
         let next_tick = g.tick.wrapping_add(1);
         g.tick = next_tick;
         if let Some(entry) = g.map.get_mut(key) {
             entry.last_used = next_tick;
-            let slab = Arc::clone(&entry.slab);
+            let value = Arc::clone(&entry.value);
             g.hits += 1;
-            Some(slab)
+            Some(value)
         } else {
             g.misses += 1;
             None
         }
     }
 
-    pub fn insert(&self, key: SlabKey, slab: Arc<GpuSlab>) {
-        let bytes = (slab.height as usize)
-            .saturating_mul(slab.stride as usize)
-            .saturating_mul(std::mem::size_of::<f32>());
-        let mut g = self.inner.lock().expect("slab cache mutex poisoned");
+    fn insert(&self, key: K, value: Arc<V>, bytes: usize) {
+        let mut g = self.inner.lock().expect("gpu LRU cache mutex poisoned");
         if bytes > g.max_bytes {
             return;
         }
         if let Some(old) = g.map.remove(&key) {
             g.used_bytes = g.used_bytes.saturating_sub(old.bytes);
         }
-        while g.used_bytes + bytes > g.max_bytes && !g.map.is_empty() {
+        while g.used_bytes.saturating_add(bytes) > g.max_bytes && !g.map.is_empty() {
             let lru_key = g
                 .map
                 .iter()
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(k, _)| *k);
-            if let Some(ek) = lru_key {
-                if let Some(removed) = g.map.remove(&ek) {
-                    g.used_bytes = g.used_bytes.saturating_sub(removed.bytes);
-                    g.evictions += 1;
-                }
+            if let Some(ek) = lru_key
+                && let Some(removed) = g.map.remove(&ek)
+            {
+                g.used_bytes = g.used_bytes.saturating_sub(removed.bytes);
+                g.evictions += 1;
             } else {
                 break;
             }
         }
         let next_tick = g.tick.wrapping_add(1);
         g.tick = next_tick;
-        g.used_bytes += bytes;
+        g.used_bytes = g.used_bytes.saturating_add(bytes);
         g.map.insert(
             key,
-            CacheEntry {
-                slab,
+            LruEntry {
+                value,
                 bytes,
                 last_used: next_tick,
             },
         );
+    }
+
+    fn clear(&self) {
+        let mut g = self.inner.lock().expect("gpu LRU cache mutex poisoned");
+        g.map.clear();
+        g.used_bytes = 0;
+    }
+}
+
+/// Thread-safe byte-bounded LRU cache of GPU-resident `GpuSlab` buffers.
+///
+/// Uploading a decoded COG block once and keeping it resident in VRAM / unified memory
+/// eliminates host->device copy overhead across overlapping tiles, zoom levels, and styling changes.
+pub struct GpuSlabCache {
+    inner: LruByteCache<SlabKey, GpuSlab>,
+}
+
+impl GpuSlabCache {
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: LruByteCache::new(max_bytes),
+        }
+    }
+
+    pub fn stats(&self) -> GpuCacheStats {
+        self.inner.stats()
+    }
+
+    pub fn get(&self, key: &SlabKey) -> Option<Arc<GpuSlab>> {
+        self.inner.get(key)
+    }
+
+    pub fn insert(&self, key: SlabKey, slab: Arc<GpuSlab>) {
+        let bytes = (slab.height as usize)
+            .saturating_mul(slab.stride as usize)
+            .saturating_mul(std::mem::size_of::<f32>());
+        self.inner.insert(key, slab, bytes);
     }
 
     /// Look up `key`, or upload `data` on miss and cache the resulting `GpuSlab`.
@@ -149,9 +180,7 @@ impl GpuSlabCache {
     }
 
     pub fn clear(&self) {
-        let mut g = self.inner.lock().expect("slab cache mutex poisoned");
-        g.map.clear();
-        g.used_bytes = 0;
+        self.inner.clear();
     }
 }
 
@@ -166,115 +195,38 @@ pub struct MultiBandSlabKey {
     pub ty: u32,
 }
 
-struct MultiBandEntry {
-    slab: Arc<GpuMultiBandSlab>,
-    bytes: usize,
-    last_used: u64,
-}
-
-struct MultiBandInner {
-    map: HashMap<MultiBandSlabKey, MultiBandEntry>,
-    used_bytes: usize,
-    max_bytes: usize,
-    tick: u64,
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-}
-
 /// Thread-safe byte-bounded LRU cache of GPU-resident `GpuMultiBandSlab` buffers.
 ///
 /// Eliminates repeated CPU multi-band stitching and host->device PCIe uploads across warm
 /// `CustomExpr` (NDVI/EVI/SAR) and 3-band `RGB` tile and `/cog/{preview,bbox}` requests.
 pub struct GpuMultiBandCache {
-    inner: Mutex<MultiBandInner>,
+    inner: LruByteCache<MultiBandSlabKey, GpuMultiBandSlab>,
 }
 
 impl GpuMultiBandCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
-            inner: Mutex::new(MultiBandInner {
-                map: HashMap::new(),
-                used_bytes: 0,
-                max_bytes: max_bytes.max(1024 * 1024),
-                tick: 0,
-                hits: 0,
-                misses: 0,
-                evictions: 0,
-            }),
+            inner: LruByteCache::new(max_bytes),
         }
     }
 
     pub fn stats(&self) -> GpuCacheStats {
-        let g = self.inner.lock().expect("multi-band cache mutex poisoned");
-        GpuCacheStats {
-            entries: g.map.len(),
-            used_bytes: g.used_bytes,
-            max_bytes: g.max_bytes,
-            hits: g.hits,
-            misses: g.misses,
-            evictions: g.evictions,
-        }
+        self.inner.stats()
     }
 
     pub fn get(&self, key: &MultiBandSlabKey) -> Option<Arc<GpuMultiBandSlab>> {
-        let mut g = self.inner.lock().expect("multi-band cache mutex poisoned");
-        g.tick = g.tick.wrapping_add(1);
-        let tick = g.tick;
-        if let Some(entry) = g.map.get_mut(key) {
-            entry.last_used = tick;
-            let slab = Arc::clone(&entry.slab);
-            g.hits += 1;
-            Some(slab)
-        } else {
-            g.misses += 1;
-            None
-        }
+        self.inner.get(key)
     }
 
     pub fn insert(&self, key: MultiBandSlabKey, slab: Arc<GpuMultiBandSlab>) {
         let bytes = (slab.num_bands as usize)
             .saturating_mul(slab.band_stride as usize)
             .saturating_mul(std::mem::size_of::<f32>());
-        let mut g = self.inner.lock().expect("multi-band cache mutex poisoned");
-        if bytes > g.max_bytes {
-            return;
-        }
-        if let Some(prev) = g.map.remove(&key) {
-            g.used_bytes = g.used_bytes.saturating_sub(prev.bytes);
-        }
-        while g.used_bytes.saturating_add(bytes) > g.max_bytes && !g.map.is_empty() {
-            let lru_key = g
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| *k);
-            if let Some(k) = lru_key
-                && let Some(evicted) = g.map.remove(&k)
-            {
-                g.used_bytes = g.used_bytes.saturating_sub(evicted.bytes);
-                g.evictions += 1;
-            } else {
-                break;
-            }
-        }
-        g.tick = g.tick.wrapping_add(1);
-        let tick = g.tick;
-        g.used_bytes = g.used_bytes.saturating_add(bytes);
-        g.map.insert(
-            key,
-            MultiBandEntry {
-                slab,
-                bytes,
-                last_used: tick,
-            },
-        );
+        self.inner.insert(key, slab, bytes);
     }
 
     pub fn clear(&self) {
-        let mut g = self.inner.lock().expect("multi-band cache mutex poisoned");
-        g.map.clear();
-        g.used_bytes = 0;
+        self.inner.clear();
     }
 }
 

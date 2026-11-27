@@ -186,6 +186,19 @@ pub(crate) fn needs_source_unscale(bands: &BandRequest, format: OutputFormat) ->
     ) || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
 }
 
+/// Whether `bands` draws one value per pixel under the grayscale map: a grey picture.
+fn draws_one_grey_band(bands: &BandRequest) -> bool {
+    matches!(
+        bands,
+        BandRequest::Single { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral1 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral2 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral3 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::CustomExpr { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Dem { colormap: ColormapName::Grayscale, .. }
+    )
+}
+
 /// Wrap raw band-major little-endian `f32` tile bytes into the requested float output format
 /// (`RawF32`, `Npy`, `RawF64`, or `NpyF64`) so float64 requests on multi-COG/mosaic paths never
 /// fall through to RGBA8.
@@ -480,6 +493,15 @@ pub(crate) fn validate_multi_cog_grid(
     Ok(())
 }
 
+/// Shared startup configuration for `cogzilla-server` and `cogzilla-lambda`.
+#[derive(Debug, Clone)]
+pub struct EngineBootConfig {
+    pub cache_mb: usize,
+    pub tile_cache_mb: usize,
+    pub disk_cache_mb: u64,
+    pub disk_cache_dir: Option<std::path::PathBuf>,
+}
+
 impl TileEngine {
     pub fn new(cache_max_bytes: usize) -> Self {
         Self::with_store(Arc::new(CogStore::new(cache_max_bytes)))
@@ -512,6 +534,41 @@ impl TileEngine {
             #[cfg(feature = "gpu")]
             gpu,
         }
+    }
+
+    /// Build a `TileEngine` from `EngineBootConfig`, opening the optional tier-2
+    /// compressed-block disk cache if `disk_cache_mb > 0`.
+    pub fn boot(cfg: EngineBootConfig) -> Arc<Self> {
+        let mut store = CogStore::new(cfg.cache_mb.saturating_mul(1024 * 1024));
+        if cfg.disk_cache_mb > 0 {
+            let dir = cfg
+                .disk_cache_dir
+                .unwrap_or_else(|| std::env::temp_dir().join("cogzilla-disk-cache"));
+            match cogzilla_io::DiskBlockCache::open(
+                &dir,
+                cfg.disk_cache_mb.saturating_mul(1024 * 1024),
+            ) {
+                Ok(dc) => {
+                    tracing::info!(
+                        dir = %dir.display(),
+                        disk_cache_mb = cfg.disk_cache_mb,
+                        "enabled tier-2 compressed-block disk cache"
+                    );
+                    store = store.with_disk_cache(dc);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to open disk cache directory; continuing with tier 2 disabled"
+                    );
+                }
+            }
+        }
+        Arc::new(Self::with_store_and_tile_cache(
+            Arc::new(store),
+            cfg.tile_cache_mb.saturating_mul(1024 * 1024),
+        ))
     }
 
     /// Attach the pgSTAC database behind the `/searches` routes. The first call wins.
@@ -2766,7 +2823,9 @@ impl TileEngine {
     /// the raster's own, NaN where it has no data. An empty `bands_1based` asks for every
     /// band. `req` gives the tile, its size and `unscale`; `resampling` is used for a raster
     /// already in the tile's projection and `reproject` for one that has to be warped into
-    /// it. The raster's sample type comes back with the planes.
+    /// it. `nodata` (a request's `?nodata=`) stands in place of the raster's own. The raster's
+    /// sample type comes back with the planes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn raster_planes(
         &self,
         uri: &str,
@@ -2774,8 +2833,9 @@ impl TileEngine {
         req: &TileRequest,
         resampling: ResampleMode,
         reproject: ResampleMode,
+        nodata: Option<f32>,
     ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
-        let cog = self.store.open_uri(uri).await?;
+        let cog = self.store.with_nodata(&self.store.open_uri(uri).await?, nodata);
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
         let wanted = Self::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
@@ -3142,15 +3202,17 @@ impl TileEngine {
                 failed_assets,
             ));
         }
-        Ok((
-            encode_rgba_tile(
-                &canvas,
-                req.tile_size,
-                filled == total_pixels,
-                req.format,
-            ),
-            failed_assets,
-        ))
+        // One band drawn in grey is a grey picture, as TiTiler writes it (a palette of a
+        // raster's own colours it, and is not).
+        let opaque = filled == total_pixels;
+        let bytes = if draws_one_grey_band(&req.bands)
+            && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]))
+        {
+            cogzilla_kernel::encode_grey_rgba_tile(&canvas, req.tile_size, opaque, req.format)
+        } else {
+            encode_rgba_tile(&canvas, req.tile_size, opaque, req.format)
+        };
+        Ok((bytes, failed_assets))
     }
 
     /// Query a pluggable `SceneCatalog` for the requested tile's EPSG:3857 bounding box
@@ -3504,11 +3566,13 @@ mod tests {
             band_metadata: vec![Vec::new(); 3],
             band_descriptions: vec![String::new(); 3],
             color_map: None,
-            ifds: vec![ifd],
+            ifds: vec![ifd].into(),
         };
         let source = cogzilla_io::CogSource::open_local(&tmp_path).unwrap();
         let cog = OpenedCog {
             id: 999_999,
+            source_id: 999_999,
+            sparse_fill: None,
             uri: tmp_path.to_string_lossy().into_owned(),
             index,
             source,

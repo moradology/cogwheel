@@ -183,13 +183,7 @@ impl SingleflightBlockCache {
             f.notify.notify_waiters();
         }
         if old_bytes > 0 {
-            now_bytes = self
-                .current_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                    Some(cur.saturating_sub(old_bytes))
-                })
-                .unwrap_or(0)
-                .saturating_sub(old_bytes);
+            now_bytes = Self::atomic_saturating_sub_usize(&self.current_bytes, old_bytes);
         }
         if now_bytes > self.max_bytes {
             self.evict_some();
@@ -243,11 +237,18 @@ impl SingleflightBlockCache {
                 false
             }
         });
-        let _ = self
-            .current_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                Some(c.saturating_sub(removed_bytes))
-            });
+        Self::atomic_saturating_sub_usize(&self.current_bytes, removed_bytes);
+    }
+
+    fn atomic_saturating_sub_usize(atom: &AtomicUsize, delta: usize) -> usize {
+        let mut cur = atom.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(delta);
+            match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return next,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     pub fn current_bytes(&self) -> usize {
@@ -338,11 +339,7 @@ impl SingleflightBlockCache {
                             let sz = tile_bytes(&tile);
                             dropped += sz;
                             removed_any = true;
-                            let _ = self.current_bytes.fetch_update(
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                                |c| Some(c.saturating_sub(sz)),
-                            );
+                            Self::atomic_saturating_sub_usize(&self.current_bytes, sz);
                         } else {
                             skipped.push(key);
                         }
@@ -363,11 +360,7 @@ impl SingleflightBlockCache {
                                 let sz = tile_bytes(&tile);
                                 dropped += sz;
                                 removed_any = true;
-                                let _ = self.current_bytes.fetch_update(
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                    |c| Some(c.saturating_sub(sz)),
-                                );
+                                Self::atomic_saturating_sub_usize(&self.current_bytes, sz);
                             }
                         }
                     }
