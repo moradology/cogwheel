@@ -5938,6 +5938,43 @@ fn is_compressible_content_type(ct: &str) -> bool {
         || media.starts_with("text/")
 }
 
+const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+
+/// Extract a valid caller-supplied `X-Request-Id` header (1..=128 printable non-whitespace ASCII
+/// bytes) or generate a compact lock-free hex ID (`<8-hex-process-seed>-<12-hex-seq>`).
+fn resolve_request_id(headers: &hyper::HeaderMap) -> HeaderValue {
+    if let Some(hv) = headers.get(&X_REQUEST_ID) {
+        let bytes = hv.as_bytes();
+        if !bytes.is_empty()
+            && bytes.len() <= 128
+            && bytes.iter().all(|&b| (0x21..=0x7E).contains(&b))
+        {
+            return hv.clone();
+        }
+    }
+    static SEED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seed = *SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        (nanos ^ (nanos >> 32) ^ (pid.wrapping_mul(0x9E37_79B9))) as u32
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) & 0x0000_FFFF_FFFF_FFFF;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 21];
+    for i in 0..8 {
+        buf[7 - i] = HEX[((seed >> (i * 4)) & 0xF) as usize];
+    }
+    buf[8] = b'-';
+    for i in 0..12 {
+        buf[20 - i] = HEX[((seq >> (i * 4)) & 0xF) as usize];
+    }
+    HeaderValue::from_bytes(&buf).expect("ASCII hex request id")
+}
+
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
     mut req: Request<B>,
@@ -5947,17 +5984,21 @@ where
     B::Error: std::fmt::Display,
 {
     let t0 = std::time::Instant::now();
-    let is_head = *req.method() == Method::HEAD;
-    let is_post = *req.method() == Method::POST;
-    let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
+    let req_id = resolve_request_id(req.headers());
+    let req_method = req.method().clone();
+    // O(1) `Bytes`-backed URI clone (zero heap allocation) for structured access logging.
+    let req_uri = req.uri().clone();
+    let is_head = req_method == Method::HEAD;
+    let is_post = req_method == Method::POST;
+    let is_get_or_head = matches!(req_method, Method::GET | Method::HEAD);
     let is_health_or_metrics =
-        matches!(req.uri().path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
+        matches!(req_uri.path(), "/healthz" | "/readyz" | "/metrics" | "/stats");
     let is_control_plane = is_health_or_metrics
         || matches!(
-            req.uri().path(),
+            req_uri.path(),
             "/admin/clear-cache" | "/searches" | "/searches/list" | "/searches/register"
         );
-    let bypass_aimd = is_control_plane || *req.method() == Method::OPTIONS;
+    let bypass_aimd = is_control_plane || req_method == Method::OPTIONS;
     let mut aimd_permit = if bypass_aimd {
         None
     } else {
@@ -5980,6 +6021,22 @@ where
                     resp.headers_mut()
                         .insert(HeaderName::from_static("x-cogzilla-aimd-limit"), hv);
                 }
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    tracing::debug!(
+                        request_id = req_id.to_str().unwrap_or(""),
+                        method = %req_method,
+                        path = %req_uri.path(),
+                        status = 429u16,
+                        dur_ms = format_args!("{dur_ms:.2}"),
+                        "http request"
+                    );
+                }
+                resp.headers_mut().insert(X_REQUEST_ID, req_id);
+                resp.headers_mut().insert(
+                    hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static("X-Request-Id"),
+                );
                 return Ok(resp);
             }
         }
@@ -6059,6 +6116,36 @@ where
         resp.headers_mut().insert(
             hyper::header::HeaderName::from_static("server-timing"),
             hv,
+        );
+    }
+    let status = resp.status();
+    if status.is_server_error() {
+        tracing::warn!(
+            request_id = req_id.to_str().unwrap_or(""),
+            method = %req_method,
+            path = %req_uri.path(),
+            status = status.as_u16(),
+            dur_ms = format_args!("{dur_ms:.2}"),
+            "http request failed"
+        );
+    } else if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!(
+            request_id = req_id.to_str().unwrap_or(""),
+            method = %req_method,
+            path = %req_uri.path(),
+            status = status.as_u16(),
+            dur_ms = format_args!("{dur_ms:.2}"),
+            "http request"
+        );
+    }
+    resp.headers_mut().insert(X_REQUEST_ID, req_id);
+    if !resp
+        .headers()
+        .contains_key(hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+    {
+        resp.headers_mut().insert(
+            hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("X-Request-Id"),
         );
     }
     if is_post {
@@ -6234,7 +6321,7 @@ where
         );
         resp.headers_mut().insert(
             hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("Content-Type, If-None-Match, Authorization"),
+            HeaderValue::from_static("Content-Type, If-None-Match, Authorization, X-Request-Id"),
         );
         return Ok(resp);
     }
@@ -13132,5 +13219,108 @@ mod tests {
         // Multi-header HTTP/1.1 & HTTP/2 Accept-Encoding lines
         assert_eq!(negotiate_encoding(["gzip", "br"]), PreferredEncoding::Brotli);
         assert_eq!(negotiate_encoding(["*", "gzip;q=0", "br;q=0"]), PreferredEncoding::None);
+    }
+
+    #[tokio::test]
+    async fn x_request_id_echoes_valid_generates_when_absent_or_invalid_and_on_429() {
+        let engine = Arc::new(TileEngine::new(8 * 1024 * 1024));
+
+        // Absent -> generated 21-byte <8-hex>-<12-hex>, unique across calls.
+        let r1 = handle_request(
+            engine.clone(),
+            Request::builder().uri("/healthz").body(Full::new(Bytes::new())).unwrap(),
+        )
+        .await
+        .unwrap();
+        let r2 = handle_request(
+            engine.clone(),
+            Request::builder().uri("/healthz").body(Full::new(Bytes::new())).unwrap(),
+        )
+        .await
+        .unwrap();
+        let id1 = r1.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id2 = r2.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+        assert_eq!(id1.len(), 21);
+        assert_eq!(id1.as_bytes()[8], b'-');
+        assert!(id1[..8].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(id1[9..].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_ne!(id1, id2);
+        assert_eq!(
+            r1.headers()
+                .get(hyper::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|v| v.to_str().ok()),
+            Some("X-Request-Id")
+        );
+
+        // Valid caller-supplied X-Request-Id (including exact 128-byte boundary) is echoed verbatim.
+        let exact_128 = "a".repeat(128);
+        for valid in ["trace-abc-123_XYZ", exact_128.as_str()] {
+            let r_echo = handle_request(
+                engine.clone(),
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", valid)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                r_echo.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap(),
+                valid
+            );
+        }
+
+        // Invalid (empty, contains whitespace/tab, or >128 bytes) -> replaced with fresh generated ID.
+        for invalid in ["", "bad id with spaces", "bad\tid"] {
+            let r_bad = handle_request(
+                engine.clone(),
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", invalid)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let bad_out = r_bad.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap();
+            assert_ne!(bad_out, invalid);
+            assert_eq!(bad_out.len(), 21);
+        }
+
+        let too_long = "a".repeat(129);
+        let r_long = handle_request(
+            engine.clone(),
+            Request::builder()
+                .uri("/healthz")
+                .header("x-request-id", &too_long)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_long.headers().get(&X_REQUEST_ID).unwrap().len(), 21);
+
+        // AIMD 429 shedding still carries X-Request-Id.
+        let tight = Arc::new(
+            TileEngine::new(8 * 1024 * 1024)
+                .with_aimd(crate::aimd::AimdLimiter::new(true, 1, 1, 1, 150)),
+        );
+        let _held = tight.aimd.try_acquire().unwrap();
+        let r_429 = handle_request(
+            tight.clone(),
+            Request::builder()
+                .uri("/cog/info")
+                .header("x-request-id", "shed-req-42")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r_429.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            r_429.headers().get(&X_REQUEST_ID).unwrap().to_str().unwrap(),
+            "shed-req-42"
+        );
     }
 }
