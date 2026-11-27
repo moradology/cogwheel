@@ -1769,14 +1769,33 @@ fn prepare_gpu_zonal_weights(
 
 /// Compute exact analytical coverage-weighted & ellipsoidal area-weighted zonal statistics
 /// directly on the COG's native pixel grid (zero resampling).
+///
+/// `values` (with `cov`), when at hand, are binned here as numpy bins them, in coverage units;
+/// without them the GPU's own counts are kept against numpy's edges (or synthesized directly
+/// when the band is constant so widened edges receive all coverage in the exact bin of `min`).
 #[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
 fn weighted_gpu_stats_to_json(
     gs: &cogzilla_gpu::GpuWeightedBandStats,
     area_scale: f64,
     total_poly_area_px: Option<f64>,
     description: &str,
     opts: &StatsOptions,
+    dtype: HistDtype,
+    values: Option<(&[f32], &[f64])>,
 ) -> serde_json::Value {
+    let edges = opts.histogram_bin_edges(Some((gs.min, gs.max)), dtype);
+    let counts = match values {
+        Some((v, cov)) => crate::histogram::unsorted_weighted_counts(v, cov, COV_EPS, &edges),
+        None if gs.min == gs.max => {
+            let mut c = vec![0.0f64; edges.len().saturating_sub(1)];
+            if let Some(b) = crate::histogram::bin_of(&edges, gs.min) {
+                c[b] = gs.count_cov;
+            }
+            c
+        }
+        None => gs.hist_counts.clone(),
+    };
     let count_out = snap_near_int(gs.count_cov);
     let (valid_percent, masked_pixels) = weighted_valid_percent_and_masked(
         gs.count_cov,
@@ -1797,7 +1816,7 @@ fn weighted_gpu_stats_to_json(
     obj.insert("unique".into(), serde_json::json!(gs.unique_bins as f64));
     obj.insert(
         "histogram".into(),
-        serde_json::json!([gs.hist_counts, gs.hist_edges]),
+        serde_json::json!([counts, edges]),
     );
     obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
     obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
@@ -1806,7 +1825,6 @@ fn weighted_gpu_stats_to_json(
     for &(p, val) in &gs.percentiles {
         obj.insert(crate::titiler::percentile_key(p), serde_json::json!(val));
     }
-    let _ = opts;
     if !description.is_empty() {
         obj.insert("description".into(), serde_json::json!(description));
     }
@@ -1850,8 +1868,19 @@ fn try_gpu_weighted_polygon_bands(
         gs_list
             .iter()
             .zip(bands.iter())
-            .map(|(gs, &(desc, _))| {
-                weighted_gpu_stats_to_json(gs, weights.area_scale, total_poly_area_px, desc, opts)
+            .map(|(gs, &(desc, values))| {
+                let dtype = opts
+                    .hist_dtype
+                    .unwrap_or_else(|| HistDtype::infer(values.iter().copied()));
+                weighted_gpu_stats_to_json(
+                    gs,
+                    weights.area_scale,
+                    total_poly_area_px,
+                    desc,
+                    opts,
+                    dtype,
+                    Some((values, cov)),
+                )
             })
             .collect(),
     )
@@ -1869,6 +1898,7 @@ fn try_gpu_weighted_polygon_exprs(
     area_model: &PixelAreaModel,
     total_poly_area_px: Option<f64>,
     opts: &StatsOptions,
+    band_dtype: HistDtype,
 ) -> Option<Vec<serde_json::Value>> {
     if opts.categorical
         || opts.histogram_edges.is_some()
@@ -1929,7 +1959,18 @@ fn try_gpu_weighted_polygon_exprs(
             .iter()
             .zip(exprs.iter())
             .map(|(gs, (desc, _))| {
-                weighted_gpu_stats_to_json(gs, weights.area_scale, total_poly_area_px, desc, opts)
+                let dtype = opts
+                    .hist_dtype
+                    .unwrap_or(HistDtype::for_expression(desc, band_dtype));
+                weighted_gpu_stats_to_json(
+                    gs,
+                    weights.area_scale,
+                    total_poly_area_px,
+                    desc,
+                    opts,
+                    dtype,
+                    None,
+                )
             })
             .collect(),
     )
@@ -2455,6 +2496,7 @@ pub async fn compute_native_exact_polygon_stats(
                     &area_model,
                     total_poly_area_px,
                     &opts_owned,
+                    band_dtype,
                 )
             {
                 gpu_stats_counter
@@ -3123,6 +3165,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 &area_model,
                 total_poly_area_px,
                 &opts_owned,
+                band_dtype,
             )
         {
             gpu_stats_counter

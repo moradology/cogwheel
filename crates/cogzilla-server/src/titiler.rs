@@ -1734,7 +1734,10 @@ pub fn compute_f32_band_stats_with_engine(
                 &opts.percentiles,
             )
         {
-            return gpu_band_stats_to_json(&gs, pixels.len(), description, opts);
+            let dtype = opts
+                .hist_dtype
+                .unwrap_or_else(|| HistDtype::infer(pixels.iter().copied()));
+            return gpu_band_stats_to_json(&gs, pixels.len(), description, opts, dtype, Some(pixels));
         }
     }
     let _ = engine;
@@ -1742,16 +1745,34 @@ pub fn compute_f32_band_stats_with_engine(
 }
 
 #[cfg(feature = "gpu")]
+/// `values`, when the band's values are at hand, are binned here as numpy bins them; without
+/// them the GPU's own counts are kept against numpy's edges.
 fn gpu_band_stats_to_json(
     gs: &cogzilla_gpu::GpuBandStats,
     denom_pixels: usize,
     description: &str,
     opts: &StatsOptions,
+    dtype: HistDtype,
+    values: Option<&[f32]>,
 ) -> serde_json::Value {
     let masked_pixels = denom_pixels.saturating_sub(gs.valid_pixels);
     if gs.valid_pixels == 0 {
-        return empty_band_stats_json(masked_pixels, description, opts, opts.hist_dtype.unwrap_or(HistDtype::Float64));
+        return empty_band_stats_json(masked_pixels, description, opts, dtype);
     }
+    let edges = opts.histogram_bin_edges(gs.min.zip(gs.max), dtype);
+    let counts = match values {
+        Some(v) => crate::histogram::unsorted_counts(v, &edges),
+        None if gs.min.is_some() && gs.min == gs.max => {
+            let mut c = vec![0u64; edges.len().saturating_sub(1)];
+            if let Some(v) = gs.min
+                && let Some(b) = crate::histogram::bin_of(&edges, v)
+            {
+                c[b] = gs.valid_pixels as u64;
+            }
+            c
+        }
+        None => gs.hist_counts.clone(),
+    };
     let valid_percent = if denom_pixels > 0 {
         ((gs.valid_pixels as f64 / denom_pixels as f64) * 100.0 * 100.0).round() / 100.0
     } else {
@@ -1776,7 +1797,7 @@ fn gpu_band_stats_to_json(
     }
     obj.insert(
         "histogram".into(),
-        serde_json::json!([gs.hist_counts, gs.hist_edges]),
+        serde_json::json!([counts, edges]),
     );
     obj.insert("description".into(), serde_json::json!(description));
     serde_json::Value::Object(obj)
@@ -2748,7 +2769,8 @@ fn compute_statistics_cpu(
                         &opts.percentiles,
                     )?;
                     let bname = format!("b{}", b + 1);
-                    let json = gpu_band_stats_to_json(&gs, total_pixels, &bname, opts);
+                    let dtype = HistDtype::for_sample_type(ifd.sample_type, unscale);
+                    let json = gpu_band_stats_to_json(&gs, total_pixels, &bname, opts, dtype, None);
                     Some((bname, json))
                 };
                 let results: Vec<Option<(String, serde_json::Value)>> = if sel_bands.len() == 1 {
@@ -3025,7 +3047,14 @@ fn compute_statistics_cpu(
         {
             out.insert(
                 bname.clone(),
-                gpu_band_stats_to_json(&gs, denom_pixels, &bname, opts),
+                gpu_band_stats_to_json(
+                    &gs,
+                    denom_pixels,
+                    &bname,
+                    opts,
+                    HistDtype::for_sample_type(ifd.sample_type, unscale),
+                    Some(vals),
+                ),
             );
             continue;
         }
@@ -3221,7 +3250,17 @@ fn compute_expression_statistics_cpu(
                 )?;
                 Some((
                     format!("b{}", i + 1),
-                    gpu_band_stats_to_json(&gs, denom_pixels, expr_str, opts),
+                    gpu_band_stats_to_json(
+                        &gs,
+                        denom_pixels,
+                        expr_str,
+                        opts,
+                        HistDtype::for_expression(
+                            expr_str,
+                            HistDtype::for_sample_type(ifd.sample_type, unscale),
+                        ),
+                        None,
+                    ),
                 ))
             };
             let results: Vec<Option<(String, serde_json::Value)>> = if exprs.len() == 1 {
@@ -3429,7 +3468,19 @@ fn compute_expression_statistics_cpu(
         {
             out.insert(
                 format!("b{}", i + 1),
-                gpu_band_stats_to_json(&gs, denom_pixels, expr_str, opts),
+                gpu_band_stats_to_json(
+                    &gs,
+                    denom_pixels,
+                    expr_str,
+                    opts,
+                    opts.hist_dtype.unwrap_or_else(|| {
+                        HistDtype::for_expression(
+                            expr_str,
+                            HistDtype::for_sample_type(ifd.sample_type, unscale),
+                        )
+                    }),
+                    Some(&vals),
+                ),
             );
             continue;
         }
@@ -8021,6 +8072,8 @@ async fn render_bbox_core(
                             w * h,
                             desc,
                             sopts,
+                            sopts.hist_dtype.unwrap_or(HistDtype::Float32),
+                            None,
                         ));
                     }
                 }

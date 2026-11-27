@@ -27,7 +27,9 @@ impl HistDtype {
     /// The edge type numpy uses for a band read with this sample type. rio-tiler casts a band to
     /// float32 when it applies scales and offsets, so an unscaled band of any type is float32.
     pub fn for_sample_type(st: cogzilla_tiff::SampleType, unscale: bool) -> Self {
-        if unscale || st == cogzilla_tiff::SampleType::Float32 {
+        if st == cogzilla_tiff::SampleType::Float32
+            || (unscale && st != cogzilla_tiff::SampleType::Float64)
+        {
             Self::Float32
         } else {
             Self::Float64
@@ -117,7 +119,17 @@ pub fn bin_edges(
                 last += 0.5;
             }
             let step = (last - first) / n as f32;
-            let mut edges: Vec<f64> = (0..=n).map(|k| f64::from(k as f32 * step + first)).collect();
+            let mut edges: Vec<f64> = if step.is_finite() {
+                (0..=n).map(|k| f64::from(k as f32 * step + first)).collect()
+            } else {
+                let (f64_first, f64_last) = (f64::from(first), f64::from(last));
+                (0..=n)
+                    .map(|k| {
+                        let t = k as f64 / n as f64;
+                        f64::from((f64_first * (1.0 - t) + f64_last * t) as f32)
+                    })
+                    .collect()
+            };
             edges[n] = f64::from(last);
             edges
         }
@@ -142,7 +154,10 @@ pub fn bin_edges(
                     .collect()
             };
             edges[n] = last;
-            if dtype == HistDtype::Float32 {
+            if dtype == HistDtype::Float32
+                && first.abs() <= f32::MAX as f64
+                && last.abs() <= f32::MAX as f64
+            {
                 for e in &mut edges {
                     *e = f64::from(*e as f32);
                 }
@@ -186,6 +201,85 @@ impl<'a> AscendingBins<'a> {
         }
         Some(self.bin)
     }
+}
+
+/// [`bin_of`] for values in any order, as numpy finds it: a first guess from the edges' even
+/// spacing, then moved to the edges that hold the value (exact for any increasing edges).
+pub struct Binner<'a> {
+    edges: &'a [f64],
+    n: usize,
+    scale: f64,
+}
+
+impl<'a> Binner<'a> {
+    pub fn new(edges: &'a [f64]) -> Self {
+        let n = edges.len().saturating_sub(1);
+        let span = if n > 0 { edges[n] - edges[0] } else { 0.0 };
+        let scale = if span > 0.0 && span.is_finite() { n as f64 / span } else { 0.0 };
+        Self { edges, n, scale }
+    }
+
+    #[inline]
+    pub fn bin_of(&self, v: f64) -> Option<usize> {
+        let (e, n) = (self.edges, self.n);
+        if n == 0 || !(v >= e[0] && v <= e[n]) {
+            return None;
+        }
+        let mut i = (((v - e[0]) * self.scale) as usize).min(n - 1);
+        while i > 0 && v < e[i] {
+            i -= 1;
+        }
+        while i + 1 < n && v >= e[i + 1] {
+            i += 1;
+        }
+        Some(i)
+    }
+}
+
+/// numpy's histogram counts of `values` in any order (non-finite values skipped), split over a
+/// few threads when there are many.
+pub fn unsorted_counts(values: &[f32], edges: &[f64]) -> Vec<u64> {
+    let n = edges.len().saturating_sub(1);
+    let count = |chunk: &[f32]| {
+        let binner = Binner::new(edges);
+        let mut counts = vec![0u64; n];
+        for &v in chunk {
+            if let Some(b) = binner.bin_of(v as f64) {
+                counts[b] += 1;
+            }
+        }
+        counts
+    };
+    if values.len() < 1 << 18 {
+        return count(values);
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |p| p.get().clamp(2, 8));
+    let chunk = values.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let parts: Vec<_> = values.chunks(chunk).map(|c| s.spawn(move || count(c))).collect();
+        let mut total = vec![0u64; n];
+        for p in parts {
+            for (t, c) in total.iter_mut().zip(p.join().unwrap_or_default()) {
+                *t += c;
+            }
+        }
+        total
+    })
+}
+
+/// [`unsorted_counts`] with each value counted by its weight, values whose weight is not above
+/// `min_weight` left out.
+pub fn unsorted_weighted_counts(values: &[f32], weights: &[f64], min_weight: f64, edges: &[f64]) -> Vec<f64> {
+    let binner = Binner::new(edges);
+    let mut counts = vec![0.0f64; edges.len().saturating_sub(1)];
+    for (&v, &w) in values.iter().zip(weights) {
+        if w > min_weight
+            && let Some(b) = binner.bin_of(v as f64)
+        {
+            counts[b] += w;
+        }
+    }
+    counts
 }
 
 /// For values sorted ascending, the index range of the values in each bin of `edges`.
@@ -301,9 +395,13 @@ mod tests {
             let counts: Vec<u64> = ranges.iter().map(|r| r.len() as u64).collect();
             assert_eq!(counts, np_counts(&vals, &edges), "{edges:?}");
             let mut walk = AscendingBins::new(&edges);
+            let binner = Binner::new(&edges);
             for &v in &vals {
                 assert_eq!(walk.bin_of(v), bin_of(&edges, v), "{v} in {edges:?}");
+                assert_eq!(binner.bin_of(v), bin_of(&edges, v), "{v} in {edges:?}");
             }
+            let f: Vec<f32> = vals.iter().rev().map(|&v| v as f32).chain([f32::NAN]).collect();
+            assert_eq!(unsorted_counts(&f, &edges), np_counts(&vals, &edges), "{edges:?}");
         }
     }
 
@@ -333,5 +431,20 @@ mod tests {
             HistDtype::for_sample_type(cogzilla_tiff::SampleType::Int16, false),
             HistDtype::Float64
         );
+        assert_eq!(
+            HistDtype::for_sample_type(cogzilla_tiff::SampleType::Float64, true),
+            HistDtype::Float64
+        );
+    }
+
+    #[test]
+    fn extreme_float32_spans_and_ranges_stay_finite() {
+        let e = bin_edges(4, None, None, Some((f64::from(f32::MIN), f64::from(f32::MAX))), HistDtype::Float32);
+        assert_eq!(e.len(), 5);
+        assert!(e.iter().all(|v| v.is_finite()), "edges must stay finite: {e:?}");
+        assert_eq!(e[0], f64::from(f32::MIN));
+        assert_eq!(e[4], f64::from(f32::MAX));
+        let e2 = bin_edges(4, None, Some((-1e100, 1e100)), Some((0.0, 1.0)), HistDtype::Float32);
+        assert!(e2.iter().all(|v| v.is_finite()), "wide range edges must stay finite: {e2:?}");
     }
 }
