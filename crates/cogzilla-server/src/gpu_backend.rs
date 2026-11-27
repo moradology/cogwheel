@@ -3,6 +3,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 pub use cogzilla_gpu::{GpuBandStats, GpuInstr, GpuPixelSelection, GpuWeightedBandStats};
+
+// Compile-time seam contract: pin that `GpuInstr` keeps the exact 4-field 16-byte layout
+// mirrored by `gpu_stub::GpuInstr` (the other three re-exports are shared directly from
+// `cogzilla-raster` so they cannot drift).
+const _: () = {
+    let _assert_size: [u8; 16] = [0; std::mem::size_of::<GpuInstr>()];
+    let _check_fields = |ins: GpuInstr| -> (u32, u32, f32, u32) {
+        (ins.opcode, ins.imm_u32, ins.imm_f32, ins._pad)
+    };
+    let _ = _check_fields;
+};
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer,
     GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuJpegEncoder,

@@ -218,6 +218,83 @@ impl Affine2D {
     }
 }
 
+/// Complete TiTiler-compatible band statistics computed on the GPU.
+///
+/// Lives in `cogzilla-raster` (plain data, no `wgpu` types) so both `cogzilla-gpu` and
+/// CPU-only `--no-default-features` builds of `cogzilla-server` share the exact same type
+/// definition with zero risk of stub field drift.
+#[derive(Debug, Clone)]
+pub struct GpuBandStats {
+    pub total_pixels: usize,
+    pub valid_pixels: usize,
+    pub masked_pixels: usize,
+    pub valid_percent: f64,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub mean: Option<f64>,
+    pub sum: f64,
+    pub std: Option<f64>,
+    pub median: Option<f64>,
+    pub majority: Option<f64>,
+    pub minority: Option<f64>,
+    pub unique_bins: usize,
+    pub percentiles: Vec<(f64, Option<f64>)>,
+    pub hist_counts: Vec<u64>,
+    pub hist_edges: Vec<f64>,
+}
+
+/// Complete coverage-weighted / area-weighted zonal statistics computed on the GPU.
+///
+/// Lives in `cogzilla-raster` so GPU and CPU-only builds share one definition.
+#[derive(Debug, Clone)]
+pub struct GpuWeightedBandStats {
+    pub valid_pixels: usize,
+    pub masked_pixels: usize,
+    pub count_cov: f64,
+    pub sum_cov: f64,
+    pub w_total: f64,
+    pub area_valid_m2: f64,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    pub std: f64,
+    pub median: f64,
+    pub majority: f64,
+    pub minority: f64,
+    pub unique_bins: usize,
+    pub percentiles: Vec<(f64, f64)>,
+    pub hist_counts: Vec<f64>,
+    pub hist_edges: Vec<f64>,
+}
+
+/// Pixel-selection reduction mode for GPU mosaic compositing (shared by `cogzilla-gpu` and
+/// CPU-only builds of `cogzilla-server`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPixelSelection {
+    First,
+    Highest,
+    Lowest,
+    Mean,
+    Median,
+    Stdev,
+    Count,
+}
+
+impl GpuPixelSelection {
+    #[inline(always)]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::First => 0,
+            Self::Highest => 1,
+            Self::Lowest => 2,
+            Self::Mean => 3,
+            Self::Median => 4,
+            Self::Stdev => 5,
+            Self::Count => 6,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

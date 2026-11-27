@@ -80,27 +80,8 @@ struct WeightedResolved {
     _pad0: u32,
 }
 
-/// Complete coverage-weighted / area-weighted zonal statistics computed on the GPU.
-#[derive(Debug, Clone)]
-pub struct GpuWeightedBandStats {
-    pub valid_pixels: usize,
-    pub masked_pixels: usize,
-    pub count_cov: f64,
-    pub sum_cov: f64,
-    pub w_total: f64,
-    pub area_valid_m2: f64,
-    pub min: f64,
-    pub max: f64,
-    pub mean: f64,
-    pub std: f64,
-    pub median: f64,
-    pub majority: f64,
-    pub minority: f64,
-    pub unique_bins: usize,
-    pub percentiles: Vec<(f64, f64)>,
-    pub hist_counts: Vec<f64>,
-    pub hist_edges: Vec<f64>,
-}
+/// Complete coverage-weighted / area-weighted zonal statistics computed on the GPU (defined in `cogzilla-raster`).
+pub use cogzilla_raster::GpuWeightedBandStats;
 
 const RESOLVED_BYTES: u64 = std::mem::size_of::<WeightedResolved>() as u64;
 const HIST_BYTES: u64 = (2048 * std::mem::size_of::<u32>()) as u64;
