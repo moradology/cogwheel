@@ -1043,6 +1043,50 @@ impl GpuBackend {
             .ok()
     }
 
+    /// 1-pass fused GPU expression VM + single-submit weighted zonal statistics across `E`
+    /// expressions sharing `1..=8` raw input bands, analytical coverage `covs`, and normalized
+    /// per-row areas `row_areas`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_reduce_weighted_zonal_expr_stats(
+        &self,
+        raw_bands: &[&[f32]],
+        exprs: &[(&[GpuInstr], u32)],
+        covs: &[f32],
+        win_w: usize,
+        row_areas: &[f32],
+        area_weighted: bool,
+        cov_eps: f32,
+        pixel_set_eps: f32,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<Vec<GpuWeightedBandStats>> {
+        let min_px = if self.ctx.info.unified_memory && exprs.len() < 2 {
+            512 * 512
+        } else {
+            256 * 256
+        };
+        if covs.len() < min_px || raw_bands.is_empty() || raw_bands.len() > 8 || exprs.is_empty() {
+            return None;
+        }
+        let mut guard = self.weighted_stats.lock().ok()?;
+        guard
+            .reduce_weighted_exprs(
+                raw_bands,
+                exprs,
+                covs,
+                win_w,
+                row_areas,
+                area_weighted,
+                cov_eps,
+                pixel_set_eps,
+                num_bins,
+                hist_range,
+                percentiles,
+            )
+            .ok()
+    }
+
     fn fused_jpeg_quality(&self, dst_w: usize, dst_h: usize, format: OutputFormat) -> Option<u8> {
         if let OutputFormat::Jpeg { quality } = format {
             let min_px = if self.ctx.info.unified_memory {
