@@ -4806,6 +4806,28 @@ where
     let is_post = *req.method() == Method::POST;
     let is_get_or_head = matches!(*req.method(), Method::GET | Method::HEAD);
     let is_health_or_metrics = matches!(req.uri().path(), "/healthz" | "/metrics");
+    let bypass_aimd = is_health_or_metrics || *req.method() == Method::OPTIONS;
+    let mut aimd_permit = if bypass_aimd {
+        None
+    } else {
+        match engine.aimd.try_acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let mut resp = plain_resp(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Bytes::from_static(br#"{"detail":"server overloaded; retry shortly"}"#),
+                    "application/json",
+                );
+                resp.headers_mut()
+                    .insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                if let Ok(hv) = HeaderValue::from_str(&engine.aimd.current_limit().to_string()) {
+                    resp.headers_mut()
+                        .insert(HeaderName::from_static("x-cogzilla-aimd-limit"), hv);
+                }
+                return Ok(resp);
+            }
+        }
+    };
     let accepts_gzip = req
         .headers()
         .get(hyper::header::ACCEPT_ENCODING)
@@ -4826,9 +4848,15 @@ where
         *retry_req.method_mut() = m;
         *retry_req.uri_mut() = u;
         *retry_req.headers_mut() = h;
-        resp = handle_request_inner(engine, retry_req, is_head).await?;
+        resp = handle_request_inner(engine.clone(), retry_req, is_head).await?;
         resp.headers_mut().remove("x-cogzilla-retry");
     }
+    if let Some(permit) = aimd_permit.as_mut()
+        && resp.status().is_client_error()
+    {
+        permit.ignore_rtt();
+    }
+    drop(aimd_permit);
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
         resp.headers_mut().insert(
@@ -10296,6 +10324,17 @@ fn render_prometheus_metrics(engine: &TileEngine) -> String {
     let _ = writeln!(out, "cogzilla_remote_range_requests_total {}", engine.store.metrics.remote_range_requests.load(Ordering::Relaxed));
     let _ = writeln!(out, "# TYPE cogzilla_remote_bytes_fetched_total counter");
     let _ = writeln!(out, "cogzilla_remote_bytes_fetched_total {}", engine.store.metrics.remote_bytes_fetched.load(Ordering::Relaxed));
+
+    let aimd = engine.aimd.snapshot();
+    let _ = writeln!(out, "# HELP cogzilla_aimd_limit Current adaptive AIMD concurrency limit.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_limit gauge");
+    let _ = writeln!(out, "cogzilla_aimd_limit {}", aimd.limit);
+    let _ = writeln!(out, "# HELP cogzilla_aimd_in_flight Current in-flight HTTP requests admitted by AIMD.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_in_flight gauge");
+    let _ = writeln!(out, "cogzilla_aimd_in_flight {}", aimd.in_flight);
+    let _ = writeln!(out, "# HELP cogzilla_aimd_rejected_429_total Total HTTP requests shed with 429 Too Many Requests by AIMD.");
+    let _ = writeln!(out, "# TYPE cogzilla_aimd_rejected_429_total counter");
+    let _ = writeln!(out, "cogzilla_aimd_rejected_429_total {}", aimd.rejected_429);
 
     if let Some(dc) = &engine.store.disk_cache {
         let s = dc.stats();
