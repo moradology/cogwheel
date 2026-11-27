@@ -353,7 +353,9 @@ async fn search_routes_match_titiler_pgstac_shapes() {
         // Counted on a grid in metres; nothing lies under the triangle either way.
         ("statistics?assets=visual&dst_crs=epsg:3857", &triangle, 204),
         ("statistics?assets=visual&dst_crs=epsg:32632", &triangle, 400),
-        ("statistics?assets=visual&algorithm=hillshade", &triangle, 400),
+        // Taken, and nothing lies under the triangle; a parameter out of titiler's range is refused.
+        ("statistics?assets=visual&algorithm=hillshade", &triangle, 204),
+        ("statistics?assets=visual&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A400%7D", &triangle, 400),
         ("statistics?assets=visual&pixel_selection=mean", &triangle, 204),
         ("statistics?assets=visual&pixel_selection=lastbandhigh", &triangle, 204),
         ("statistics?assets=visual&pixel_selection=nope", &triangle, 422),

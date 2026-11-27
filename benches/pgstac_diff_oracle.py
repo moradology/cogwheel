@@ -962,7 +962,8 @@ def main() -> int:
                 f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=slope{no_buffer}&dst_crs=epsg:3857", "POST", in_degrees)
         o.check("statistics of contours", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=contours", "POST", in_degrees)
         o.check("statistics of contours of three bands", "json", f"/searches/{sid}/statistics?assets=visual&max_size=64&algorithm=contours", "POST", in_degrees)
-        o.check("statistics, an algorithm parameter out of range", "json",
+        # pydantic's words, but for the link to its documentation of the version it is.
+        o.check("statistics, an algorithm parameter out of range", "status",
                 f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A400%7D", "POST", in_degrees)
         o.check("statistics of grayscale after band math", "zonal",
                 f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&expression=b1*2;b2;b1&max_size=64&algorithm=grayscale", "POST", in_degrees)
