@@ -177,6 +177,8 @@ fn query_pairs(raw_query: &str) -> Vec<(String, String)> {
 pub(super) fn plain_numbers(raw_query: &str) -> String {
     let plain = |part: &str| -> Option<String> {
         let (key, value) = part.split_once('=')?;
+        let key = super::query_key(key);
+        let key = key.as_ref();
         let value = percent_decode(value);
         let written = match key {
             "tilesize" | "padding" | "items_limit" | "scan_limit" | "time_limit" | "width" | "height" | "max_size"
@@ -195,7 +197,7 @@ pub(super) fn plain_numbers(raw_query: &str) -> String {
     // A size of zero is a size not given, as rio-tiler reads it: the pair is dropped.
     let unset = |part: &str| {
         part.split_once('=').is_some_and(|(key, value)| {
-            matches!(key, "width" | "height" | "max_size") && py_whole(&percent_decode(value)) && py_number(&percent_decode(value)) == Some(0.0)
+            matches!(super::query_key(key).as_ref(), "width" | "height" | "max_size") && py_whole(&percent_decode(value)) && py_number(&percent_decode(value)) == Some(0.0)
         })
     };
     let parts: Vec<String> =
@@ -1294,7 +1296,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         .into_iter()
         .map(|(name, qs)| {
             // The tile size is the service's to choose, not the layer's.
-            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.starts_with("tilesize=")).collect();
+            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.split_once('=').is_some_and(|(k, _)| super::query_key(k) == "tilesize")).collect();
             (name, qs.join("&"), (source.minzoom, source.maxzoom))
         })
         .collect();
@@ -6784,11 +6786,12 @@ pub(super) async fn item_route(
 /// A query string without the parameters only a search's routes read: how its items are
 /// chosen among and how many are looked for.
 fn without_search_options(raw_query: &str) -> String {
-    let algorithm = raw_query.split('&').any(|part| part.starts_with("algorithm="));
+    let algorithm = raw_query.split('&').any(|part| part.split_once('=').is_some_and(|(k, _)| super::query_key(k) == "algorithm"));
     let kept: Vec<&str> = raw_query
         .split('&')
         .filter(|part| {
-            let name = part.split('=').next().unwrap_or(part);
+            let name = super::query_key(part.split('=').next().unwrap_or(part));
+            let name = name.as_ref();
             !matches!(name, "pixel_selection" | "items_limit" | "scan_limit" | "time_limit" | "exitwhenfull" | "skipcovered")
                 && (algorithm || name != "algorithm_params")
         })

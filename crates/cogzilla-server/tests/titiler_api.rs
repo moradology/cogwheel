@@ -6495,3 +6495,49 @@ async fn nodata_query_replaces_the_rasters_own() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A percent-encoded query key is read as the key it spells (`max%5Fsize` is `max_size`), as
+/// Starlette reads it; and one band of a mosaic is a grey picture, as TiTiler writes it.
+#[tokio::test]
+async fn encoded_query_keys_and_grey_mosaic_tiles() {
+    let (b4, b3) = (fixture("landsat_c2_B4.tif"), fixture("landsat_c2_B3.tif"));
+    if !b4.exists() || !b3.exists() {
+        eprintln!("fixtures not generated; skipping");
+        return;
+    }
+    let (b4, b3) = (b4.canonicalize().unwrap(), b3.canonicalize().unwrap());
+    let (b4, b3) = (b4.to_string_lossy(), b3.to_string_lossy());
+    let engine = Arc::new(TileEngine::new(128 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let get = |u: String| {
+        let client = client.clone();
+        async move {
+            let resp = client.get(&u).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{u}");
+            resp.bytes().await.unwrap()
+        }
+    };
+    let png_size = |b: &[u8]| (u32::from_be_bytes(b[16..20].try_into().unwrap()), u32::from_be_bytes(b[20..24].try_into().unwrap()));
+    for key in ["max_size", "max%5Fsize", "max%5fsize"] {
+        let png = get(format!("{base}/cog/preview.png?url={b4}&{key}=64&rescale=0,30000")).await;
+        assert_eq!(png_size(&png).0.max(png_size(&png).1), 64, "{key}");
+    }
+    let tile = |q: &str| format!("{base}/mosaic/tiles/WebMercatorQuad/12/653/1583.png?url={b4}&url={b3}&rescale=0,30000{q}");
+    // PNG colour type: 0 grey, 4 grey and alpha; 2 and 6 colour, 3 a palette.
+    for q in ["", "&resampling=bilinear"] {
+        let png = get(tile(q)).await;
+        assert!(matches!(png[25], 0 | 4), "one band in grey{q}: colour type {}", png[25]);
+    }
+    let mapped = get(tile("&colormap_name=viridis")).await;
+    assert!(matches!(mapped[25], 2 | 3 | 6), "a colour map is colour: {}", mapped[25]);
+    let jpg = get(tile("").replace(".png", ".jpg")).await;
+    // The frame header's component count: one for grey.
+    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0 | 0xC1 | 0xC2)).unwrap();
+    assert_eq!(jpg[sof + 9], 1, "a grey JPEG");
+}

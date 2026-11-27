@@ -186,6 +186,19 @@ pub(crate) fn needs_source_unscale(bands: &BandRequest, format: OutputFormat) ->
     ) || !matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
 }
 
+/// Whether `bands` draws one value per pixel under the grayscale map: a grey picture.
+fn draws_one_grey_band(bands: &BandRequest) -> bool {
+    matches!(
+        bands,
+        BandRequest::Single { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral1 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral2 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Spectral3 { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::CustomExpr { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Dem { colormap: ColormapName::Grayscale, .. }
+    )
+}
+
 /// Wrap raw band-major little-endian `f32` tile bytes into the requested float output format
 /// (`RawF32`, `Npy`, `RawF64`, or `NpyF64`) so float64 requests on multi-COG/mosaic paths never
 /// fall through to RGBA8.
@@ -3189,15 +3202,17 @@ impl TileEngine {
                 failed_assets,
             ));
         }
-        Ok((
-            encode_rgba_tile(
-                &canvas,
-                req.tile_size,
-                filled == total_pixels,
-                req.format,
-            ),
-            failed_assets,
-        ))
+        // One band drawn in grey is a grey picture, as TiTiler writes it (a palette of a
+        // raster's own colours it, and is not).
+        let opaque = filled == total_pixels;
+        let bytes = if draws_one_grey_band(&req.bands)
+            && canvas.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]))
+        {
+            cogzilla_kernel::encode_grey_rgba_tile(&canvas, req.tile_size, opaque, req.format)
+        } else {
+            encode_rgba_tile(&canvas, req.tile_size, opaque, req.format)
+        };
+        Ok((bytes, failed_assets))
     }
 
     /// Query a pluggable `SceneCatalog` for the requested tile's EPSG:3857 bounding box
