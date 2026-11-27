@@ -1,4 +1,4 @@
-//! Shared `wgpu` bind-group-layout and compute-pipeline construction helpers.
+//! Shared `wgpu` bind-group-layout construction helpers.
 
 #[inline]
 pub(crate) fn bgl_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {

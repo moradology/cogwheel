@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use cogzilla_gpu::{
-    DispatchPolicy, GpuColormapRenderer, GpuContext, GpuMosaicCompositor, GpuPixelOutput,
+    DispatchPolicy, GpuContext, GpuMosaicCompositor, GpuPixelOutput, pack_rgb_lut,
     GpuPixelSelection,
 };
 use cogzilla_kernel::ColormapName;
@@ -106,7 +106,7 @@ fn main() {
 
     let mut comp = GpuMosaicCompositor::new(&ctx);
     let lut = ColormapName::Viridis.lut();
-    let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+    let lut_u32 = pack_rgb_lut(&lut.rgb);
 
     println!("| Method | Scenes | Output | CPU (us) | GPU Warm IdxU8 (us) | Speedup |");
     println!("| :--- | ---: | :--- | ---: | ---: | ---: |");

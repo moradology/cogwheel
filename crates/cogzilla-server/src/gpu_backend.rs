@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuBandStats, GpuCoalescer,
-    GpuColorFormula, GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
-    GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
-    GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuStatsReducer,
-    GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
+    GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuInstr, GpuJpegEncoder,
+    GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuSlab,
+    GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
     MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
+    pack_rgb_lut,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -123,7 +123,6 @@ pub struct GpuBackend {
     pub slab_cache: GpuSlabCache,
     pub multi_slab_cache: GpuMultiBandCache,
     pub coalescer: GpuCoalescer,
-    resampler: GpuResampler,
     mosaic: Mutex<GpuMosaicCompositor>,
     batcher: Mutex<GpuTileBatcher>,
     jpeg: Mutex<GpuJpegEncoder>,
@@ -488,7 +487,6 @@ impl GpuBackend {
             override_mode = ?policy.override_mode,
             "cogzilla GPU backend initialized"
         );
-        let resampler = GpuResampler::new(&ctx);
         let coalesce_us = if ctx.info.unified_memory { 400 } else { 250 };
         let coalescer = GpuCoalescer::new(&ctx, 32, coalesce_us);
         let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
@@ -502,7 +500,6 @@ impl GpuBackend {
             slab_cache: GpuSlabCache::new(slab_cache_bytes),
             multi_slab_cache: GpuMultiBandCache::new(slab_cache_bytes),
             coalescer,
-            resampler,
             mosaic,
             batcher,
             jpeg,
@@ -528,12 +525,11 @@ impl GpuBackend {
                     let width = stride as u32;
                     if let Some(k) = key {
                         self.slab_cache
-                            .get_or_upload(k, slice, width, height, stride as u32, &self.resampler)
+                            .get_or_upload(k, slice, width, height, stride as u32, &self.ctx.device)
                             .ok()?
                     } else {
                         Arc::new(
-                            self.resampler
-                                .upload_slab(slice, width, height, stride as u32)
+                            GpuSlab::upload(&self.ctx.device, slice, width, height, stride as u32)
                                 .ok()?,
                         )
                     }
@@ -799,7 +795,7 @@ impl GpuBackend {
             readback_bytes,
             active,
         )?;
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
+        let lut_u32 = pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Colormap {
@@ -1230,7 +1226,7 @@ impl GpuBackend {
             readback_bytes,
             active,
         )?;
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
+        let lut_u32 = pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Terrain {
@@ -1686,7 +1682,7 @@ impl GpuBackend {
             readback_bytes,
             active,
         )?;
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
+        let lut_u32 = pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Expr {
@@ -2099,7 +2095,7 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
 
         let lut = colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
         let mut mosaic_guard = self.mosaic.lock().ok()?;
 
         // 1-pass fused Mosaic -> GPU JPEG FDCT: zero per-call VRAM alloc, zero RGBA8 readback,
@@ -2674,7 +2670,7 @@ impl GpuBackend {
             .collect();
 
         let lut = style.colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
         let raw = self
             .batcher
             .lock()

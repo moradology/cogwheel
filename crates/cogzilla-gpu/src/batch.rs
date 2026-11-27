@@ -379,8 +379,7 @@ impl GpuTileBatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::colormap::GpuColormapRenderer;
-    use crate::resample::GpuResampler;
+    use crate::colormap::pack_rgb_lut;
     use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
     use cogzilla_kernel::{BandSource, ColormapName, sample_cubic};
 
@@ -393,7 +392,6 @@ mod tests {
                 return;
             }
         };
-        let resampler = GpuResampler::new(&ctx);
         let mut batcher = GpuTileBatcher::new(&ctx);
 
         let src_w = 1024u32;
@@ -425,7 +423,7 @@ mod tests {
         };
         let blocks = [Some(&band)];
         let bs = BandSource::new(src_w, src_h, src_w, src_h, 0, 0, 1, 1, &blocks);
-        let gpu_slab = resampler.upload_slab(&src, src_w, src_h, src_w).unwrap();
+        let gpu_slab = GpuSlab::upload(&ctx.device, &src, src_w, src_h, src_w).unwrap();
 
         let tile_n = 256usize;
         let mut u_vecs = Vec::with_capacity(16);
@@ -448,7 +446,7 @@ mod tests {
             .collect();
 
         let lut = ColormapName::Viridis.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
         let rmin = 500.0f32;
         let rmax = 1500.0f32;
         let inv254 = 254.0 / (rmax - rmin);
