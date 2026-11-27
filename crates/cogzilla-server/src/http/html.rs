@@ -24,20 +24,23 @@ pub(crate) fn offers_html(path: &str) -> bool {
     }
 }
 
-/// The explicit `f=` query parameter value, if present.
-pub(crate) fn explicit_format(query: &str) -> Option<&str> {
+/// The last explicit `f=` or `format=` query parameter value (percent-decoded), matching `parse_query`.
+pub(crate) fn explicit_format(query: &str) -> Option<String> {
     query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| *k == "f")
-        .map(|(_, v)| v)
+        .rfind(|(k, _)| *k == "f" || *k == "format")
+        .map(|(_, v)| super::percent_decode(v))
 }
 
 /// Whether an `Accept` header prefers `text/html` over `application/json` (RFC 9110 §12.5.1).
-/// Wildcards (`*/*`, `text/*`) do not trigger HTML so API clients (`curl`, etc.) keep JSON.
+/// Wildcards (`*/*`, `text/*`) do not trigger HTML on their own, so API clients (`curl`, etc.)
+/// keep JSON, while explicit higher-q `application/*` or `*/*` beat a lower-q `text/html`.
 pub(crate) fn accepts_html(accept: &str) -> bool {
     let mut best_html: Option<(f32, usize)> = None;
     let mut best_json: Option<(f32, usize)> = None;
+    let mut best_app_wild: Option<(f32, usize)> = None;
+    let mut best_any_wild: Option<(f32, usize)> = None;
     for (idx, item) in accept.split(',').enumerate() {
         let mut parts = item.split(';');
         let Some(media_type) = parts.next().map(str::trim) else {
@@ -45,7 +48,9 @@ pub(crate) fn accepts_html(accept: &str) -> bool {
         };
         let is_html = media_type.eq_ignore_ascii_case("text/html");
         let is_json = media_type.eq_ignore_ascii_case("application/json");
-        if !is_html && !is_json {
+        let is_app_wild = media_type.eq_ignore_ascii_case("application/*");
+        let is_any_wild = media_type == "*/*";
+        if !is_html && !is_json && !is_app_wild && !is_any_wild {
             continue;
         }
         let mut q = 1.0f32;
@@ -62,7 +67,15 @@ pub(crate) fn accepts_html(accept: &str) -> bool {
                 }
             }
         }
-        let slot = if is_html { &mut best_html } else { &mut best_json };
+        let slot = if is_html {
+            &mut best_html
+        } else if is_json {
+            &mut best_json
+        } else if is_app_wild {
+            &mut best_app_wild
+        } else {
+            &mut best_any_wild
+        };
         if slot.is_none_or(|(prev_q, _)| q > prev_q) {
             *slot = Some((q, idx));
         }
@@ -73,13 +86,22 @@ pub(crate) fn accepts_html(accept: &str) -> bool {
     if q_html <= 0.0 {
         return false;
     }
-    match best_json {
-        Some((q_json, pos_json)) => q_html > q_json || (q_html == q_json && pos_html < pos_json),
+    // Effective q for application/json is the most-specific matching range (RFC 9110 §12.5.1).
+    let eff_json = best_json.or(best_app_wild).or(best_any_wild);
+    match eff_json {
+        Some((q_json, pos_json)) => {
+            if best_json.is_some() {
+                q_html > q_json || (q_html == q_json && pos_html < pos_json)
+            } else {
+                // Explicit `text/html` is more specific than `application/*` or `*/*` when q is equal.
+                q_html >= q_json
+            }
+        }
         None => true,
     }
 }
 
-/// Whether a request asks for HTML: explicit `?f=` always wins over the `Accept` header.
+/// Whether a request asks for HTML: explicit `?f=` / `?format=` always wins over `Accept`.
 pub(crate) fn wants_html(query: &str, accept: Option<&str>) -> bool {
     match explicit_format(query) {
         Some(f) => f.eq_ignore_ascii_case("html"),
@@ -316,12 +338,18 @@ mod tests {
             assert!(!offers_html(path), "{path}");
         }
         assert!(wants_html("url=a&f=html", None));
+        assert!(wants_html("format=html", None));
         assert!(!wants_html("url=a&f=json", Some("text/html,application/xhtml+xml,*/*;q=0.8")));
-        assert!(!wants_html("format=html", None));
+        assert!(!wants_html("format=json", Some("text/html,application/xhtml+xml,*/*;q=0.8")));
+        assert!(!wants_html("f=html&f=json", None));
+        assert!(wants_html("f=json&f=html", None));
+        assert!(wants_html("f=%68tml", None));
         assert!(wants_html("", Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")));
         assert!(!wants_html("", Some("application/json")));
         assert!(!wants_html("", Some("*/*")));
         assert!(!wants_html("", Some("application/json, text/html;q=0.9")));
+        assert!(!wants_html("", Some("application/*, text/html;q=0.5")));
+        assert!(!wants_html("", Some("text/html;q=0.8, */*;q=0.9")));
         assert!(!wants_html("", Some("text/html;q=0, */*;q=0.8")));
         assert!(wants_html("", Some("text/html;q=0.9, application/json;q=0.5")));
     }

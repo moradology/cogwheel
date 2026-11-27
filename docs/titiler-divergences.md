@@ -95,6 +95,12 @@ This document is the living record of every intentional divergence, **why** it e
 - **TiTiler / GDAL:** Opening a public `s3://` URI without AWS credentials fails with `500 InvalidCredentials: No valid AWS credentials found`.
 - **`cogzilla`:** Falls back automatically to unsigned HTTPS with S3 bucket-region discovery for public `s3://` buckets, while supporting static env vars, `AWS_PROFILE`, ECS task roles, EKS Pod Identity (`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`), EKS IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`), and EC2 IMDSv2 for private buckets.
 
+### 1.11 Exact `grayscale` of Whole Numbers, and Algorithms TiTiler Cannot Finish
+
+- **TiTiler:** `grayscale` sums `r*299/1000 + g*587/1000 + b*114/1000` term by term in float64 and truncates, so a grey picture stored as RGB (three equal bands) comes out one lower than its own value on about 5.5% of pixels (`0.299·a + 0.587·a + 0.114·a` lands just under `a`). `sum` over unsigned integer bands answers `500`, as does `grayscale` over a single band; `std` and `var` over a single band mask every pixel (`ddof=1` over one value).
+- **`cogzilla`:** Sums whole-number bands exactly (`(r*299 + g*587 + b*114) / 1000`) before truncating, so equal bands give back their value, and otherwise matches TiTiler's type and values (`ddof=1` spread, truncation, `astype` wrapping for `cast`/`ceil`/`floor`). `sum` of unsigned bands is written as `uint64`; `grayscale` of one band is that band; `std`/`var` of one band is `0`.
+- **Client significance:** Grey RGB imagery keeps its values through `grayscale`, and the algorithms answer where TiTiler fails.
+
 ---
 
 ## 2. Deliberate API & Error-Handling Divergences
