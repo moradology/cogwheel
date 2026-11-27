@@ -1340,26 +1340,25 @@ pub fn compute_weighted_band_stats_with_geom(
     }
 
     if valid_pixels == 0 || w_total <= 0.0 {
-        let mut empty = compute_f32_band_stats(&[], description, opts);
-        if let Some(obj) = empty.as_object_mut() {
-            let masked_out = total_geom_area_px
-                .filter(|&a| a > COV_EPS)
-                .unwrap_or(masked_pixels as f64);
-            obj.insert("masked_pixels".into(), serde_json::json!(masked_out));
-            match geom_kind {
-                ZonalGeomKind::Polygon => {
-                    obj.insert("area".into(), serde_json::json!(0.0));
-                }
-                ZonalGeomKind::Line => {
-                    obj.insert("area".into(), serde_json::Value::Null);
-                    obj.insert("length".into(), serde_json::json!(0.0));
-                }
-                ZonalGeomKind::Point => {
-                    obj.insert("area".into(), serde_json::Value::Null);
-                }
+        let masked_out = total_geom_area_px
+            .filter(|&a| a > COV_EPS)
+            .unwrap_or(masked_pixels as f64);
+        let dtype = opts.hist_dtype.unwrap_or(HistDtype::Float64);
+        let mut bs = crate::titiler::BandStats::empty(
+            crate::titiler::StatCount::Float(masked_out),
+            Some(description.to_string()),
+            opts,
+            dtype,
+        );
+        match geom_kind {
+            ZonalGeomKind::Polygon => bs.area = Some(Some(0.0)),
+            ZonalGeomKind::Line => {
+                bs.area = Some(None);
+                bs.length = Some(0.0);
             }
+            ZonalGeomKind::Point => bs.area = Some(None),
         }
-        return empty;
+        return bs.to_json();
     }
 
     let mean = w_sum / w_total;
@@ -1559,18 +1558,7 @@ pub fn compute_weighted_band_stats_with_geom(
     }
 
     let count_out = snap_near_int(count_cov);
-    let mut obj = serde_json::Map::new();
-    obj.insert("min".into(), serde_json::json!(min_v));
-    obj.insert("max".into(), serde_json::json!(max_v));
-    obj.insert("mean".into(), serde_json::json!(mean));
-    obj.insert("count".into(), serde_json::json!(count_out));
-    obj.insert("sum".into(), serde_json::json!(sum_cov));
-    obj.insert("std".into(), serde_json::json!(std));
-    obj.insert("median".into(), serde_json::json!(median));
-    obj.insert("majority".into(), serde_json::json!(maj_val));
-    obj.insert("minority".into(), serde_json::json!(min_val_freq));
-    obj.insert("unique".into(), serde_json::json!(unique_count as f64));
-    if is_categorical {
+    let (histogram, categories, category_areas) = if is_categorical {
         // T2 + T4: categorical histogram and `categories` always report exact coverage counts
         // summing to `count` (preserving float keys on float rasters), and `category_areas`
         // reports per-class ground area in m² (summing to `area`) for polygons.
@@ -1605,11 +1593,11 @@ pub fn compute_weighted_band_stats_with_geom(
                 }
             }
         }
-        obj.insert("histogram".into(), serde_json::json!([cat_counts, cat_vals]));
-        obj.insert("categories".into(), serde_json::Value::Object(cats_obj));
-        if geom_kind == ZonalGeomKind::Polygon {
-            obj.insert("category_areas".into(), serde_json::Value::Object(cat_areas_obj));
-        }
+        (
+            crate::titiler::BandHistogram::Categorical(serde_json::json!([cat_counts, cat_vals])),
+            Some(cats_obj),
+            (geom_kind == ZonalGeomKind::Polygon).then_some(cat_areas_obj),
+        )
     } else {
         // T4: numeric histogram always reports coverage counts summing to `count`, in numpy's
         // bins (the values are sorted, so each bin is a run of them).
@@ -1640,39 +1628,48 @@ pub fn compute_weighted_band_stats_with_geom(
                 .map(|r| weighted_vals[r].iter().fold(0.0, |acc, &(_, _, c)| acc + c))
                 .collect()
         };
-        obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
-    }
-    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
-    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels_out));
-    obj.insert("valid_pixels".into(), serde_json::json!(valid_pixels as f64));
-    match geom_kind {
-        ZonalGeomKind::Polygon => {
-            obj.insert("area".into(), serde_json::json!(area_valid_m2));
-        }
-        ZonalGeomKind::Line => {
-            obj.insert("area".into(), serde_json::Value::Null);
-            obj.insert("length".into(), serde_json::json!(length_valid_m));
-        }
-        ZonalGeomKind::Point => {
-            obj.insert("area".into(), serde_json::Value::Null);
-        }
-    }
-
+        (
+            crate::titiler::BandHistogram::NumericFloat(hist_w, edges),
+            None,
+            None,
+        )
+    };
+    let (area, length) = match geom_kind {
+        ZonalGeomKind::Polygon => (Some(Some(area_valid_m2)), None),
+        ZonalGeomKind::Line => (Some(None), Some(length_valid_m)),
+        ZonalGeomKind::Point => (Some(None), None),
+    };
     let pcts: Vec<f64> = if opts.percentiles.is_empty() {
         vec![2.0, 98.0]
     } else {
         opts.percentiles.clone()
     };
-    for p in pcts {
-        obj.insert(
-            crate::titiler::percentile_key(p),
-            serde_json::json!(weighted_quantile(p)),
-        );
+    crate::titiler::BandStats {
+        min: Some(crate::titiler::StatScalar::F64(min_v)),
+        max: Some(crate::titiler::StatScalar::F64(max_v)),
+        mean: Some(mean),
+        count: crate::titiler::StatCount::Float(count_out),
+        sum: sum_cov,
+        std: Some(std),
+        median: Some(crate::titiler::StatScalar::F64(median)),
+        majority: Some(crate::titiler::StatScalar::F64(maj_val)),
+        minority: Some(crate::titiler::StatScalar::F64(min_val_freq)),
+        unique: crate::titiler::StatCount::Float(unique_count as f64),
+        valid_percent,
+        masked_pixels: crate::titiler::StatCount::Float(masked_pixels_out),
+        valid_pixels: crate::titiler::StatCount::Float(valid_pixels as f64),
+        percentiles: pcts
+            .into_iter()
+            .map(|p| (p, Some(crate::titiler::StatScalar::F64(weighted_quantile(p)))))
+            .collect(),
+        histogram,
+        categories,
+        category_areas,
+        area,
+        length,
+        description: (!description.is_empty()).then(|| description.to_string()),
     }
-    if !description.is_empty() {
-        obj.insert("description".into(), serde_json::json!(description));
-    }
-    serde_json::Value::Object(obj)
+    .to_json()
 }
 
 /// Shared CPU+GPU polygon-relative `(valid_percent, masked_pixels)` computation.
@@ -1802,32 +1799,33 @@ fn weighted_gpu_stats_to_json(
         gs.masked_pixels,
         total_poly_area_px,
     );
-    let mut obj = serde_json::Map::new();
-    obj.insert("min".into(), serde_json::json!(gs.min));
-    obj.insert("max".into(), serde_json::json!(gs.max));
-    obj.insert("mean".into(), serde_json::json!(gs.mean));
-    obj.insert("count".into(), serde_json::json!(count_out));
-    obj.insert("sum".into(), serde_json::json!(gs.sum_cov));
-    obj.insert("std".into(), serde_json::json!(gs.std));
-    obj.insert("median".into(), serde_json::json!(gs.median));
-    obj.insert("majority".into(), serde_json::json!(gs.majority));
-    obj.insert("minority".into(), serde_json::json!(gs.minority));
-    obj.insert("unique".into(), serde_json::json!(gs.unique_bins as f64));
-    obj.insert(
-        "histogram".into(),
-        serde_json::json!([counts, edges]),
-    );
-    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
-    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
-    obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels as f64));
-    obj.insert("area".into(), serde_json::json!(gs.area_valid_m2 * area_scale));
-    for &(p, val) in &gs.percentiles {
-        obj.insert(crate::titiler::percentile_key(p), serde_json::json!(val));
+    crate::titiler::BandStats {
+        min: Some(crate::titiler::StatScalar::F64(gs.min)),
+        max: Some(crate::titiler::StatScalar::F64(gs.max)),
+        mean: Some(gs.mean),
+        count: crate::titiler::StatCount::Float(count_out),
+        sum: gs.sum_cov,
+        std: Some(gs.std),
+        median: Some(crate::titiler::StatScalar::F64(gs.median)),
+        majority: Some(crate::titiler::StatScalar::F64(gs.majority)),
+        minority: Some(crate::titiler::StatScalar::F64(gs.minority)),
+        unique: crate::titiler::StatCount::Float(gs.unique_bins as f64),
+        valid_percent,
+        masked_pixels: crate::titiler::StatCount::Float(masked_pixels),
+        valid_pixels: crate::titiler::StatCount::Float(gs.valid_pixels as f64),
+        percentiles: gs
+            .percentiles
+            .iter()
+            .map(|&(p, val)| (p, Some(crate::titiler::StatScalar::F64(val))))
+            .collect(),
+        histogram: crate::titiler::BandHistogram::NumericFloat(counts, edges),
+        categories: None,
+        category_areas: None,
+        area: Some(Some(gs.area_valid_m2 * area_scale)),
+        length: None,
+        description: (!description.is_empty()).then(|| description.to_string()),
     }
-    if !description.is_empty() {
-        obj.insert("description".into(), serde_json::json!(description));
-    }
-    serde_json::Value::Object(obj)
+    .to_json()
 }
 
 #[cfg(feature = "gpu")]
