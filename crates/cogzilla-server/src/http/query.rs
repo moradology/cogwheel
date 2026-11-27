@@ -31,6 +31,14 @@ pub(super) struct ZarrParams {
     pub(super) sel: Vec<String>,
     pub(super) decode_times: bool,
     pub(super) show_times: bool,
+    /// Last-wins 0-based `bidx` (`u64`, supporting >65535 time steps such as hourly ERA5).
+    pub(super) bidx: Option<u64>,
+    /// Last-wins resampling mode across `resample`/`resampling`/`reproject` (preserving explicit `nearest`).
+    pub(super) resample: ResampleMode,
+    /// Raw parsed `tilesize`/`tile_size`/`size` (`u32`) so out-of-range values (0, >2048) still trigger 400.
+    pub(super) tilesize: Option<u32>,
+    /// Raw EPSG code from `coord_crs` when supplied, so unsupported codes (e.g. EPSG:9999) trigger 400.
+    pub(super) coord_crs_raw_epsg: Option<u16>,
 }
 
 impl Default for ZarrParams {
@@ -41,6 +49,10 @@ impl Default for ZarrParams {
             sel: Vec::new(),
             decode_times: true,
             show_times: false,
+            bidx: None,
+            resample: ResampleMode::Nearest,
+            tilesize: None,
+            coord_crs_raw_epsg: None,
         }
     }
 }
@@ -63,9 +75,9 @@ pub(super) struct FamilyRequestParams {
     pub(super) family: FamilyParams,
 }
 
-/// Parse a `/zarr/*` query string using [`parse_query`] for all 12 common parameters and
-/// extracting only the 5 Zarr-specific fields (`variable`, `group`, `sel`, `decode_times`,
-/// `show_times`).
+/// Parse a `/zarr/*` query string using [`parse_query`] for shared parameters and
+/// extracting the 5 Zarr-specific fields plus Zarr's exact `bidx` (`u64`), `resample`
+/// (last-wins), `tilesize` (raw `u32`), and `coord_crs` (raw EPSG) semantics.
 pub(super) fn parse_zarr_request(raw_query: &str) -> FamilyRequestParams {
     let common = parse_query(Some(raw_query));
     let mut zp = ZarrParams::default();
@@ -84,6 +96,41 @@ pub(super) fn parse_zarr_request(raw_query: &str) -> FamilyRequestParams {
             "show_times" => {
                 if let Some(b) = parse_bool_encoded(v) {
                     zp.show_times = b;
+                }
+            }
+            "bidx" | "indexes" => {
+                for part in percent_decode(v).split(',') {
+                    if let Ok(b) = part.trim().parse::<u64>()
+                        && b >= 1
+                    {
+                        zp.bidx = Some(b - 1);
+                    }
+                }
+            }
+            "resample" | "resampling" | "reproject" => {
+                let dec = percent_decode(v).to_ascii_lowercase();
+                if let Some(m) = parse_resample_mode(&dec) {
+                    zp.resample = m;
+                }
+            }
+            "tilesize" | "tile_size" | "size" => {
+                if let Ok(sz) = percent_decode(v).trim().parse::<u32>() {
+                    zp.tilesize = Some(sz);
+                }
+            }
+            "coord_crs" => {
+                let dec = percent_decode(v);
+                if let Ok((_, epsg)) = parse_coord_crs_with_epsg(&dec) {
+                    zp.coord_crs_raw_epsg = Some(epsg);
+                } else {
+                    let trimmed = dec.trim();
+                    let digits = trimmed
+                        .strip_prefix("EPSG:")
+                        .or_else(|| trimmed.strip_prefix("epsg:"))
+                        .unwrap_or(trimmed);
+                    if let Ok(code) = digits.trim().parse::<u16>() {
+                        zp.coord_crs_raw_epsg = Some(code);
+                    }
                 }
             }
             _ => {}
@@ -1149,5 +1196,32 @@ mod tests {
         assert_eq!(zp.sel, vec!["time=2024-01-01", "level=500"]);
         assert!(!zp.decode_times);
         assert!(zp.show_times);
+    }
+
+    #[test]
+    fn zarr_request_preserves_error_inputs_precedence_and_u64_bidx() {
+        // Out-of-range tilesize (0 / 9999) is preserved for 400 validation; non-numeric stays None.
+        let FamilyParams::Zarr(z0) = parse_zarr_request("tilesize=0").family else { unreachable!() };
+        assert_eq!(z0.tilesize, Some(0));
+        let FamilyParams::Zarr(z9) = parse_zarr_request("tilesize=9999").family else { unreachable!() };
+        assert_eq!(z9.tilesize, Some(9999));
+        let FamilyParams::Zarr(zabc) = parse_zarr_request("tilesize=abc").family else { unreachable!() };
+        assert_eq!(zabc.tilesize, None);
+
+        // Unsupported coord_crs is preserved as raw EPSG code so handlers return 400 instead of 4326.
+        let FamilyParams::Zarr(zcrs) = parse_zarr_request("coord_crs=EPSG:9999").family else { unreachable!() };
+        assert_eq!(zcrs.coord_crs_raw_epsg, Some(9999));
+
+        // resampling/reproject is strictly last-write-wins, including overriding back to nearest.
+        let FamilyParams::Zarr(zr1) = parse_zarr_request("resampling=bilinear&reproject=cubic").family else { unreachable!() };
+        assert_eq!(zr1.resample, ResampleMode::Cubic);
+        let FamilyParams::Zarr(zr2) = parse_zarr_request("reproject=bilinear&resampling=nearest").family else { unreachable!() };
+        assert_eq!(zr2.resample, ResampleMode::Nearest);
+
+        // bidx supports > u16::MAX (e.g. hourly ERA5) and is last-wins; rescale is last-wins.
+        let req = parse_zarr_request("bidx=1&bidx=70001&rescale=0,100&rescale=250,310");
+        let FamilyParams::Zarr(zb) = req.family else { unreachable!() };
+        assert_eq!(zb.bidx, Some(70_000));
+        assert_eq!(req.common.rescale.last().copied(), Some((250.0, 310.0)));
     }
 }

@@ -470,31 +470,26 @@ impl ZarrQuery {
         let super::query::FamilyParams::Zarr(zp) = req.family else {
             unreachable!("parse_zarr_request always returns FamilyParams::Zarr");
         };
-        let resample = if common.resample != ResampleMode::Nearest {
-            common.resample
-        } else {
-            common.reproject
-        };
         let has_key = |names: &[&str]| common.keys.iter().any(|k| names.contains(&k.as_str()));
         Self {
             url: common.urls.last().cloned(),
             variable: zp.variable,
             group: zp.group,
             sel: zp.sel,
-            bidx: common.bidx.first().map(|&b| u64::from(b - 1)),
+            bidx: zp.bidx,
             decode_times: zp.decode_times,
             show_times: zp.show_times,
-            rescale: common.rescale.first().copied(),
+            rescale: common.rescale.last().copied(),
             colormap: common.colormap,
-            resample,
+            resample: zp.resample,
             nodata: common.nodata,
             unscale: common.unscale,
             return_mask: common.return_mask,
             max_size: has_key(&["max_size"])
                 .then_some(if common.max_size_zero { 0 } else { common.max_size }),
-            tilesize: has_key(&["tilesize", "tile_size", "size"]).then_some(common.tile_size),
+            tilesize: zp.tilesize,
             format: common.format_param,
-            coord_crs: common.coord_crs_epsg,
+            coord_crs: zp.coord_crs_raw_epsg,
         }
     }
 
@@ -511,6 +506,9 @@ fn parse_output_format(ext: Option<&str>, q_fmt: Option<&str>) -> (OutputFormat,
     let raw = ext.or(q_fmt).unwrap_or("png").to_ascii_lowercase();
     match raw.as_str() {
         "tif" | "tiff" => (OutputFormat::RawF32, "image/tiff; application=geotiff"),
+        // Zarr encoders treat `OutputFormat::RawF32` as GeoTIFF, so do not route raw binary
+        // extensions through `parse_ext_format`'s `RawF32` sentinel.
+        "f32" | "bin" | "raw" => (OutputFormat::Png, "image/png"),
         other => super::parse_ext_format(other, Some(80.0), 85)
             .unwrap_or((OutputFormat::Png, "image/png")),
     }
