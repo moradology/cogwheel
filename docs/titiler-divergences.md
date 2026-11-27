@@ -103,6 +103,10 @@ This document is the living record of every intentional divergence, **why** it e
 
 ---
 
+### 1.12 A Fractional Contour `increment`
+
+`algorithm_params` are checked as TiTiler's pydantic models check them (2026-11-26): each algorithm reads its own fields in pydantic's lax mode (`"45"`, `45.0` and `true` are the integer they spell), within its bounds, and passes over other keys; what it refuses is a `400` in pydantic's words (without the line that links to pydantic's documentation), and parameters that are not JSON are FastAPI's `422`, on the routes that apply an algorithm. One field is wider: `contours`' `increment` may be a fraction, for data whose values lie between whole numbers (reflectance, say), where TiTiler takes only a whole number. Parameters that are JSON but not an object, which TiTiler fails on with a `500`, are a `400` here.
+
 ## 2. Deliberate API & Error-Handling Divergences
 
 | Area | TiTiler 2.4.1 | `cogzilla` | Why |
