@@ -398,7 +398,21 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
             i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
         if !prev_is_ident && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
             let rest = &expr[i..];
-            // 1. Check TiTiler default `{asset}_b{k}` first (e.g. `nir_b1`, `visual_b3`).
+            // 1. Bare `{asset}` first (longest-first, matching `select_stac_asset_names`), so an
+            //    asset literally named `red_b1` beats prefix `red` + `_b1`.
+            if let Some(&(band_1based, matched)) = ordered.iter().find(|&&(_, name)| {
+                rest.starts_with(name)
+                    && !bytes
+                        .get(i + name.len())
+                        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+            }) {
+                out.push('b');
+                out.push_str(&band_1based.to_string());
+                i += matched.len();
+                continue;
+            }
+
+            // 2. TiTiler default `{asset}_b{k}` (e.g. `nir_b1`, `visual_b3`).
             let mut matched_band_suffix: Option<(usize, usize)> = None;
             for &(asset_1based, name) in &ordered {
                 if !rest.starts_with(name) {
@@ -432,19 +446,6 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
                 out.push('b');
                 out.push_str(&target_band.to_string());
                 i += consumed;
-                continue;
-            }
-
-            // 2. Bare `{asset}` (TiTiler `asset_as_band=true` & backward-compatible shorthand).
-            if let Some(&(band_1based, matched)) = ordered.iter().find(|&&(_, name)| {
-                rest.starts_with(name)
-                    && !bytes
-                        .get(i + name.len())
-                        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
-            }) {
-                out.push('b');
-                out.push_str(&band_1based.to_string());
-                i += matched.len();
                 continue;
             }
         }
@@ -567,12 +568,37 @@ pub fn get_colormap_image(
     let (def_w, def_h) = if vertical { (20u32, 256u32) } else { (256u32, 20u32) };
     let w = width.unwrap_or(def_w).clamp(1, 4096) as usize;
     let h = height.unwrap_or(def_h).clamp(1, 4096) as usize;
-    let mut rgba = vec![0u8; w * h * 4];
     let denom = if vertical {
         (h.saturating_sub(1)).max(1)
     } else {
         (w.saturating_sub(1)).max(1)
     };
+    if matches!(format, cogzilla_kernel::OutputFormat::Npy) {
+        let mut dict = format!(
+            "{{'descr': '|u1', 'fortran_order': False, 'shape': (4, {h}, {w}), }}"
+        );
+        while (10 + dict.len() + 1) % 64 != 0 {
+            dict.push(' ');
+        }
+        dict.push('\n');
+        let hlen = dict.len() as u16;
+        let pixels = w * h;
+        let mut out = Vec::with_capacity(10 + dict.len() + 4 * pixels);
+        out.extend_from_slice(b"\x93NUMPY\x01\x00");
+        out.extend_from_slice(&hlen.to_le_bytes());
+        out.extend_from_slice(dict.as_bytes());
+        for ch in 0..4usize {
+            for y in 0..h {
+                for x in 0..w {
+                    let pos = if vertical { y } else { x };
+                    let idx = ((pos * 255 + denom / 2) / denom).min(255);
+                    out.push(lut.rgba_u32[idx].to_le_bytes()[ch]);
+                }
+            }
+        }
+        return Ok(Bytes::from(out));
+    }
+    let mut rgba = vec![0u8; w * h * 4];
     for y in 0..h {
         let row_off = y * w * 4;
         for x in 0..w {
@@ -695,5 +721,17 @@ mod tests {
             resolve_href("file:///allowed/items/item.json", "B04.tif"),
             "/allowed/items/B04.tif"
         );
+    }
+
+    #[test]
+    fn rewrite_stac_expr_prefers_exact_asset_name_over_shorter_band_suffix() {
+        // Audit #70 #7: assets ["red", "red_b1"] with expr "red_b1-red" -> "b2-b1" (not "b1-b1")
+        let names = vec!["red".to_string(), "red_b1".to_string()];
+        assert_eq!(rewrite_stac_expr("red_b1-red", &names).unwrap(), "b2-b1");
+        let names2 = vec!["red".to_string(), "red_b2".to_string()];
+        assert_eq!(rewrite_stac_expr("red_b2-red", &names2).unwrap(), "b2-b1");
+        // Single-asset band suffix still works
+        let single = vec!["visual".to_string()];
+        assert_eq!(rewrite_stac_expr("visual_b3-visual_b1", &single).unwrap(), "b3-b1");
     }
 }

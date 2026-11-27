@@ -50,7 +50,10 @@ pub enum CustomColormap {
         stops: Vec<(f32, [u8; 4])>,
         direct_lookup: bool,
     },
-    Intervals(Vec<(f32, f32, [u8; 4])>),
+    Intervals {
+        intervals: Vec<(f32, f32, [u8; 4])>,
+        direct_lookup: bool,
+    },
 }
 
 impl CustomColormap {
@@ -68,7 +71,7 @@ impl CustomColormap {
             }
         }
         Self::Discrete {
-            lut: Box::new(ColormapLut { rgb, rgba_u32 }),
+            lut: Box::new(ColormapLut::new(rgba_u32, rgb)),
             extra,
             direct_lookup: true,
         }
@@ -131,7 +134,7 @@ impl CustomColormap {
                 }
             }
             Ok(Self::Discrete {
-                lut: Box::new(ColormapLut { rgba_u32, rgb }),
+                lut: Box::new(ColormapLut::new(rgba_u32, rgb)),
                 extra,
                 direct_lookup: !rescale_explicit,
             })
@@ -163,7 +166,10 @@ impl CustomColormap {
                 })?;
                 intervals.push((lo, hi, color));
             }
-            Ok(Self::Intervals(intervals))
+            Ok(Self::Intervals {
+                intervals,
+                direct_lookup: !rescale_explicit,
+            })
         } else {
             Err(
                 "colormap JSON must be an object {idx: color} or interval array [[[min,max], color], ...]"
@@ -176,10 +182,9 @@ impl CustomColormap {
     #[inline(always)]
     pub fn uses_direct_lookup(&self) -> bool {
         match self {
-            Self::Discrete { direct_lookup, .. } | Self::Linear { direct_lookup, .. } => {
-                *direct_lookup
-            }
-            Self::Intervals(_) => true,
+            Self::Discrete { direct_lookup, .. }
+            | Self::Linear { direct_lookup, .. }
+            | Self::Intervals { direct_lookup, .. } => *direct_lookup,
         }
     }
 
@@ -246,9 +251,17 @@ impl CustomColormap {
                     lerp(c0[3], c1[3]),
                 ]
             }
-            Self::Intervals(intervals) => {
+            Self::Intervals {
+                intervals,
+                direct_lookup,
+            } => {
+                let x = if *direct_lookup {
+                    v
+                } else {
+                    ((v - rescale_min) * inv_range).clamp(0.0, 255.0)
+                };
                 for &(lo, hi, rgba) in intervals {
-                    if v >= lo && v < hi {
+                    if x >= lo && x < hi {
                         return rgba;
                     }
                 }
@@ -264,16 +277,44 @@ impl CustomColormap {
 pub struct ColormapLut {
     pub rgba_u32: [u32; 256],
     pub rgb: [[u8; 3]; 256],
+    /// The palette of a palette PNG with empty pixels: index 0 is transparent and the 256
+    /// entries share the other 255. Entry `nodata_merged` shares the index of the entry before
+    /// it, the one nearest it in colour, so the picture is exact for the colour maps that
+    /// repeat a colour next to itself and, for the rest, one entry is drawn with its
+    /// neighbour's colour (one step of one channel for most maps). `nodata_index` places a
+    /// byte value.
+    pub(crate) nodata_plte: [u8; 768],
+    pub(crate) nodata_merged: u8,
+}
+
+/// Where a byte value (rio-tiler's `rescale_u8`) goes in `ColormapLut::nodata_plte`: as
+/// arithmetic, not a table, so the loops that call it stay vectorised.
+#[inline(always)]
+pub(crate) fn nodata_index(v: u8, merged: u8) -> u8 {
+    v + u8::from(v < merged)
 }
 
 impl ColormapLut {
+    pub fn new(rgba_u32: [u32; 256], rgb: [[u8; 3]; 256]) -> Self {
+        let step = |i: usize| -> u32 {
+            (0..3).map(|k| u32::from(rgb[i - 1][k].abs_diff(rgb[i][k])).pow(2)).sum()
+        };
+        let nodata_merged = (1..256).min_by_key(|i| step(*i)).unwrap_or(1) as u8;
+        let mut nodata_plte = [0u8; 768];
+        for v in (0..=255u8).filter(|v| *v != nodata_merged) {
+            let at = usize::from(nodata_index(v, nodata_merged)) * 3;
+            nodata_plte[at..at + 3].copy_from_slice(&rgb[usize::from(v)]);
+        }
+        Self { rgba_u32, rgb, nodata_plte, nodata_merged }
+    }
+
     pub fn from_rgb_table(rgb: [[u8; 3]; 256]) -> Self {
         let mut rgba_u32 = [0u32; 256];
         for i in 0..256 {
             let c = rgb[i];
             rgba_u32[i] = u32::from_le_bytes([c[0], c[1], c[2], 255]);
         }
-        Self { rgba_u32, rgb }
+        Self::new(rgba_u32, rgb)
     }
 
     /// Parse TiTiler custom JSON colormap `{"0":[r,g,b,a], "128":"#rrggbb", ...}`.
@@ -320,7 +361,7 @@ impl ColormapLut {
                 }
             }
         }
-        Ok(Self { rgba_u32, rgb })
+        Ok(Self::new(rgba_u32, rgb))
     }
 }
 
@@ -407,6 +448,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_band_with_no_colour_map_is_drawn_as_its_own_byte() {
+        let lut = ColormapName::Grayscale.lut();
+        for level in 0..=255u8 {
+            assert_eq!(lut.rgb[usize::from(level)], [level; 3], "grey {level}");
+            assert_eq!(lut.rgba_u32[usize::from(level)], u32::from_le_bytes([level, level, level, 255]), "grey {level}");
+        }
+        // The colour map TiTiler calls `gray` is another table, matplotlib's, and stays so.
+        let named = ColormapName::from_str_opt("gray").expect("a colour map called gray");
+        assert_ne!(named, ColormapName::Grayscale);
+        assert_eq!(named.lut().rgb[33], [32; 3]);
+    }
+
+    #[test]
     fn custom_colormap_discrete_direct_and_extra_keys_work_without_rescaling() {
         let json = r##"{"-1":[1,2,3,255],"10":[0,100,0,255],"80":[0,100,200,255],"300":"#ff880080"}"##;
         // Without explicit `?rescale=`, Uint16 rescale (0, 65535) must NOT crush classes into idx 0.
@@ -437,6 +491,14 @@ mod tests {
         assert_eq!(cmap.lookup(100.0, 0.0, 1.0), [0, 255, 0, 255]);
         assert_eq!(cmap.lookup(499.9, 0.0, 1.0), [0, 255, 0, 255]);
         assert_eq!(cmap.lookup(500.0, 0.0, 1.0), [0, 0, 0, 0]);
+
+        // With explicit `?rescale=0,1000`, interval bounds apply to the rescaled 0..=255 value.
+        let json_rescaled = r#"[[[0,128],[0,0,255,255]],[[128,256],[255,0,0,255]]]"#;
+        let rcmap = CustomColormap::from_json_str(json_rescaled, true).unwrap();
+        assert!(!rcmap.uses_direct_lookup());
+        let inv = 255.0 / 1000.0;
+        assert_eq!(rcmap.lookup(200.0, 0.0, inv), [0, 0, 255, 255]); // 51 -> [0, 128)
+        assert_eq!(rcmap.lookup(800.0, 0.0, inv), [255, 0, 0, 255]); // 204 -> [128, 256)
     }
 
     #[test]

@@ -12,6 +12,9 @@ use cogzilla_kernel::{
 use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
+use crate::geotiff::{
+    GeoTiffLayout, GeoTiffPhotometric, GeoTiffSample, GeoTiffSpec, write_geotiff,
+};
 
 fn infer_colorinterp(full: &cogzilla_tiff::IfdMeta, has_color_map: bool) -> Vec<&'static str> {
     let count = full.samples_per_pixel as usize;
@@ -88,7 +91,8 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         .collect();
 
     let has_alpha = cogzilla_codec::alpha_channel_index(count, &full.extra_samples).is_some();
-    let (nodata_type, nodata_value) = match cog.index.nodata {
+    let nodata_exact = cog.index.nodata_f64.or_else(|| cog.index.nodata.map(|v| v as f64));
+    let (nodata_type, nodata_value) = match nodata_exact {
         Some(v) if v.is_nan() => ("Nodata", Some(serde_json::Value::Null)),
         Some(v) => ("Nodata", Some(serde_json::json!(v))),
         None if has_alpha => ("Alpha", None),
@@ -243,22 +247,45 @@ pub fn build_cog_info_geojson(
 }
 
 /// TiTiler / `rio-cogeo`-compatible `/cog/validate` JSON payload.
+///
+/// Structural COG validation (tiling, overviews, IFD/block layout) works for any readable TIFF,
+/// including ungeoreferenced and RPC-only TIFFs; missing/unsupported georeferencing is reported
+/// as a warning in `COG_warnings` with `GEO` fields set to `null` rather than failing with 400.
 pub fn build_cog_validate(
     engine: &TileEngine,
     cog: &OpenedCog,
     url: &str,
     strict: bool,
 ) -> Result<serde_json::Value, EngineError> {
-    let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
     let coarsest = cog.index.ifds.last().unwrap();
     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
         .max(full.height as f64 / coarsest.height.max(1) as f64);
-    let (minzoom, maxzoom) =
-        crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor);
 
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+
+    let crs_opt = if cog.index.is_georeferenced {
+        match engine.get_or_build_crs(cog) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warnings.push(format!("Unsupported CRS metadata: {e}"));
+                None
+            }
+        }
+    } else {
+        let msg = if cog.index.has_rpc {
+            "Dataset has no supported georeferencing (missing GeoTransform/GCPs; RPC georeferencing is not supported)"
+        } else {
+            "Dataset has no georeferencing (missing GeoTransform/GCPs; RPCs are not supported)"
+        };
+        warnings.push(msg.into());
+        None
+    };
+
+    let zoom_range = crs_opt
+        .as_ref()
+        .map(|crs| crs.web_mercator_zoom_range(&full.pixel_to_crs, full.width, full.height, ov_factor));
 
     if full.is_stripped && (full.width > 512 || full.height > 512) {
         errors.push(
@@ -276,10 +303,39 @@ pub fn build_cog_validate(
             errors.push(format!("Overview IFD {idx} is not tiled"));
         }
     }
-    // rio-cogeo COG block-offset order check: coarser overviews must be stored before finer levels.
+    // rio-cogeo COG header & block-offset layout checks:
+    // 1. Main IFD must sit near the front of the file (< 300 bytes) so a single initial range read
+    //    can parse the header without extra round-trips.
+    if cog.index.main_ifd_offset >= 300 {
+        errors.push(format!(
+            "The offset of the main IFD should be < 300. It is {} instead",
+            cog.index.main_ifd_offset
+        ));
+    }
     let first_block_offset = |ifd: &cogzilla_tiff::IfdMeta| -> Option<u64> {
         ifd.tile_offsets.iter().copied().find(|&o| o > 0)
     };
+    // 2. Image block data must be stored after its IFD (plain GTiff writes data first, IFD at EOF).
+    if let (Some(first_blk), Some(&main_ifd_off)) = (
+        first_block_offset(&cog.index.ifds[0]),
+        cog.index.ifd_offsets.first(),
+    ) && first_blk < main_ifd_off
+    {
+        errors.push(format!(
+            "The offset of the first block of the image should be after its IFD (block offset {first_blk} < IFD offset {main_ifd_off})"
+        ));
+    }
+    for (idx, ifd) in cog.index.ifds.iter().enumerate().skip(1) {
+        if let (Some(first_blk), Some(&ifd_off)) =
+            (first_block_offset(ifd), cog.index.ifd_offsets.get(idx))
+            && first_blk < ifd_off
+        {
+            errors.push(format!(
+                "The offset of the first block of overview of index {idx} should be after its IFD (block offset {first_blk} < IFD offset {ifd_off})"
+            ));
+        }
+    }
+    // 3. Coarser overviews must be stored before finer levels.
     if cog.index.ifds.len() > 1 {
         if let (Some(main_off), Some(ov1_off)) = (
             first_block_offset(&cog.index.ifds[0]),
@@ -341,52 +397,72 @@ pub fn build_cog_validate(
     let offsets: Vec<f64> = (0..count)
         .map(|i| cog.index.offsets_f64.get(i).copied().unwrap_or(0.0))
         .collect();
-    let nodata_json = match cog.index.nodata {
+    let nodata_json = match cog.index.nodata_f64.or_else(|| cog.index.nodata.map(|v| v as f64)) {
         Some(v) if v.is_nan() => serde_json::json!("nan"),
         Some(v) => serde_json::json!(v),
         None => serde_json::Value::Null,
     };
 
-    let gk = &cog.index.geo_keys;
-    let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
-    let is_user_defined_projected = std_proj_epsg.is_none()
-        && (gk.model_type == Some(1)
-            || gk.projected_cs_type == Some(32767)
-            || gk.proj_coord_trans.is_some());
-    let crs_str = if let Some(epsg) = std_proj_epsg {
-        format!("EPSG:{epsg}")
-    } else if !is_user_defined_projected
-        && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
-    {
-        format!("EPSG:{epsg}")
-    } else {
-        "EPSG:4326".to_string()
-    };
+    let geo_json = if crs_opt.is_some() {
+        let gk = &cog.index.geo_keys;
+        let std_proj_epsg = gk.projected_cs_type.filter(|&c| c > 0 && c != 32767);
+        let is_user_defined_projected = std_proj_epsg.is_none()
+            && (gk.model_type == Some(1)
+                || gk.projected_cs_type == Some(32767)
+                || gk.proj_coord_trans.is_some());
+        let crs_str = if let Some(epsg) = std_proj_epsg {
+            format!("EPSG:{epsg}")
+        } else if !is_user_defined_projected
+            && let Some(epsg) = gk.geographic_type.filter(|&c| c > 0 && c != 32767)
+        {
+            format!("EPSG:{epsg}")
+        } else {
+            "EPSG:4326".to_string()
+        };
 
-    let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
-    let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
-    let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
-    let (x11, y11) = full
-        .pixel_to_crs
-        .forward(full.width as f64, full.height as f64);
-    let native_bounds = if is_user_defined_projected {
-        cogzilla_proj::CrsModel::from_geo_keys(gk)
-            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
-            .unwrap_or([
+        let (x00, y00) = full.pixel_to_crs.forward(0.0, 0.0);
+        let (x10, y10) = full.pixel_to_crs.forward(full.width as f64, 0.0);
+        let (x01, y01) = full.pixel_to_crs.forward(0.0, full.height as f64);
+        let (x11, y11) = full
+            .pixel_to_crs
+            .forward(full.width as f64, full.height as f64);
+        let native_bounds = if is_user_defined_projected {
+            cogzilla_proj::CrsModel::from_geo_keys(gk)
+                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                .unwrap_or([
+                    x00.min(x10).min(x01).min(x11),
+                    y00.min(y10).min(y01).min(y11),
+                    x00.max(x10).max(x01).max(x11),
+                    y00.max(y10).max(y01).max(y11),
+                ])
+        } else {
+            [
                 x00.min(x10).min(x01).min(x11),
                 y00.min(y10).min(y01).min(y11),
                 x00.max(x10).max(x01).max(x11),
                 y00.max(y10).max(y01).max(y11),
-            ])
+            ]
+        };
+        let (res_x, res_y) = full.pixel_resolution();
+        let (minzoom, maxzoom) = zoom_range.unwrap_or((0, 0));
+        serde_json::json!({
+            "CRS": crs_str,
+            "BoundingBox": native_bounds,
+            "Origin": [full.pixel_to_crs.c, full.pixel_to_crs.f],
+            "Resolution": [res_x, res_y],
+            "MinZoom": minzoom,
+            "MaxZoom": maxzoom,
+        })
     } else {
-        [
-            x00.min(x10).min(x01).min(x11),
-            y00.min(y10).min(y01).min(y11),
-            x00.max(x10).max(x01).max(x11),
-            y00.max(y10).max(y01).max(y11),
-        ]
+        serde_json::json!({
+            "CRS": null,
+            "BoundingBox": null,
+            "Origin": null,
+            "Resolution": null,
+            "MinZoom": null,
+            "MaxZoom": null,
+        })
     };
-    let (res_x, res_y) = full.pixel_resolution();
 
     let ifds: Vec<serde_json::Value> = cog
         .index
@@ -432,14 +508,7 @@ pub fn build_cog_validate(
             "Scales": scales,
             "Offsets": offsets,
         },
-        "GEO": {
-            "CRS": crs_str,
-            "BoundingBox": native_bounds,
-            "Origin": [full.pixel_to_crs.c, full.pixel_to_crs.f],
-            "Resolution": [res_x, res_y],
-            "MinZoom": minzoom,
-            "MaxZoom": maxzoom,
-        },
+        "GEO": geo_json,
         "Tags": {},
         "IFD": ifds,
     }))
@@ -989,6 +1058,7 @@ pub fn build_tilejson(
         "maxzoom": maxzoom,
         "bounds": bounds,
         "center": center,
+        "raster_layers": {},
         "band_descriptions": band_descriptions,
         "data_type": full.sample_type.gdal_name(),
     }))
@@ -1005,12 +1075,21 @@ pub async fn query_point(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let ifd = cog.index.full_res();
+    let Some(norm_lon) = cogzilla_proj::normalize_geographic_lon(lon) else {
+        return Err(EngineError::NotFound(format!(
+            "point ({lon}, {lat}) is outside dataset bounds"
+        )));
+    };
     let q_lon = if let Some(lo) = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width)
-        && lon < lo
+        && norm_lon < lo
     {
-        lon + 360.0
+        norm_lon + 360.0
+    } else if let Some(hi) = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width)
+        && norm_lon > hi
+    {
+        norm_lon - 360.0
     } else {
-        lon
+        norm_lon
     };
     let (sx, sy) = crs.from_lonlat_deg(q_lon, lat);
     let (col_f, row_f) = ifd.crs_to_pixel_pt(sx, sy);
@@ -1039,15 +1118,15 @@ pub async fn query_point(
     let ly = (row as u32) % ifd.tile_height;
     let pidx = (ly as usize) * (ifd.tile_width as usize) + (lx as usize);
 
-    let maybe_unscale = |b: usize, v: f32| -> f32 {
+    let maybe_unscale = |b: usize, v: f64| -> f64 {
         if let Some(nd) = nodata_override {
-            if !nd.is_nan() && v == nd {
-                return f32::NAN;
+            if !nd.is_nan() && v == nd as f64 {
+                return f64::NAN;
             }
         }
         if unscale && !v.is_nan() {
-            let sc = cog.index.scales.get(b).copied().unwrap_or(1.0);
-            let off = cog.index.offsets.get(b).copied().unwrap_or(0.0);
+            let sc = cog.index.scales_f64.get(b).copied().unwrap_or(1.0);
+            let off = cog.index.offsets_f64.get(b).copied().unwrap_or(0.0);
             v * sc + off
         } else {
             v
@@ -1065,8 +1144,8 @@ pub async fn query_point(
                     tiles[0]
                         .as_ref()
                         .and_then(|t| t.bands.get(b))
-                        .map(|band| band.data.get_f32(pidx))
-                        .unwrap_or(f32::NAN),
+                        .map(|band| band.data.get_f64(pidx))
+                        .unwrap_or(f64::NAN),
                 );
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
@@ -1087,8 +1166,8 @@ pub async fn query_point(
                     tiles[slot]
                         .as_ref()
                         .and_then(|t| t.bands.first())
-                        .map(|band| band.data.get_f32(pidx))
-                        .unwrap_or(f32::NAN),
+                        .map(|band| band.data.get_f64(pidx))
+                        .unwrap_or(f64::NAN),
                 );
                 values.push(if v.is_nan() {
                     serde_json::Value::Null
@@ -1113,13 +1192,17 @@ enum BandStatsAcc {
     HistU8([u64; 256]),
     HistU16(Vec<u64>),
     Floats(Vec<f32>),
+    Floats64(Vec<f64>),
 }
 
 impl BandStatsAcc {
     fn for_sample_type(st: cogzilla_tiff::SampleType, capacity_hint: usize) -> Self {
         match st {
-            cogzilla_tiff::SampleType::Uint8 => Self::HistU8([0u64; 256]),
+            cogzilla_tiff::SampleType::Uint1
+            | cogzilla_tiff::SampleType::Uint4
+            | cogzilla_tiff::SampleType::Uint8 => Self::HistU8([0u64; 256]),
             cogzilla_tiff::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
+            s if s.needs_f64() => Self::Floats64(Vec::with_capacity(capacity_hint)),
             _ => Self::Floats(Vec::with_capacity(capacity_hint)),
         }
     }
@@ -1224,6 +1307,23 @@ impl BandStatsAcc {
                             if v.is_finite() && nd_ov != Some(v) {
                                 vals.push(v);
                             }
+                        }
+                    }
+                }
+            }
+            (Self::Floats64(vals), other) => {
+                let nd_ov = nodata_override.filter(|v| !v.is_nan()).map(|v| v as f64);
+                let sc = scale as f64;
+                let off = offset as f64;
+                for ly in 0..y_max {
+                    let base = ly * tw;
+                    for lx in 0..x_max {
+                        let mut v = other.get_f64(base + lx);
+                        if v.is_finite() && nd_ov != Some(v) {
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            vals.push(v);
                         }
                     }
                 }
@@ -1354,6 +1454,26 @@ impl BandStatsAcc {
                     }
                 }
             }
+            (Self::Floats64(vals), other) => {
+                let nd_ov = nodata_override.filter(|v| !v.is_nan()).map(|v| v as f64);
+                let sc = scale as f64;
+                let off = offset as f64;
+                for ly in 0..y_max {
+                    let mrow = &mask_bits[ly * x_max..(ly + 1) * x_max];
+                    let base = ly * tw;
+                    for lx in 0..x_max {
+                        if mrow[lx] != 0 {
+                            let mut v = other.get_f64(base + lx);
+                            if v.is_finite() && nd_ov != Some(v) {
+                                if unscale {
+                                    v = v * sc + off;
+                                }
+                                vals.push(v);
+                            }
+                        }
+                    }
+                }
+            }
             (acc, other) => {
                 let nd_ov = nodata_override.filter(|v| !v.is_nan());
                 for ly in 0..y_max {
@@ -1374,6 +1494,7 @@ impl BandStatsAcc {
                                         }
                                         vals.push(v);
                                     }
+                                    Self::Floats64(_) => unreachable!(),
                                 }
                             }
                         }
@@ -1418,16 +1539,27 @@ impl BandStatsAcc {
                     None => true,
                 };
                 if keep {
-                    let mut v = data.get_f32(base + lx);
-                    if v.is_finite() && nd_ov != Some(v) {
-                        match self {
-                            Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
-                            Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
-                            Self::Floats(vals) => {
-                                if unscale {
-                                    v = v * scale + offset;
+                    if let Self::Floats64(vals) = self {
+                        let mut v = data.get_f64(base + lx);
+                        if v.is_finite() && nd_ov.map(|n| n as f64) != Some(v) {
+                            if unscale {
+                                v = v * (scale as f64) + (offset as f64);
+                            }
+                            vals.push(v);
+                        }
+                    } else {
+                        let mut v = data.get_f32(base + lx);
+                        if v.is_finite() && nd_ov != Some(v) {
+                            match self {
+                                Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
+                                Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
+                                Self::Floats(vals) => {
+                                    if unscale {
+                                        v = v * scale + offset;
+                                    }
+                                    vals.push(v);
                                 }
-                                vals.push(v);
+                                Self::Floats64(_) => unreachable!(),
                             }
                         }
                     }
@@ -1453,16 +1585,27 @@ impl BandStatsAcc {
         for &ly in ys {
             let base = ly * tw;
             for &lx in xs {
-                let mut v = data.get_f32(base + lx);
-                if v.is_finite() && nd_ov != Some(v) {
-                    match self {
-                        Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
-                        Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
-                        Self::Floats(vals) => {
-                            if unscale {
-                                v = v * scale + offset;
+                if let Self::Floats64(vals) = self {
+                    let mut v = data.get_f64(base + lx);
+                    if v.is_finite() && nd_ov.map(|n| n as f64) != Some(v) {
+                        if unscale {
+                            v = v * (scale as f64) + (offset as f64);
+                        }
+                        vals.push(v);
+                    }
+                } else {
+                    let mut v = data.get_f32(base + lx);
+                    if v.is_finite() && nd_ov != Some(v) {
+                        match self {
+                            Self::HistU8(hist) => hist[(v.clamp(0.0, 255.0)) as usize] += 1,
+                            Self::HistU16(hist) => hist[(v.clamp(0.0, 65535.0)) as usize] += 1,
+                            Self::Floats(vals) => {
+                                if unscale {
+                                    v = v * scale + offset;
+                                }
+                                vals.push(v);
                             }
-                            vals.push(v);
+                            Self::Floats64(_) => unreachable!(),
                         }
                     }
                 }
@@ -2006,6 +2149,174 @@ impl BandStatsAcc {
                     (counts, edges)
                 };
                 let std = (var_sum / (valid_px as f64)).sqrt();
+
+                let med_idx = valid_px / 2;
+                let median = vals[med_idx];
+                let mut obj = serde_json::Map::new();
+                obj.insert("min".into(), serde_json::json!(min));
+                obj.insert("max".into(), serde_json::json!(max));
+                obj.insert("mean".into(), serde_json::json!(mean));
+                obj.insert("count".into(), serde_json::json!(valid_px));
+                obj.insert("sum".into(), serde_json::json!(sum));
+                obj.insert("std".into(), serde_json::json!(std));
+                obj.insert("median".into(), serde_json::json!(median));
+                obj.insert("majority".into(), serde_json::json!(maj_val));
+                obj.insert("minority".into(), serde_json::json!(min_val));
+                obj.insert("unique".into(), serde_json::json!(unique));
+                obj.insert("valid_percent".into(), serde_json::json!((valid_pct * 100.0).round() / 100.0));
+                obj.insert("masked_pixels".into(), serde_json::json!(masked_px));
+                obj.insert("valid_pixels".into(), serde_json::json!(valid_px));
+                for &p in &opts.percentiles {
+                    let idx = (((valid_px as f64) * (p.clamp(0.0, 100.0) / 100.0)) as usize)
+                        .min(valid_px - 1);
+                    obj.insert(percentile_key(p), serde_json::json!(vals[idx]));
+                }
+                if let Some(cats) = categories {
+                    obj.insert(
+                        "histogram".into(),
+                        build_categorical_histogram(&cat_observed, &opts.categories),
+                    );
+                    obj.insert("categories".into(), serde_json::Value::Object(cats));
+                } else {
+                    obj.insert("histogram".into(), serde_json::json!([counts, edges]));
+                }
+                obj.insert("description".into(), serde_json::json!(description));
+                serde_json::Value::Object(obj)
+            }
+            Self::Floats64(mut vals) => {
+                let valid_px = vals.len();
+                let masked_px = denom_pixels.saturating_sub(valid_px);
+                let valid_pct = if denom_pixels > 0 {
+                    (valid_px as f64 / denom_pixels as f64) * 100.0
+                } else {
+                    0.0
+                };
+                if valid_px == 0 {
+                    return empty_band_stats_json(masked_px, description, opts);
+                }
+                vals.sort_unstable_by(|a, b| a.total_cmp(b));
+                let min = vals[0];
+                let max = vals[valid_px - 1];
+                let mut sum = 0.0f64;
+                let mut unique = 0usize;
+                let mut maj_val = min;
+                let mut maj_cnt = 0usize;
+                let mut min_val = min;
+                let mut min_cnt = usize::MAX;
+                let mut run_val = min;
+                let mut run_cnt = 0usize;
+                let mut categories = if opts.categorical {
+                    Some(serde_json::Map::new())
+                } else {
+                    None
+                };
+                let mut cat_observed: Vec<(f64, u64)> = Vec::new();
+                for &v in &vals {
+                    sum += v;
+                    if v == run_val {
+                        run_cnt += 1;
+                    } else {
+                        unique += 1;
+                        if let Some(ref mut cats) = categories {
+                            cat_observed.push((run_val, run_cnt as u64));
+                            if matches_category_filter(run_val, &opts.categories) {
+                                cats.insert(format_category_key(run_val), serde_json::json!(run_cnt));
+                            }
+                        }
+                        if run_cnt > maj_cnt {
+                            maj_cnt = run_cnt;
+                            maj_val = run_val;
+                        }
+                        if run_cnt < min_cnt {
+                            min_cnt = run_cnt;
+                            min_val = run_val;
+                        }
+                        run_val = v;
+                        run_cnt = 1;
+                    }
+                }
+                unique += 1;
+                if let Some(ref mut cats) = categories {
+                    cat_observed.push((run_val, run_cnt as u64));
+                    if matches_category_filter(run_val, &opts.categories) {
+                        cats.insert(format_category_key(run_val), serde_json::json!(run_cnt));
+                    }
+                }
+                if run_cnt > maj_cnt {
+                    maj_val = run_val;
+                }
+                if run_cnt < min_cnt {
+                    min_val = run_val;
+                }
+                let n_f = valid_px as f64;
+                let mean = if sum.is_finite() {
+                    sum / n_f
+                } else {
+                    vals.iter().map(|&v| v / n_f).sum::<f64>()
+                };
+                // Scale variance accumulation when values exceed ~1e150 so `(v - mean)^2` never
+                // overflows `f64::MAX` to `+inf` (which JSON serializes as `null`).
+                let max_abs = min.abs().max(max.abs());
+                let var_scale = if max_abs > 1e150 { max_abs } else { 1.0 };
+                let inv_var_scale = 1.0 / var_scale;
+                let mean_scaled = mean * inv_var_scale;
+                let mut var_sum = 0.0f64;
+                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
+                    && custom_edges.len() >= 2
+                {
+                    let mut counts = vec![0u64; custom_edges.len() - 1];
+                    for &v in &vals {
+                        let d = v * inv_var_scale - mean_scaled;
+                        var_sum += d * d;
+                        if let Some(bin) = bin_into_edges(custom_edges, v) {
+                            counts[bin] += 1;
+                        }
+                    }
+                    (counts, custom_edges.clone())
+                } else {
+                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min, max));
+                    let n_bins = opts.histogram_bins.clamp(1, 1000);
+                    let mut counts = vec![0u64; n_bins];
+                    let raw_span = h_max - h_min;
+                    let step = if raw_span.is_finite() {
+                        raw_span.max(1e-12) / (n_bins as f64)
+                    } else {
+                        (h_max / (n_bins as f64)) - (h_min / (n_bins as f64))
+                    };
+                    for &v in &vals {
+                        let d = v * inv_var_scale - mean_scaled;
+                        var_sum += d * d;
+                        if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
+                            let bin = if step.is_finite() && step > 0.0 {
+                                let off = if (v - h_min).is_finite() {
+                                    (v - h_min) / step
+                                } else {
+                                    (v / step) - (h_min / step)
+                                };
+                                off.floor().clamp(0.0, (n_bins - 1) as f64) as usize
+                            } else {
+                                0
+                            };
+                            counts[bin] += 1;
+                        }
+                    }
+                    let edges: Vec<f64> = (0..=n_bins)
+                        .map(|i| {
+                            if i == 0 {
+                                h_min
+                            } else if i == n_bins {
+                                h_max
+                            } else if raw_span.is_finite() {
+                                h_min + step * (i as f64)
+                            } else {
+                                let t = (i as f64) / (n_bins as f64);
+                                h_min * (1.0 - t) + h_max * t
+                            }
+                        })
+                        .collect();
+                    (counts, edges)
+                };
+                let std = (var_sum / n_f).sqrt() * var_scale;
 
                 let med_idx = valid_px / 2;
                 let median = vals[med_idx];
@@ -3230,140 +3541,44 @@ pub fn encode_geotiff_rgba(
     } else {
         3
     };
-    let pixel_bytes = n_px * (spp as usize);
-    let n_entries: u16 = if return_mask { 14 } else { 13 };
-
-    // Layout:
-    // 0..8                     : TIFF header ("II", 42, ifd_offset=8)
-    // 8..8+2+12*n_entries+4    : IFD
-    // out_off..                : BitsPerSample (spp*2 if spp>2), ModelPixelScale (24), ModelTiepoint (48), GeoKeyDir (32)
-    // pixel_off..              : Raw strip pixel data
-    let ifd_size = 2 + 12 * (n_entries as usize) + 4;
-    let bps_bytes: u32 = if spp > 2 { (spp as u32) * 2 } else { 0 };
-    let bps_off = (8 + ifd_size) as u32;
-    let scale_off = bps_off + bps_bytes;
-    let tie_off = scale_off + 24;
-    let gkd_off = tie_off + 48;
-    let pixel_off = gkd_off + 32;
-
-    let mut buf = BytesMut::with_capacity((pixel_off as usize) + pixel_bytes);
-    // TIFF little-endian header
-    buf.put_slice(b"II");
-    buf.put_u16_le(42);
-    buf.put_u32_le(8);
-
-    // IFD entry count
-    buf.put_u16_le(n_entries);
-    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
-        buf.put_u16_le(tag);
-        buf.put_u16_le(ty);
-        buf.put_u32_le(count);
-        buf.put_u32_le(val);
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: spp,
+        sample: GeoTiffSample::U8,
+        // 8-bit unsigned is the TIFF default, and GDAL's own byte GeoTIFFs carry no SampleFormat.
+        sample_format_tag: false,
+        layout: GeoTiffLayout::Chunky,
+        photometric: if is_gray { GeoTiffPhotometric::MinIsBlack } else { GeoTiffPhotometric::Rgb },
+        extra_samples: if return_mask { &[2] } else { &[] }, // UnassociatedAlpha
+        nodata: None,
+        bbox,
+        epsg,
     };
-    const SHORT: u16 = 3;
-    const LONG: u16 = 4;
-    const DOUBLE: u16 = 12;
-
-    put_entry(256, LONG, 1, width);
-    put_entry(257, LONG, 1, height);
-    match spp {
-        1 => put_entry(258, SHORT, 1, 8),
-        2 => put_entry(258, SHORT, 2, 8 | (8 << 16)),
-        _ => put_entry(258, SHORT, spp as u32, bps_off),
-    }
-    put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, if is_gray { 1 } else { 2 }); // Photometric = MinIsBlack (1) or RGB (2)
-    put_entry(273, LONG, 1, pixel_off); // StripOffsets
-    put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
-    put_entry(278, LONG, 1, height); // RowsPerStrip
-    put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
-    put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
-    if return_mask {
-        put_entry(338, SHORT, 1, 2); // ExtraSamples = UnassociatedAlpha
-    }
-    put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
-    put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
-    put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
-    buf.put_u32_le(0); // Next IFD = 0
-
-    // BitsPerSample (only out-of-line when spp > 2)
-    if spp > 2 {
-        for _ in 0..spp {
-            buf.put_u16_le(8);
-        }
-    }
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
-    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
-    let span_x = if is_geographic && bbox[2] < bbox[0] {
-        (bbox[2] + 360.0) - bbox[0]
-    } else {
-        (bbox[2] - bbox[0]).abs()
-    };
-    let dx = (span_x / (width.max(1) as f64)).max(1e-12);
-    let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
-    buf.put_f64_le(dx);
-    buf.put_f64_le(dy);
-    buf.put_f64_le(0.0);
-    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(bbox[0]);
-    buf.put_f64_le(bbox[3]);
-    buf.put_f64_le(0.0);
-    // GeoKeyDirectoryTag (16 u16s = 32 bytes)
-    let (model_type, crs_key): (u16, u16) = if is_geographic {
-        (2, 2048) // ModelTypeGeographic, GeographicTypeGeoKey
-    } else {
-        (1, 3072) // ModelTypeProjected, ProjectedCSTypeGeoKey
-    };
-    let gkd: [u16; 16] = [
-        1, 1, 0, 3, // version 1.1.0, 3 keys
-        1024, 0, 1, model_type, // GTModelTypeGeoKey
-        1025, 0, 1, 1, // GTRasterTypeGeoKey = PixelIsArea
-        crs_key, 0, 1, epsg, // EPSG code
-    ];
-    for &k in &gkd {
-        buf.put_u16_le(k);
-    }
-
-    // Pixel data
-    if is_gray {
-        if return_mask {
-            for px in rgba.chunks_exact(4).take(n_px) {
-                buf.put_u8(px[0]);
-                buf.put_u8(px[3]);
+    // A short `rgba` leaves the rest of the strip zero-filled by the writer.
+    write_geotiff(&spec, |buf| {
+        if is_gray {
+            if return_mask {
+                for px in rgba.chunks_exact(4).take(n_px) {
+                    buf.put_u8(px[0]);
+                    buf.put_u8(px[3]);
+                }
+            } else {
+                for px in rgba.chunks_exact(4).take(n_px) {
+                    buf.put_u8(px[0]);
+                }
             }
+        } else if return_mask {
+            let take = (n_px * 4).min(rgba.len());
+            buf.put_slice(&rgba[..take]);
         } else {
             for px in rgba.chunks_exact(4).take(n_px) {
                 buf.put_u8(px[0]);
+                buf.put_u8(px[1]);
+                buf.put_u8(px[2]);
             }
         }
-        let target_len = (pixel_off as usize) + pixel_bytes;
-        if buf.len() < target_len {
-            buf.resize(target_len, 0);
-        }
-    } else if return_mask {
-        let take = pixel_bytes.min(rgba.len());
-        buf.put_slice(&rgba[..take]);
-        if take < pixel_bytes {
-            buf.resize((pixel_off as usize) + pixel_bytes, 0);
-        }
-    } else {
-        for px in rgba.chunks_exact(4).take(n_px) {
-            buf.put_u8(px[0]);
-            buf.put_u8(px[1]);
-            buf.put_u8(px[2]);
-        }
-        let target_len = (pixel_off as usize) + pixel_bytes;
-        if buf.len() < target_len {
-            buf.resize(target_len, 0);
-        }
-    }
-    buf.freeze()
+    })
 }
 
 /// Encode a CHW `f32` little-endian buffer as a spec-compliant uncompressed Classic IEEE Float32
@@ -3388,11 +3603,12 @@ pub fn encode_geotiff_f32(
     };
     let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
     let pixel_bytes = n_px * (spp as usize) * 4;
-    let photometric: u32 = if data_spp == 3 { 2 } else { 1 }; // RGB when data has 3 bands, MinIsBlack otherwise
-    let extra_samples_count: u16 = if photometric == 2 {
-        spp.saturating_sub(3)
-    } else {
-        spp.saturating_sub(1)
+    // RGB when data has 3 bands, MinIsBlack otherwise
+    let photometric =
+        if data_spp == 3 { GeoTiffPhotometric::Rgb } else { GeoTiffPhotometric::MinIsBlack };
+    let extra_samples_count: u16 = match photometric {
+        GeoTiffPhotometric::Rgb => spp.saturating_sub(3),
+        GeoTiffPhotometric::MinIsBlack => spp.saturating_sub(1),
     };
     let mut extra_samples = Vec::with_capacity(extra_samples_count as usize);
     for idx in 0..extra_samples_count {
@@ -3400,174 +3616,59 @@ pub fn encode_geotiff_f32(
         // 2 = UnassociatedAlpha for the appended validity mask, 0 = Unspecified for extra data bands.
         extra_samples.push(if is_mask { 2u16 } else { 0u16 });
     }
-    let n_entries: u16 = if extra_samples_count > 0 { 16 } else { 15 };
-
-    let ifd_size = 2 + 12 * (n_entries as usize) + 4;
-    let mut extra_off = (8 + ifd_size) as u32;
-    let bps_val = if spp == 1 {
-        32u32
-    } else if spp == 2 {
-        32u32 | (32u32 << 16)
-    } else {
-        let off = extra_off;
-        extra_off += (spp as u32) * 2;
-        off
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: spp,
+        sample: GeoTiffSample::F32,
+        sample_format_tag: true,
+        layout: GeoTiffLayout::Chunky,
+        photometric,
+        extra_samples: &extra_samples,
+        nodata: Some("nan"),
+        bbox,
+        epsg,
     };
-    let extra_samples_val = match extra_samples_count {
-        0 => 0u32,
-        1 => extra_samples[0] as u32,
-        2 => (extra_samples[0] as u32) | ((extra_samples[1] as u32) << 16),
-        _ => {
-            let off = extra_off;
-            extra_off += (extra_samples_count as u32) * 2;
-            off
-        }
-    };
-    let sf_val = if spp == 1 {
-        3u32
-    } else if spp == 2 {
-        3u32 | (3u32 << 16)
-    } else {
-        let off = extra_off;
-        extra_off += (spp as u32) * 2;
-        off
-    };
-    let scale_off = extra_off;
-    let tie_off = scale_off + 24;
-    let gkd_off = tie_off + 48;
-    let pixel_off = gkd_off + 32;
-
-    let mut buf = BytesMut::with_capacity((pixel_off as usize) + pixel_bytes);
-    // TIFF little-endian header
-    buf.put_slice(b"II");
-    buf.put_u16_le(42);
-    buf.put_u32_le(8);
-
-    // IFD entries (must be in strictly ascending tag order)
-    buf.put_u16_le(n_entries);
-    let mut put_entry = |tag: u16, ty: u16, count: u32, val: u32| {
-        buf.put_u16_le(tag);
-        buf.put_u16_le(ty);
-        buf.put_u32_le(count);
-        buf.put_u32_le(val);
-    };
-    const ASCII: u16 = 2;
-    const SHORT: u16 = 3;
-    const LONG: u16 = 4;
-    const DOUBLE: u16 = 12;
-
-    put_entry(256, LONG, 1, width);
-    put_entry(257, LONG, 1, height);
-    put_entry(258, SHORT, spp as u32, bps_val); // BitsPerSample = 32
-    put_entry(259, SHORT, 1, 1); // Compression = None
-    put_entry(262, SHORT, 1, photometric); // Photometric = RGB (2) or MinIsBlack (1)
-    put_entry(273, LONG, 1, pixel_off); // StripOffsets
-    put_entry(277, SHORT, 1, spp as u32); // SamplesPerPixel
-    put_entry(278, LONG, 1, height); // RowsPerStrip
-    put_entry(279, LONG, 1, pixel_bytes as u32); // StripByteCounts
-    put_entry(284, SHORT, 1, 1); // PlanarConfiguration = Chunky
-    if extra_samples_count > 0 {
-        put_entry(338, SHORT, extra_samples_count as u32, extra_samples_val); // ExtraSamples = Unspecified (0)
-    }
-    put_entry(339, SHORT, spp as u32, sf_val); // SampleFormat = IEEEFloat (3)
-    put_entry(33550, DOUBLE, 3, scale_off); // ModelPixelScaleTag
-    put_entry(33922, DOUBLE, 6, tie_off); // ModelTiepointTag
-    put_entry(34735, SHORT, 16, gkd_off); // GeoKeyDirectoryTag
-    put_entry(42113, ASCII, 4, u32::from_le_bytes(*b"nan\0")); // GDAL_NODATA = "nan"
-    buf.put_u32_le(0); // Next IFD = 0
-
-    if spp >= 3 {
-        for _ in 0..spp {
-            buf.put_u16_le(32);
-        }
-    }
-    if extra_samples_count >= 3 {
-        for &es in &extra_samples {
-            buf.put_u16_le(es);
-        }
-    }
-    if spp >= 3 {
-        for _ in 0..spp {
-            buf.put_u16_le(3);
-        }
-    }
-    let is_geographic = matches!(
-        cogzilla_proj::CrsModel::from_epsg(epsg),
-        Ok(cogzilla_proj::CrsModel::Geographic)
-    );
-    // ModelPixelScaleTag: [dx, dy, 0.0] (unwrap antimeridian-crossing geographic bboxes w > e)
-    let span_x = if is_geographic && bbox[2] < bbox[0] {
-        (bbox[2] + 360.0) - bbox[0]
-    } else {
-        (bbox[2] - bbox[0]).abs()
-    };
-    let dx = (span_x / (width.max(1) as f64)).max(1e-12);
-    let dy = ((bbox[3] - bbox[1]).abs() / (height.max(1) as f64)).max(1e-12);
-    buf.put_f64_le(dx);
-    buf.put_f64_le(dy);
-    buf.put_f64_le(0.0);
-    // ModelTiepointTag: [0, 0, 0, minx, maxy, 0]
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(0.0);
-    buf.put_f64_le(bbox[0]);
-    buf.put_f64_le(bbox[3]);
-    buf.put_f64_le(0.0);
-    // GeoKeyDirectoryTag
-    let (model_type, crs_key): (u16, u16) = if is_geographic {
-        (2, 2048)
-    } else {
-        (1, 3072)
-    };
-    let gkd: [u16; 16] = [
-        1, 1, 0, 3,
-        1024, 0, 1, model_type,
-        1025, 0, 1, 1,
-        crs_key, 0, 1, epsg,
-    ];
-    for &k in &gkd {
-        buf.put_u16_le(k);
-    }
-
-    // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
-    if spp == 1 && !return_mask {
-        let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
-        buf.put_slice(&raw_f32_chw[..take]);
-        if take < pixel_bytes {
-            let rem_f32 = (pixel_bytes - take) / 4;
-            for _ in 0..rem_f32 {
-                buf.put_f32_le(f32::NAN);
-            }
-        }
-    } else {
-        let data_spp_us = data_spp as usize;
-        let plane_bytes = n_px * 4;
-        let valid_le = 255.0f32.to_le_bytes();
-        let zero_le = 0.0f32.to_le_bytes();
-        for px in 0..n_px {
-            let px_off = px * 4;
-            let mut any_valid = false;
-            for b in 0..data_spp_us {
-                let off = b * plane_bytes + px_off;
-                if off + 4 <= raw_f32_chw.len() {
-                    let sl = &raw_f32_chw[off..off + 4];
-                    if return_mask
-                        && !any_valid
-                        && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
-                    {
-                        any_valid = true;
-                    }
-                    buf.put_slice(sl);
-                } else {
+    write_geotiff(&spec, |buf| {
+        // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
+        if spp == 1 && !return_mask {
+            let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
+            buf.put_slice(&raw_f32_chw[..take]);
+            if take < pixel_bytes {
+                let rem_f32 = (pixel_bytes - take) / 4;
+                for _ in 0..rem_f32 {
                     buf.put_f32_le(f32::NAN);
                 }
             }
-            if return_mask {
-                buf.put_slice(if any_valid { &valid_le } else { &zero_le });
+        } else {
+            let data_spp_us = data_spp as usize;
+            let plane_bytes = n_px * 4;
+            let valid_le = 255.0f32.to_le_bytes();
+            let zero_le = 0.0f32.to_le_bytes();
+            for px in 0..n_px {
+                let px_off = px * 4;
+                let mut any_valid = false;
+                for b in 0..data_spp_us {
+                    let off = b * plane_bytes + px_off;
+                    if off + 4 <= raw_f32_chw.len() {
+                        let sl = &raw_f32_chw[off..off + 4];
+                        if return_mask
+                            && !any_valid
+                            && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
+                        {
+                            any_valid = true;
+                        }
+                        buf.put_slice(sl);
+                    } else {
+                        buf.put_f32_le(f32::NAN);
+                    }
+                }
+                if return_mask {
+                    buf.put_slice(if any_valid { &valid_le } else { &zero_le });
+                }
             }
         }
-    }
-    buf.freeze()
+    })
 }
 
 /// Project a WGS84 polygon bbox into an IFD's pixel space and return `(win_w, win_h, intersects)`.
@@ -3577,9 +3678,107 @@ pub fn encode_geotiff_f32(
 pub fn native_bbox_dims_in_crs(
     ifd: &cogzilla_tiff::IfdMeta,
     src_crs: &cogzilla_proj::CrsModel,
+    dst_crs: &cogzilla_proj::CrsModel,
     wgs_bbox: [f64; 4],
     dst_bbox: [f64; 4],
 ) -> (u32, u32) {
+    // Scale `(w_f, h_f)` proportionally into `[1, 4096]` without squashing aspect ratio on
+    // large non-square rasters (e.g. a 21600x10800 global COG must stay 2:1, not 4096x4096).
+    let scale_dims_to_cap = |w_f: f64, h_f: f64| -> (u32, u32) {
+        let max_d = w_f.max(h_f);
+        if max_d > 4096.0 && max_d.is_finite() {
+            let s = 4096.0 / max_d;
+            (
+                (w_f * s).round().clamp(1.0, 4096.0) as u32,
+                (h_f * s).round().clamp(1.0, 4096.0) as u32,
+            )
+        } else {
+            (
+                w_f.round().clamp(1.0, 4096.0) as u32,
+                h_f.round().clamp(1.0, 4096.0) as u32,
+            )
+        }
+    };
+
+    let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
+        (dst_bbox[2] + 360.0) - dst_bbox[0]
+    } else {
+        (dst_bbox[2] - dst_bbox[0]).abs()
+    };
+    let dy = (dst_bbox[3] - dst_bbox[1]).abs();
+
+    // Primary path: match GDAL `GDALSuggestedWarpOutput2` / `rasterio.warp.calculate_default_transform`
+    // (diagonal distance in `dst_crs` divided by pixel diagonal `hypot(src_w, src_h)`), or native
+    // per-axis pixel resolution when `src_crs` and `dst_crs` coincide.
+    if dx > 1e-12 && dy > 1e-12 && ifd.width > 0 && ifd.height > 0 && ifd.gcp_poly.is_none() {
+        let (sx0, sy0) = ifd.pixel_to_crs.forward(0.0, 0.0);
+        let (sx1, sy1) = ifd.pixel_to_crs.forward(ifd.width as f64, ifd.height as f64);
+        let both_geographic = matches!(
+            (src_crs, dst_crs),
+            (
+                cogzilla_proj::CrsModel::Geographic,
+                cogzilla_proj::CrsModel::Geographic
+            )
+        );
+        if both_geographic {
+            let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+            let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+            if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
+                return scale_dims_to_cap(dx / w_res, dy / h_res);
+            }
+        }
+        let (lon0, mut lat0) = src_crs.to_lonlat_deg(sx0, sy0);
+        let (lon1, mut lat1) = src_crs.to_lonlat_deg(sx1, sy1);
+        let mut eff_h = ifd.height as f64;
+        if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
+            && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
+            && (lat0.abs() > 85.06 || lat1.abs() > 85.06)
+        {
+            let orig_span = (lat1 - lat0).abs().max(1e-9);
+            lat0 = lat0.clamp(-85.06, 85.06);
+            lat1 = lat1.clamp(-85.06, 85.06);
+            eff_h = (eff_h * ((lat1 - lat0).abs() / orig_span)).max(1.0);
+        }
+        let (dx0, dy0) = dst_crs.from_lonlat_deg(lon0, lat0);
+        let (dx1, dy1) = dst_crs.from_lonlat_deg(lon1, lat1);
+        if dx0.is_finite() && dy0.is_finite() && dx1.is_finite() && dy1.is_finite() {
+            let src_diag_crs = (sx1 - sx0).hypot(sy1 - sy0);
+            let same_crs = src_diag_crs > 0.0
+                && (dx0 - sx0).hypot(dy0 - sy0) <= 1e-4 * src_diag_crs
+                && (dx1 - sx1).hypot(dy1 - sy1) <= 1e-4 * src_diag_crs;
+            if same_crs {
+                let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+                let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+                if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
+                    return scale_dims_to_cap(dx / w_res, dy / h_res);
+                }
+            }
+            let mut ddx = if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
+                && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
+            {
+                // Preserve full unwrapped span for 0..360° global geographic rasters -> 3857.
+                (sx1 - sx0) * (20_037_508.342_789_244 / 180.0)
+            } else {
+                dx1 - dx0
+            };
+            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && ddx.abs() > 180.0 {
+                let (lon_mid, _) = src_crs.to_lonlat_deg(0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1));
+                // Wrap only when the midpoint lies on the opposite hemisphere from the arithmetic
+                // mean of endpoints (antimeridian-crossing scene), NOT on wide/global scenes
+                // centered near 0° longitude.
+                if (lon_mid - 0.5 * (lon0 + lon1)).abs() > 90.0 {
+                    ddx = if ddx > 0.0 { ddx - 360.0 } else { ddx + 360.0 };
+                }
+            }
+            let ddy = dy1 - dy0;
+            let px_diag = (ifd.width as f64).hypot(eff_h);
+            let res = ddx.hypot(ddy) / px_diag;
+            if res.is_finite() && res > 0.0 {
+                return scale_dims_to_cap(dx / res, dy / res);
+            }
+        }
+    }
+
     let [w, s, mut e, n] = wgs_bbox;
     if e < w {
         e += 360.0;
@@ -3626,30 +3825,19 @@ pub fn native_bbox_dims_in_crs(
     }
     let nat_w = (cmax - cmin).abs();
     let nat_h = (rmax - rmin).abs();
-    let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
-        (dst_bbox[2] + 360.0) - dst_bbox[0]
-    } else {
-        (dst_bbox[2] - dst_bbox[0]).abs()
-    };
-    let dy = (dst_bbox[3] - dst_bbox[1]).abs();
     if dx <= 1e-12 || dy <= 1e-12 || nat_w <= 1e-6 || nat_h <= 1e-6 {
         return (
             nat_w.round().clamp(1.0, 4096.0) as u32,
             nat_h.round().clamp(1.0, 4096.0) as u32,
         );
     }
-    // Equal-pixel-density isotropic resolution in dst_crs matching GDAL WarpedVRT:
+    // Equal-pixel-density isotropic resolution in dst_crs fallback:
     let area_px = (nat_w * nat_h).max(1.0);
     let res = ((dx * dy) / area_px).sqrt();
     if !res.is_finite() || res <= 0.0 {
-        return (
-            nat_w.round().clamp(1.0, 4096.0) as u32,
-            nat_h.round().clamp(1.0, 4096.0) as u32,
-        );
+        return scale_dims_to_cap(nat_w, nat_h);
     }
-    let ow = (dx / res).round().clamp(1.0, 4096.0) as u32;
-    let oh = (dy / res).round().clamp(1.0, 4096.0) as u32;
-    (ow, oh)
+    scale_dims_to_cap(dx / res, dy / res)
 }
 
 fn polygon_window_dims(
@@ -3805,7 +3993,13 @@ pub async fn compute_statistics_with_options(
                 eff_bbox[3] = cy + 0.5 * dlat;
             }
         }
-        let (nat_w, nat_h) = native_bbox_dims_in_crs(full, &crs, eff_bbox, eff_bbox);
+        let (nat_w, nat_h) = native_bbox_dims_in_crs(
+            full,
+            &crs,
+            &cogzilla_proj::CrsModel::Geographic,
+            eff_bbox,
+            eff_bbox,
+        );
         let (out_w, out_h) = match (opts.width, opts.height) {
             (Some(w), Some(h)) => (w.clamp(1, 4096), h.clamp(1, 4096)),
             (Some(w), None) => {
@@ -5411,10 +5605,303 @@ pub(crate) fn encode_rgba_output(
             }
         }
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
-        OutputFormat::RawF32 | OutputFormat::Npy | OutputFormat::RawRgba => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 | OutputFormat::RawRgba => {
             Bytes::copy_from_slice(rgba)
         }
     }
+}
+
+/// Full-precision `f64` data-array renderer for wide TIFF sample types (`Uint32`, `Int32`,
+/// `Uint64`, `Int64`, `Float64`) on unstyled `.npy` and `.tif` routes (`/cog/preview`,
+/// `/cog/bbox`, `/cog/feature`, `/cog/tiles`), bypassing `f32` quantization while leaving the
+/// hot 8-bit/f32 render path untouched.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_exact_f64_array(
+    engine: &TileEngine,
+    cog: &OpenedCog,
+    mut bbox: [f64; 4],
+    dst_crs: &cogzilla_proj::CrsModel,
+    native_preview: bool,
+    width: u32,
+    height: u32,
+    poly_mask: Option<&PolygonMask>,
+    bands_1based: &[u16],
+    resample: ResampleMode,
+    nodata_override: Option<f32>,
+    unscale: bool,
+    out_kind: cogzilla_tiff::SampleType,
+    return_mask: bool,
+    as_raw_f64: bool,
+    allow_empty: bool,
+) -> Result<Bytes, EngineError> {
+    if !native_preview {
+        if !bbox.iter().all(|v| v.is_finite()) || bbox[1] >= bbox[3] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+        if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+            bbox[2] += 360.0;
+        }
+        if bbox[0] >= bbox[2] {
+            return Err(EngineError::BadRequest(format!(
+                "invalid bbox: [{}, {}, {}, {}]",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+    }
+    let w = width.clamp(1, 4096) as usize;
+    let h = height.clamp(1, 4096) as usize;
+    let crs = if native_preview && !cog.index.is_georeferenced {
+        cogzilla_proj::CrsModel::Geographic
+    } else {
+        engine.get_or_build_crs(cog)?
+    };
+    let dlx = (bbox[2] - bbox[0]) / (w as f64);
+    let dly = (bbox[3] - bbox[1]) / (h as f64);
+    let ifd_idx = if native_preview {
+        let full = cog.index.full_res();
+        let rx0 = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d);
+        let ry0 = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e);
+        cog.index
+            .select_ifd(rx0 * (full.width as f64) / (w as f64), ry0 * (full.height as f64) / (h as f64))
+    } else {
+        let cx = 0.5 * (bbox[0] + bbox[2]);
+        let cy = 0.5 * (bbox[1] + bbox[3]);
+        let to_src = |x: f64, y: f64| -> (f64, f64) {
+            match dst_crs {
+                cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
+                cogzilla_proj::CrsModel::Geographic => {
+                    let lon = if x > 180.0 { x - 360.0 } else { x };
+                    crs.from_lonlat_deg(lon, y)
+                }
+                other => {
+                    let (lon, lat) = other.to_lonlat_deg(x, y);
+                    if lon.is_finite() && lat.is_finite() {
+                        crs.from_lonlat_deg(lon, lat)
+                    } else {
+                        (f64::NAN, f64::NAN)
+                    }
+                }
+            }
+        };
+        let (s0x, s0y) = to_src(cx, cy);
+        let (s1x, s1y) = to_src(cx + dlx, cy);
+        let (s2x, s2y) = to_src(cx, cy + dly);
+        let rx = (s1x - s0x).hypot(s1y - s0y);
+        let ry = (s2x - s0x).hypot(s2y - s0y);
+        if rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0 {
+            cog.index.select_ifd(rx, ry)
+        } else {
+            0
+        }
+    };
+    let ifd = &cog.index.ifds[ifd_idx];
+    let n_bands = bands_1based.len();
+    for &b in bands_1based {
+        if b == 0 || b > ifd.samples_per_pixel {
+            return Err(EngineError::BadRequest(format!(
+                "bidx {b} out of range (dataset has {} bands)",
+                ifd.samples_per_pixel
+            )));
+        }
+    }
+
+    let mut us = vec![f64::NAN; w * h];
+    let mut vs = vec![f64::NAN; w * h];
+    let mut min_u = f64::INFINITY;
+    let mut max_u = f64::NEG_INFINITY;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+
+    if native_preview {
+        let sx = (ifd.width as f64) / (w as f64);
+        let sy = (ifd.height as f64) / (h as f64);
+        for py in 0..h {
+            let v = (py as f64 + 0.5) * sy - 0.5;
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+            for px in 0..w {
+                let u = (px as f64 + 0.5) * sx - 0.5;
+                min_u = min_u.min(u);
+                max_u = max_u.max(u);
+                us[py * w + px] = u;
+                vs[py * w + px] = v;
+            }
+        }
+    } else {
+        if let Some(pm) = poly_mask {
+            pm.check_work_budget(w * h)?;
+        }
+        let touched_mask: Option<Vec<bool>> =
+            poly_mask.map(|pm| pm.rasterize_all_touched(w, h, bbox, dst_crs));
+        let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let wrap_hi = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width);
+        for py in 0..h {
+            let y = bbox[3] - (py as f64 + 0.5) * dly;
+            for px in 0..w {
+                if let Some(ref mask) = touched_mask
+                    && !mask[py * w + px]
+                {
+                    continue;
+                }
+                let x = bbox[0] + (px as f64 + 0.5) * dlx;
+                let (sx, sy) = match dst_crs {
+                    cogzilla_proj::CrsModel::Epsg3857 => {
+                        if wrap_lo.is_some() || wrap_hi.is_some() {
+                            let (mut lon, lat) = cogzilla_proj::mercator_to_lonlat_deg(x, y);
+                            if let Some(lo) = wrap_lo && lon < lo {
+                                lon += 360.0;
+                            } else if let Some(hi) = wrap_hi && lon > hi {
+                                lon -= 360.0;
+                            }
+                            crs.from_lonlat_deg(lon, lat)
+                        } else {
+                            crs.from_3857(x, y)
+                        }
+                    }
+                    cogzilla_proj::CrsModel::Geographic => {
+                        let mut lon = if x > 180.0 { x - 360.0 } else { x };
+                        if let Some(lo) = wrap_lo && lon < lo {
+                            lon += 360.0;
+                        } else if let Some(hi) = wrap_hi && lon > hi {
+                            lon -= 360.0;
+                        }
+                        crs.from_lonlat_deg(lon, y)
+                    }
+                    other => {
+                        let (mut lon, lat) = other.to_lonlat_deg(x, y);
+                        if !lon.is_finite() || !lat.is_finite() {
+                            continue;
+                        }
+                        if let Some(lo) = wrap_lo && lon < lo {
+                            lon += 360.0;
+                        } else if let Some(hi) = wrap_hi && lon > hi {
+                            lon -= 360.0;
+                        }
+                        crs.from_lonlat_deg(lon, lat)
+                    }
+                };
+                if !sx.is_finite() || !sy.is_finite() {
+                    continue;
+                }
+                let (col, row) = ifd.crs_to_pixel_pt(sx, sy);
+                let u = col - 0.5;
+                let v = row - 0.5;
+                if u.is_finite() && v.is_finite() {
+                    us[py * w + px] = u;
+                    vs[py * w + px] = v;
+                    if u >= -1.0 && v >= -1.0 && u <= ifd.width as f64 && v <= ifd.height as f64 {
+                        min_u = min_u.min(u);
+                        max_u = max_u.max(u);
+                        min_v = min_v.min(v);
+                        max_v = max_v.max(v);
+                    }
+                }
+            }
+        }
+    }
+
+    let pixels = w * h;
+    if !native_preview && !allow_empty && (!min_u.is_finite() || !min_v.is_finite()) {
+        let full = cog.index.full_res();
+        if !crate::http::tile_box_intersects_cog(&crs, full, dst_crs, bbox) {
+            return Err(EngineError::NotFound(format!(
+                "bbox [{}, {}, {}, {}] is outside dataset bounds",
+                bbox[0], bbox[1], bbox[2], bbox[3]
+            )));
+        }
+    }
+    let mut out_f64 = vec![f64::NAN; n_bands * pixels];
+    if min_u.is_finite() && min_v.is_finite() {
+        let c0 = (min_u.floor() as i32 - 1).clamp(0, ifd.width as i32 - 1) as u32;
+        let c1 = (max_u.ceil() as i32 + 1).clamp(0, ifd.width as i32 - 1) as u32;
+        let r0 = (min_v.floor() as i32 - 1).clamp(0, ifd.height as i32 - 1) as u32;
+        let r1 = (max_v.ceil() as i32 + 1).clamp(0, ifd.height as i32 - 1) as u32;
+        let tx0 = c0 / ifd.tile_width;
+        let tx1 = c1 / ifd.tile_width;
+        let ty0 = r0 / ifd.tile_height;
+        let ty1 = r1 / ifd.tile_height;
+        let gw = tx1 - tx0 + 1;
+        let gh = ty1 - ty0 + 1;
+
+        match ifd.planar_config {
+            PlanarConfig::Chunky => {
+                let mut indices = Vec::with_capacity((gw * gh) as usize);
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        indices.push(Some(ifd.tile_index(tx, ty, 0) as u32));
+                    }
+                }
+                let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+                for (bi, &b1) in bands_1based.iter().enumerate() {
+                    let b0 = (b1 - 1) as usize;
+                    let band_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                        .iter()
+                        .map(|t| t.as_ref().and_then(|dt| dt.bands.get(b0)))
+                        .collect();
+                    let mut src = cogzilla_kernel::BandSource::new(
+                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height,
+                        tx0, ty0, gw, gh, &band_refs,
+                    )
+                    .with_nodata_override(nodata_override);
+                    if unscale {
+                        let sc = cog.index.scales.get(b0).copied().unwrap_or(1.0);
+                        let off = cog.index.offsets.get(b0).copied().unwrap_or(0.0);
+                        src = src.with_scale_offset(sc, off);
+                    }
+                    let dst = &mut out_f64[bi * pixels..(bi + 1) * pixels];
+                    for i in 0..pixels {
+                        dst[i] = cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample);
+                    }
+                }
+            }
+            PlanarConfig::Planar => {
+                for (bi, &b1) in bands_1based.iter().enumerate() {
+                    let b0 = (b1 - 1) as usize;
+                    let mut indices = Vec::with_capacity((gw * gh) as usize);
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            indices.push(Some(ifd.tile_index(tx, ty, b0 as u16) as u32));
+                        }
+                    }
+                    let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+                    let band_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                        .iter()
+                        .map(|t| t.as_ref().and_then(|dt| dt.bands.first()))
+                        .collect();
+                    let mut src = cogzilla_kernel::BandSource::new(
+                        ifd.width, ifd.height, ifd.tile_width, ifd.tile_height,
+                        tx0, ty0, gw, gh, &band_refs,
+                    )
+                    .with_nodata_override(nodata_override);
+                    if unscale {
+                        let sc = cog.index.scales.get(b0).copied().unwrap_or(1.0);
+                        let off = cog.index.offsets.get(b0).copied().unwrap_or(0.0);
+                        src = src.with_scale_offset(sc, off);
+                    }
+                    let dst = &mut out_f64[bi * pixels..(bi + 1) * pixels];
+                    for i in 0..pixels {
+                        dst[i] = cogzilla_kernel::sample_f64_general(&src, us[i], vs[i], resample);
+                    }
+                }
+            }
+        }
+    }
+
+    let bytes = if as_raw_f64 {
+        let mut raw = Vec::with_capacity(out_f64.len() * 8);
+        for &v in &out_f64 {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        Bytes::from(raw)
+    } else {
+        cogzilla_kernel::encode_npy_typed_f64(
+            &out_f64, n_bands, h, w, out_kind, None, return_mask,
+        )
+    };
+    Ok(bytes)
 }
 
 /// Native pixel-space preview renderer backing `/cog/preview*` and `/stac/preview*`,
@@ -5812,6 +6299,54 @@ pub async fn render_wgs84_bbox_stats(
     }
 }
 
+/// Three bands of band math painted as RGB: each channel's program evaluated a run of pixels
+/// at a time on the row VM (which works each value as the one-pixel VM does), each sampled at
+/// `(u_map, v_map)`, and rescaled by `rescale_min` and `inv`; a pixel with no place or a
+/// channel without a value is left as it is. Kept out of line, away from the other renders.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn paint_rgb_band_math(
+    progs: &[cogzilla_kernel::ExprProgram; 3],
+    all_srcs: &[Vec<BandSource<'_>>],
+    sample: &impl Fn(&BandSource<'_>, f32, f32) -> f32,
+    u_map: &[f32],
+    v_map: &[f32],
+    rescale_min: [f32; 3],
+    inv: [f32; 3],
+    rgba: &mut [u8],
+) {
+    const RUN: usize = 64;
+    let npix = u_map.len();
+    let mut rows = vec![[0.0f32; RUN]; 16];
+    let mut scratch: Vec<[f32; RUN]> = Vec::new();
+    let mut rgb = [[0.0f32; RUN]; 3];
+    for start in (0..npix).step_by(RUN) {
+        let n = RUN.min(npix - start);
+        for c in 0..3 {
+            let srcs = &all_srcs[c];
+            let nb = srcs.len().min(16);
+            for t in 0..n {
+                let (u, v) = (u_map[start + t], v_map[start + t]);
+                for k in 0..nb {
+                    rows[k][t] = if u.is_nan() { f32::NAN } else { sample(&srcs[k], u, v) };
+                }
+            }
+            progs[c].eval_row_with_scratch::<RUN>(&rows[..nb], &mut scratch, &mut rgb[c]);
+        }
+        for t in 0..n {
+            let i = start + t;
+            let px = [rgb[0][t], rgb[1][t], rgb[2][t]];
+            if u_map[i].is_nan() || px.iter().any(|v| v.is_nan()) {
+                continue;
+            }
+            for c in 0..3 {
+                rgba[i * 4 + c] = ((px[c] - rescale_min[c]) * inv[c]).clamp(0.0, 255.0) as u8;
+            }
+            rgba[i * 4 + 3] = 255;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_bbox_impl(
     engine: &TileEngine,
@@ -5904,12 +6439,53 @@ async fn render_bbox_core(
         }
     }
     if let BandRequest::MultiBand { bands_1based } = bands
-        && !matches!(format, OutputFormat::RawF32 | OutputFormat::Npy)
+        && !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64)
     {
         return Err(EngineError::BadRequest(format!(
             "unsupported bidx count {} for visual image output (expected 1 or 3 bands; use .tif, .npy, or .f32)",
             bands_1based.len()
         )));
+    }
+    // Exact f64 data path for wide sample types (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`)
+    // on unstyled `.npy` / `.tif` requests: bypasses `f32` quantization while leaving the hot
+    // 8-bit / f32 render path completely untouched.
+    if cogs.len() == 1
+        && !unscale
+        && color_formula.is_none()
+        && custom_lut.is_none()
+        && matches!(resample, ResampleMode::Nearest | ResampleMode::Bilinear)
+        && cogs[0].index.full_res().sample_type.needs_f64()
+        && matches!(format, OutputFormat::RawF64 | OutputFormat::NpyF64)
+    {
+        let bands_1based: Option<Vec<u16>> = match bands {
+            BandRequest::Single { band_1based, .. } => Some(vec![*band_1based]),
+            BandRequest::Rgb { bands_1based, .. } => Some(bands_1based.to_vec()),
+            BandRequest::MultiBand { bands_1based } => Some(bands_1based.clone()),
+            _ => None,
+        };
+        if let Some(b1) = bands_1based {
+            let kind = cogs[0].index.full_res().sample_type;
+            return render_exact_f64_array(
+                engine,
+                &cogs[0],
+                bbox,
+                dst_crs,
+                native_preview,
+                width,
+                height,
+                poly_mask,
+                &b1,
+                resample,
+                nodata_override,
+                unscale,
+                kind,
+                return_mask,
+                matches!(format, OutputFormat::RawF64),
+                false,
+            )
+            .await
+            .map(BboxRenderOutput::Bytes);
+        }
     }
     let w = width.clamp(1, 4096) as usize;
     let h = height.clamp(1, 4096) as usize;
@@ -6329,6 +6905,7 @@ async fn render_bbox_core(
         let crs = crs.clone();
         let dst_crs = dst_crs.clone();
         let wrap_lo = crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+        let wrap_hi = crs.geographic_neg_180_max_lon(&ifd.pixel_to_crs, ifd.width);
         let crs_to_pixel = ifd.crs_to_pixel;
         let gcp_poly = ifd.gcp_poly.clone();
         let ifd_width = ifd.width;
@@ -6349,7 +6926,13 @@ async fn render_bbox_core(
                 let (mut sx, sy) = match &dst_crs {
                     cogzilla_proj::CrsModel::Epsg3857 => crs.from_3857(x, y),
                     cogzilla_proj::CrsModel::Geographic => {
-                        let lon = if x > 180.0 { x - 360.0 } else { x };
+                        let lon = if x > 180.0 {
+                            x - 360.0
+                        } else if x < -180.0 {
+                            x + 360.0
+                        } else {
+                            x
+                        };
                         crs.from_lonlat_deg(lon, y)
                     }
                     other => {
@@ -6361,11 +6944,16 @@ async fn render_bbox_core(
                         }
                     }
                 };
-                if let Some(lo) = wrap_lo
-                    && sx.is_finite()
-                    && sx < lo
-                {
-                    sx += 360.0;
+                if sx.is_finite() {
+                    if let Some(lo) = wrap_lo
+                        && sx < lo
+                    {
+                        sx += 360.0;
+                    } else if let Some(hi) = wrap_hi
+                        && sx > hi
+                    {
+                        sx -= 360.0;
+                    }
                 }
                 (sx, sy)
             };
@@ -6656,15 +7244,23 @@ async fn render_bbox_core(
     }
     };
 
-    // Empty check: zero source pixels mapped into the requested tile/bbox/feature.
-    if !min_u.is_finite() {
+    // Empty check: zero source pixel centers mapped into the requested tile/bbox/feature.
+    // Only return 404 when the requested bbox genuinely does not intersect the dataset footprint;
+    // coarse grids over wide/dateline-spanning polygons whose pixel centers miss narrow edge
+    // overlaps still overlap the dataset and should render an empty (all-nodata) 200 image.
+    let empty_but_overlapping = if !min_u.is_finite() {
         let full = primary.index.full_res();
-        let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
-        return Err(EngineError::NotFound(format!(
-            "request is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
-            rb[0], rb[1], rb[2], rb[3]
-        )));
-    }
+        if !crate::http::tile_box_intersects_cog(&crs, full, dst_crs, bbox) {
+            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            return Err(EngineError::NotFound(format!(
+                "request is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
+                rb[0], rb[1], rb[2], rb[3]
+            )));
+        }
+        true
+    } else {
+        false
+    };
 
     let (footprint_sx, footprint_sy) = if native_preview {
         (
@@ -6701,7 +7297,9 @@ async fn render_bbox_core(
     let max_c = (ifd.width as i32 - 1).max(0);
     let max_r = (ifd.height as i32 - 1).max(0);
     let is_dem = matches!(bands, BandRequest::Dem { .. });
-    let (c0, c1, r0, r1) = if is_dem {
+    let (c0, c1, r0, r1) = if empty_but_overlapping {
+        (0u32, 0u32, 0u32, 0u32)
+    } else if is_dem {
         let (lo, hi) = crate::engine::resample_fetch_margin(resample, true);
         (
             (min_u.floor() as i32).saturating_sub(lo).clamp(0, max_c) as u32,
@@ -7837,15 +8435,17 @@ async fn render_bbox_core(
             return BboxRenderOutput::Bytes(raw);
         }
 
-        let cf_single_lut: Option<[u8; 256]> = if matches!(
-            bands,
-            BandRequest::Single { .. }
-                | BandRequest::Dem { .. }
-                | BandRequest::CustomExpr { .. }
-                | BandRequest::Spectral1 { .. }
-                | BandRequest::Spectral2 { .. }
-                | BandRequest::Spectral3 { .. }
-        ) {
+        let cf_single_lut: Option<[u8; 256]> = if custom_lut.is_none()
+            && matches!(
+                bands,
+                BandRequest::Single { .. }
+                    | BandRequest::Dem { .. }
+                    | BandRequest::CustomExpr { .. }
+                    | BandRequest::Spectral1 { .. }
+                    | BandRequest::Spectral2 { .. }
+                    | BandRequest::Spectral3 { .. }
+            )
+        {
             color_formula.map(|cf| {
                 let mut t = [0u8; 256];
                 for i in 0..256 {
@@ -8490,35 +9090,7 @@ async fn render_bbox_core(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
-                let mut vals = [0.0f32; 16];
-                for i in 0..(w * h) {
-                    if u_map[i].is_nan() {
-                        continue;
-                    }
-                    let mut rgb = [0.0f32; 3];
-                    let mut ok = true;
-                    for c in 0..3 {
-                        let srcs = &all_srcs[c];
-                        let nb = srcs.len().min(16);
-                        for k in 0..nb {
-                            vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
-                        }
-                        let v = progs[c].eval(&vals[..nb]);
-                        if v.is_nan() {
-                            ok = false;
-                            break;
-                        }
-                        rgb[c] = v;
-                    }
-                    if ok {
-                        rgba[i * 4] = ((rgb[0] - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 1] =
-                            ((rgb[1] - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 2] =
-                            ((rgb[2] - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 3] = 255;
-                    }
-                }
+                paint_rgb_band_math(progs, &all_srcs, &sample, &u_map, &v_map, *rescale_min, inv, &mut rgba);
             }
             BandRequest::Spectral1 {
                 expr,
@@ -9189,15 +9761,17 @@ async fn render_mixed_grid_bbox(
         return Ok(raw);
     }
 
-    let cf_single_lut: Option<[u8; 256]> = if matches!(
-        bands,
-        BandRequest::Single { .. }
-            | BandRequest::Dem { .. }
-            | BandRequest::CustomExpr { .. }
-            | BandRequest::Spectral1 { .. }
-            | BandRequest::Spectral2 { .. }
-            | BandRequest::Spectral3 { .. }
-    ) {
+    let cf_single_lut: Option<[u8; 256]> = if custom_lut.is_none()
+        && matches!(
+            bands,
+            BandRequest::Single { .. }
+                | BandRequest::Dem { .. }
+                | BandRequest::CustomExpr { .. }
+                | BandRequest::Spectral1 { .. }
+                | BandRequest::Spectral2 { .. }
+                | BandRequest::Spectral3 { .. }
+        )
+    {
         color_formula.map(|cf| {
             let mut t = [0u8; 256];
             for i in 0..256 {

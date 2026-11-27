@@ -75,6 +75,20 @@ pub struct RangeResponse {
     pub last_modified: Option<String>,
 }
 
+/// Convert a `reqwest::Error` into `IoError`, surfacing any nested `IoError::Forbidden` thrown
+/// by the redirect-allowlist policy hook as top-level `IoError::Forbidden` so every caller maps
+/// cross-allowlist redirects to `403 Forbidden`.
+pub fn io_error_from_reqwest(e: reqwest::Error) -> IoError {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(s) = src {
+        if let Some(IoError::Forbidden(u)) = s.downcast_ref::<IoError>() {
+            return IoError::Forbidden(u.clone());
+        }
+        src = s.source();
+    }
+    IoError::Http(e.without_url())
+}
+
 #[derive(Clone)]
 pub enum CogSource {
     LocalMmap {
@@ -412,7 +426,7 @@ impl CogSource {
                             if is_retryable_transport_error(&e) {
                                 permit.on_throttle();
                             }
-                            return Err(IoError::Http(e.without_url()));
+                            return Err(io_error_from_reqwest(e));
                         }
                     };
                     let status = resp.status().as_u16();
@@ -459,6 +473,11 @@ impl CogSource {
                     {
                         // Server ignored Range header and sent full object:
                         // returning those bytes would silently corrupt tile/IFD data or OOM.
+                        return Err(IoError::RangeNotSupported {
+                            url: redact_http_url(url),
+                        });
+                    }
+                    if status == 206 && !validate_content_range_start(&resp, start) {
                         return Err(IoError::RangeNotSupported {
                             url: redact_http_url(url),
                         });
@@ -573,7 +592,7 @@ impl CogSource {
             client,
             metrics,
             limiter,
-            ..
+            max_retries,
         } = self
         else {
             return Ok(false);
@@ -581,50 +600,84 @@ impl CogSource {
         if validator.etag.is_none() && validator.last_modified.is_none() {
             return Ok(false);
         }
-        let permit = limiter.acquire().await;
-        metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-        let mut req = client.get(url).header("Range", "bytes=0-0");
-        if let Some(ref etag) = validator.etag {
-            req = req.header("If-None-Match", etag);
-        } else if let Some(ref lm) = validator.last_modified {
-            req = req.header("If-Modified-Since", lm);
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => return Err(IoError::Http(e.without_url())),
-        };
-        let status = resp.status().as_u16();
-        if status == 304 {
-            permit.on_success();
-            return Ok(true);
-        }
-        if status == 200 || status == 206 {
-            let resp_etag = resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let resp_lm = resp
-                .headers()
-                .get("last-modified")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            permit.on_success();
-            let unchanged = match (&validator.etag, &resp_etag) {
-                (Some(exp), Some(got)) => exp == got,
-                _ => match (&validator.last_modified, &resp_lm) {
-                    (Some(exp), Some(got)) => exp == got,
-                    _ => false,
-                },
+        let mut attempt = 0u32;
+        loop {
+            let permit = limiter.acquire().await;
+            metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
+            let mut req = client.get(url).header("Range", "bytes=0-0");
+            if let Some(ref etag) = validator.etag {
+                req = req.header("If-None-Match", etag);
+            } else if let Some(ref lm) = validator.last_modified {
+                req = req.header("If-Modified-Since", lm);
+            }
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) if attempt < *max_retries && is_retryable_transport_error(&e) => {
+                    permit.on_throttle();
+                    tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    if is_retryable_transport_error(&e) {
+                        permit.on_throttle();
+                    }
+                    return Err(io_error_from_reqwest(e));
+                }
             };
-            return Ok(unchanged);
+            let status = resp.status().as_u16();
+            if status == 304 {
+                permit.on_success();
+                return Ok(true);
+            }
+            if status == 200 || status == 206 {
+                let resp_etag = resp
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let resp_lm = resp
+                    .headers()
+                    .get("last-modified")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                permit.on_success();
+                let unchanged = match (&validator.etag, &resp_etag) {
+                    (Some(exp), Some(got)) => exp == got,
+                    _ => match (&validator.last_modified, &resp_lm) {
+                        (Some(exp), Some(got)) => exp == got,
+                        _ => false,
+                    },
+                };
+                // Drain the tiny 1-byte body on `206 Partial Content` (for `Range: bytes=0-0`) so
+                // reqwest can return the HTTP/1.1 keep-alive connection to the pool instead of
+                // tearing it down. Never drain a `200` (origin may have ignored Range on a huge file).
+                if status == 206 && resp.content_length().is_some_and(|n| n <= 64) {
+                    let _ = resp.bytes().await;
+                }
+                return Ok(unchanged);
+            }
+            if is_retryable_status(status) && attempt < *max_retries {
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                permit.on_throttle();
+                tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
+                attempt += 1;
+                continue;
+            }
+            if is_retryable_status(status) {
+                permit.on_throttle();
+            }
+            return Err(IoError::HttpStatus {
+                status,
+                url: redact_http_url(url),
+            });
         }
-        Err(IoError::HttpStatus {
-            status,
-            url: redact_http_url(url),
-        })
     }
 
     /// Zero-copy slice read when backed by local `mmap`.
@@ -644,9 +697,61 @@ impl CogSource {
     }
 }
 
+/// Validate that a `206 Partial Content` response's `Content-Range` (when present) starts at
+/// `expected_start` in `bytes` units and is not `multipart/byteranges`. Prevents misconfigured
+/// CDNs or proxies from silently serving offset-0 or misaligned bytes into TIFF/tile caches.
+pub(crate) fn validate_content_range_headers(
+    content_type: Option<&str>,
+    content_range: Option<&str>,
+    expected_start: u64,
+) -> bool {
+    if content_type
+        .is_some_and(|s| s.trim_start().to_ascii_lowercase().starts_with("multipart/byteranges"))
+    {
+        return false;
+    }
+    let Some(cr) = content_range else {
+        return true;
+    };
+    let s = cr.trim();
+    if !s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("bytes ")) {
+        return false;
+    }
+    let rest = s[6..].trim_start();
+    let Some((start_str, _)) = rest.split_once('-') else {
+        return false;
+    };
+    start_str.trim().parse::<u64>().ok() == Some(expected_start)
+}
+
+pub(crate) fn validate_content_range_start(resp: &reqwest::Response, expected_start: u64) -> bool {
+    let ct = match resp.headers().get(reqwest::header::CONTENT_TYPE) {
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    let cr = match resp.headers().get(reqwest::header::CONTENT_RANGE) {
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    validate_content_range_headers(ct, cr, expected_start)
+}
+
+/// Extract the numeric start offset from a `Range: bytes=<start>-<end>` header value.
+pub(crate) fn parse_range_header_start(range_header: &str) -> Option<u64> {
+    let rest = range_header.strip_prefix("bytes=")?;
+    let (start_str, _) = rest.split_once('-')?;
+    start_str.parse::<u64>().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::redact_http_url;
+    use super::{parse_range_header_start, redact_http_url, validate_content_range_headers};
 
     #[test]
     fn redact_http_url_strips_credentials_query_and_fragment() {
@@ -662,5 +767,22 @@ mod tests {
             redact_http_url("https://example.com/cog.tif"),
             "https://example.com/cog.tif"
         );
+    }
+
+    #[test]
+    fn content_range_validation_rejects_mismatched_start_and_multipart() {
+        assert!(validate_content_range_headers(None, Some("bytes 4096-8191/65536"), 4096));
+        assert!(validate_content_range_headers(Some("image/tiff"), Some("BYTES 0-1023/*"), 0));
+        assert!(validate_content_range_headers(Some("image/tiff"), None, 4096));
+        assert!(!validate_content_range_headers(None, Some("bytes 0-4095/65536"), 4096));
+        assert!(!validate_content_range_headers(None, Some("items 4096-8191/65536"), 4096));
+        assert!(!validate_content_range_headers(
+            Some("multipart/byteranges; boundary=abc"),
+            None,
+            4096
+        ));
+        assert_eq!(parse_range_header_start("bytes=262144-524287"), Some(262144));
+        assert_eq!(parse_range_header_start("bytes=0-1023"), Some(0));
+        assert_eq!(parse_range_header_start("items=0-10"), None);
     }
 }

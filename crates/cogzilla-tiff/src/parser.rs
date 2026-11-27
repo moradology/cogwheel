@@ -29,6 +29,7 @@ const TAG_EXTRA_SAMPLES: u16 = 338;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_JPEG_TABLES: u16 = 347;
 const TAG_LERC_PARAMETERS: u16 = 50674;
+const TAG_RPC_COEFFICIENT: u16 = 50844;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_MODEL_TRANSFORMATION: u16 = 34264;
@@ -339,6 +340,9 @@ impl TagEntry {
     }
 
     fn read_ascii(&self, r: &Reader<'_>) -> Result<String, TiffError> {
+        if !matches!(self.ty, TYPE_ASCII | TYPE_BYTE | TYPE_UNDEFINED) {
+            return Err(TiffError::Corrupt("unexpected TIFF field type for ASCII tag"));
+        }
         if self.count > MAX_TAG_ARRAY_BYTES {
             return Err(TiffError::Corrupt("ASCII tag exceeds max size"));
         }
@@ -527,16 +531,20 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         _ => return Err(TiffError::InvalidHeader),
     };
 
+    let main_ifd_offset = next_ifd;
     let mut ifds: Vec<IfdMeta> = Vec::with_capacity(8);
+    let mut ifd_offsets: Vec<u64> = Vec::with_capacity(8);
     let mut mask_ifds: Vec<MaskIfdMeta> = Vec::new();
     let mut geo_keys = GeoKeys::default();
     let mut nodata: Option<f32> = None;
+    let mut nodata_f64: Option<f64> = None;
     let mut gdal_metadata_xml: Option<String> = None;
     let mut color_map: Option<Vec<[u8; 4]>> = None;
     let mut base_affine: Option<Affine2D> = None;
     let mut base_dims: Option<(u32, u32)> = None;
     let mut base_gcp_poly: Option<crate::gcp::GcpPoly> = None;
     let mut is_georeferenced = true;
+    let mut has_rpc = false;
     let mut gcp_residual_px: Option<f64> = None;
 
     // Guard against cyclic IFD chains, runaway IFD counts, and cumulative heap amplification DoS.
@@ -553,6 +561,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             return Err(TiffError::Corrupt("IFD chain exceeds 64 entries"));
         }
         visited_ifds.push(next_ifd);
+        let current_ifd_offset = next_ifd;
         let (entries, following) = parse_ifd_entries(&r, next_ifd, is_bigtiff)?;
         next_ifd = following;
 
@@ -583,6 +592,10 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         let mut model_transform: Option<Vec<f64>> = None;
         let mut raw_geo_keys: Option<Vec<u16>> = None;
         let mut double_params: Vec<f64> = Vec::new();
+        let mut ifd_color_map: Option<Vec<[u8; 4]>> = None;
+        let mut ifd_gdal_metadata_xml: Option<String> = None;
+        let mut ifd_nodata: Option<f32> = None;
+        let mut ifd_nodata_f64: Option<f64> = None;
 
         let to_u32 = |v: u64| -> Result<u32, TiffError> {
             u32::try_from(v).map_err(|_| TiffError::Corrupt("IFD integer tag exceeds u32::MAX"))
@@ -638,6 +651,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     | TAG_GEO_DOUBLE_PARAMS
                     | TAG_GDAL_METADATA
                     | TAG_GDAL_NODATA
+                    | TAG_LERC_PARAMETERS
             );
             if is_recognized {
                 if seen_tags.contains(&entry.tag) {
@@ -669,7 +683,13 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_PHOTOMETRIC => photometric = to_u16(entry.read_u64_scalar(&r)?)?,
                 TAG_COLOR_MAP => {
-                    if color_map.is_none() && entry.count > 0 && entry.count % 3 == 0 && entry.count <= 3 * 65_536 {
+                    if ifds.is_empty()
+                        && color_map.is_none()
+                        && ifd_color_map.is_none()
+                        && entry.count > 0
+                        && entry.count % 3 == 0
+                        && entry.count <= 3 * 65_536
+                    {
                         charge_tag(entry.count, 2)?;
                         let vals = entry.read_u16_vec(&r)?;
                         let n = vals.len() / 3;
@@ -681,7 +701,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                             lut.push([r_c, g_c, b_c, 255]);
                         }
                         if !lut.is_empty() {
-                            color_map = Some(lut);
+                            ifd_color_map = Some(lut);
                         }
                     }
                 }
@@ -742,6 +762,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_LERC_PARAMETERS => {
                     if entry.count >= 2 && entry.count <= 16 {
+                        charge_tag(entry.count, 8)?;
                         match entry.read_u64_vec(&r) {
                             Ok(vals) => {
                                 if vals.len() >= 2 {
@@ -755,6 +776,9 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                             Err(_) => {}
                         }
                     }
+                }
+                TAG_RPC_COEFFICIENT if ifds.is_empty() => {
+                    has_rpc = true;
                 }
                 TAG_MODEL_PIXEL_SCALE if ifds.is_empty() => {
                     charge_tag(entry.count, 8)?;
@@ -778,15 +802,17 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                 }
                 TAG_GDAL_METADATA if ifds.is_empty() => {
                     charge_tag(entry.count, 1)?;
-                    gdal_metadata_xml = Some(entry.read_ascii(&r)?);
+                    ifd_gdal_metadata_xml = Some(entry.read_ascii(&r)?);
                 }
                 TAG_GDAL_NODATA if ifds.is_empty() => {
                     charge_tag(entry.count, 1)?;
                     let s = entry.read_ascii(&r)?;
                     if s.eq_ignore_ascii_case("nan") {
-                        nodata = Some(f32::NAN);
-                    } else if let Ok(v) = s.parse::<f32>() {
-                        nodata = Some(v);
+                        ifd_nodata = Some(f32::NAN);
+                        ifd_nodata_f64 = Some(f64::NAN);
+                    } else if let Ok(v) = s.parse::<f64>() {
+                        ifd_nodata = Some(v as f32);
+                        ifd_nodata_f64 = Some(v);
                     }
                 }
                 _ => {}
@@ -806,6 +832,11 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                         let ta = width.div_ceil(tile_width);
                         let td = height.div_ceil(tile_height);
                         let exp = (ta as usize).saturating_mul(td as usize);
+                        if offs.len() < exp || cnts.len() < exp {
+                            return Err(TiffError::Corrupt(
+                                "mask IFD tile offset/byte-count table shorter than tile grid",
+                            ));
+                        }
                         let offs: Box<[u64]> = if offs.len() > exp { offs[..exp].into() } else { offs };
                         let cnts: Box<[u32]> = if cnts.len() > exp { cnts[..exp].into() } else { cnts };
                         total_meta_bytes = total_meta_bytes
@@ -841,6 +872,11 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     if width > 0 && height > 0 {
                         let td = height.div_ceil(rps);
                         let exp = td as usize;
+                        if offs.len() < exp || cnts.len() < exp {
+                            return Err(TiffError::Corrupt(
+                                "mask IFD strip offset/byte-count table shorter than strip count",
+                            ));
+                        }
                         let offs: Box<[u64]> = if offs.len() > exp { offs[..exp].into() } else { offs };
                         let cnts: Box<[u32]> = if cnts.len() > exp { cnts[..exp].into() } else { cnts };
                         total_meta_bytes = total_meta_bytes
@@ -871,6 +907,22 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             continue;
         }
 
+        // Only commit first-image-IFD metadata after mask IFDs have been skipped.
+        if ifds.is_empty() {
+            if color_map.is_none() {
+                color_map = ifd_color_map;
+            }
+            if gdal_metadata_xml.is_none() {
+                gdal_metadata_xml = ifd_gdal_metadata_xml;
+            }
+            if nodata.is_none() {
+                nodata = ifd_nodata;
+            }
+            if nodata_f64.is_none() {
+                nodata_f64 = ifd_nodata_f64;
+            }
+        }
+
         // Accept all 8 standard GDAL numeric sample types (widened to f32 at block decode)
         let bps = match bits_per_sample.as_deref() {
             Some(v) if !v.is_empty() => {
@@ -895,12 +947,16 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             _ => 1,
         };
         let sample_type = match (fmt, bps) {
+            (1, 1) => SampleType::Uint1,
+            (1, 4) => SampleType::Uint4,
             (1, 8) => SampleType::Uint8,
             (2, 8) => SampleType::Int8,
             (1, 16) => SampleType::Uint16,
             (2, 16) => SampleType::Int16,
             (1, 32) => SampleType::Uint32,
             (2, 32) => SampleType::Int32,
+            (1, 64) => SampleType::Uint64,
+            (2, 64) => SampleType::Int64,
             (3, 32) => SampleType::Float32,
             (3, 64) => SampleType::Float64,
             _ => {
@@ -1021,10 +1077,14 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
                     },
                     None,
                 )
-            } else if let (Some(ps), Some(tp)) = (pixel_scale.as_ref(), tiepoint.as_ref()) {
-                if ps.len() < 2 || tp.len() < 6 {
-                    return Err(TiffError::MissingGeoTransform);
-                }
+            } else if let (Some(ps), Some(tp)) = (pixel_scale.as_ref(), tiepoint.as_ref())
+                && ps.len() >= 2
+                && ps[0].is_finite()
+                && ps[1].is_finite()
+                && ps[0] != 0.0
+                && ps[1] != 0.0
+                && tp.len() >= 6
+            {
                 let sx = ps[0];
                 let sy = -ps[1];
                 let mut c = tp[3] - tp[0] * sx;
@@ -1098,6 +1158,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             .invert()
             .ok_or(TiffError::Corrupt("singular GeoTransform affine"))?;
 
+        ifd_offsets.push(current_ifd_offset);
         ifds.push(IfdMeta {
             width,
             height,
@@ -1127,12 +1188,15 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         return Err(TiffError::Corrupt("no valid float32 image IFDs found"));
     }
 
-    // Sort IFDs from highest resolution (smallest pixel size) to coarsest overview
-    ifds.sort_by(|a, b| {
+    // Sort IFDs from highest resolution (smallest pixel size) to coarsest overview,
+    // keeping `ifd_offsets` 1:1 aligned with `ifds`.
+    let mut paired: Vec<(IfdMeta, u64)> = ifds.into_iter().zip(ifd_offsets).collect();
+    paired.sort_by(|(a, _), (b, _)| {
         let ra = a.pixel_resolution().0;
         let rb = b.pixel_resolution().0;
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
     });
+    let (mut ifds, ifd_offsets): (Vec<IfdMeta>, Vec<u64>) = paired.into_iter().unzip();
 
     // Attach internal transparency mask IFDs to matching image IFDs by (width, height)
     for m in mask_ifds {
@@ -1165,8 +1229,12 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         byte_order: bo,
         is_bigtiff,
         is_georeferenced,
+        has_rpc,
+        main_ifd_offset,
+        ifd_offsets,
         gcp_residual_px,
         nodata,
+        nodata_f64,
         scales,
         offsets,
         scales_f64,
@@ -1248,7 +1316,10 @@ fn parse_gdal_metadata(
             continue;
         }
 
-        if val_str.len() > MAX_META_VALUE_BYTES || stored_items >= MAX_META_ITEMS {
+        if name.len() > MAX_META_VALUE_BYTES
+            || val_str.len() > MAX_META_VALUE_BYTES
+            || stored_items >= MAX_META_ITEMS
+        {
             continue;
         }
         if name.eq_ignore_ascii_case("DESCRIPTION") {
@@ -1364,5 +1435,53 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes());
         let err = parse_cog(&buf).unwrap_err();
         assert!(matches!(err, TiffError::Corrupt("duplicate TIFF tag in IFD")), "got {err:?}");
+    }
+
+    #[test]
+    fn unknown_field_type_on_ascii_tag_is_rejected_without_range_fetch() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+        buf.extend_from_slice(&TAG_GDAL_NODATA.to_le_bytes());
+        buf.extend_from_slice(&99u16.to_le_bytes()); // unknown TIFF field type
+        buf.extend_from_slice(&33_554_432u32.to_le_bytes()); // 32 MiB count
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(
+            matches!(err, TiffError::Corrupt("unexpected TIFF field type for ASCII tag")),
+            "expected Corrupt(unexpected TIFF field type for ASCII tag), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_lerc_parameters_rejected_and_oversized_gdal_metadata_name_skipped() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        for _ in 0..2 {
+            buf.extend_from_slice(&TAG_LERC_PARAMETERS.to_le_bytes());
+            buf.extend_from_slice(&TYPE_LONG.to_le_bytes());
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = parse_cog(&buf).unwrap_err();
+        assert!(matches!(err, TiffError::Corrupt("duplicate TIFF tag in IFD")), "got {err:?}");
+
+        let huge_name = "K".repeat(8192);
+        let xml = format!(
+            r#"<GDALMetadata><Item name="{huge_name}" sample="0">x</Item><Item name="ok" sample="0">y</Item></GDALMetadata>"#
+        );
+        let mut scales = [1.0f64];
+        let mut offsets = [0.0f64];
+        let mut meta = vec![Vec::new(); 1];
+        let mut desc = vec![String::new(); 1];
+        parse_gdal_metadata(&xml, &mut scales, &mut offsets, &mut meta, &mut desc);
+        assert_eq!(meta[0], vec![("ok".to_string(), "y".to_string())]);
     }
 }

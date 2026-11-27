@@ -309,7 +309,7 @@ impl DynamicCredsCache {
             }
         }
 
-        // 1. ECS Task Role (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or FULL_URI)
+        // 1. ECS Task Role / EKS Pod Identity (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or FULL_URI)
         let ecs_url = match std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
             Ok(rel) if !rel.trim().is_empty() => Some(format!("http://169.254.170.2{}", rel.trim())),
             _ => std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
@@ -324,7 +324,13 @@ impl DynamicCredsCache {
             }
         }
 
-        // 2. EC2 IMDSv2 (only when not explicitly disabled via AWS_EC2_METADATA_DISABLED=true)
+        // 2. Web Identity Token / EKS IRSA (AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN)
+        if let Some(creds) = fetch_web_identity_credentials(client).await {
+            *self.cached.write() = Some(CachedDynamicCreds::Creds(creds.clone()));
+            return Some(creds);
+        }
+
+        // 3. EC2 IMDSv2 (only when not explicitly disabled via AWS_EC2_METADATA_DISABLED=true)
         if !env_truthy("AWS_EC2_METADATA_DISABLED") {
             if let Some(creds) = fetch_imds_v2_credentials(client).await {
                 *self.cached.write() = Some(CachedDynamicCreds::Creds(creds.clone()));
@@ -339,9 +345,25 @@ impl DynamicCredsCache {
     }
 }
 
+fn read_container_auth_token(
+    token_env: Option<&str>,
+    token_file_env: Option<&str>,
+) -> Option<String> {
+    if let Some(tok) = token_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(tok.to_string());
+    }
+    let path = token_file_env.map(str::trim).filter(|s| !s.is_empty())?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub async fn fetch_ecs_credentials(client: &reqwest::Client, url: &str) -> Option<AwsCredentials> {
     let mut req = client.get(url).timeout(Duration::from_secs(2));
-    if let Ok(tok) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
+    let tok_env = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN").ok();
+    let tok_file = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE").ok();
+    if let Some(tok) = read_container_auth_token(tok_env.as_deref(), tok_file.as_deref()) {
         req = req.header("Authorization", tok);
     }
     let resp = req.send().await.ok()?;
@@ -350,6 +372,151 @@ pub async fn fetch_ecs_credentials(client: &reqwest::Client, url: &str) -> Optio
     }
     let body = resp.text().await.ok()?;
     parse_aws_json_credentials(&body)
+}
+
+/// Resolve the AWS STS endpoint URL for `AssumeRoleWithWebIdentity`, honouring
+/// `AWS_ENDPOINT_URL_STS` and `AWS_STS_REGIONAL_ENDPOINTS` (`regional` vs `legacy`).
+fn sts_endpoint_url(
+    endpoint_override: Option<&str>,
+    regional_endpoints: Option<&str>,
+    region: Option<&str>,
+) -> String {
+    if let Some(ep) = endpoint_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return ep.to_string();
+    }
+    let is_legacy = regional_endpoints
+        .map(str::trim)
+        .is_some_and(|s| s.eq_ignore_ascii_case("legacy"));
+    if !is_legacy
+        && let Some(r) = region.map(str::trim).filter(|s| !s.is_empty())
+    {
+        return format!("https://sts.{r}.amazonaws.com");
+    }
+    "https://sts.amazonaws.com".to_string()
+}
+
+fn form_percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Exchange an OIDC web identity token file (`AWS_WEB_IDENTITY_TOKEN_FILE`) + IAM role ARN
+/// (`AWS_ROLE_ARN`) for temporary AWS credentials via STS `AssumeRoleWithWebIdentity` (EKS IRSA).
+pub async fn fetch_web_identity_credentials(client: &reqwest::Client) -> Option<AwsCredentials> {
+    let token_file = std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let role_arn = std::env::var("AWS_ROLE_ARN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let session_name = std::env::var("AWS_ROLE_SESSION_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "cogzilla-session".to_string());
+    let endpoint_override = std::env::var("AWS_ENDPOINT_URL_STS").ok();
+    let regional_endpoints = std::env::var("AWS_STS_REGIONAL_ENDPOINTS").ok();
+    let region = std::env::var("AWS_REGION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    let endpoint = sts_endpoint_url(
+        endpoint_override.as_deref(),
+        regional_endpoints.as_deref(),
+        region.as_deref(),
+    );
+    fetch_web_identity_credentials_from(client, &endpoint, &token_file, &role_arn, &session_name)
+        .await
+}
+
+pub async fn fetch_web_identity_credentials_from(
+    client: &reqwest::Client,
+    sts_endpoint: &str,
+    token_file: &str,
+    role_arn: &str,
+    session_name: &str,
+) -> Option<AwsCredentials> {
+    let token = std::fs::read_to_string(token_file).ok()?;
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let body = format!(
+        "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={}&RoleSessionName={}&WebIdentityToken={}",
+        form_percent_encode(role_arn),
+        form_percent_encode(session_name),
+        form_percent_encode(token),
+    );
+    let resp = client
+        .post(sts_endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "text/xml")
+        .timeout(Duration::from_secs(5))
+        .body(body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let xml = resp.text().await.ok()?;
+    parse_sts_xml_credentials(&xml)
+}
+
+/// Minimal dependency-free XML parser for AWS STS `AssumeRoleWithWebIdentityResponse`
+/// (`<AccessKeyId>`, `<SecretAccessKey>`, `<SessionToken>`, `<Expiration>`).
+pub fn parse_sts_xml_credentials(xml: &str) -> Option<AwsCredentials> {
+    fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let start = xml.find(&open)? + open.len();
+        let end = start + xml[start..].find(&close)?;
+        let raw = xml[start..end].trim();
+        let decoded = raw
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&");
+        Some(decoded)
+    }
+
+    let access_key = extract_tag(xml, "AccessKeyId").filter(|s| !s.is_empty())?;
+    let secret_key = extract_tag(xml, "SecretAccessKey").filter(|s| !s.is_empty())?;
+    let session_token = extract_tag(xml, "SessionToken").filter(|s| !s.is_empty());
+    let ttl_secs = extract_tag(xml, "Expiration")
+        .and_then(|s| parse_iso8601_utc_epoch(&s))
+        .and_then(|exp_epoch| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(exp_epoch.saturating_sub(now))
+        })
+        .unwrap_or(900);
+
+    Some(AwsCredentials {
+        access_key,
+        secret_key,
+        session_token,
+        expires_at: Some(Instant::now() + Duration::from_secs(ttl_secs)),
+    })
 }
 
 async fn fetch_imds_v2_credentials(client: &reqwest::Client) -> Option<AwsCredentials> {
@@ -450,7 +617,7 @@ pub fn parse_aws_json_credentials(body: &str) -> Option<AwsCredentials> {
 }
 
 /// Minimal ISO-8601 UTC timestamp parser (`YYYY-MM-DDTHH:MM:SSZ`) returning Unix epoch seconds.
-fn parse_iso8601_utc_epoch(s: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_utc_epoch(s: &str) -> Option<u64> {
     let s = s.trim();
     let bytes = s.as_bytes();
     if bytes.len() < 19
@@ -896,6 +1063,15 @@ async fn fetch_s3_inner(
                 url: crate::backend::redact_http_url(&url),
             });
         }
+        if status == 206
+            && let Some(rng) = range_header
+            && let Some(req_start) = crate::backend::parse_range_header_start(rng)
+            && !crate::backend::validate_content_range_start(&resp, req_start)
+        {
+            return Err(IoError::RangeNotSupported {
+                url: crate::backend::redact_http_url(&url),
+            });
+        }
         if status == 200 || status == 206 {
             // The body can still fail after a good status line (connection reset mid-transfer).
             let body_res = if let Some(cap) = max_bytes {
@@ -909,6 +1085,11 @@ async fn fetch_s3_inner(
                         p.on_success();
                     }
                     return Ok(body);
+                }
+                Err(IoError::ResponseTooLarge { .. }) if status == 200 && range_header.is_some() => {
+                    return Err(IoError::RangeNotSupported {
+                        url: crate::backend::redact_http_url(&url),
+                    });
                 }
                 Err(IoError::Http(e))
                     if attempt < cfg.max_retries && is_retryable_transport_error(&e) =>
@@ -1028,5 +1209,101 @@ mod uri_tests {
         for bad in ["attacker.example?", "us-east-1/x#", "US-EAST-1", "a--b", "ab", ""] {
             assert!(!is_valid_aws_region(bad), "expected region rejection for {bad}");
         }
+    }
+
+    #[test]
+    fn pp1_sts_endpoint_and_xml_parsing() {
+        assert_eq!(
+            sts_endpoint_url(None, Some("regional"), Some("us-west-2")),
+            "https://sts.us-west-2.amazonaws.com"
+        );
+        assert_eq!(
+            sts_endpoint_url(None, None, Some("eu-central-1")),
+            "https://sts.eu-central-1.amazonaws.com"
+        );
+        assert_eq!(
+            sts_endpoint_url(None, Some("legacy"), Some("us-west-2")),
+            "https://sts.amazonaws.com"
+        );
+        assert_eq!(
+            sts_endpoint_url(None, None, None),
+            "https://sts.amazonaws.com"
+        );
+        assert_eq!(
+            sts_endpoint_url(Some("http://127.0.0.1:9000"), Some("regional"), Some("us-west-2")),
+            "http://127.0.0.1:9000"
+        );
+
+        let xml = r#"<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+            <AssumeRoleWithWebIdentityResult>
+                <Credentials>
+                    <AccessKeyId>ASIATESTKEY123</AccessKeyId>
+                    <SecretAccessKey>sec&amp;ret/key+1</SecretAccessKey>
+                    <SessionToken>tok==abc</SessionToken>
+                    <Expiration>2099-01-01T00:00:00Z</Expiration>
+                </Credentials>
+            </AssumeRoleWithWebIdentityResult>
+        </AssumeRoleWithWebIdentityResponse>"#;
+        let creds = parse_sts_xml_credentials(xml).expect("valid STS XML");
+        assert_eq!(creds.access_key, "ASIATESTKEY123");
+        assert_eq!(creds.secret_key, "sec&ret/key+1");
+        assert_eq!(creds.session_token.as_deref(), Some("tok==abc"));
+        assert!(!creds.is_expired_soon());
+
+        // EKS Pod Identity: reads AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE when plain var is unset.
+        let tok_path = std::env::temp_dir().join(format!("cgz_pod_id_tok_{}", std::process::id()));
+        std::fs::write(&tok_path, "pod-identity-bearer-token\n").unwrap();
+        assert_eq!(
+            read_container_auth_token(None, tok_path.to_str()).as_deref(),
+            Some("pod-identity-bearer-token")
+        );
+        assert_eq!(
+            read_container_auth_token(Some("plain-token"), tok_path.to_str()).as_deref(),
+            Some("plain-token")
+        );
+        let _ = std::fs::remove_file(&tok_path);
+    }
+
+    #[tokio::test]
+    async fn pp1_web_identity_exchange_posts_form_and_parses_temp_creds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tmp = std::env::temp_dir().join(format!("cgz_irsa_{}", std::process::id()));
+        std::fs::write(&tmp, "eyJhbGciOiJSUzI1NiJ9.payload+foo/bar=\n").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(req.starts_with("POST / HTTP/1.1"));
+            assert!(req.contains("Action=AssumeRoleWithWebIdentity"));
+            assert!(req.contains("RoleArn=arn%3Aaws%3Aiam%3A%3A123456789012%3Arole%2Fmy-role"));
+            assert!(req.contains("WebIdentityToken=eyJhbGciOiJSUzI1NiJ9.payload%2Bfoo%2Fbar%3D"));
+            let xml = "<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>ASIAIRSA</AccessKeyId><SecretAccessKey>SECRETIRSA</SecretAccessKey><SessionToken>TOKIRSA</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                xml.len(),
+                xml
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let creds = fetch_web_identity_credentials_from(
+            &client,
+            &format!("http://{addr}/"),
+            tmp.to_str().unwrap(),
+            "arn:aws:iam::123456789012:role/my-role",
+            "test-sess",
+        )
+        .await
+        .expect("IRSA creds");
+        assert_eq!(creds.access_key, "ASIAIRSA");
+        assert_eq!(creds.secret_key, "SECRETIRSA");
+        assert_eq!(creds.session_token.as_deref(), Some("TOKIRSA"));
+        srv.await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
     }
 }

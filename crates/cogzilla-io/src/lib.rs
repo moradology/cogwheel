@@ -13,7 +13,7 @@ pub use allowlist::{
 };
 pub use backend::{
     CogSource, IoError, IoMetrics, RangeResponse, RemoteValidator, TileByteReq, coalesce_ranges,
-    redact_http_url,
+    io_error_from_reqwest, redact_http_url,
 };
 pub use cache::{BlockKey, SingleflightBlockCache};
 pub use cloud::{

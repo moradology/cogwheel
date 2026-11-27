@@ -392,6 +392,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "reqwest",
+ "ring",
  "sha2",
  "thiserror 2.0.21",
  "time",
@@ -411,6 +412,7 @@ dependencies = [
  "libdeflater",
  "libwebp-sys",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
 ]
 

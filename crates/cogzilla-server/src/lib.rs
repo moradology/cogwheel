@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod engine;
 #[cfg(feature = "gpu")]
 pub mod gpu_backend;
+mod geotiff;
 pub mod http;
 pub mod openapi;
 pub mod stac;

@@ -442,7 +442,32 @@ impl TmsDef {
         let Ok(dst_crs) = self.crs_model() else {
             return (0, max_c, 0, max_r);
         };
-        let [w, s, e, n] = wgs84_bounds;
+        let [mut w, s, mut e, n] = wgs84_bounds;
+        // Normalize wholly-shifted 0..360 or -360..0 regional intervals (e.g. CONUS [235, 295])
+        // before checking for antimeridian crossing.
+        if w <= e && (e - w) < 360.0 - 1e-9 {
+            if w >= 180.0 - 1e-9 && e > 180.0 + 1e-9 {
+                w -= 360.0;
+                e -= 360.0;
+            } else if e <= -180.0 + 1e-9 && w < -180.0 - 1e-9 {
+                w += 360.0;
+                e += 360.0;
+            }
+        }
+        let (w_eff, e_eff, crosses_am) = if w > e {
+            (w, e + 360.0, true)
+        } else if e > 180.0 + 1e-9 || w < -180.0 - 1e-9 {
+            (w, e, true)
+        } else {
+            (w, e, false)
+        };
+        let wrap_lon = |l: f64| {
+            if (-180.0..=180.0).contains(&l) {
+                l
+            } else {
+                ((l + 180.0).rem_euclid(360.0)) - 180.0
+            }
+        };
         let clamp_lat = |lat: f64| -> f64 {
             if matches!(dst_crs, CrsModel::Epsg3857) {
                 lat.clamp(-85.05112878, 85.05112878)
@@ -457,13 +482,13 @@ impl TmsDef {
         let steps = 8;
         for i in 0..=steps {
             let t = i as f64 / steps as f64;
-            let lon_t = w + t * (e - w);
+            let lon_t = wrap_lon(w_eff + t * (e_eff - w_eff));
             let lat_t = clamp_lat(s + t * (n - s));
             for &(lon, lat) in &[
                 (lon_t, clamp_lat(s)),
                 (lon_t, clamp_lat(n)),
-                (w, lat_t),
-                (e, lat_t),
+                (wrap_lon(w_eff), lat_t),
+                (wrap_lon(e_eff), lat_t),
             ] {
                 let (x, y) = dst_crs.from_lonlat_deg(lon, lat);
                 if x.is_finite() && y.is_finite() {
@@ -479,12 +504,22 @@ impl TmsDef {
         }
         let span_x = (m.cell_size * (m.tile_width as f64)).max(1e-12);
         let span_y = (m.cell_size * (m.tile_height as f64)).max(1e-12);
-        let c0 = ((min_x - m.origin_x) / span_x)
-            .floor()
-            .clamp(0.0, max_c as f64) as u64;
-        let c1 = (((max_x - m.origin_x) / span_x) - 1e-9)
-            .floor()
-            .clamp(c0 as f64, max_c as f64) as u64;
+        let (c0, c1) = if crosses_am
+            && matches!(
+                dst_crs,
+                CrsModel::Geographic | CrsModel::Epsg3857 | CrsModel::WorldMercator
+            )
+        {
+            (0, max_c)
+        } else {
+            let c0 = ((min_x - m.origin_x) / span_x)
+                .floor()
+                .clamp(0.0, max_c as f64) as u64;
+            let c1 = (((max_x - m.origin_x) / span_x) - 1e-9)
+                .floor()
+                .clamp(c0 as f64, max_c as f64) as u64;
+            (c0, c1)
+        };
         let r0 = ((m.origin_y - max_y) / span_y)
             .floor()
             .clamp(0.0, max_r as f64) as u64;
@@ -626,5 +661,22 @@ pub fn get_tms_def_json(id: &str) -> Result<serde_json::Value, EngineError> {
     lookup_tms(id)
         .map(TmsDef::to_ogc_json)
         .ok_or_else(|| EngineError::NotFound(format!("unknown TileMatrixSet '{id}'")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_limits_handle_antimeridian_bounds() {
+        let tms = lookup_tms("WorldCRS84Quad").unwrap();
+        let m1 = tms.matrix(1).unwrap();
+        // RFC 7946 w > e crossing antimeridian
+        let (c0, c1, _, _) = tms.tile_limits_for_wgs84_bounds(&m1, [170.0, -10.0, -170.0, 10.0]);
+        assert_eq!((c0, c1), (0, m1.matrix_width - 1));
+        // Unwrapped e > 180 crossing antimeridian
+        let (c0b, c1b, _, _) = tms.tile_limits_for_wgs84_bounds(&m1, [170.0, -20.0, 190.0, 0.0]);
+        assert_eq!((c0b, c1b), (0, m1.matrix_width - 1));
+    }
 }
 

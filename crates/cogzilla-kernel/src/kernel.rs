@@ -2,9 +2,10 @@ use std::cell::RefCell;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use cogzilla_proj::{CoordPlan, GRID_DIM};
+use cogzilla_tiff::SampleType;
 
 use crate::bandmath::{SpectralExpr, fast_db_from_power};
-use crate::colormap::{ColormapLut, ColormapName};
+use crate::colormap::{nodata_index, ColormapLut, ColormapName};
 use crate::expr_vm::ExprProgram;
 use crate::jpeg_fast::{empty_black_jpeg, encode_jpeg_rgb, encode_jpeg_rgba};
 use crate::png_fast::{
@@ -13,28 +14,17 @@ use crate::png_fast::{
 };
 
 #[inline]
-fn build_plte_opaque(lut: &ColormapLut) -> [u8; 768] {
-    let mut plte = [0u8; 768];
-    for i in 0..256 {
-        plte[i * 3] = lut.rgb[i][0];
-        plte[i * 3 + 1] = lut.rgb[i][1];
-        plte[i * 3 + 2] = lut.rgb[i][2];
-    }
-    plte
+fn build_plte_opaque(lut: &ColormapLut) -> &[u8] {
+    lut.rgb.as_flattened()
 }
 
+/// A palette for a colour-mapped tile that may have empty pixels, and the colour-map entry
+/// that gives up its index (see `ColormapLut::nodata_plte`; `nodata_index` places a byte value).
 #[inline]
-fn build_plte_nodata(lut: &ColormapLut) -> [u8; 768] {
-    let mut plte = [0u8; 768];
-    // Index 0 = transparent nodata (paired with tRNS = [0]); indices 1..=255 span lut[0..=255].
-    for i in 1..256 {
-        let src_idx = ((i - 1) * 255 + 127) / 254;
-        plte[i * 3] = lut.rgb[src_idx][0];
-        plte[i * 3 + 1] = lut.rgb[src_idx][1];
-        plte[i * 3 + 2] = lut.rgb[src_idx][2];
-    }
-    plte
+fn build_plte_nodata(lut: &ColormapLut) -> (&[u8; 768], u8) {
+    (&lut.nodata_plte, lut.nodata_merged)
 }
+
 use crate::source::BandSource;
 use crate::webp_fast::{empty_transparent_webp, encode_webp_rgb, encode_webp_rgba};
 
@@ -65,8 +55,12 @@ pub enum OutputFormat {
     /// JPEG (lossy quality `1..=100`, default `85`).
     Jpeg { quality: u8 },
     RawF32,
-    /// NumPy v1.0 `.npy` float32 array (`shape = (C, H, W)`, little-endian `<f4`).
+    /// Raw CHW little-endian `f64` array (`8` bytes/sample), used for unstyled wide-dtype GeoTIFFs.
+    RawF64,
+    /// NumPy v1.0 `.npy` array (`shape = (C, H, W)`).
     Npy,
+    /// Exact wide-dtype NumPy v1.0 `.npy` array rendered via the `f64` data path.
+    NpyF64,
     /// Uncompressed RGBA8 (`N * N * 4` bytes), used internally for multi-scene mosaic compositing.
     RawRgba,
 }
@@ -941,13 +935,24 @@ pub fn sample_general_scaled(
     scale_y: f32,
     mode: ResampleMode,
 ) -> f32 {
-    if !u.is_finite()
-        || !v.is_finite()
-        || u < -0.5
-        || v < -0.5
-        || u > src.ifd_w as f32 - 0.5
-        || v > src.ifd_h as f32 - 0.5
-    {
+    if !u.is_finite() || !v.is_finite() {
+        return f32::NAN;
+    }
+    if matches!(
+        mode,
+        ResampleMode::Average
+            | ResampleMode::Mode
+            | ResampleMode::Rms
+            | ResampleMode::Min
+            | ResampleMode::Max
+            | ResampleMode::Med
+            | ResampleMode::Q1
+            | ResampleMode::Q3
+            | ResampleMode::Sum
+    ) {
+        return sample_footprint_exact(src, u, v, scale_x, scale_y, mode);
+    }
+    if u < -0.5 || v < -0.5 || u > src.ifd_w as f32 - 0.5 || v > src.ifd_h as f32 - 0.5 {
         return f32::NAN;
     }
     match mode {
@@ -1067,9 +1072,9 @@ fn sample_footprint_exact(
     }
 
     let ix0 = x0.floor() as i32;
-    let ix1 = (x1 - 1e-12).floor() as i32;
+    let ix1 = x1.next_down().floor() as i32;
     let iy0 = y0.floor() as i32;
-    let iy1 = (y1 - 1e-12).floor() as i32;
+    let iy1 = y1.next_down().floor() as i32;
 
     // Fast 1-pixel path: exact 1:1 overview read or upsampling strictly inside one source pixel.
     if ix0 == ix1 && iy0 == iy1 {
@@ -1289,7 +1294,7 @@ fn sample_footprint_exact(
 
 /// Estimate source-pixel footprint `(scale_x, scale_y)` per output pixel from a `CoordPlan`.
 #[inline]
-fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
+pub fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
     match plan {
         CoordPlan::Separable1D { u, v, .. } => {
             let denom = (N.saturating_sub(1)).max(1) as f32;
@@ -1314,16 +1319,41 @@ fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
             )
         }
         CoordPlan::Exact2D { u, v, .. } => {
-            let mid = N / 2;
-            let i00 = mid * N + mid;
-            let i10 = i00 + 1;
-            let i01 = (mid + 1).min(N - 1) * N + mid;
-            let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
-            let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
-            (
-                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
-                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
-            )
+            if N <= 1 {
+                return (1.0, 1.0);
+            }
+            let probe = |py: usize, px: usize| -> Option<(f32, f32)> {
+                let i00 = py * N + px;
+                let i10 = i00 + 1;
+                let i01 = (py + 1) * N + px;
+                let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
+                let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
+                if sx.is_finite() && sx > 1e-4 && sy.is_finite() && sy > 1e-4 {
+                    Some((sx, sy))
+                } else {
+                    None
+                }
+            };
+            let mid = (N / 2).min(N - 2);
+            if let Some(s) = probe(mid, mid) {
+                return s;
+            }
+            let step = (N / 16).max(1);
+            for py in (0..N - 1).step_by(step) {
+                for px in (0..N - 1).step_by(step) {
+                    if let Some(s) = probe(py, px) {
+                        return s;
+                    }
+                }
+            }
+            for py in 0..N - 1 {
+                for px in 0..N - 1 {
+                    if let Some(s) = probe(py, px) {
+                        return s;
+                    }
+                }
+            }
+            (1.0, 1.0)
         }
     }
 }
@@ -1391,12 +1421,21 @@ fn for_each_pixel_in_row<const N: usize, F: FnMut(usize, f32, f32)>(
     }
 }
 
-/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous `<f4` array
-/// of shape `(bands, height, width)`.
-pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
-    let mut dict = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({bands}, {height}, {width}), }}"
-    );
+/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous array of the
+/// dtype `descr` (`<f4`, `|u1`, ...) and of `shape`: the magic, the version, the length of
+/// what follows, then the dict padded with spaces and ended by a newline so that the data
+/// starts on a multiple of 64 bytes. Every `.npy` this crate writes begins with it.
+pub fn encode_npy_header(descr: &str, shape: &[usize]) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': (");
+    for (i, dim) in shape.iter().enumerate() {
+        if i > 0 {
+            dict.push_str(", ");
+        }
+        let _ = write!(dict, "{dim}");
+    }
+    // A tuple of one is written `(n,)`.
+    dict.push_str(if shape.len() == 1 { ",), }" } else { "), }" });
     let unpadded = 10 + dict.len() + 1;
     let pad = (64 - (unpadded % 64)) % 64;
     for _ in 0..pad {
@@ -1409,6 +1448,278 @@ pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
     hdr.extend_from_slice(&hlen.to_le_bytes());
     hdr.extend_from_slice(dict.as_bytes());
     hdr
+}
+
+/// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous `<f4` array
+/// of shape `(bands, height, width)`.
+pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
+    encode_npy_header("<f4", &[bands, height as usize, width as usize])
+}
+
+/// The NumPy dtype string of a sample type: little-endian, and `|` for the single bytes.
+pub fn npy_descr(kind: SampleType) -> &'static str {
+    match kind {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => "|u1",
+        SampleType::Int8 => "|i1",
+        SampleType::Uint16 => "<u2",
+        SampleType::Int16 => "<i2",
+        SampleType::Uint32 => "<u4",
+        SampleType::Int32 => "<i4",
+        SampleType::Uint64 => "<u8",
+        SampleType::Int64 => "<i8",
+        SampleType::Float32 => "<f4",
+        SampleType::Float64 => "<f8",
+    }
+}
+
+/// A `.npy` array of `bands` planes of `height` by `width`, written in the dtype of `kind`
+/// from CHW float32 `values` in which NaN marks a value that is not there.
+///
+/// A value that is not there is written as `absent`, or as zero without one. Integers take
+/// the value truncated toward zero and held to the type's range (a NaN `absent` is zero);
+/// the float types hold an infinity to their largest finite number. With `mask`, one more
+/// plane follows the bands, as rio-tiler's `ImageData.mask` is: the type's largest number
+/// (`255` for `u1`, `65535` for `u2`, `f32::MAX` for `f4`, ...) where any band has a value,
+/// and its smallest elsewhere (`0` for the unsigned types, `-32768` for `i2`, `f32::MIN`
+/// for `f4`, ...). Only the first
+/// `bands * height * width` of `values` are written, and a shorter slice makes a shorter
+/// body under a header that still names every plane.
+///
+/// This is not the float32 path of [`wrap_raw_f32_as_npy_with_mask`], which copies its
+/// planes as they are, counts an infinity as absent and writes `255.0` in its mask.
+pub fn encode_npy_typed(
+    values: &[f32],
+    bands: usize,
+    height: usize,
+    width: usize,
+    kind: SampleType,
+    absent: Option<f32>,
+    mask: bool,
+) -> Bytes {
+    let pixels = width * height;
+    let planes = bands + usize::from(mask);
+    let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
+    out.extend_from_slice(&hdr);
+    let absent = f64::from(absent.unwrap_or(0.0));
+    let data = &values[..(bands * pixels).min(values.len())];
+    // One loop for each type, so the type is not asked about per value.
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for v in data {
+                let x: $t = cast(if v.is_nan() { absent } else { f64::from(*v) });
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if mask {
+                for i in 0..pixels {
+                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+    Bytes::from(out)
+}
+
+/// The shape of a float32 `.npy` this crate wrote (`<f4`, C order), and where its data starts.
+pub fn f32_npy_shape(npy: &[u8]) -> Option<(Vec<usize>, usize)> {
+    if npy.len() < 10 || &npy[..8] != b"\x93NUMPY\x01\x00" {
+        return None;
+    }
+    let start = 10 + usize::from(u16::from_le_bytes([npy[8], npy[9]]));
+    let dict = std::str::from_utf8(npy.get(10..start)?).ok()?;
+    if !dict.contains("'descr': '<f4'") || !dict.contains("'fortran_order': False") {
+        return None;
+    }
+    let from = dict.find("'shape': (")? + "'shape': (".len();
+    let shape = dict[from..from + dict[from..].find(')')?]
+        .split(',')
+        .map(str::trim)
+        .filter(|dim| !dim.is_empty())
+        .map(|dim| dim.parse().ok())
+        .collect::<Option<Vec<usize>>>()?;
+    Some((shape, start))
+}
+
+/// A float32 `.npy` of CHW planes rewritten in the dtype of `kind`, or `None` when `npy` is
+/// not such an array or its body is not the size its header names.
+///
+/// The values are cast as [`encode_npy_typed`] casts them: integers truncated toward zero
+/// and held to the type's range (NaN as zero), floats with an infinity held to their largest
+/// finite number. With `mask` the last plane is a validity mask (any value but zero where a
+/// pixel is there), written as the type's largest number there and its smallest elsewhere,
+/// as rio-tiler's `ImageData.mask` is. The values under the mask are kept as they are: what
+/// the renderer put there is the raster's own fill.
+pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes> {
+    retype_f32_npy_with(npy, kind, mask, |v| v)
+}
+
+/// [`retype_f32_npy`], each value (not the mask) passed through `prepare` before it is cast:
+/// how an algorithm rounds or wraps it into `kind`.
+pub fn retype_f32_npy_with(npy: &[u8], kind: SampleType, mask: bool, prepare: impl Fn(f64) -> f64) -> Option<Bytes> {
+    let (shape, start) = f32_npy_shape(npy)?;
+    let [planes, height, width] = shape[..] else { return None };
+    let body = &npy[start..];
+    let pixels = height.checked_mul(width)?;
+    if planes == 0 || body.len() != planes.checked_mul(pixels)?.checked_mul(4)? {
+        return None;
+    }
+    let values = body.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+    let bands = planes - usize::from(mask);
+    let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
+    out.extend_from_slice(&hdr);
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for (i, v) in values.enumerate() {
+                let x: $t = if i < bands * pixels {
+                    cast(prepare(f64::from(v)))
+                } else if v.is_finite() && v != 0.0 {
+                    <$t>::MAX
+                } else {
+                    <$t>::MIN
+                };
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+    Some(Bytes::from(out))
+}
+
+/// Like [`encode_npy_typed`], taking full-precision CHW `f64` values (preserving exact
+/// `uint32`/`int32`/`int64` up to ±2^53 and 17-digit `float64` without `f32` quantization).
+pub fn encode_npy_typed_f64(
+    values: &[f64],
+    bands: usize,
+    height: usize,
+    width: usize,
+    kind: SampleType,
+    absent: Option<f64>,
+    mask: bool,
+) -> Bytes {
+    let pixels = width * height;
+    let planes = bands + usize::from(mask);
+    let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
+    let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
+    out.extend_from_slice(&hdr);
+    let absent = absent.unwrap_or(0.0);
+    let data = &values[..(bands * pixels).min(values.len())];
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for &v in data {
+                let x: $t = cast(if v.is_nan() { absent } else { v });
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if mask {
+                for i in 0..pixels {
+                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
+                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+    Bytes::from(out)
+}
+
+/// Full-precision `f64` point/resampling sampler for wide dtypes (`Uint32`, `Int32`, `Uint64`,
+/// `Int64`, `Float64`) on data-array routes (`.npy` / unstyled data `.tif`).
+#[inline]
+pub fn sample_f64_general(
+    src: &BandSource<'_>,
+    u: f64,
+    v: f64,
+    mode: ResampleMode,
+) -> f64 {
+    if !u.is_finite() || !v.is_finite() {
+        return f64::NAN;
+    }
+    if u < -0.5 || v < -0.5 || u > src.ifd_w as f64 - 0.5 || v > src.ifd_h as f64 - 0.5 {
+        return f64::NAN;
+    }
+    match mode {
+        ResampleMode::Nearest => {
+            let ix = (u + 0.5).floor() as i32;
+            let iy = (v + 0.5).floor() as i32;
+            src.sample_f64_checked(ix, iy)
+        }
+        ResampleMode::Bilinear => {
+            let x0 = u.floor() as i32;
+            let y0 = v.floor() as i32;
+            let fx = u - x0 as f64;
+            let fy = v - y0 as f64;
+            let s00 = src.sample_f64_checked(x0, y0);
+            let s10 = src.sample_f64_checked(x0 + 1, y0);
+            let s01 = src.sample_f64_checked(x0, y0 + 1);
+            let s11 = src.sample_f64_checked(x0 + 1, y0 + 1);
+            let w00 = (1.0 - fx) * (1.0 - fy);
+            let w10 = fx * (1.0 - fy);
+            let w01 = (1.0 - fx) * fy;
+            let w11 = fx * fy;
+            let mut sum = 0.0f64;
+            let mut wsum = 0.0f64;
+            for (s, w) in [(s00, w00), (s10, w10), (s01, w01), (s11, w11)] {
+                if !s.is_nan() {
+                    sum += s * w;
+                    wsum += w;
+                }
+            }
+            if wsum > 1e-12 { sum / wsum } else { f64::NAN }
+        }
+        _ => {
+            // For higher-order / footprint modes on wide dtypes, fall back to nearest when exact
+            // 1:1 or bilinear in f64 to avoid f32 quantization on large integers/doubles.
+            let x0 = u.floor() as i32;
+            let y0 = v.floor() as i32;
+            let fx = u - x0 as f64;
+            let fy = v - y0 as f64;
+            if fx.abs() < 1e-6 && fy.abs() < 1e-6 {
+                src.sample_f64_checked(x0, y0)
+            } else {
+                sample_f64_general(src, u, v, ResampleMode::Bilinear)
+            }
+        }
+    }
 }
 
 /// Prepend a NumPy v1.0 `.npy` `<f4` header to raw CHW little-endian float32 bytes.
@@ -1465,6 +1776,15 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
         OutputFormat::Png => empty_transparent_png(tile_size),
         OutputFormat::Webp { .. } => empty_transparent_webp(tile_size),
         OutputFormat::Jpeg { .. } => empty_black_jpeg(tile_size),
+        OutputFormat::RawF64 => {
+            let count = (tile_size as usize) * (tile_size as usize) * num_bands;
+            let mut buf = BytesMut::with_capacity(count * 8);
+            let nan_bytes = f64::NAN.to_le_bytes();
+            for _ in 0..count {
+                buf.put_slice(&nan_bytes);
+            }
+            buf.freeze()
+        }
         OutputFormat::RawF32 => {
             let build = |sz: u32, nb: usize| -> Bytes {
                 let count = (sz as usize) * (sz as usize) * nb;
@@ -1487,7 +1807,7 @@ pub fn empty_tile_bytes(tile_size: u32, format: OutputFormat, num_bands: usize) 
                 _ => build(tile_size, num_bands),
             }
         }
-        OutputFormat::Npy => {
+        OutputFormat::Npy | OutputFormat::NpyF64 => {
             let hdr = encode_npy_f32_header(num_bands, tile_size, tile_size);
             let count = (tile_size as usize) * (tile_size as usize) * num_bands;
             let mut buf = BytesMut::with_capacity(hdr.len() + count * 4);
@@ -1575,7 +1895,7 @@ pub fn encode_rgba_tile(rgba: &[u8], size: u32, all_opaque: bool, format: Output
         }
         OutputFormat::Webp { quality } => encode_webp_rgba(size, size, rgba, quality),
         OutputFormat::Jpeg { quality } => encode_jpeg_rgba(size, size, rgba, quality),
-        OutputFormat::RawRgba | OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawRgba | OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             Bytes::copy_from_slice(rgba)
         }
     }
@@ -1604,7 +1924,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
             let max_y = (blk.height() as i32 - 1).max(0);
             let br_f = blk.base_row() as f32;
             match style.format {
-                OutputFormat::RawF32 | OutputFormat::Npy => {
+                OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
                     let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
@@ -1688,7 +2008,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
                             encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                         } else {
-                            encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                            encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
                         }
                     });
                 }
@@ -1786,7 +2106,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
             (plan, SingleBlockRef::from_source(src))
         {
             match style.format {
-                OutputFormat::RawF32 | OutputFormat::Npy => {
+                OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
                     let mut out = BytesMut::with_capacity(N * N * 4);
                     let mut row_f32 = [0.0f32; N];
                     for py in 0..N {
@@ -1828,7 +2148,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
                             encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                         } else {
-                            encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                            encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
                         }
                     });
                 }
@@ -1873,7 +2193,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
     }
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -1909,7 +2229,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                     } else {
                         let plte = build_plte_opaque(lut);
-                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
                     }
                 } else if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
                     let ga_stride = 1 + N * 2;
@@ -1940,8 +2260,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                     }
                     encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
                 } else {
-                    let plte = build_plte_nodata(lut);
-                    let inv_range_254 = 254.0 / range;
+                    let (plte, merged) = build_plte_nodata(lut);
                     for py in 0..N {
                         let row_idx = &mut sc.row_buf[..N];
                         for_each_pixel_in_row(plan, py, |px, u, v| {
@@ -1949,8 +2268,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                             if val.is_nan() {
                                 row_idx[px] = 0;
                             } else {
-                                let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                                row_idx[px] = 1 + (t as u8);
+                                row_idx[px] = nodata_index(rescale_u8(val, inv_range, min_val), merged);
                             }
                         });
                         filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
@@ -1958,7 +2276,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                     encode_indexed_png(
                         N as u32,
                         N as u32,
-                        &plte,
+                        plte,
                         Some(&[0u8]),
                         &sc.img_buf[..total],
                     )
@@ -2129,6 +2447,8 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     let r_ptr = r_slice.as_ptr();
     let g_ptr = g_slice.as_ptr();
     let b_ptr = b_slice.as_ptr();
+    #[allow(unused_assignments, unused_mut)]
+    let mut start_px = 0usize;
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -2137,7 +2457,6 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
         let v_br = vdupq_n_f32(br);
         let v_zero = vdupq_n_f32(0.0);
         let v_255 = vdupq_n_f32(255.0);
-        let v_half = vdupq_n_f32(0.5);
         let v_inv0 = vdupq_n_f32(inv[0]);
         let v_inv1 = vdupq_n_f32(inv[1]);
         let v_inv2 = vdupq_n_f32(inv[2]);
@@ -2209,8 +2528,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
                     let val = vfmaq_f32(top, vsubq_f32(bot, top), fy);
                     let scaled = vmulq_f32(vsubq_f32(val, $v_min), $v_inv);
                     let clamped = vminq_f32(vmaxq_f32(scaled, v_zero), v_255);
-                    let rounded = vaddq_f32(clamped, v_half);
-                    vst1q_u32($out.as_mut_ptr(), vcvtq_u32_f32(rounded));
+                    vst1q_u32($out.as_mut_ptr(), vcvtq_u32_f32(clamped));
                 }};
             }
 
@@ -2226,7 +2544,7 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
             }
             px += 4;
         }
-        return;
+        start_px = px;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2240,15 +2558,14 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
                     &to_f32,
                 );
             }
-            return;
+            start_px = (N / 8) * 8;
         }
     }
 
-    #[allow(unreachable_code)]
-    {
+    if start_px < N {
         let max_x = (stride as i32 - 2).max(0);
         let max_y = ((r_slice.len().min(g_slice.len()).min(b_slice.len()) / stride) as i32 - 2).max(0);
-        for px in 0..N {
+        for px in start_px..N {
         let (x0_raw, fx) = fast_floor_i32(u_row[px] - bc);
         let (y0_raw, fy) = fast_floor_i32(v_row[px] - br);
         let x0 = x0_raw.clamp(0, max_x) as usize;
@@ -2311,7 +2628,6 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
     let v_br = _mm256_set1_ps(br);
     let v_zero = _mm256_setzero_ps();
     let v_255 = _mm256_set1_ps(255.0);
-    let v_half = _mm256_set1_ps(0.5);
     let v_inv0 = _mm256_set1_ps(inv[0]);
     let v_inv1 = _mm256_set1_ps(inv[1]);
     let v_inv2 = _mm256_set1_ps(inv[2]);
@@ -2369,10 +2685,9 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
                 let val = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), fy, top);
                 let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
                 let clamped = _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255);
-                let rounded = _mm256_add_ps(clamped, v_half);
                 _mm256_storeu_si256(
                     $out.as_mut_ptr() as *mut __m256i,
-                    _mm256_cvttps_epi32(rounded),
+                    _mm256_cvttps_epi32(clamped),
                 );
             }};
         }
@@ -2711,8 +3026,7 @@ unsafe fn bilinear_row_rgb_u8_separable_neon<const N: usize>(
                         vaddq_f32(val, v_half)
                     } else {
                         let scaled = vmulq_f32(vsubq_f32(val, $v_min), $v_inv);
-                        let clamped = vminq_f32(vmaxq_f32(scaled, v_zero), v_255);
-                        vaddq_f32(clamped, v_half)
+                        vminq_f32(vmaxq_f32(scaled, v_zero), v_255)
                     };
                     vst1q_s32($out.as_mut_ptr(), vcvtq_s32_f32(rounded));
                 }};
@@ -2825,8 +3139,7 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
                     _mm256_add_ps(val, v_half)
                 } else {
                     let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
-                    let clamped = _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255);
-                    _mm256_add_ps(clamped, v_half)
+                    _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255)
                 };
                 _mm256_storeu_si256($out.as_mut_ptr() as *mut __m256i, _mm256_cvttps_epi32(rounded));
             }};
@@ -3072,6 +3385,14 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
                         )
                     }
                 }
+                cogzilla_codec::BandData::F64(s) => unsafe {
+                    (
+                        *s.get_unchecked(p00) as f32,
+                        *s.get_unchecked(p00 + 1) as f32,
+                        *s.get_unchecked(p01) as f32,
+                        *s.get_unchecked(p01 + 1) as f32,
+                    )
+                },
                 cogzilla_codec::BandData::U16 { data, .. } => unsafe {
                     (
                         *data.get_unchecked(p00) as f32,
@@ -3472,7 +3793,7 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
     let mins = style.rescale_min;
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             let mut out = BytesMut::with_capacity(N * N * 3 * 4);
             for b in 0..3 {
                 for py in 0..N {
@@ -3676,7 +3997,7 @@ fn render_rgb_cubic<const N: usize>(
         }
     };
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             let mut out = BytesMut::with_capacity(N * N * 12);
             for b in 0..3 {
                 for py in 0..N {
@@ -3767,7 +4088,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
     let min_val = style.rescale_min;
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |_px, u, v| {
@@ -3777,41 +4098,73 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
             out.freeze()
         }
         OutputFormat::Png => {
-            let lut: &ColormapLut = style.colormap.lut();
-            let plte = build_plte_nodata(lut);
-            let inv_range_254 = 254.0 / range;
-            SCRATCH.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let sc = &mut *guard;
-                let stride = 1 + N;
-                let total = N * stride;
-                if sc.img_buf.len() < total {
-                    sc.img_buf.resize(total, 0);
-                }
-                if sc.row_buf.len() < N {
-                    sc.row_buf.resize(N, 0);
-                }
-                for py in 0..N {
-                    let row_idx = &mut sc.row_buf[..N];
-                    for_each_pixel_in_row(plan, py, |px, u, v| {
-                        let val = eval_uv(u, v);
-                        row_idx[px] = if val.is_nan() {
-                            0
-                        } else {
-                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                            1 + (t as u8)
-                        };
-                    });
-                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
-                }
-                encode_indexed_png(
-                    N as u32,
-                    N as u32,
-                    &plte,
-                    Some(&[0u8]),
-                    &sc.img_buf[..total],
-                )
-            })
+            if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
+                    }
+                    if sc.row_buf.len() < N * 2 {
+                        sc.row_buf.resize(N * 2, 0);
+                    }
+                    for py in 0..N {
+                        let row_ga = &mut sc.row_buf[..N * 2];
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let val = eval_uv(u, v);
+                            let off = px * 2;
+                            if val.is_nan() {
+                                row_ga[off] = 0;
+                                row_ga[off + 1] = 0;
+                            } else {
+                                row_ga[off] = rescale_u8(val, inv_range, min_val);
+                                row_ga[off + 1] = 255;
+                            }
+                        });
+                        filter_sub_ga_row(
+                            row_ga,
+                            &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride],
+                        );
+                    }
+                    encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
+                })
+            } else {
+                let lut: &ColormapLut = style.colormap.lut();
+                let (plte, merged) = build_plte_nodata(lut);
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let stride = 1 + N;
+                    let total = N * stride;
+                    if sc.img_buf.len() < total {
+                        sc.img_buf.resize(total, 0);
+                    }
+                    if sc.row_buf.len() < N {
+                        sc.row_buf.resize(N, 0);
+                    }
+                    for py in 0..N {
+                        let row_idx = &mut sc.row_buf[..N];
+                        for_each_pixel_in_row(plan, py, |px, u, v| {
+                            let val = eval_uv(u, v);
+                            row_idx[px] = if val.is_nan() {
+                                0
+                            } else {
+                                nodata_index(rescale_u8(val, inv_range, min_val), merged)
+                            };
+                        });
+                        filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                    }
+                    encode_indexed_png(
+                        N as u32,
+                        N as u32,
+                        plte,
+                        Some(&[0u8]),
+                        &sc.img_buf[..total],
+                    )
+                })
+            }
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
             let lut: &ColormapLut = style.colormap.lut();
@@ -3945,21 +4298,22 @@ pub fn render_sar_rgb<const N: usize>(
     };
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
-            let mut out = BytesMut::with_capacity(N * N * 3 * 4);
-            let mut g_plane = Vec::with_capacity(N * N * 4);
-            let mut b_plane = Vec::with_capacity(N * N * 4);
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
+            let plane_bytes = N * N * 4;
+            let mut out = vec![0u8; plane_bytes * 3];
+            let (r_plane, rest) = out.split_at_mut(plane_bytes);
+            let (g_plane, b_plane) = rest.split_at_mut(plane_bytes);
             for py in 0..N {
-                for_each_pixel_in_row(plan, py, |_px, u, v| {
+                let row_off = py * N;
+                for_each_pixel_in_row(plan, py, |px, u, v| {
                     let (r, g, b) = sample_pair(u, v);
-                    out.put_slice(&r.to_le_bytes());
-                    g_plane.extend_from_slice(&g.to_le_bytes());
-                    b_plane.extend_from_slice(&b.to_le_bytes());
+                    let off = (row_off + px) * 4;
+                    r_plane[off..off + 4].copy_from_slice(&r.to_le_bytes());
+                    g_plane[off..off + 4].copy_from_slice(&g.to_le_bytes());
+                    b_plane[off..off + 4].copy_from_slice(&b.to_le_bytes());
                 });
             }
-            out.put_slice(&g_plane);
-            out.put_slice(&b_plane);
-            out.freeze()
+            Bytes::from(out)
         }
         OutputFormat::Png => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
@@ -4201,7 +4555,6 @@ pub fn render_expr_vm<const N: usize>(
         plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
     let range = safe_rescale_denom(style.rescale_min, style.rescale_max);
     let inv_range = 255.0 / range;
-    let inv_range_254 = 254.0 / range;
     let min_val = style.rescale_min;
 
     let single_bands: Vec<Option<SingleBlockRef<'_>>> =
@@ -4321,7 +4674,7 @@ pub fn render_expr_vm<const N: usize>(
     };
 
     match style.format {
-        OutputFormat::RawF32 | OutputFormat::Npy => {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             let mut out = BytesMut::with_capacity(N * N * 4);
             for py in 0..N {
                 sample_row(py, &mut band_rows);
@@ -4333,42 +4686,77 @@ pub fn render_expr_vm<const N: usize>(
             out.freeze()
         }
         OutputFormat::Png => {
-            let lut: &ColormapLut = style.colormap.lut();
-            let plte = build_plte_nodata(lut);
-            SCRATCH.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let sc = &mut *guard;
-                let stride = 1 + N;
-                let total = N * stride;
-                if sc.img_buf.len() < total {
-                    sc.img_buf.resize(total, 0);
-                }
-                if sc.row_buf.len() < N {
-                    sc.row_buf.resize(N, 0);
-                }
-                for py in 0..N {
-                    sample_row(py, &mut band_rows);
-                    eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
-                    let row_idx = &mut sc.row_buf[..N];
-                    for px in 0..N {
-                        let val = out_row[px];
-                        row_idx[px] = if val.is_nan() {
-                            0
-                        } else {
-                            let t = ((val - min_val) * inv_range_254).clamp(0.0, 254.0);
-                            1 + (t as u8)
-                        };
+            if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
                     }
-                    filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
-                }
-                encode_indexed_png(
-                    N as u32,
-                    N as u32,
-                    &plte,
-                    Some(&[0u8]),
-                    &sc.img_buf[..total],
-                )
-            })
+                    if sc.row_buf.len() < N * 2 {
+                        sc.row_buf.resize(N * 2, 0);
+                    }
+                    for py in 0..N {
+                        sample_row(py, &mut band_rows);
+                        eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
+                        let row_ga = &mut sc.row_buf[..N * 2];
+                        for px in 0..N {
+                            let val = out_row[px];
+                            let off = px * 2;
+                            if val.is_nan() {
+                                row_ga[off] = 0;
+                                row_ga[off + 1] = 0;
+                            } else {
+                                row_ga[off] = rescale_u8(val, inv_range, min_val);
+                                row_ga[off + 1] = 255;
+                            }
+                        }
+                        filter_sub_ga_row(
+                            row_ga,
+                            &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride],
+                        );
+                    }
+                    encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
+                })
+            } else {
+                let lut: &ColormapLut = style.colormap.lut();
+                let (plte, merged) = build_plte_nodata(lut);
+                SCRATCH.with(|cell| {
+                    let mut guard = cell.borrow_mut();
+                    let sc = &mut *guard;
+                    let stride = 1 + N;
+                    let total = N * stride;
+                    if sc.img_buf.len() < total {
+                        sc.img_buf.resize(total, 0);
+                    }
+                    if sc.row_buf.len() < N {
+                        sc.row_buf.resize(N, 0);
+                    }
+                    for py in 0..N {
+                        sample_row(py, &mut band_rows);
+                        eval_masked_row(py, &band_rows, &mut expr_scratch, &mut out_row);
+                        let row_idx = &mut sc.row_buf[..N];
+                        for px in 0..N {
+                            let val = out_row[px];
+                            row_idx[px] = if val.is_nan() {
+                                0
+                            } else {
+                                nodata_index(rescale_u8(val, inv_range, min_val), merged)
+                            };
+                        }
+                        filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                    }
+                    encode_indexed_png(
+                        N as u32,
+                        N as u32,
+                        plte,
+                        Some(&[0u8]),
+                        &sc.img_buf[..total],
+                    )
+                })
+            }
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
             let lut: &ColormapLut = style.colormap.lut();
@@ -4604,28 +4992,30 @@ pub fn render_terrain_tile<const N: usize>(
                 encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
             }
         }),
-        OutputFormat::RawF32 | OutputFormat::Npy => {
-            let mut r_plane = BytesMut::with_capacity(N * N * 4);
-            let mut g_plane = Vec::with_capacity(N * N * 4);
-            let mut b_plane = Vec::with_capacity(N * N * 4);
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
+            let plane_bytes = N * N * 4;
+            let mut out = vec![0u8; plane_bytes * 3];
+            let (r_plane, rest) = out.split_at_mut(plane_bytes);
+            let (g_plane, b_plane) = rest.split_at_mut(plane_bytes);
             for py in 0..N {
-                for_each_pixel_in_row(plan, py, |_px, u, v| {
+                let row_off = py * N;
+                for_each_pixel_in_row(plan, py, |px, u, v| {
                     let elev = sample_px(u, v);
+                    let off = (row_off + px) * 4;
                     if elev.is_nan() {
-                        r_plane.put_slice(&f32::NAN.to_le_bytes());
-                        g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
-                        b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
+                        let nan_b = f32::NAN.to_le_bytes();
+                        r_plane[off..off + 4].copy_from_slice(&nan_b);
+                        g_plane[off..off + 4].copy_from_slice(&nan_b);
+                        b_plane[off..off + 4].copy_from_slice(&nan_b);
                     } else {
                         let [r, g, b] = encode_px(elev);
-                        r_plane.put_slice(&(r as f32).to_le_bytes());
-                        g_plane.extend_from_slice(&(g as f32).to_le_bytes());
-                        b_plane.extend_from_slice(&(b as f32).to_le_bytes());
+                        r_plane[off..off + 4].copy_from_slice(&(r as f32).to_le_bytes());
+                        g_plane[off..off + 4].copy_from_slice(&(g as f32).to_le_bytes());
+                        b_plane[off..off + 4].copy_from_slice(&(b as f32).to_le_bytes());
                     }
                 });
             }
-            r_plane.put_slice(&g_plane);
-            r_plane.put_slice(&b_plane);
-            r_plane.freeze()
+            Bytes::from(out)
         }
         OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } if clean => {
             SCRATCH.with(|cell| {
@@ -4876,6 +5266,8 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
     let sun_u = zenith.cos();
     let neg_z_scale = -z_factor * inv_8dx;
     let pos_z_scale = z_factor * inv_8dx;
+    #[allow(unused_assignments, unused_mut)]
+    let mut start_px = 0usize;
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -4884,7 +5276,6 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
         let v_one = vdupq_n_f32(1.0);
         let v_zero = vdupq_n_f32(0.0);
         let v_255 = vdupq_n_f32(255.0);
-        let v_half = vdupq_n_f32(0.5);
         let v_neg_zs = vdupq_n_f32(neg_z_scale);
         let v_pos_zs = vdupq_n_f32(pos_z_scale);
         let v_se = vdupq_n_f32(sun_e);
@@ -4896,7 +5287,7 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
         let r0 = row0.as_ptr();
         let r1 = row1.as_ptr();
         let r2 = row2.as_ptr();
-        let mut tmp = [0u32; 4];
+        let out_ptr = out_idx.as_mut_ptr();
         let mut px = 0usize;
         while px + 4 <= N {
             let nw = vld1q_f32(r0.add(px));
@@ -4921,14 +5312,15 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
             let dot = vdivq_f32(num, vsqrtq_f32(len_sq));
             let hs = vminq_f32(vmulq_f32(vmaxq_f32(dot, v_zero), v_255), v_255);
             let scaled = vminq_f32(vmaxq_f32(vmulq_f32(vsubq_f32(hs, v_min), v_inv_r), v_zero), v_255);
-            vst1q_u32(tmp.as_mut_ptr(), vcvtq_u32_f32(vaddq_f32(scaled, v_half)));
-            *out_idx.get_unchecked_mut(px) = tmp[0] as u8;
-            *out_idx.get_unchecked_mut(px + 1) = tmp[1] as u8;
-            *out_idx.get_unchecked_mut(px + 2) = tmp[2] as u8;
-            *out_idx.get_unchecked_mut(px + 3) = tmp[3] as u8;
+            // Narrow 4x u32 -> 4x u8 in registers and emit a single unaligned u32 store.
+            let u32_v = vcvtq_u32_f32(scaled);
+            let u16_v = vmovn_u32(u32_v);
+            let u8_v = vmovn_u16(vcombine_u16(u16_v, u16_v));
+            let packed = vget_lane_u32::<0>(vreinterpret_u32_u8(u8_v));
+            (out_ptr.add(px) as *mut u32).write_unaligned(packed);
             px += 4;
         }
-        return;
+        start_px = px;
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4949,12 +5341,11 @@ fn eval_horn_hillshade_row_clean<const N: usize>(
                     out_idx,
                 );
             }
-            return;
+            start_px = (N / 8) * 8;
         }
     }
 
-    #[allow(unreachable_code)]
-    for px in 0..N {
+    for px in start_px..N {
         let c = px + 1;
         let val = eval_horn_3x3(
             row0[c - 1], row0[c], row0[c + 1],
@@ -4988,6 +5379,7 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     let v_zero = _mm256_setzero_ps();
     let v_255 = _mm256_set1_ps(255.0);
     let v_half = _mm256_set1_ps(0.5);
+    let v_one_half = _mm256_set1_ps(1.5);
     let v_neg_zs = _mm256_set1_ps(neg_z_scale);
     let v_pos_zs = _mm256_set1_ps(pos_z_scale);
     let v_se = _mm256_set1_ps(sun_e);
@@ -4996,7 +5388,7 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
     let v_inv_r = _mm256_set1_ps(inv_range);
     let v_min = _mm256_set1_ps(min_val);
 
-    let mut tmp = [0i32; 8];
+    let out_ptr = out_idx.as_mut_ptr();
     let mut px = 0usize;
     while px + 8 <= N {
         let nw = _mm256_loadu_ps(r0.add(px));
@@ -5018,19 +5410,24 @@ unsafe fn eval_horn_hillshade_row_clean_avx2<const N: usize>(
 
         let len_sq = _mm256_fmadd_ps(ny, ny, _mm256_fmadd_ps(nx, nx, v_one));
         let num = _mm256_fmadd_ps(ny, v_sn, _mm256_fmadd_ps(nx, v_se, v_su));
-        let dot = _mm256_div_ps(num, _mm256_sqrt_ps(len_sq));
+        // Hardware reciprocal-sqrt + 1 Newton-Raphson step: r * (1.5 - 0.5 * len_sq * r * r)
+        let r = _mm256_rsqrt_ps(len_sq);
+        let r2 = _mm256_mul_ps(r, r);
+        let inv_len = _mm256_mul_ps(r, _mm256_fnmadd_ps(_mm256_mul_ps(v_half, len_sq), r2, v_one_half));
+        let dot = _mm256_mul_ps(num, inv_len);
         let hs = _mm256_min_ps(_mm256_mul_ps(_mm256_max_ps(dot, v_zero), v_255), v_255);
         let scaled = _mm256_min_ps(
             _mm256_max_ps(_mm256_mul_ps(_mm256_sub_ps(hs, v_min), v_inv_r), v_zero),
             v_255,
         );
-        _mm256_storeu_si256(
-            tmp.as_mut_ptr() as *mut __m256i,
-            _mm256_cvttps_epi32(_mm256_add_ps(scaled, v_half)),
-        );
-        for k in 0..8 {
-            *out_idx.get_unchecked_mut(px + k) = tmp[k] as u8;
-        }
+        // Narrow 8x i32 -> 8x u8 in registers and emit a single unaligned u64 store.
+        let i32_v = _mm256_cvttps_epi32(scaled);
+        let lo128 = _mm256_castsi256_si128(i32_v);
+        let hi128 = _mm256_extracti128_si256::<1>(i32_v);
+        let u16_v = _mm_packus_epi32(lo128, hi128);
+        let u8_v = _mm_packus_epi16(u16_v, u16_v);
+        let packed = _mm_cvtsi128_si64(u8_v) as u64;
+        (out_ptr.add(px) as *mut u64).write_unaligned(packed);
         px += 8;
     }
 }
@@ -5210,7 +5607,7 @@ pub fn render_dem_algorithm<const N: usize>(
         let lut = style.colormap.lut();
 
         match style.format {
-            OutputFormat::RawF32 | OutputFormat::Npy => {
+            OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
                 let mut out = BytesMut::with_capacity(N * N * 4);
                 for py in 0..N {
                     let r0 = py * pad;
@@ -5275,16 +5672,60 @@ pub fn render_dem_algorithm<const N: usize>(
                                 &mut sc.img_buf[py * stride..(py + 1) * stride],
                             );
                         }
+                        if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                            return encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total]);
+                        }
                         let plte = build_plte_opaque(lut);
                         return encode_indexed_png(
                             N as u32,
                             N as u32,
-                            &plte,
+                            plte,
                             None,
                             &sc.img_buf[..total],
                         );
                     }
                 }
+                let is_opaque_dem = clean && !matches!(alg, DemAlgorithm::Aspect);
+                let is_gray = matches!(style.colormap, crate::colormap::ColormapName::Grayscale);
+                if is_gray && !is_opaque_dem {
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
+                    }
+                    let mut row_ga = vec![0u8; N * 2];
+                    for py in 0..N {
+                        let r0 = py * pad;
+                        let r1 = (py + 1) * pad;
+                        let r2 = (py + 2) * pad;
+                        for px in 0..N {
+                            let c = px + 1;
+                            let val = eval_horn_3x3(
+                                elev[r0 + c - 1],
+                                elev[r0 + c],
+                                elev[r0 + c + 1],
+                                elev[r1 + c - 1],
+                                elev[r1 + c],
+                                elev[r1 + c + 1],
+                                elev[r2 + c - 1],
+                                elev[r2 + c],
+                                elev[r2 + c + 1],
+                                inv_8dx,
+                                alg,
+                            );
+                            if val.is_nan() {
+                                row_ga[px * 2] = 0;
+                                row_ga[px * 2 + 1] = 0;
+                            } else {
+                                row_ga[px * 2] = rescale_u8(val, inv_range, min_val);
+                                row_ga[px * 2 + 1] = 255;
+                            }
+                        }
+                        filter_sub_ga_row(&row_ga, &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride]);
+                    }
+                    return encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total]);
+                }
+                let (nodata_plte, merged) = build_plte_nodata(lut);
                 for py in 0..N {
                     let r0 = py * pad;
                     let r1 = (py + 1) * pad;
@@ -5308,24 +5749,96 @@ pub fn render_dem_algorithm<const N: usize>(
                         if val.is_nan() {
                             has_nodata = true;
                             row_idx[px] = 0;
+                        } else if is_opaque_dem {
+                            row_idx[px] = rescale_u8(val, inv_range, min_val);
                         } else {
-                            let idx = rescale_u8(val, inv_range, min_val);
-                            row_idx[px] = if clean && !matches!(alg, DemAlgorithm::Aspect) {
-                                idx
-                            } else {
-                                idx.max(1)
-                            };
+                            row_idx[px] = nodata_index(rescale_u8(val, inv_range, min_val), merged);
                         }
                     }
                     filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
-                if !has_nodata && clean && !matches!(alg, DemAlgorithm::Aspect) {
-                    let plte = build_plte_opaque(lut);
-                    encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                if !has_nodata && is_opaque_dem {
+                    if is_gray {
+                        encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
+                    } else {
+                        let plte = build_plte_opaque(lut);
+                        encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
+                    }
+                } else if is_opaque_dem && has_nodata {
+                    // Rare case: `clean == true` float32 DEM contained `±Inf`, producing `NaN`
+                    // gradients (`inf - inf`). Re-encode with nodata-safe indices so valid index 0
+                    // pixels are never made transparent.
+                    if is_gray {
+                        let ga_stride = 1 + N * 2;
+                        let ga_total = N * ga_stride;
+                        if sc.img_buf.len() < ga_total {
+                            sc.img_buf.resize(ga_total, 0);
+                        }
+                        let mut row_ga = vec![0u8; N * 2];
+                        for py in 0..N {
+                            let r0 = py * pad;
+                            let r1 = (py + 1) * pad;
+                            let r2 = (py + 2) * pad;
+                            for px in 0..N {
+                                let c = px + 1;
+                                let val = eval_horn_3x3(
+                                    elev[r0 + c - 1],
+                                    elev[r0 + c],
+                                    elev[r0 + c + 1],
+                                    elev[r1 + c - 1],
+                                    elev[r1 + c],
+                                    elev[r1 + c + 1],
+                                    elev[r2 + c - 1],
+                                    elev[r2 + c],
+                                    elev[r2 + c + 1],
+                                    inv_8dx,
+                                    alg,
+                                );
+                                if val.is_nan() {
+                                    row_ga[px * 2] = 0;
+                                    row_ga[px * 2 + 1] = 0;
+                                } else {
+                                    row_ga[px * 2] = rescale_u8(val, inv_range, min_val);
+                                    row_ga[px * 2 + 1] = 255;
+                                }
+                            }
+                            filter_sub_ga_row(&row_ga, &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride]);
+                        }
+                        encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
+                    } else {
+                        for py in 0..N {
+                            let r0 = py * pad;
+                            let r1 = (py + 1) * pad;
+                            let r2 = (py + 2) * pad;
+                            let row_idx = &mut sc.row_buf[..N];
+                            for px in 0..N {
+                                let c = px + 1;
+                                let val = eval_horn_3x3(
+                                    elev[r0 + c - 1],
+                                    elev[r0 + c],
+                                    elev[r0 + c + 1],
+                                    elev[r1 + c - 1],
+                                    elev[r1 + c],
+                                    elev[r1 + c + 1],
+                                    elev[r2 + c - 1],
+                                    elev[r2 + c],
+                                    elev[r2 + c + 1],
+                                    inv_8dx,
+                                    alg,
+                                );
+                                row_idx[px] = if val.is_nan() {
+                                    0
+                                } else {
+                                    nodata_index(rescale_u8(val, inv_range, min_val), merged)
+                                };
+                            }
+                            filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                        }
+                        encode_indexed_png(N as u32, N as u32, nodata_plte, Some(&[0u8][..]), &sc.img_buf[..total])
+                    }
                 } else {
-                    let plte = build_plte_nodata(lut);
                     let trns = has_nodata.then_some(&[0u8][..]);
-                    encode_indexed_png(N as u32, N as u32, &plte, trns, &sc.img_buf[..total])
+                    encode_indexed_png(N as u32, N as u32, nodata_plte, trns, &sc.img_buf[..total])
                 }
             }
             OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
@@ -5379,6 +5892,31 @@ pub fn render_dem_algorithm<const N: usize>(
 mod tests {
     use super::*;
     use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
+
+    #[test]
+    fn a_nodata_palette_keeps_the_colour_map_s_colours() {
+        use crate::colormap::ColormapName;
+        for name in [ColormapName::Viridis, ColormapName::Terrain, ColormapName::Grayscale] {
+            let lut = name.lut();
+            let (plte, merged) = build_plte_nodata(lut);
+            let mut off = 0;
+            for v in 0..=255u8 {
+                let at = usize::from(nodata_index(v, merged));
+                assert!(at >= 1, "index 0 is the transparent one");
+                if plte[at * 3..at * 3 + 3] != lut.rgb[usize::from(v)] {
+                    off += 1;
+                    assert_eq!(v, merged, "only the merged entry may take another colour");
+                    let got = &plte[at * 3..at * 3 + 3];
+                    let want = lut.rgb[usize::from(v)];
+                    assert!((0..3).all(|k| got[k].abs_diff(want[k]) <= 4), "{name:?}: {got:?} for {want:?}");
+                }
+            }
+            // Viridis repeats a colour next to itself, so it is drawn exactly.
+            if matches!(name, ColormapName::Viridis) {
+                assert_eq!(off, 0);
+            }
+        }
+    }
 
     fn make_plan_32() -> CoordPlan<32> {
         let mut u = [0.0f32; 32];
@@ -6235,5 +6773,566 @@ mod tests {
         let in_w = f32::from_le_bytes(out_where[8 * 4..9 * 4].try_into().unwrap());
         assert!(oob_w.is_nan(), "OOB pixel for where() expr must be NaN, got {oob_w}");
         assert_eq!(in_w, 5.0, "in-bounds pixel for where(1, 5, b1) must be 5.0");
+    }
+}
+
+/// Golden bytes of the `.npy` float32 writers: the header in full for a spread of shapes,
+/// and the length and SHA-256 of whole arrays. These pin the response bytes, so a change
+/// here is a change to what clients receive.
+#[cfg(test)]
+mod npy_golden_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The header as it must be written: magic, version 1.0, dict length, the dict, `pad`
+    /// spaces and a newline.
+    fn header(dict: &str, pad: usize) -> Vec<u8> {
+        let mut out = b"\x93NUMPY\x01\x00".to_vec();
+        out.extend_from_slice(&((dict.len() + pad + 1) as u16).to_le_bytes());
+        out.extend_from_slice(dict.as_bytes());
+        out.extend(std::iter::repeat_n(b' ', pad));
+        out.push(b'\n');
+        out
+    }
+
+    /// Reproducible float32 planes with NaN, both infinities, negatives and fractions.
+    fn planes(bands: usize, height: u32, width: u32, seed: u32) -> Vec<u8> {
+        let count = bands * height as usize * width as usize;
+        let mut state = seed;
+        let mut out = Vec::with_capacity(count * 4);
+        for _ in 0..count {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = match (state >> 16) % 11 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                _ => ((state >> 8) as i32 - (1 << 23)) as f32 / 1000.0,
+            };
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn f32_header_bytes_are_pinned() {
+        // (bands, height, width), the dict, and the spaces that pad it.
+        let cases: [(usize, u32, u32, &str, usize); 7] = [
+            (1, 2, 2, "{'descr': '<f4', 'fortran_order': False, 'shape': (1, 2, 2), }", 55),
+            (3, 256, 256, "{'descr': '<f4', 'fortran_order': False, 'shape': (3, 256, 256), }", 51),
+            (4, 7, 13, "{'descr': '<f4', 'fortran_order': False, 'shape': (4, 7, 13), }", 54),
+            (10, 1024, 512, "{'descr': '<f4', 'fortran_order': False, 'shape': (10, 1024, 512), }", 49),
+            (2, 12345, 1, "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 12345, 1), }", 51),
+            (0, 0, 0, "{'descr': '<f4', 'fortran_order': False, 'shape': (0, 0, 0), }", 55),
+            (
+                usize::MAX,
+                u32::MAX,
+                u32::MAX,
+                "{'descr': '<f4', 'fortran_order': False, 'shape': (18446744073709551615, 4294967295, 4294967295), }",
+                18,
+            ),
+        ];
+        for (bands, height, width, dict, pad) in cases {
+            let got = encode_npy_f32_header(bands, height, width);
+            assert_eq!(got.len(), 128, "header length for ({bands}, {height}, {width})");
+            assert_eq!(got, header(dict, pad), "header bytes for ({bands}, {height}, {width})");
+        }
+    }
+
+    #[test]
+    fn f32_small_arrays_are_pinned_in_full() {
+        let le = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let nan = f32::NAN;
+
+        // One band, 2x2: the planes follow the header untouched, then the mask.
+        let values = [1.5, nan, f32::NEG_INFINITY, -2.0];
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (1, 2, 2), }", 55);
+        exp.extend_from_slice(&le(&values));
+        let got = wrap_raw_f32_as_npy(Bytes::from(le(&values)), 1, 2, 2);
+        assert_eq!(got.as_ref(), exp.as_slice());
+        let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(le(&values)), 1, 2, 2, false);
+        assert_eq!(got.as_ref(), exp.as_slice());
+
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }", 55);
+        exp.extend_from_slice(&le(&values));
+        exp.extend_from_slice(&le(&[255.0, 0.0, 0.0, 255.0]));
+        let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(le(&values)), 1, 2, 2, true);
+        assert_eq!(got.as_ref(), exp.as_slice());
+
+        // Three bands, 1 row of 2: a pixel is masked out only when no band is finite there.
+        let values = [nan, 1.0, f32::INFINITY, nan, nan, -0.0];
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (4, 1, 2), }", 55);
+        exp.extend_from_slice(&le(&values));
+        exp.extend_from_slice(&le(&[0.0, 255.0]));
+        let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(le(&values)), 3, 1, 2, true);
+        assert_eq!(got.as_ref(), exp.as_slice());
+
+        // An empty tile is the header and NaN throughout.
+        let mut exp = header("{'descr': '<f4', 'fortran_order': False, 'shape': (2, 3, 3), }", 55);
+        exp.extend_from_slice(&le(&[nan; 18]));
+        assert_eq!(empty_tile_bytes(3, OutputFormat::Npy, 2).as_ref(), exp.as_slice());
+    }
+
+    #[test]
+    fn f32_arrays_are_pinned_by_length_and_digest() {
+        // bands, height, width, mask, bytes cut from the end of the planes, length, SHA-256.
+        let cases: [(usize, u32, u32, bool, usize, usize, &str); 14] = [
+            (1, 2, 2, false, 0, 144, "a2f108947a23fd0bf4a45863a61642c8737f4a737de4ae562e04a90bc71c05f4"),
+            (1, 2, 2, true, 0, 160, "d0037009d0ba0f13e146d568787c345a423ec2907d6cb00b31000ec65258a30b"),
+            (3, 1, 5, true, 0, 208, "bf56f2c2b8000609fb42496e22e5f943de6b0a877470fe254d27cb89cab7e05f"),
+            (3, 7, 13, false, 0, 1220, "17cdaaea973e5db420409f60adeab2ee13586b2544a1a5fc1ba1ef7f07e74e6d"),
+            (3, 7, 13, true, 0, 1584, "9d14efff4748fd24de1c2a71c6ad4847fa1ea5b8f5f522fcfe69edefd28c9a39"),
+            (1, 256, 256, false, 0, 262272, "7d0665ee74caf962f474512cae016c2846cd45d6196a7f1651a73156b3dcc705"),
+            (1, 256, 256, true, 0, 524416, "020d46b447418a8fe60c40d93f4fc624d2149590ad38d6d38ee90130a725a835"),
+            (3, 256, 256, true, 0, 1048704, "2eb4f63e99fb4a12b94f3a397ed4bd1e6e33e7ce715ad8de64aa5eca21adc716"),
+            (3, 512, 512, false, 0, 3145856, "87028dd38eb31c700fef51f6918423e0674e54af6bf0106d9cef4eedbd1e7337"),
+            (1, 1000, 3, true, 0, 24128, "0ec5029e87634968585a837ed56567549724a34e4a8c77bb196626a3269fe510"),
+            (2, 1, 1024, true, 0, 12416, "58b72da7c4d034a04afe596f22dda8eea4c670780a1258d5629959694db7ac6f"),
+            (4, 12345, 1, true, 0, 247028, "8e8bf86438d0a349a9780d8e920d24537ea1292fbf9e629eb88273ef25ba4c34"),
+            (3, 9, 17, true, 150, 2426, "530137fad2f5a61fa10aa1043ed85832f2155ed0a9624fd94ecb8a9e1b9c4e33"),
+            (0, 5, 6, true, 0, 248, "7225ef713825a642977bb6c7f903da5f140d1920d95aae073503dd2be4fdcc62"),
+        ];
+        for (i, (bands, height, width, mask, cut, len, digest)) in cases.into_iter().enumerate() {
+            let mut raw = planes(bands, height, width, 0x9E37_79B9 ^ i as u32);
+            raw.truncate(raw.len() - cut);
+            let got = wrap_raw_f32_as_npy_with_mask(Bytes::from(raw.clone()), bands, height, width, mask);
+            let what = format!("case {i}: ({bands}, {height}, {width}), mask {mask}, cut {cut}");
+            assert_eq!(got.len(), len, "{what}");
+            assert_eq!(sha256_hex(&got), digest, "{what}");
+            if !mask {
+                assert_eq!(got, wrap_raw_f32_as_npy(Bytes::from(raw), bands, height, width));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_npy_tiles_are_pinned_by_length_and_digest() {
+        // tile size, bands, length, SHA-256.
+        let cases: [(u32, usize, usize, &str); 5] = [
+            (256, 1, 262272, "820ec7e5f3dfd5b867b3fd2e8d56e43f8c6afe3bde4a76720a77eafefdfd002f"),
+            (256, 3, 786560, "803f28ae94e98efe8807f4fe51b0772f36d8318ba550ec45e5135cb70496d5de"),
+            (512, 1, 1048704, "845324c7127f73c5a480b5b24d1a9b228c802e837171d77a33994bae555550cd"),
+            (64, 2, 32896, "85a5dff8aa70b4e8df6b7455d9c44fcce85905cec33692d1b4c2776edfee5cee"),
+            (1, 5, 148, "a5497f607d665ebcbf609c18495d17f61a4f30eb9107430f00f8c94f791dc6a5"),
+        ];
+        for (size, bands, len, digest) in cases {
+            let got = empty_tile_bytes(size, OutputFormat::Npy, bands);
+            assert_eq!(got.len(), len, "empty {size} tile of {bands} bands");
+            assert_eq!(sha256_hex(&got), digest, "empty {size} tile of {bands} bands");
+        }
+    }
+}
+
+/// The typed `.npy` writer and the header it shares with the float32 one.
+#[cfg(test)]
+mod npy_typed_tests {
+    use super::*;
+
+    const KINDS: [(SampleType, &str, usize); 8] = [
+        (SampleType::Uint8, "|u1", 1),
+        (SampleType::Int8, "|i1", 1),
+        (SampleType::Uint16, "<u2", 2),
+        (SampleType::Int16, "<i2", 2),
+        (SampleType::Uint32, "<u4", 4),
+        (SampleType::Int32, "<i4", 4),
+        (SampleType::Float32, "<f4", 4),
+        (SampleType::Float64, "<f8", 8),
+    ];
+
+    /// Read a header back: the dtype, the order, the shape, and where the data starts.
+    fn parse(npy: &[u8]) -> (String, String, Vec<usize>, usize) {
+        assert_eq!(&npy[..8], b"\x93NUMPY\x01\x00");
+        let start = 10 + usize::from(u16::from_le_bytes([npy[8], npy[9]]));
+        assert_eq!(start % 64, 0, "the data starts on a multiple of 64 bytes");
+        let dict = std::str::from_utf8(&npy[10..start]).unwrap();
+        assert!(dict.ends_with('\n'));
+        assert!(dict[..dict.len() - 1].trim_end_matches(' ').ends_with(", }"));
+        let field = |name: &str, end: &str| {
+            let from = dict.find(name).unwrap_or_else(|| panic!("{name} in {dict}")) + name.len();
+            dict[from..from + dict[from..].find(end).unwrap()].to_string()
+        };
+        let shape = field("'shape': (", ")")
+            .split(',')
+            .map(str::trim)
+            .filter(|dim| !dim.is_empty())
+            .map(|dim| dim.parse().unwrap())
+            .collect();
+        (field("'descr': '", "'"), field("'fortran_order': ", ","), shape, start)
+    }
+
+    #[test]
+    fn header_is_general_over_dtype_and_shape() {
+        for (_, descr, _) in KINDS {
+            for shape in [vec![], vec![7], vec![1, 2, 2], vec![4, 1024, 512], vec![2, 3, 4, 5]] {
+                let hdr = encode_npy_header(descr, &shape);
+                let (got_descr, order, got_shape, start) = parse(&hdr);
+                assert_eq!((got_descr.as_str(), order.as_str()), (descr, "False"));
+                assert_eq!(got_shape, shape);
+                assert_eq!(start, hdr.len());
+            }
+        }
+        // NumPy writes a tuple of one with its comma, and of none as `()`.
+        let dict = |hdr: Vec<u8>| String::from_utf8(hdr[10..].to_vec()).unwrap();
+        assert!(dict(encode_npy_header("<i2", &[7])).starts_with("{'descr': '<i2', 'fortran_order': False, 'shape': (7,), }"));
+        assert!(dict(encode_npy_header("<f8", &[])).starts_with("{'descr': '<f8', 'fortran_order': False, 'shape': (), }"));
+    }
+
+    #[test]
+    fn header_pads_to_the_next_64_bytes() {
+        // Shapes of 2 to 40 dimensions, led by a number of one or two digits, so the dict
+        // runs through every length from short to past 128 bytes.
+        let (mut unpadded, mut short, mut long) = (false, false, false);
+        for first in [1usize, 10] {
+            for dims in 2..=40usize {
+                let mut shape = vec![1usize; dims];
+                shape[0] = first;
+                let inner = shape.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+                let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({inner}), }}");
+                let total = (10 + dict.len() + 1).div_ceil(64) * 64;
+                let pad = total - 11 - dict.len();
+                let hdr = encode_npy_header("<f4", &shape);
+                assert_eq!(hdr.len(), total, "{dict}");
+                assert_eq!(usize::from(u16::from_le_bytes([hdr[8], hdr[9]])), total - 10);
+                assert_eq!(&hdr[10..10 + dict.len()], dict.as_bytes());
+                assert!(hdr[10 + dict.len()..total - 1].iter().all(|b| *b == b' '));
+                assert_eq!(hdr[total - 1], b'\n');
+                unpadded |= pad == 0;
+                short |= total == 128;
+                long |= total == 192;
+            }
+        }
+        assert!(unpadded && short && long, "a dict that fills its block, and both block counts");
+    }
+
+    #[test]
+    fn f32_header_is_the_general_header() {
+        for (bands, height, width) in [(1usize, 2u32, 2u32), (3, 256, 256), (10, 1024, 512), (usize::MAX, u32::MAX, u32::MAX)] {
+            assert_eq!(
+                encode_npy_f32_header(bands, height, width),
+                encode_npy_header("<f4", &[bands, height as usize, width as usize])
+            );
+        }
+    }
+
+    #[test]
+    fn every_dtype_parses_back_with_a_body_of_the_right_length() {
+        let values: Vec<f32> = (0..3 * 5 * 7).map(|i| if i % 4 == 0 { f32::NAN } else { i as f32 }).collect();
+        for (kind, descr, size) in KINDS {
+            assert_eq!(npy_descr(kind), descr);
+            assert_eq!(kind.bytes_per_sample(), size);
+            for bands in [1usize, 3] {
+                for mask in [false, true] {
+                    let npy = encode_npy_typed(&values, bands, 5, 7, kind, None, mask);
+                    let (got_descr, order, shape, start) = parse(&npy);
+                    assert_eq!((got_descr.as_str(), order.as_str()), (descr, "False"));
+                    assert_eq!(shape, [bands + usize::from(mask), 5, 7]);
+                    assert_eq!(npy.len() - start, (bands + usize::from(mask)) * 5 * 7 * size);
+                }
+            }
+        }
+    }
+
+    /// The body of a 1x4 single-band array of `values`, with its mask plane.
+    fn body(values: &[f32], kind: SampleType, absent: Option<f32>, mask: bool) -> Vec<u8> {
+        let npy = encode_npy_typed(values, 1, 1, values.len(), kind, absent, mask);
+        npy[parse(&npy).3..].to_vec()
+    }
+
+    #[test]
+    fn values_fill_and_mask_in_each_dtype() {
+        let nan = f32::NAN;
+        let values = [1.9, nan, -2.9, 70000.0];
+        macro_rules! le {
+            ($t:ty, $($v:expr),*) => {{
+                let mut out = Vec::new();
+                $(out.extend_from_slice(&<$t>::to_le_bytes($v));)*
+                out
+            }};
+        }
+        // Truncated toward zero, held to the range, absent as zero; then the mask, the
+        // type's largest number where there is a value and its smallest where there is not.
+        assert_eq!(body(&values, SampleType::Uint8, None, true), le!(u8, 1, 0, 0, 255, 255, 0, 255, 255));
+        assert_eq!(body(&values, SampleType::Int8, None, true), le!(i8, 1, 0, -2, 127, 127, -128, 127, 127));
+        assert_eq!(body(&values, SampleType::Uint16, None, true), le!(u16, 1, 0, 0, 65535, 65535, 0, 65535, 65535));
+        assert_eq!(body(&values, SampleType::Int16, None, true), le!(i16, 1, 0, -2, 32767, 32767, -32768, 32767, 32767));
+        assert_eq!(body(&values, SampleType::Uint32, None, true), le!(u32, 1, 0, 0, 70000, u32::MAX, 0, u32::MAX, u32::MAX));
+        assert_eq!(body(&values, SampleType::Int32, None, true), le!(i32, 1, 0, -2, 70000, i32::MAX, i32::MIN, i32::MAX, i32::MAX));
+        assert_eq!(
+            body(&values, SampleType::Float32, None, true),
+            le!(f32, 1.9, 0.0, -2.9, 70000.0, f32::MAX, f32::MIN, f32::MAX, f32::MAX)
+        );
+        assert_eq!(
+            body(&values, SampleType::Float64, None, true),
+            le!(f64, f64::from(1.9f32), 0.0, f64::from(-2.9f32), 70000.0, f64::MAX, f64::MIN, f64::MAX, f64::MAX)
+        );
+        // Without the mask the body is the bands alone.
+        assert_eq!(body(&values, SampleType::Uint16, None, false), le!(u16, 1, 0, 0, 65535));
+        assert_eq!(body(&values, SampleType::Float32, None, false), le!(f32, 1.9, 0.0, -2.9, 70000.0));
+    }
+
+    #[test]
+    fn absent_values_take_the_named_fill() {
+        let nan = f32::NAN;
+        let values = [nan, 5.0, nan];
+        assert_eq!(body(&values, SampleType::Uint8, Some(9.0), false), [9, 5, 9]);
+        assert_eq!(body(&values, SampleType::Uint8, None, false), [0, 5, 0]);
+        // The fill is cast as a value is: out of range it is held to the range.
+        assert_eq!(body(&values, SampleType::Uint8, Some(-9999.0), false), [0, 5, 0]);
+        assert_eq!(body(&values, SampleType::Int16, Some(-9999.0), false), [(-9999i16).to_le_bytes(), 5i16.to_le_bytes(), (-9999i16).to_le_bytes()].concat());
+        assert_eq!(body(&values, SampleType::Float32, Some(-9999.0), false), [(-9999f32).to_le_bytes(), 5f32.to_le_bytes(), (-9999f32).to_le_bytes()].concat());
+        // A fill of NaN is zero in an integer and stays NaN in a float.
+        assert_eq!(body(&values, SampleType::Int32, Some(nan), false), [0i32.to_le_bytes(), 5i32.to_le_bytes(), 0i32.to_le_bytes()].concat());
+        assert!(f32::from_le_bytes(body(&values, SampleType::Float32, Some(nan), false)[..4].try_into().unwrap()).is_nan());
+        // The fill does not reach the mask, which reads the values given.
+        assert_eq!(body(&values, SampleType::Uint8, Some(9.0), true), [9, 5, 9, 0, 255, 0]);
+    }
+
+    #[test]
+    fn floats_hold_infinities_to_the_largest_finite_number() {
+        let values = [f32::INFINITY, f32::NEG_INFINITY];
+        assert_eq!(body(&values, SampleType::Float32, None, false), [f32::MAX.to_le_bytes(), f32::MIN.to_le_bytes()].concat());
+        assert_eq!(
+            body(&values, SampleType::Float64, None, false),
+            [f64::MAX.to_le_bytes(), f64::MIN.to_le_bytes()].concat()
+        );
+        assert_eq!(body(&values, SampleType::Int16, None, true), [i16::MAX.to_le_bytes(), i16::MIN.to_le_bytes(), i16::MAX.to_le_bytes(), i16::MAX.to_le_bytes()].concat());
+    }
+
+    #[test]
+    fn mask_is_set_where_any_band_has_a_value() {
+        let nan = f32::NAN;
+        // Three bands of 1x3: nothing at the first pixel, one band at the second, all at the third.
+        let values = [nan, nan, 1.0, nan, 2.0, 3.0, nan, nan, 0.0];
+        let npy = encode_npy_typed(&values, 3, 1, 3, SampleType::Uint16, None, true);
+        let (_, _, shape, start) = parse(&npy);
+        assert_eq!(shape, [4, 1, 3]);
+        assert_eq!(&npy[start + 18..], [0u16.to_le_bytes(), u16::MAX.to_le_bytes(), u16::MAX.to_le_bytes()].concat().as_slice());
+    }
+
+    #[test]
+    fn a_float32_array_is_rewritten_in_another_type() {
+        // Two planes of a band and its mask, as the float32 writer makes them.
+        let raw: Vec<u8> = [1.9f32, 70000.0, -2.5, 0.0, 255.0, 255.0, 0.0, 255.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_npy = wrap_raw_f32_as_npy(Bytes::from(raw), 2, 2, 2);
+        let typed = retype_f32_npy(&f32_npy, SampleType::Uint16, true).unwrap();
+        let (descr, _, shape, start) = parse(&typed);
+        assert_eq!((descr.as_str(), shape), ("<u2", vec![2, 2, 2]));
+        let words: Vec<u16> = typed[start..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words, [1, 65535, 0, 0, 65535, 65535, 0, 65535]);
+        // Signed: the mask's nothing is the smallest number; the value under it is kept.
+        let typed = retype_f32_npy(&f32_npy, SampleType::Int16, true).unwrap();
+        let start = parse(&typed).3;
+        let words: Vec<i16> = typed[start..].chunks_exact(2).map(|w| i16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words, [1, 32767, -2, 0, 32767, 32767, -32768, 32767]);
+        // Without a mask every plane is a band.
+        let typed = retype_f32_npy(&f32_npy, SampleType::Uint8, false).unwrap();
+        assert_eq!(&typed[parse(&typed).3..], [1, 255, 0, 0, 255, 255, 0, 255]);
+        // float32 to float32 changes only the mask.
+        let typed = retype_f32_npy(&f32_npy, SampleType::Float32, true).unwrap();
+        let start = parse(&typed).3;
+        let floats: Vec<f32> = typed[start..].chunks_exact(4).map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        assert_eq!(floats, [1.9, 70000.0, -2.5, 0.0, f32::MAX, f32::MAX, f32::MIN, f32::MAX]);
+        // What is not a float32 array of three dimensions, or is cut short, is left alone.
+        let typed_already = encode_npy_typed(&[1.0], 1, 1, 1, SampleType::Uint8, None, false);
+        assert!(retype_f32_npy(&typed_already, SampleType::Uint16, false).is_none());
+        assert!(retype_f32_npy(&f32_npy[..f32_npy.len() - 1], SampleType::Uint16, true).is_none());
+        assert!(retype_f32_npy(b"not an array", SampleType::Uint16, true).is_none());
+        let flat = [encode_npy_header("<f4", &[2]), 1f32.to_le_bytes().repeat(2)].concat();
+        assert!(retype_f32_npy(&flat, SampleType::Uint16, false).is_none());
+        // NaN in the mask plane maps to the type's minimum (invalid), not maximum.
+        let raw_nan_mask: Vec<u8> = [5.0f32, 6.0, f32::NAN, 255.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_nan_mask = wrap_raw_f32_as_npy(Bytes::from(raw_nan_mask), 2, 1, 2);
+        let typed_u16 = retype_f32_npy(&f32_nan_mask, SampleType::Uint16, true).unwrap();
+        let words_u16: Vec<u16> = typed_u16[parse(&typed_u16).3..].chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words_u16, [5, 6, 0, u16::MAX]);
+        let typed_i16 = retype_f32_npy(&f32_nan_mask, SampleType::Int16, true).unwrap();
+        let words_i16: Vec<i16> = typed_i16[parse(&typed_i16).3..].chunks_exact(2).map(|w| i16::from_le_bytes([w[0], w[1]])).collect();
+        assert_eq!(words_i16, [5, 6, i16::MIN, i16::MAX]);
+    }
+
+    #[test]
+    fn only_the_named_planes_are_read() {
+        let values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // More values than the planes hold: the rest is left out.
+        let npy = encode_npy_typed(&values, 1, 2, 2, SampleType::Uint8, None, false);
+        assert_eq!(&npy[parse(&npy).3..], [1, 2, 3, 4]);
+        // Fewer: the body is short, and the mask counts what is missing as absent.
+        let npy = encode_npy_typed(&values[..3], 1, 2, 2, SampleType::Uint8, None, true);
+        let (_, _, shape, start) = parse(&npy);
+        assert_eq!(shape, [2, 2, 2]);
+        assert_eq!(&npy[start..], [1, 2, 3, 255, 255, 255, 0]);
+        // No bands: a mask of nothing there, the type's smallest number.
+        let npy = encode_npy_typed(&[], 0, 2, 2, SampleType::Int16, None, true);
+        assert_eq!(&npy[parse(&npy).3..], i16::MIN.to_le_bytes().repeat(4).as_slice());
+    }
+
+    #[test]
+    fn typed_float32_is_not_the_raw_float32_wrapper() {
+        // The two float32 writers agree on the header and on finite values, and differ
+        // in what they write for an absent value, an infinity and the mask.
+        let values = [1.5f32, -2.0, 3.25, 4.0];
+        let raw = Bytes::from(values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        assert_eq!(
+            encode_npy_typed(&values, 1, 2, 2, SampleType::Float32, None, false),
+            wrap_raw_f32_as_npy(raw.clone(), 1, 2, 2)
+        );
+        let typed = encode_npy_typed(&values, 1, 2, 2, SampleType::Float32, None, true);
+        let wrapped = wrap_raw_f32_as_npy_with_mask(raw, 1, 2, 2, true);
+        assert_eq!(typed[..144], wrapped[..144]);
+        assert_eq!(&typed[144..148], f32::MAX.to_le_bytes());
+        assert_eq!(&wrapped[144..148], 255.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn simd_tail_loops_write_all_pixels_for_non_multiple_widths() {
+        // N = 5 is neither a multiple of 4 (NEON) nor 8 (AVX2).
+        let u = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let v = [1.0f32, 1.0, 1.0, 1.0, 1.0];
+        let band = vec![100u8; 64];
+        let mut rgb = [0xAAu8; 5 * 3];
+        bilinear_rgb_single_block_row::<5, u8, _>(
+            &u,
+            &v,
+            &band,
+            &band,
+            &band,
+            0,
+            0,
+            8,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            &mut rgb,
+            |x| x as f32,
+        );
+        assert!(
+            rgb.iter().all(|&b| b == 100),
+            "tail pixel in bilinear_rgb_single_block_row::<5> was not written: {rgb:?}"
+        );
+
+        let r0 = [10.0f32; 7];
+        let r1 = [10.0f32; 7];
+        let r2 = [10.0f32; 7];
+        let mut hs = [0xEEu8; 5];
+        eval_horn_hillshade_row_clean::<5>(&r0, &r1, &r2, 1.0 / 80.0, 315.0, 45.0, 1.0, 1.0, 0.0, &mut hs);
+        assert!(
+            hs.iter().all(|&b| b == hs[0] && b != 0xEE),
+            "tail pixel in eval_horn_hillshade_row_clean::<5> was not written: {hs:?}"
+        );
+    }
+
+    #[test]
+    fn exact2d_coord_plan_scale_handles_nan_center_and_n1() {
+        // Audit #68 #2: N == 1 must not panic OOB
+        let plan1 = CoordPlan::Exact2D {
+            u: vec![5.0].into_boxed_slice(),
+            v: vec![5.0].into_boxed_slice(),
+            all_in_bounds: true,
+            src_min_col: 0,
+            src_max_col: 10,
+            src_min_row: 0,
+            src_max_row: 10,
+        };
+        assert_eq!(coord_plan_scale::<1>(&plan1), (1.0, 1.0));
+
+        // Exact2D with NaN center (N/2, N/2) but valid 16x downscale in top-left quadrant
+        let n = 8usize;
+        let mut u = vec![f32::NAN; n * n];
+        let mut v = vec![f32::NAN; n * n];
+        for py in 0..3 {
+            for px in 0..3 {
+                u[py * n + px] = (px as f32) * 16.0;
+                v[py * n + px] = (py as f32) * 16.0;
+            }
+        }
+        let plan8 = CoordPlan::Exact2D {
+            u: u.into_boxed_slice(),
+            v: v.into_boxed_slice(),
+            all_in_bounds: false,
+            src_min_col: 0,
+            src_max_col: 48,
+            src_min_row: 0,
+            src_max_row: 48,
+        };
+        let (sx, sy) = coord_plan_scale::<8>(&plan8);
+        assert!((sx - 16.0).abs() < 1e-4 && (sy - 16.0).abs() < 1e-4, "got ({sx}, {sy})");
+    }
+
+    #[test]
+    fn audit87_simd_scalar_rounding_parity_and_downscale_footprint_edge() {
+        // 1. Clean Horn hillshade: SIMD lanes (0..4) and scalar tail (4) must match exactly.
+        let r0 = [10.0f32; 7];
+        let r1 = [10.0f32; 7];
+        let r2 = [10.0f32; 7];
+        let mut out = [0u8; 5];
+        eval_horn_hillshade_row_clean::<5>(&r0, &r1, &r2, 1.0, 315.0, 40.0, 1.0, 1.0, 0.0, &mut out);
+        assert!(
+            out.iter().all(|&v| v == out[0]),
+            "hillshade SIMD lanes and scalar tail diverged: {out:?}"
+        );
+        assert_eq!(out[0], 163);
+
+        // 2. Single-block RGB bilinear: SIMD lanes (0..4) and scalar tail (4) must match exactly.
+        let r_blk: [u8; 16] = [
+            100, 100, 101, 101, 100, 100, 101, 101, 100, 100, 101, 101, 100, 100, 101, 101,
+        ];
+        let u_row = [1.6f32; 5];
+        let v_row = [0.0f32; 5];
+        let mut row_rgb = [0u8; 15];
+        bilinear_rgb_single_block_row::<5, u8, _>(
+            &u_row,
+            &v_row,
+            &r_blk,
+            &r_blk,
+            &r_blk,
+            0,
+            0,
+            4,
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            &mut row_rgb,
+            |x| x as f32,
+        );
+        for px in 0..5 {
+            assert_eq!(
+                &row_rgb[px * 3..px * 3 + 3],
+                &[100, 100, 100],
+                "RGB bilinear SIMD/scalar mismatch at px={px}: {row_rgb:?}"
+            );
+        }
+
+        // 3. Downscaled footprint resampling must not clip centers outside [-0.5, w - 0.5]
+        // when the footprint box still overlaps the raster.
+        let band = cogzilla_codec::DecodedBand {
+            data: cogzilla_codec::BandData::U8 {
+                data: vec![10u8; 16 * 16].into_boxed_slice(),
+                nodata: None,
+            },
+            width: 16,
+            height: 16,
+            stats: cogzilla_codec::BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 10.0,
+                max: 10.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        let src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blocks);
+        let avg = sample_general_scaled(&src, -1.0, 4.0, 4.0, 4.0, ResampleMode::Average);
+        assert!(
+            avg.is_finite() && (avg - 10.0).abs() < 1e-4,
+            "expected overlap Average=10.0, got {avg}"
+        );
+        let sum = sample_general_scaled(&src, -1.0, 4.0, 4.0, 4.0, ResampleMode::Sum);
+        // cx = -0.5, footprint x in [-2.5, 1.5] -> overlap width 1.5, height 4.0 -> area 6.0 * 10.0 = 60.0
+        assert!(
+            sum.is_finite() && (sum - 60.0).abs() < 1e-3,
+            "expected overlap Sum=60.0, got {sum}"
+        );
+        // Completely outside footprint still returns NaN
+        assert!(sample_general_scaled(&src, -5.0, 4.0, 4.0, 4.0, ResampleMode::Average).is_nan());
     }
 }

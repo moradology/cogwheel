@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cogzilla_codec::{
-    DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile_rows,
-    decode_tile_rows,
+    BandData, DecodedTile, apply_alpha_band_to_tile, apply_mask_to_tile, decode_mask_tile_rows,
+    decode_tile_rows_exact as decode_tile_rows,
 };
 use cogzilla_tiff::{CogIndex, IfdMeta, PlanarConfig, TiffError, parse_cog, parse_cog_sparse};
 use dashmap::DashMap;
@@ -32,7 +32,11 @@ enum SidecarTileRange {
 
 fn mark_tile_all_nodata(tile: &mut DecodedTile) {
     for b in &mut tile.bands {
-        b.data.make_f32_mut().fill(f32::NAN);
+        if let BandData::F64(ref mut s) = b.data {
+            s.fill(f64::NAN);
+        } else {
+            b.data.make_f32_mut().fill(f32::NAN);
+        }
         b.stats = cogzilla_codec::BlockStats::ALL_NODATA;
     }
 }
@@ -137,6 +141,9 @@ pub enum SourceFreshness {
         validator: crate::backend::RemoteValidator,
         opened_at: std::time::Instant,
         last_checked_ms: AtomicU64,
+        /// Serializes TTL-expired conditional revalidation so N concurrent requests don't fire N
+        /// simultaneous `Range: bytes=0-0` GETs when the TTL ticks over.
+        revalidate_lock: tokio::sync::Mutex<()>,
     },
     /// Cloud object store (`s3://`, `gs://`, `az://`, `abfs(s)://`): cached without 5s TTL
     /// thrashing (clearable via `/admin/clear-cache` or LRU eviction).
@@ -173,7 +180,23 @@ impl OpenedCog {
                     .or(validator.last_modified.as_deref())
                 {
                     Some(tag) => Some(std::borrow::Cow::Owned(format!("{}#v={tag}", self.uri))),
-                    None => Some(std::borrow::Cow::Borrowed(self.uri.as_str())),
+                    // Without an ETag or Last-Modified validator, scope the disk cache key to this
+                    // process instance and `OpenedCog::id` so RAM-eviction spills still hit disk
+                    // within the TTL window, while TTL re-opens and restarts never serve stale data.
+                    None => {
+                        static PROCESS_NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                        let nonce = *PROCESS_NONCE.get_or_init(|| {
+                            let nanos = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos() as u64)
+                                .unwrap_or(0);
+                            nanos ^ ((std::process::id() as u64).rotate_left(32))
+                        });
+                        Some(std::borrow::Cow::Owned(format!(
+                            "{}#g={nonce:x}-{}",
+                            self.uri, self.id
+                        )))
+                    }
                 }
             }
         }
@@ -574,16 +597,32 @@ impl CogStore {
 
     /// Evict a cached URI (optionally only if its `OpenedCog::id` matches `expected_id`) and
     /// advance `invalidation_epoch` so downstream caches flush stale rendered tiles.
+    /// Never evicts `OpenSlot::InFlight` entries so concurrent waiters are always woken by the owner.
     pub fn invalidate_uri(&self, uri: &str, expected_id: Option<u64>) {
         let removed = match expected_id {
             Some(id) => self
                 .datasets_by_uri
                 .remove_if(uri, |_, slot| matches!(slot, OpenSlot::Ready { cog, .. } if cog.id == id))
                 .is_some(),
-            None => self.datasets_by_uri.remove(uri).is_some(),
+            None => self
+                .datasets_by_uri
+                .remove_if(uri, |_, slot| matches!(slot, OpenSlot::Ready { .. }))
+                .is_some(),
         };
         if removed {
             self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Evict all cached `Ready` `OpenedCog` entries (leaving any `InFlight` opens intact) and
+    /// advance `invalidation_epoch`. Called by `POST /admin/clear-cache` so overwritten Cloud COGs
+    /// (`s3://`, `gs://`, `az://`) re-read fresh IFD headers on the next request.
+    pub fn clear_open_uris(&self) {
+        self.datasets_by_uri
+            .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
+        self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some(ref dc) = self.disk_cache {
+            dc.clear();
         }
     }
 
@@ -618,19 +657,35 @@ impl CogStore {
                 validator,
                 opened_at,
                 last_checked_ms,
+                revalidate_lock,
             } => {
                 let ttl_ms = self.remote_cache_ttl.as_millis() as u64;
                 let now_ms = opened_at.elapsed().as_millis() as u64;
-                let prev_ms = last_checked_ms.load(Ordering::Relaxed);
+                let prev_ms = last_checked_ms.load(Ordering::Acquire);
                 if ttl_ms > 0 && now_ms.saturating_sub(prev_ms) < ttl_ms {
                     return Ok(true);
+                }
+                // Singleflight TTL revalidation: serialize concurrent waiters and re-check TTL
+                // (and whether this cog was already invalidated) after acquiring the lock.
+                let _guard = revalidate_lock.lock().await;
+                let now_ms = opened_at.elapsed().as_millis() as u64;
+                let prev_ms = last_checked_ms.load(Ordering::Acquire);
+                if ttl_ms > 0 && now_ms.saturating_sub(prev_ms) < ttl_ms {
+                    return Ok(true);
+                }
+                let still_cached = self
+                    .datasets_by_uri
+                    .get(uri)
+                    .is_some_and(|slot| matches!(&*slot, OpenSlot::Ready { cog: c, .. } if c.id == cog.id));
+                if !still_cached {
+                    return Ok(false);
                 }
                 if validator.etag.is_some() || validator.last_modified.is_some() {
                     match cog.source.revalidate_remote(validator).await {
                         Ok(true) => {
                             last_checked_ms.store(
                                 opened_at.elapsed().as_millis() as u64,
-                                Ordering::Relaxed,
+                                Ordering::Release,
                             );
                             Ok(true)
                         }
@@ -769,7 +824,7 @@ impl CogStore {
             let mut open_guard = OpenAbortGuard {
                 map: &self.datasets_by_uri,
                 uri: uri.to_string(),
-                flight: my_flight,
+                flight: my_flight.clone(),
                 done: false,
             };
 
@@ -905,6 +960,7 @@ impl CogStore {
                                 validator,
                                 opened_at: std::time::Instant::now(),
                                 last_checked_ms: AtomicU64::new(0),
+                                revalidate_lock: tokio::sync::Mutex::new(()),
                             }
                         } else {
                             SourceFreshness::Cloud
@@ -926,13 +982,18 @@ impl CogStore {
             open_guard.done = true;
             match open_res {
                 Ok(cog) => {
-                    if let Some(OpenSlot::InFlight(f)) = self.datasets_by_uri.insert(
+                    my_flight.set_outcome(Ok(cog.clone()));
+                    let prev = self.datasets_by_uri.insert(
                         uri.to_string(),
                         OpenSlot::Ready {
                             cog: cog.clone(),
                             last_used: AtomicU64::new(self.uri_tick()),
                         },
-                    ) {
+                    );
+                    my_flight.notify.notify_waiters();
+                    if let Some(OpenSlot::InFlight(f)) = prev
+                        && !Arc::ptr_eq(&f, &my_flight)
+                    {
                         f.set_outcome(Ok(cog.clone()));
                         f.notify.notify_waiters();
                     }
@@ -943,18 +1004,17 @@ impl CogStore {
                 }
                 Err(err) => {
                     let shared = Arc::new(err);
-                    // Set outcome while holding the shard lock before removing the InFlight entry
-                    // so no waiter can observe `None` in both the map and `take_outcome()`.
-                    if let Some((_, OpenSlot::InFlight(f))) =
-                        self.datasets_by_uri.remove_if(uri, |_, v| {
-                            if let OpenSlot::InFlight(f) = v {
-                                f.set_outcome(Err(shared.clone()));
-                                true
-                            } else {
-                                false
-                            }
-                        })
+                    // Set outcome before removing the InFlight entry so no waiter can observe
+                    // `None` in both the map and `take_outcome()`.
+                    my_flight.set_outcome(Err(shared.clone()));
+                    let removed = self.datasets_by_uri.remove_if(uri, |_, v| {
+                        matches!(v, OpenSlot::InFlight(cur) if Arc::ptr_eq(cur, &my_flight))
+                    });
+                    my_flight.notify.notify_waiters();
+                    if let Some((_, OpenSlot::InFlight(f))) = removed
+                        && !Arc::ptr_eq(&f, &my_flight)
                     {
+                        f.set_outcome(Err(shared.clone()));
                         f.notify.notify_waiters();
                     }
                     return Err(IoError::Shared(shared));
@@ -1029,7 +1089,7 @@ impl CogStore {
                             slice,
                             ifd,
                             cog.index.byte_order,
-                            cog.index.nodata,
+                            cog.index.nodata_f64,
                             rows,
                         )?;
                         if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
@@ -1264,7 +1324,7 @@ impl CogStore {
                 if heavy_block && no_sidecar_mask {
                     let decode_meta = Arc::new(clone_for_decode(ifd));
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     let mut decode_set = tokio::task::JoinSet::new();
                     let mut decode_err: Option<IoError> = None;
 
@@ -1341,7 +1401,7 @@ impl CogStore {
                 {
                     let decode_meta = Arc::new(clone_for_decode(ifd));
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     let mut decode_set = tokio::task::JoinSet::new();
                     let mut decode_err: Option<IoError> = None;
 
@@ -1413,7 +1473,7 @@ impl CogStore {
                     // Zero-copy inline mmap decode (covers single-block, 1-vCPU, trivial
                     // uncompressed blocks, and local COGs with an internal mask_ifd).
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
                         let decode_res: Result<DecodedTile, IoError> = (|| {
                             let Some(slice) = cog.source.local_slice(offset, count) else {
@@ -1533,7 +1593,7 @@ impl CogStore {
                         if !disk_candidates.is_empty() {
                             let meta = Arc::new(clone_for_decode(ifd));
                             let byte_order = cog.index.byte_order;
-                            let nodata = cog.index.nodata;
+                            let nodata = cog.index.nodata_f64;
                             let max_disk_conc = std::thread::available_parallelism()
                                 .map(|n| n.get())
                                 .unwrap_or(4)
@@ -1643,7 +1703,7 @@ impl CogStore {
                     > = tokio::task::JoinSet::new();
                     let mut decode_meta_opt: Option<Arc<IfdMeta>> = None;
                     let byte_order = cog.index.byte_order;
-                    let nodata = cog.index.nodata;
+                    let nodata = cog.index.nodata_f64;
                     let mut fetch_err: Option<IoError> = None;
 
                     let remote_val = cog.remote_validator().cloned();
@@ -1873,10 +1933,16 @@ impl CogStore {
                                                 let mut mset = tokio::task::JoinSet::new();
                                                 for ms in mspans {
                                                     let src = cog.source.clone();
+                                                    let rv = remote_val.clone();
                                                     mset.spawn(async move {
                                                         let b = src
-                                                            .fetch_range(ms.start, ms.end)
-                                                            .await?;
+                                                            .fetch_range_with_meta(
+                                                                ms.start,
+                                                                ms.end,
+                                                                rv.as_ref(),
+                                                            )
+                                                            .await?
+                                                            .bytes;
                                                         Ok::<_, IoError>((ms, b))
                                                     });
                                                 }
@@ -1956,10 +2022,16 @@ impl CogStore {
                                             let mut aset = tokio::task::JoinSet::new();
                                             for aspan in aspans {
                                                 let src = cog.source.clone();
+                                                let rv = remote_val.clone();
                                                 aset.spawn(async move {
                                                     let b = src
-                                                        .fetch_range(aspan.start, aspan.end)
-                                                        .await?;
+                                                        .fetch_range_with_meta(
+                                                            aspan.start,
+                                                            aspan.end,
+                                                            rv.as_ref(),
+                                                        )
+                                                        .await?
+                                                        .bytes;
                                                     Ok::<_, IoError>((aspan, b))
                                                 });
                                             }
@@ -2273,7 +2345,18 @@ impl CogStore {
                 available: 0,
             })
         })?;
-        let raw = cog.source.fetch_range(offset, end).await?;
+        let raw = match cog
+            .source
+            .fetch_range_with_meta(offset, end, cog.remote_validator())
+            .await
+        {
+            Ok(resp) => resp.bytes,
+            Err(e @ IoError::SourceChanged { .. }) => {
+                self.invalidate_uri(&cog.uri, Some(cog.id));
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         if raw.len() < want {
             return Err(IoError::Tiff(TiffError::NeedMoreBytes {
                 required: end,
@@ -2401,7 +2484,7 @@ impl CogStore {
                                 continue;
                             }
                         }
-                        return Err(IoError::Http(e.without_url()));
+                        return Err(crate::backend::io_error_from_reqwest(e));
                     }
                 };
                 let status = resp.status().as_u16();
@@ -2447,7 +2530,7 @@ impl CogStore {
                                 continue;
                             }
                         }
-                        return Err(IoError::Http(e.without_url()));
+                        return Err(crate::backend::io_error_from_reqwest(e));
                     }
                     Err(e) => return Err(e),
                 }

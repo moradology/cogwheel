@@ -253,6 +253,27 @@ pub fn stitch_band_source_into(src: &BandSource<'_>, w: u32, h: u32, out: &mut [
                         }
                     }
                 }
+                BandData::F64(data) => {
+                    for ly in 0..copy_h {
+                        let srow = &data[ly * tw..ly * tw + copy_w];
+                        let d0 = (dst_y0 + ly) * w_us + dst_x0;
+                        let drow = &mut out[d0..d0 + copy_w];
+                        for (d, &v) in drow.iter_mut().zip(srow) {
+                            let mut val = v as f32;
+                            if let Some(nd) = nd_ovr
+                                && val == nd
+                            {
+                                val = f32::NAN;
+                            }
+                            if let Some((sc, off)) = sc_off
+                                && !val.is_nan()
+                            {
+                                val = val * sc + off;
+                            }
+                            *d = val;
+                        }
+                    }
+                }
                 BandData::U16 { data, nodata } => {
                     let nd_u16 = *nodata;
                     if nd_u16.is_none() && nd_ovr.is_none() && sc_off.is_none() {
@@ -466,6 +487,27 @@ fn stitch_band_row_strip(src: &BandSource<'_>, w_us: usize, gy: usize, strip: &m
                             }
                             *d = val;
                         }
+                    }
+                }
+            }
+            BandData::F64(data) => {
+                for ly in 0..copy_h {
+                    let srow = &data[ly * tw..ly * tw + copy_w];
+                    let d0 = ly * w_us + dst_x0;
+                    let drow = &mut strip[d0..d0 + copy_w];
+                    for (d, &v) in drow.iter_mut().zip(srow) {
+                        let mut val = v as f32;
+                        if let Some(nd) = nd_ovr
+                            && val == nd
+                        {
+                            val = f32::NAN;
+                        }
+                        if let Some((sc, off)) = sc_off
+                            && !val.is_nan()
+                        {
+                            val = val * sc + off;
+                        }
+                        *d = val;
                     }
                 }
             }

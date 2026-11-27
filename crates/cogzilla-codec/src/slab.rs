@@ -34,6 +34,37 @@ fn pool_for_len(len: usize) -> Option<(&'static Mutex<Vec<SendF32Ptr>>, usize)> 
     }
 }
 
+/// Minimum slab size (2 MiB) for requesting Linux Transparent Huge Pages (`MADV_HUGEPAGE`).
+const HUGE_SLAB_BYTES: usize = 2 * 1024 * 1024;
+
+#[inline]
+fn slab_layout(len: usize) -> Layout {
+    let bytes = len
+        .checked_mul(std::mem::size_of::<f32>())
+        .expect("AlignedF32Slab size overflow");
+    // Page-align large slabs (>= 2 MiB) so `madvise(MADV_HUGEPAGE)` on Linux is guaranteed
+    // page-aligned, reducing TLB pressure in multi-GiB block caches.
+    let align = if bytes >= HUGE_SLAB_BYTES { 4096 } else { 64 };
+    Layout::from_size_align(bytes, align).expect("valid aligned f32 layout")
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+unsafe fn advise_hugepage(ptr: *mut f32, bytes: usize) {
+    // MADV_HUGEPAGE = 14 on Linux x86_64 and aarch64.
+    const MADV_HUGEPAGE: std::ffi::c_int = 14;
+    unsafe extern "C" {
+        fn madvise(
+            addr: *mut std::ffi::c_void,
+            length: usize,
+            advice: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    if bytes >= HUGE_SLAB_BYTES {
+        let _ = unsafe { madvise(ptr as *mut std::ffi::c_void, bytes, MADV_HUGEPAGE) };
+    }
+}
+
 /// 64-byte-aligned heap-allocated contiguous `f32` slab for SIMD-friendly tile storage.
 /// Recycles standard COG block sizes (`256×256`, `512×512`, `1024×1024`) through a bounded
 /// free-list pool to avoid repeated `mmap`/`munmap` zero-page faults under cold-cache churn.
@@ -63,12 +94,30 @@ impl AlignedF32Slab {
                 }
             }
         }
-        let layout = Layout::from_size_align(len * std::mem::size_of::<f32>(), 64)
-            .expect("valid aligned f32 layout");
+        let layout = slab_layout(len);
         // SAFETY: layout size > 0 and align is power of two; zero-initializing ensures
         // subsequent `&[f32]`/`&mut [f32]` slice views are always valid initialized memory.
-        let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
-        let ptr = NonNull::new(raw).expect("OOM allocating AlignedF32Slab");
+        // On Linux (x86_64/aarch64) for >= 2 MiB slabs, allocate uninitialized first and call
+        // `madvise(MADV_HUGEPAGE)` *before* zeroing so the first-touch page faults allocate
+        // 2 MiB transparent huge pages under `madvise` mode instead of 4 KiB pages.
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let ptr = if layout.size() >= HUGE_SLAB_BYTES {
+            let raw = unsafe { std::alloc::alloc(layout) as *mut f32 };
+            let ptr = NonNull::new(raw).expect("OOM allocating AlignedF32Slab");
+            unsafe {
+                advise_hugepage(raw, layout.size());
+                std::ptr::write_bytes(raw, 0, len);
+            }
+            ptr
+        } else {
+            let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
+            NonNull::new(raw).expect("OOM allocating AlignedF32Slab")
+        };
+        #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let ptr = {
+            let raw = unsafe { alloc_zeroed(layout) as *mut f32 };
+            NonNull::new(raw).expect("OOM allocating AlignedF32Slab")
+        };
         Self { ptr, len }
     }
 
@@ -133,8 +182,7 @@ impl Drop for AlignedF32Slab {
                     }
                 }
             }
-            let layout = Layout::from_size_align(self.len * std::mem::size_of::<f32>(), 64)
-                .expect("valid aligned f32 layout");
+            let layout = slab_layout(self.len);
             unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
         }
     }
@@ -172,6 +220,10 @@ pub enum BandData {
         data: Box<[u8]>,
         nodata: Option<u8>,
     },
+    /// Exact 64-bit floating-point storage for wide TIFF sample types whose precision exceeds
+    /// IEEE-754 `f32`'s 24-bit mantissa (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`).
+    /// Holds every `u32`, `i32`, `f64`, and `i64`/`u64` up to ±2^53 bit-exact (`NaN` = nodata).
+    F64(Box<[f64]>),
     /// Zero-deinterleave view into a shared interleaved RGB8 (`[R, G, B, ...]`) block
     /// for chunky 3-band `uint8` COGs (Sentinel-2 TCI, NAIP, aerial JPEG/WebP RGB).
     RgbU8Channel {
@@ -193,6 +245,7 @@ impl BandData {
     pub fn len(&self) -> usize {
         match self {
             Self::F32(s) => s.len(),
+            Self::F64(s) => s.len(),
             Self::U16 { data, .. } => data.len(),
             Self::U8 { data, .. } => data.len(),
             Self::RgbU8Channel { rgb, .. } => rgb.len() / 3,
@@ -204,11 +257,12 @@ impl BandData {
         self.len() == 0
     }
 
-    /// Resident heap byte size of this band (1 B/px for `U8`/`RgbU8Channel`, 2 B/px for `U16`, 4 B/px for `F32`).
+    /// Resident heap byte size of this band (1 B/px for `U8`/`RgbU8Channel`, 2 B/px for `U16`, 4 B/px for `F32`, 8 B/px for `F64`).
     #[inline(always)]
     pub fn byte_len(&self) -> usize {
         match self {
             Self::F32(s) => s.len() * 4,
+            Self::F64(s) => s.len() * 8,
             Self::U16 { data, .. } => data.len() * 2,
             Self::U8 { data, .. } => data.len(),
             Self::RgbU8Channel { rgb, .. } => rgb.len() / 3,
@@ -224,6 +278,15 @@ impl BandData {
         }
     }
 
+    /// Borrow the underlying `f64` slice if this band is stored as `F64`.
+    #[inline(always)]
+    pub fn as_f64_slice(&self) -> Option<&[f64]> {
+        match self {
+            Self::F64(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Read pixel `idx` as `f32` without bounds checking (`nodata` normalized to `f32::NAN`).
     ///
     /// # Safety
@@ -232,6 +295,7 @@ impl BandData {
     pub unsafe fn get_f32_unchecked(&self, idx: usize) -> f32 {
         match self {
             Self::F32(s) => unsafe { *s.as_slice().get_unchecked(idx) },
+            Self::F64(s) => unsafe { *s.get_unchecked(idx) as f32 },
             Self::U16 { data, nodata } => {
                 let v = unsafe { *data.get_unchecked(idx) };
                 if *nodata == Some(v) {
@@ -268,6 +332,7 @@ impl BandData {
     pub fn get_f32(&self, idx: usize) -> f32 {
         match self {
             Self::F32(s) => s.as_slice()[idx],
+            Self::F64(s) => s[idx] as f32,
             Self::U16 { data, nodata } => {
                 let v = data[idx];
                 if *nodata == Some(v) {
@@ -294,6 +359,83 @@ impl BandData {
                     f32::NAN
                 } else {
                     v as f32
+                }
+            }
+        }
+    }
+
+    /// Bounds-checked read of pixel `idx` as exact `f64` (`nodata` normalized to `f64::NAN`).
+    #[inline(always)]
+    pub fn get_f64(&self, idx: usize) -> f64 {
+        match self {
+            Self::F64(s) => s[idx],
+            Self::F32(s) => s.as_slice()[idx] as f64,
+            Self::U16 { data, nodata } => {
+                let v = data[idx];
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::U8 { data, nodata } => {
+                let v = data[idx];
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::RgbU8Channel {
+                rgb,
+                channel,
+                nodata,
+            } => {
+                let v = rgb[idx * 3 + (*channel as usize)];
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+        }
+    }
+
+    /// Read pixel `idx` as exact `f64` without bounds checking (`nodata` normalized to `f64::NAN`).
+    ///
+    /// # Safety
+    /// `idx` must be `< self.len()`.
+    #[inline(always)]
+    pub unsafe fn get_f64_unchecked(&self, idx: usize) -> f64 {
+        match self {
+            Self::F64(s) => unsafe { *s.get_unchecked(idx) },
+            Self::F32(s) => unsafe { *s.as_slice().get_unchecked(idx) as f64 },
+            Self::U16 { data, nodata } => {
+                let v = unsafe { *data.get_unchecked(idx) };
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::U8 { data, nodata } => {
+                let v = unsafe { *data.get_unchecked(idx) };
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
+                }
+            }
+            Self::RgbU8Channel {
+                rgb,
+                channel,
+                nodata,
+            } => {
+                let v = unsafe { *rgb.get_unchecked(idx * 3 + (*channel as usize)) };
+                if *nodata == Some(v) {
+                    f64::NAN
+                } else {
+                    v as f64
                 }
             }
         }
@@ -417,5 +559,26 @@ mod tests {
         assert_eq!(b_p2[1].data.get_f32(3), 26.0);
         assert_eq!(b_p2[2].data.get_f32(3), 39.0);
         assert_eq!(b_p2[0].data.get_f32(5), 10.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "AlignedF32Slab size overflow")]
+    fn slab_new_uninit_panics_on_size_overflow_wrap_to_zero() {
+        let _ = AlignedF32Slab::new_uninit(usize::MAX / std::mem::size_of::<f32>() + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "AlignedF32Slab size overflow")]
+    fn slab_new_uninit_panics_on_size_overflow_small_wrap() {
+        let _ = AlignedF32Slab::new_uninit(usize::MAX / std::mem::size_of::<f32>() + 2);
+    }
+
+    #[test]
+    fn slab_hugepage_size_is_zero_initialized_and_page_aligned() {
+        let len = HUGE_SLAB_BYTES / std::mem::size_of::<f32>();
+        let slab = AlignedF32Slab::new_uninit(len);
+        assert_eq!(slab.len(), len);
+        assert_eq!((slab.as_slice().as_ptr() as usize) % 4096, 0);
+        assert!(slab.as_slice().iter().all(|&v| v == 0.0));
     }
 }

@@ -57,6 +57,9 @@ pub fn compress_gzip(input: &[u8]) -> Result<Vec<u8>, String> {
 /// Decompress a gzip-encoded buffer using `libdeflater` with an upper bound on decompressed size
 /// to guard against decompression bombs.
 pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {
+    if max_out_bytes == 0 {
+        return Err("gzip payload exceeds 0 B limit".into());
+    }
     if input.len() < 18 || input[0] != 0x1f || input[1] != 0x8b {
         return Err("invalid gzip header".into());
     }
@@ -66,9 +69,14 @@ pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec
         input[input.len() - 2],
         input[input.len() - 1],
     ]) as usize;
+    // Cap initial allocation against an attacker-controlled ISIZE trailer; legitimate high-ratio
+    // streams still grow smoothly via the 2x `InsufficientSpace` loop up to `max_out_bytes`.
+    let max_initial = input.len().saturating_mul(16).max(65_536);
+    let min_cap = 4096usize.min(max_out_bytes);
     let mut cap = isize_hint
+        .min(max_initial)
         .max(input.len().saturating_mul(2))
-        .clamp(4096, max_out_bytes);
+        .clamp(min_cap, max_out_bytes);
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut out = vec![0u8; cap];
@@ -172,12 +180,41 @@ pub fn decode_tile_rows(
     nodata: Option<f32>,
     actual_rows: u32,
 ) -> Result<DecodedTile, CodecError> {
+    decode_tile_rows_exact(
+        compressed,
+        ifd,
+        byte_order,
+        nodata.map(|v| v as f64),
+        actual_rows,
+    )
+}
+
+/// Like [`decode_tile_rows`], accepting full-precision `Option<f64>` nodata for wide sample types
+/// (`Uint32`, `Int32`, `Uint64`, `Int64`, `Float64`).
+pub fn decode_tile_rows_exact(
+    compressed: &[u8],
+    ifd: &IfdMeta,
+    byte_order: ByteOrder,
+    nodata_f64: Option<f64>,
+    actual_rows: u32,
+) -> Result<DecodedTile, CodecError> {
+    let nodata: Option<f32> = nodata_f64.map(|v| v as f32);
     let tile_h = actual_rows.min(ifd.tile_height).max(1);
     let bands_in_tile = match ifd.planar_config {
         PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
         PlanarConfig::Planar => 1,
     };
-    let expected_bytes = (ifd.tile_width as usize)
+    let expected_bytes = ifd
+        .sample_type
+        .row_bytes(ifd.tile_width as usize, bands_in_tile)
+        .and_then(|rb| rb.checked_mul(tile_h as usize))
+        .filter(|&b| b > 0 && b <= MAX_DECODED_TILE_BYTES)
+        .ok_or(CodecError::SizeMismatch {
+            expected: MAX_DECODED_TILE_BYTES,
+            got: compressed.len(),
+        })?;
+    // For sub-byte types (`Uint1`/`Uint4`), also bound the unpacked 1-byte-per-sample allocation.
+    let _unpacked_bytes = (ifd.tile_width as usize)
         .checked_mul(tile_h as usize)
         .and_then(|n| n.checked_mul(bands_in_tile))
         .and_then(|n| n.checked_mul(ifd.sample_type.bytes_per_sample()))
@@ -200,7 +237,8 @@ pub fn decode_tile_rows(
         && nodata.is_some()
         && !matches!(ifd.sample_type, SampleType::Uint8 | SampleType::Uint16);
     let recon_nodata = if defer_color_nodata { None } else { nodata };
-    let deferred_nodata = if defer_color_nodata { nodata } else { None };
+    let recon_nodata_f64 = if defer_color_nodata { None } else { nodata_f64 };
+    let deferred_nodata = if defer_color_nodata { nodata_f64 } else { None };
 
     // Fast path: Uncompressed + Predictor::None avoids touching thread-local scratch completely!
     if ifd.compression == Compression::None
@@ -258,7 +296,7 @@ pub fn decode_tile_rows(
                 byte_order,
                 false,
                 false,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             SampleType::Int32 => predictor::reconstruct_int32(
                 &compressed[..expected_bytes],
@@ -268,7 +306,43 @@ pub fn decode_tile_rows(
                 byte_order,
                 true,
                 false,
+                recon_nodata_f64,
+            ),
+            SampleType::Uint1 => predictor::reconstruct_subbyte(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                1,
                 recon_nodata,
+            ),
+            SampleType::Uint4 => predictor::reconstruct_subbyte(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                4,
+                recon_nodata,
+            ),
+            SampleType::Uint64 => predictor::reconstruct_int64(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                byte_order,
+                false,
+                false,
+                recon_nodata_f64,
+            ),
+            SampleType::Int64 => predictor::reconstruct_int64(
+                &compressed[..expected_bytes],
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                byte_order,
+                true,
+                false,
+                recon_nodata_f64,
             ),
             SampleType::Float64 => predictor::reconstruct_f64_uncompressed(
                 &compressed[..expected_bytes],
@@ -276,7 +350,7 @@ pub fn decode_tile_rows(
                 tile_h,
                 bands_in_tile,
                 byte_order,
-                recon_nodata,
+                recon_nodata_f64,
             ),
         };
         apply_rgba_alpha_if_present(&mut bands, ifd, deferred_nodata);
@@ -289,6 +363,9 @@ pub fn decode_tile_rows(
             fn drop(&mut self) {
                 if self.0.scratch.capacity() > 4 * 1024 * 1024 {
                     self.0.scratch = Vec::with_capacity(512 * 512 * 4);
+                }
+                if self.0.jpeg_merge.capacity() > 1024 * 1024 {
+                    self.0.jpeg_merge = Vec::new();
                 }
             }
         }
@@ -588,9 +665,12 @@ pub fn decode_tile_rows(
                                 compressed.len(),
                             )
                         };
-                        let cap = if content_sz != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64
-                            && content_sz != zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64
-                        {
+                        if content_sz == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
+                            return Err(CodecError::Lerc(
+                                "invalid LERC_ZSTD frame header".into(),
+                            ));
+                        }
+                        let mut cap = if content_sz != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64 {
                             let sz = content_sz as usize;
                             if sz > max_cap {
                                 return Err(CodecError::Lerc(
@@ -599,22 +679,35 @@ pub fn decode_tile_rows(
                             }
                             sz.max(1)
                         } else {
-                            max_cap
+                            compressed
+                                .len()
+                                .saturating_mul(8)
+                                .clamp(65_536usize.min(max_cap), max_cap)
                         };
-                        let mut out = vec![0u8; cap];
-                        let code = unsafe {
-                            zstd_sys::ZSTD_decompressDCtx(
-                                st.zstd_dctx,
-                                out.as_mut_ptr() as *mut std::ffi::c_void,
-                                out.len(),
-                                compressed.as_ptr() as *const std::ffi::c_void,
-                                compressed.len(),
-                            )
-                        };
-                        if unsafe { zstd_sys::ZSTD_isError(code) } != 0 {
+                        let out = loop {
+                            let mut buf = vec![0u8; cap];
+                            let code = unsafe {
+                                zstd_sys::ZSTD_decompressDCtx(
+                                    st.zstd_dctx,
+                                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                    buf.len(),
+                                    compressed.as_ptr() as *const std::ffi::c_void,
+                                    compressed.len(),
+                                )
+                            };
+                            if unsafe { zstd_sys::ZSTD_isError(code) } == 0 {
+                                buf.truncate(code);
+                                break buf;
+                            }
+                            let err_code = unsafe { zstd_sys::ZSTD_getErrorCode(code) };
+                            if err_code == zstd_sys::ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall
+                                && cap < max_cap
+                            {
+                                cap = cap.saturating_mul(2).min(max_cap);
+                                continue;
+                            }
                             return Err(CodecError::Zstd(code));
-                        }
-                        out.truncate(code);
+                        };
                         Some(out)
                     }
                     _ => None,
@@ -845,7 +938,7 @@ pub fn decode_tile_rows(
                 eff_byte_order,
                 false,
                 p == Predictor::HorizontalInt,
-                recon_nodata,
+                recon_nodata_f64,
             ),
             (SampleType::Int32, p) => predictor::reconstruct_int32(
                 raw_slice,
@@ -855,7 +948,43 @@ pub fn decode_tile_rows(
                 eff_byte_order,
                 true,
                 p == Predictor::HorizontalInt,
+                recon_nodata_f64,
+            ),
+            (SampleType::Uint1, _) => predictor::reconstruct_subbyte(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                1,
                 recon_nodata,
+            ),
+            (SampleType::Uint4, _) => predictor::reconstruct_subbyte(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                4,
+                recon_nodata,
+            ),
+            (SampleType::Uint64, p) => predictor::reconstruct_int64(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                eff_byte_order,
+                false,
+                p == Predictor::HorizontalInt,
+                recon_nodata_f64,
+            ),
+            (SampleType::Int64, p) => predictor::reconstruct_int64(
+                raw_slice,
+                ifd.tile_width,
+                tile_h,
+                bands_in_tile,
+                eff_byte_order,
+                true,
+                p == Predictor::HorizontalInt,
+                recon_nodata_f64,
             ),
             (SampleType::Float64, p) => predictor::reconstruct_f64(
                 raw_slice,
@@ -864,7 +993,7 @@ pub fn decode_tile_rows(
                 bands_in_tile,
                 eff_byte_order,
                 p,
-                recon_nodata,
+                recon_nodata_f64,
             ),
         };
 
@@ -936,7 +1065,7 @@ fn parse_lerc_header_dims(blob: &[u8]) -> Option<(usize, usize, usize)> {
 fn apply_rgba_alpha_if_present(
     bands: &mut [DecodedBand],
     ifd: &IfdMeta,
-    deferred_color_nodata: Option<f32>,
+    deferred_color_nodata: Option<f64>,
 ) {
     if ifd.planar_config != PlanarConfig::Chunky {
         return;
@@ -998,10 +1127,34 @@ fn apply_rgba_alpha_if_present(
         _ => {}
     }
 
-    // Apply deferred GDAL_NODATA to non-alpha F32-backed color bands only.
-    if let Some(nd_f32) = deferred_color_nodata {
+    // Apply deferred GDAL_NODATA to non-alpha color bands only.
+    if let Some(nd_f64) = deferred_color_nodata {
+        let nd_f32 = nd_f64 as f32;
         for (idx, b) in bands.iter_mut().enumerate() {
             if idx == alpha_idx {
+                continue;
+            }
+            if let BandData::F64(ref mut slice) = b.data {
+                let mut all_nd = true;
+                let mut no_nd = true;
+                let mut mn = f64::INFINITY;
+                let mut mx = f64::NEG_INFINITY;
+                for v in slice.iter_mut() {
+                    if v.is_nan() || (!nd_f64.is_nan() && *v == nd_f64) {
+                        *v = f64::NAN;
+                        no_nd = false;
+                    } else {
+                        all_nd = false;
+                        if *v < mn { mn = *v; }
+                        if *v > mx { mx = *v; }
+                    }
+                }
+                b.stats = BlockStats {
+                    all_nodata: all_nd,
+                    no_nodata: no_nd,
+                    min: if all_nd { f32::NAN } else { (mn as f32).clamp(f32::MIN, f32::MAX) },
+                    max: if all_nd { f32::NAN } else { (mx as f32).clamp(f32::MIN, f32::MAX) },
+                };
                 continue;
             }
             let slice = b.data.make_f32_mut();
@@ -1065,6 +1218,38 @@ pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
 
 fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
     let n = alpha.len();
+    if let BandData::F64(ref mut slice) = b.data {
+        let mut all_nd = true;
+        let mut no_nd = true;
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for i in 0..n.min(slice.len()) {
+            let a = alpha.get_f32(i);
+            if a == 0.0 || a.is_nan() {
+                slice[i] = f64::NAN;
+                no_nd = false;
+            } else {
+                let v = slice[i];
+                if v.is_nan() {
+                    no_nd = false;
+                } else {
+                    all_nd = false;
+                    if v < mn { mn = v; }
+                    if v > mx { mx = v; }
+                }
+            }
+        }
+        b.stats.all_nodata = all_nd;
+        b.stats.no_nodata = no_nd;
+        if all_nd {
+            b.stats.min = f32::NAN;
+            b.stats.max = f32::NAN;
+        } else {
+            b.stats.min = (mn as f32).clamp(f32::MIN, f32::MAX);
+            b.stats.max = (mx as f32).clamp(f32::MIN, f32::MAX);
+        }
+        return;
+    }
     let slice = b.data.make_f32_mut();
     let mut all_nd = true;
     let mut no_nd = true;
@@ -1240,6 +1425,38 @@ pub fn apply_mask_to_tile(tile: &mut DecodedTile, mask: &[u8]) {
         return;
     }
     for b in &mut tile.bands {
+        if let BandData::F64(ref mut slice) = b.data {
+            let n = slice.len().min(mask.len());
+            let mut all_nd = true;
+            let mut no_nd = true;
+            let mut mn = f64::INFINITY;
+            let mut mx = f64::NEG_INFINITY;
+            for i in 0..n {
+                if mask[i] == 0 {
+                    slice[i] = f64::NAN;
+                    no_nd = false;
+                } else {
+                    let v = slice[i];
+                    if v.is_nan() {
+                        no_nd = false;
+                    } else {
+                        all_nd = false;
+                        if v < mn { mn = v; }
+                        if v > mx { mx = v; }
+                    }
+                }
+            }
+            b.stats.all_nodata = all_nd;
+            b.stats.no_nodata = no_nd;
+            if all_nd {
+                b.stats.min = f32::NAN;
+                b.stats.max = f32::NAN;
+            } else {
+                b.stats.min = (mn as f32).clamp(f32::MIN, f32::MAX);
+                b.stats.max = (mx as f32).clamp(f32::MIN, f32::MAX);
+            }
+            continue;
+        }
         let slice = b.data.make_f32_mut();
         let n = slice.len().min(mask.len());
         let mut all_nd = true;
@@ -1612,5 +1829,20 @@ mod tests {
         v1.extend_from_slice(&1024u32.to_le_bytes()); // height
         v1.extend_from_slice(&2048u32.to_le_bytes()); // width
         assert_eq!(parse_lerc_header_dims(&v1), Some((2048, 1024, 1)));
+    }
+
+    #[test]
+    fn decompress_gzip_limited_handles_small_cap_and_hostile_isize_trailer() {
+        // Must not panic when max_out_bytes < 4096 or == 0.
+        let gz = compress_gzip(b"hello cogzilla").unwrap();
+        assert_eq!(decompress_gzip_limited(&gz, 64).unwrap(), b"hello cogzilla");
+        assert!(decompress_gzip_limited(&gz, 4).is_err());
+        assert!(decompress_gzip_limited(&gz, 0).is_err());
+        // Hostile 18-byte gzip header with 0xFFFF_FFFF ISIZE trailer must fail cleanly without OOM.
+        let mut hostile = [0u8; 18];
+        hostile[0] = 0x1f;
+        hostile[1] = 0x8b;
+        hostile[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decompress_gzip_limited(&hostile, 64 * 1024 * 1024).is_err());
     }
 }

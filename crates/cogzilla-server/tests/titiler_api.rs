@@ -1014,8 +1014,12 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert_eq!(resp.status(), 200, "algorithm={alg} failed");
             let bytes = resp.bytes().await.unwrap();
             assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-            // Indexed-palette PNG (color_type=3)
-            assert_eq!(bytes[25], 3, "expected indexed PNG for algorithm={alg}");
+            // Grayscale (0), Gray+Alpha (4), or indexed-palette PNG (3)
+            assert!(
+                matches!(bytes[25], 0 | 3 | 4),
+                "expected grayscale, gray+alpha, or indexed PNG for algorithm={alg}, got color_type={}",
+                bytes[25]
+            );
         }
 
         // Verify TiTiler-compatible JSON ?algorithm_params={"azimuth":180,"angle_altitude":30}
@@ -1416,6 +1420,115 @@ async fn full_titiler_cog_api_surface_works_end_to_end() {
             assert!(hi_v >= lo_v, "highest ({hi_v}) must be >= lowest ({lo_v})");
             assert!((cnt_v - 2.0).abs() < 1e-4, "count on 2 identical scenes must be 2.0, got {cnt_v}");
 
+            let ps_tile = format!("{base}/mosaic/tiles/WebMercatorQuad/12/657/1582");
+            let f32s = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            };
+            let sat_tile = format!("{base}/mosaic/tiles/WebMercatorQuad/12/652/1583");
+            let fetch = |tile: &str, query: String| {
+                let client = client.clone();
+                let url = format!("{tile}.f32?{query}");
+                async move {
+                    let resp = client.get(url).send().await.unwrap();
+                    (resp.status(), resp.bytes().await.unwrap())
+                }
+            };
+
+            // count is a number everywhere, zero where no scene has a value.
+            let counts = f32s(&cnt_bytes);
+            assert_eq!(counts.len(), 256 * 256);
+            assert!(counts.iter().all(|v| *v == 0.0 || *v == 2.0), "count is 0 or 2 over two identical scenes");
+
+            // Names: any case, and `std` for `stdev`; anything else is refused.
+            let (status, stdev) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=stdev")).await;
+            assert_eq!(status, 200);
+            for name in ["std", "STD", "Stdev"] {
+                let (status, body) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection={name}")).await;
+                assert_eq!(status, 200, "{name}");
+                assert_eq!(body, stdev, "{name}");
+            }
+            let (status, _) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=sum")).await;
+            assert_eq!(status, 422);
+
+            // The last-band methods leave the deciding band out, and need a band beside it.
+            for name in ["lastbandhigh", "lastbandlow"] {
+                let three = format!("url={sat_url}&url={sat_url}&bidx=1&bidx=2&bidx=3&pixel_selection={name}");
+                let (status, body) = fetch(&sat_tile, three).await;
+                assert_eq!(status, 200, "{name}");
+                assert_eq!(body.len(), 2 * 256 * 256 * 4, "{name} of three bands leaves two");
+                let (status, _) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&pixel_selection={name}")).await;
+                assert_eq!(status, 400, "{name} of one band");
+            }
+            // Over one scene the bands left are that scene's own.
+            let (_, kept) = fetch(&sat_tile, format!("url={sat_url}&bidx=1&bidx=2&bidx=3&pixel_selection=lastbandhigh")).await;
+            let (_, own) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&bidx=2&pixel_selection=highest")).await;
+            assert_eq!(kept, own);
+
+            // median holds its scenes, within 64 MiB: two three-band scenes at 2048 px are over it.
+            let over = format!("url={sat_url}&url={sat_url}&bidx=1&bidx=2&bidx=3&pixel_selection=median&tilesize=2048");
+            let (status, body) = fetch(&sat_tile, over).await;
+            assert_eq!(status, 400);
+            assert!(
+                String::from_utf8_lossy(&body).contains("pixel_selection=median exceeds memory budget (64 MiB limit)"),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            let (status, body) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&pixel_selection=median")).await;
+            assert_eq!(status, 200);
+            let (_, one) = fetch(&sat_tile, format!("url={sat_url}&url={sat_url}&bidx=1&pixel_selection=highest")).await;
+            assert_eq!(body, one, "the median of a scene taken twice is the scene");
+
+            // mean and median of whole numbers are whole numbers, the fraction dropped;
+            // of floats they keep it.
+            let (b2, b3) = (fixture("landsat_c2_B2.tif"), fixture("landsat_c2_B3.tif"));
+            if b2.exists() && b3.exists() {
+                let pair = format!(
+                    "url={}&url={}&bidx=1",
+                    b2.canonicalize().unwrap().to_string_lossy(),
+                    b3.canonicalize().unwrap().to_string_lossy()
+                );
+                let (_, hi) = fetch(&sat_tile, format!("{pair}&pixel_selection=highest")).await;
+                let (_, lo) = fetch(&sat_tile, format!("{pair}&pixel_selection=lowest")).await;
+                let (hi, lo) = (f32s(&hi), f32s(&lo));
+                let halves = hi.iter().zip(&lo).filter(|(h, l)| h.is_finite() && (**h + **l) % 2.0 == 1.0).count();
+                assert!(halves > 0, "some pixel's mean of two scenes has a half to drop");
+                for name in ["mean", "median"] {
+                    let (status, got) = fetch(&sat_tile, format!("{pair}&pixel_selection={name}")).await;
+                    assert_eq!(status, 200, "{name}");
+                    let got = f32s(&got);
+                    assert_eq!(got.len(), hi.len());
+                    for (i, v) in got.iter().enumerate() {
+                        if hi[i].is_finite() {
+                            let exact = (f64::from(hi[i]) + f64::from(lo[i])) / 2.0;
+                            assert_eq!(f64::from(*v), exact.trunc(), "{name} at {i}: of {} and {}", lo[i], hi[i]);
+                        } else {
+                            assert!(v.is_nan(), "{name} at {i}");
+                        }
+                    }
+                }
+            }
+            let (_, mean) = fetch(&ps_tile, format!("url={merc_url}&url={sat_url}&bidx=1&pixel_selection=mean")).await;
+            assert!(f32s(&mean).iter().any(|v| v.is_finite() && v.fract() != 0.0), "a float mean keeps its fraction");
+
+            // What a pixel selection leaves is painted and encoded like any other picture:
+            // every format, with and without the mask, under a colour map and a formula.
+            let formats: [(&str, &[u8]); 3] = [("png", &[0x89, b'P', b'N', b'G']), ("jpg", &[0xff, 0xd8]), ("webp", b"RIFF")];
+            for (ext, magic) in formats {
+                for look in ["", "&return_mask=false", "&rescale=0,100&colormap_name=viridis", "&color_formula=gamma%20rgb%202"] {
+                    for bands in ["bidx=1", "bidx=1&bidx=2&bidx=3"] {
+                        // A colour map is for one band; it is refused over three.
+                        if look.contains("colormap_name") && bands != "bidx=1" {
+                            continue;
+                        }
+                        let url = format!("{sat_tile}.{ext}?url={sat_url}&url={sat_url}&{bands}&pixel_selection=highest{look}");
+                        let resp = client.get(&url).send().await.unwrap();
+                        assert_eq!(resp.status(), 200, "{url}");
+                        let body = resp.bytes().await.unwrap();
+                        assert!(body.starts_with(magic), "{url}");
+                    }
+                }
+            }
+
             // Sweep #1 & #7 C1-C4, D2(validate), G1-G3 regression checks
             let cog_stac = get_json(
                 &client,
@@ -1795,11 +1908,43 @@ fn write_synthetic_f32_projected_geotiff(
 fn decode_npy_f32(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.starts_with(b"\x93NUMPY"), "not an npy payload");
     let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let hdr = std::str::from_utf8(&bytes[10..10 + hlen]).unwrap();
     let payload = &bytes[10 + hlen..];
-    payload
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    if hdr.contains("'|u1'") {
+        payload.iter().map(|&b| b as f32).collect()
+    } else if hdr.contains("'|i1'") {
+        payload.iter().map(|&b| (b as i8) as f32).collect()
+    } else if hdr.contains("'<u2'") {
+        payload
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as f32)
+            .collect()
+    } else if hdr.contains("'<i2'") {
+        payload
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32)
+            .collect()
+    } else if hdr.contains("'<u4'") {
+        payload
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect()
+    } else if hdr.contains("'<i4'") {
+        payload
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32)
+            .collect()
+    } else if hdr.contains("'<f8'") {
+        payload
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect()
+    } else {
+        payload
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
 }
 
 #[tokio::test]
@@ -3797,6 +3942,2466 @@ async fn sweep23_cc1_null_geometry_and_indexed_fc_errors() {
         .await
         .unwrap();
     assert_eq!(r_bad_bidx.status(), 400, "mosaicjson null-geom with bidx=99 must return 400");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn audit53_color_formula_with_custom_colormap_and_where_nan_zonal() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_audit53_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // Two 64x64 f32 GeoTIFFs in EPSG:32610 (10 m pixels, origin (500000, 4200640)):
+    // a.tif = 10 + col, b.tif = NaN everywhere.
+    let w = 64usize;
+    let h = 64usize;
+    let mut b1 = vec![0.0f32; w * h];
+    for (i, px) in b1.iter_mut().enumerate() {
+        *px = 10.0 + (i % 64) as f32;
+    }
+    let b2 = vec![f32::NAN; w * h];
+    let a_path = tmp.join("a.tif");
+    let b_path = tmp.join("b.tif");
+    write_synthetic_f32_projected_geotiff(
+        &a_path,
+        w as u32,
+        h as u32,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &b1,
+    );
+    write_synthetic_f32_projected_geotiff(
+        &b_path,
+        w as u32,
+        h as u32,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &b2,
+    );
+    let stac_path = tmp.join("item.json");
+    let stac_json = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "audit53",
+        "geometry": null,
+        "bbox": [-123.0, 37.9, -122.9, 38.0],
+        "properties": {},
+        "assets": {
+            "a": { "href": a_path.to_string_lossy() },
+            "b": { "href": b_path.to_string_lossy() }
+        }
+    });
+    std::fs::write(&stac_path, stac_json.to_string()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let a_url = a_path.to_string_lossy().to_string();
+    let b_url = b_path.to_string_lossy().to_string();
+    let stac_url = stac_path.to_string_lossy().to_string();
+
+    let poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_100.0, 4_200_100.0],
+                [500_200.0, 4_200_100.0],
+                [500_200.0, 4_200_200.0],
+                [500_100.0, 4_200_200.0],
+                [500_100.0, 4_200_100.0]
+            ]]
+        }
+    });
+
+    // 1a. Single-COG POST /cog/statistics with where(1, 42, b1) when untaken b1 is NaN must
+    // evaluate the taken branch (42) instead of aborting on NaN.
+    let r_cog = client
+        .post(format!(
+            "{base}/cog/statistics?url={b_url}&coord_crs=EPSG:32610&max_size=0&expression=where(1,42,b1)"
+        ))
+        .header("content-type", "application/json")
+        .body(poly.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_cog.status(), 200);
+    let cog_stats: serde_json::Value = serde_json::from_str(&r_cog.text().await.unwrap()).unwrap();
+    let cog_b1 = &cog_stats["properties"]["statistics"]["b1"];
+    assert_eq!(
+        cog_b1["valid_pixels"].as_f64().unwrap(),
+        100.0,
+        "where(1,42,b1) on NaN band must keep all 100 valid pixels: {cog_b1}"
+    );
+    assert!((cog_b1["mean"].as_f64().unwrap() - 42.0).abs() < 1e-4);
+
+    // 1b. Multi-COG POST /stac/statistics with where(a>0, a, b) when untaken b is NaN must keep
+    // all 100 valid pixels from a.
+    let r_stac = client
+        .post(format!(
+            "{base}/stac/statistics?url={stac_url}&assets=a&assets=b&coord_crs=EPSG:32610&max_size=0&expression=where(a%3E0,a,b)"
+        ))
+        .header("content-type", "application/json")
+        .body(poly.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stac.status(), 200);
+    let stac_stats: serde_json::Value = serde_json::from_str(&r_stac.text().await.unwrap()).unwrap();
+    let stac_b1 = &stac_stats["properties"]["statistics"]["b1"];
+    assert_eq!(
+        stac_b1["valid_pixels"].as_f64().unwrap(),
+        100.0,
+        "STAC where(a>0,a,b) must keep all 100 valid pixels even when untaken b is NaN: {stac_b1}"
+    );
+    // cols 10..20 have values 20..29 -> mean = 24.5
+    assert!((stac_b1["mean"].as_f64().unwrap() - 24.5).abs() < 1e-4);
+
+    // 2. ?color_formula= with custom JSON ?colormap= must actually transform the output pixels.
+    let cmap = "%5B%5B%5B0%2C100%5D%2C%5B120%2C120%2C120%2C255%5D%5D%5D";
+    let r_plain = client
+        .get(format!(
+            "{base}/cog/bbox/500000,4200000,500640,4200640/32x32.png?url={a_url}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610&colormap={cmap}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_plain.status(), 200);
+    let png_plain = r_plain.bytes().await.unwrap();
+
+    let r_cf = client
+        .get(format!(
+            "{base}/cog/bbox/500000,4200000,500640,4200640/32x32.png?url={a_url}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610&colormap={cmap}&color_formula=Gamma+RGB+2.0"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_cf.status(), 200);
+    let png_cf = r_cf.bytes().await.unwrap();
+    assert_ne!(
+        png_plain, png_cf,
+        "color_formula must not be silently dropped when custom JSON colormap is active"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn audit55_admin_clear_cache_and_mosaic_tile_cache_freshness() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_audit55_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // 64x64 f32 GeoTIFF in EPSG:3857 covering WebMercator tile 2/1/1 (x in [-10018754..0], y in [0..10018754]).
+    let w = 64u32;
+    let h = 64u32;
+    let tile_span = 20_037_508.342789244 / 2.0; // z=2 tile width in EPSG:3857
+    let px = tile_span / (w as f64);
+    let tif_path = tmp.join("fresh_mosaic.tif");
+    let v1 = vec![10.0f32; (w * h) as usize];
+    write_synthetic_f32_projected_geotiff(
+        &tif_path,
+        w,
+        h,
+        3857,
+        -tile_span,
+        tile_span,
+        px,
+        &v1,
+    );
+
+    // Enable encoded tile_cache (16 MiB) to exercise warm tile_cache freshness on /mosaic/tiles!
+    let engine = Arc::new(TileEngine::with_store_and_tile_cache(
+        Arc::new(cogzilla_io::CogStore::new(16 * 1024 * 1024)),
+        16 * 1024 * 1024,
+    ));
+    let engine_check = engine.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let tif_url = tif_path.to_string_lossy().to_string();
+
+    // Warm /mosaic/tiles cache
+    let r1 = client
+        .get(format!("{base}/mosaic/tiles/2/1/1.png?url={tif_url}&rescale=0,100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let b1 = r1.bytes().await.unwrap();
+
+    // Overwrite local file with different values -> warm tile_cache MUST detect mtime/inode change!
+    let tmp_swap = tmp.join("fresh_mosaic_v2.tif");
+    let v2 = vec![90.0f32; (w * h) as usize];
+    write_synthetic_f32_projected_geotiff(
+        &tmp_swap,
+        w,
+        h,
+        3857,
+        -tile_span,
+        tile_span,
+        px,
+        &v2,
+    );
+    std::fs::rename(&tmp_swap, &tif_path).unwrap();
+
+    let r2 = client
+        .get(format!("{base}/mosaic/tiles/2/1/1.png?url={tif_url}&rescale=0,100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let b2 = r2.bytes().await.unwrap();
+    assert_ne!(
+        b1, b2,
+        "warm tile_cache on /mosaic/tiles must invalidate when backing file is replaced"
+    );
+
+    // POST /admin/clear-cache must bump invalidation_epoch (clearing datasets_by_uri)
+    let ep_before = engine_check
+        .store
+        .invalidation_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    let rc = client
+        .post(format!("{base}/admin/clear-cache"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rc.status(), 200);
+    assert!(
+        engine_check
+            .store
+            .invalidation_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            > ep_before,
+        "POST /admin/clear-cache must clear CogStore open URIs and bump invalidation_epoch"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn sweep26_dd1_antimeridian_bbox_and_dd2_partial_polygon_valid_percent() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_sweep26_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    // --- DD1 fixture: EPSG:32701 (UTM 1S, central meridian 177W) spanning ~179E..176W, 16S..18S ---
+    // At 179E, 16S -> UTM 1S easting ~ 72_000, northing ~ 8_230_000.
+    // 500 m pixels x 1024 cols = 512 km (~4.8 deg) -> crosses 180 deg into 176W.
+    let am_w = 1024u32;
+    let am_h = 512u32;
+    let mut am_px = Vec::with_capacity((am_w * am_h) as usize);
+    for _r in 0..am_h {
+        for c in 0..am_w {
+            am_px.push((c + 1) as f32);
+        }
+    }
+    let am_path = tmp.join("am32701.tif");
+    write_synthetic_f32_projected_geotiff(
+        &am_path,
+        am_w,
+        am_h,
+        32701,
+        70_000.0,
+        8_230_000.0,
+        500.0,
+        &am_px,
+    );
+
+    // --- DD2 fixture: 64x64 EPSG:32610 (10 m pixels, x in 500000..500640, y in 4200000..4200640) ---
+    let z_path = tmp.join("dd2_utm10n.tif");
+    write_synthetic_f32_projected_geotiff(
+        &z_path,
+        64,
+        64,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &vec![42.0f32; 64 * 64],
+    );
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let am_url = am_path.to_string_lossy().to_string();
+    let z_url = z_path.to_string_lossy().to_string();
+
+    // DD1a: /cog/bbox/{west>east}.npy must match {west,south,east+360,north}.npy byte-for-byte
+    let r_wrap = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_wrap.status(), 200, "DD1: geographic west>east bbox must succeed");
+    let b_wrap = r_wrap.bytes().await.unwrap();
+    let r_unwrap = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,181.5,-16.5.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_unwrap.status(), 200);
+    let b_unwrap = r_unwrap.bytes().await.unwrap();
+    assert_eq!(b_wrap, b_unwrap, "DD1: wrapped and +360 unwrapped /cog/bbox must match identically");
+
+    // DD1b: /cog/bbox/{west>east}/200x100.npy must match {west,south,east+360,north}/200x100.npy
+    let r_wrap_wh = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5/200x100.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_wrap_wh.status(), 200);
+    let b_wrap_wh = r_wrap_wh.bytes().await.unwrap();
+    let r_unwrap_wh = client
+        .get(format!("{base}/cog/bbox/179.5,-17.5,181.5,-16.5/200x100.npy?url={am_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_unwrap_wh.status(), 200);
+    let b_unwrap_wh = r_unwrap_wh.bytes().await.unwrap();
+    assert_eq!(b_wrap_wh, b_unwrap_wh, "DD1: wrapped and +360 /cog/bbox/200x100 must match identically");
+
+    // DD1c: /cog/map?bbox=179.5,-17.5,-178.5,-16.5 must match 181.5 form
+    let r_map_wrap = client
+        .get(format!(
+            "{base}/cog/map?url={am_url}&bbox=179.5,-17.5,-178.5,-16.5&width=64&height=32&format=npy"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_map_wrap.status(), 200);
+    let b_map_wrap = r_map_wrap.bytes().await.unwrap();
+    let r_map_unwrap = client
+        .get(format!(
+            "{base}/cog/map?url={am_url}&bbox=179.5,-17.5,181.5,-16.5&width=64&height=32&format=npy"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_map_unwrap.status(), 200);
+    assert_eq!(b_map_wrap, r_map_unwrap.bytes().await.unwrap());
+
+    // DD1d: projected coord_crs with minx > maxx must return 400 with one clear message
+    for path in [
+        format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5.npy?url={am_url}&coord_crs=EPSG:3857"),
+        format!("{base}/cog/bbox/179.5,-17.5,-178.5,-16.5/200x100.npy?url={am_url}&coord_crs=EPSG:3857"),
+    ] {
+        let r_proj = client.get(&path).send().await.unwrap();
+        assert_eq!(r_proj.status(), 400, "projected minx>maxx must return 400 for {path}");
+        let msg = r_proj.text().await.unwrap();
+        assert!(
+            msg.contains("minx") && msg.contains("maxx"),
+            "projected minx>maxx 400 must clearly name minx and maxx, got: {msg}"
+        );
+    }
+
+    // DD2a: fully inside polygon stays at valid_percent == 100.0, masked_pixels == 0.0
+    let poly_inside = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_100.0, 4_200_100.0],
+                [500_300.0, 4_200_100.0],
+                [500_300.0, 4_200_300.0],
+                [500_100.0, 4_200_300.0],
+                [500_100.0, 4_200_100.0]
+            ]]
+        }
+    });
+    let r_in = client
+        .post(format!("{base}/cog/statistics?url={z_url}&coord_crs=EPSG:32610&max_size=0"))
+        .header("content-type", "application/json")
+        .body(poly_inside.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_in.status(), 200);
+    let j_in: serde_json::Value = serde_json::from_str(&r_in.text().await.unwrap()).unwrap();
+    let b_in = &j_in["properties"]["statistics"]["b1"];
+    assert_eq!(b_in["valid_percent"].as_f64().unwrap(), 100.0);
+    assert_eq!(b_in["masked_pixels"].as_f64().unwrap(), 0.0);
+
+    // DD2b: half-inside, half-off-file polygon (40x20 = 800 px, 400 px inside file):
+    // native path must report valid_percent == 50.0 and masked_pixels == 400.0 (matching width/height).
+    let poly_half = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_440.0, 4_200_100.0],
+                [500_840.0, 4_200_100.0],
+                [500_840.0, 4_200_300.0],
+                [500_440.0, 4_200_300.0],
+                [500_440.0, 4_200_100.0]
+            ]]
+        }
+    });
+    let r_half = client
+        .post(format!("{base}/cog/statistics?url={z_url}&coord_crs=EPSG:32610&max_size=0"))
+        .header("content-type", "application/json")
+        .body(poly_half.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_half.status(), 200);
+    let j_half: serde_json::Value = serde_json::from_str(&r_half.text().await.unwrap()).unwrap();
+    let b_half = &j_half["properties"]["statistics"]["b1"];
+    assert!(
+        (b_half["count"].as_f64().unwrap() - 400.0).abs() < 1e-4,
+        "expected count 400, got {b_half}"
+    );
+    assert!(
+        (b_half["valid_percent"].as_f64().unwrap() - 50.0).abs() < 1e-4,
+        "DD2: expected valid_percent 50.0 for half-off-file polygon, got {b_half}"
+    );
+    assert!(
+        (b_half["masked_pixels"].as_f64().unwrap() - 400.0).abs() < 1e-4,
+        "DD2: expected masked_pixels 400.0 for half-off-file polygon, got {b_half}"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn write_synthetic_u16_2band_4326_geotiff(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    bounds: [f64; 4], // [west, south, east, north]
+    band1_val: u16,
+    band2_val: u16,
+    hole: Option<&str>, // "left" | "top"
+) {
+    let mut pixels = Vec::<u16>::with_capacity((width * height * 2) as usize);
+    for row in 0..height {
+        for col in 0..width {
+            let masked = match hole {
+                Some("left") => col < width / 2,
+                Some("top") => row < height / 2,
+                _ => false,
+            };
+            if masked {
+                pixels.push(0);
+                pixels.push(0);
+            } else {
+                pixels.push(band1_val);
+                pixels.push(band2_val);
+            }
+        }
+    }
+    let mut buf = Vec::<u8>::new();
+    buf.extend_from_slice(b"II");
+    buf.extend_from_slice(&42u16.to_le_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes());
+
+    let num_entries: u16 = 14;
+    let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+    let data_start = 8 + ifd_size;
+
+    let scale_off = data_start as u32;
+    let tiepoint_off = scale_off + 24;
+    let geokey_off = tiepoint_off + 48;
+    let pixel_off = geokey_off + 24;
+    let pixel_bytes = (pixels.len() * 2) as u32;
+
+    let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        b.extend_from_slice(&val.to_le_bytes());
+    };
+
+    buf.extend_from_slice(&num_entries.to_le_bytes());
+    push_entry(&mut buf, 256, 4, 1, width); // ImageWidth
+    push_entry(&mut buf, 257, 4, 1, height); // ImageLength
+    // BitsPerSample = [16, 16] packed inline in 4 bytes
+    push_entry(&mut buf, 258, 3, 2, 16u32 | (16u32 << 16));
+    push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+    push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+    push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+    push_entry(&mut buf, 277, 3, 1, 2); // SamplesPerPixel = 2
+    push_entry(&mut buf, 278, 4, 1, height); // RowsPerStrip
+    push_entry(&mut buf, 279, 4, 1, pixel_bytes); // StripByteCounts
+    push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+    push_entry(&mut buf, 33550, 12, 3, scale_off); // ModelPixelScaleTag
+    push_entry(&mut buf, 33922, 12, 6, tiepoint_off); // ModelTiepointTag
+    push_entry(&mut buf, 34735, 3, 12, geokey_off); // GeoKeyDirectoryTag
+    // GDAL_NODATA = "0\0" (2 bytes inline in 4-byte value field)
+    push_entry(&mut buf, 42113, 2, 2, u32::from_le_bytes([b'0', 0, 0, 0]));
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+
+    let sx = (bounds[2] - bounds[0]) / width as f64;
+    let sy = (bounds[3] - bounds[1]) / height as f64;
+    assert_eq!(buf.len(), scale_off as usize);
+    for v in [sx, sy, 0.0f64] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), tiepoint_off as usize);
+    for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), geokey_off as usize);
+    // GTModelTypeGeoKey(1024)=2 (Geographic), GeographicTypeGeoKey(2048)=4326
+    for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    assert_eq!(buf.len(), pixel_off as usize);
+    for &p in &pixels {
+        buf.extend_from_slice(&p.to_le_bytes());
+    }
+    std::fs::write(path, &buf).unwrap();
+}
+
+/// Parity Sweep #30 FF1:
+/// - /mosaicjson/bbox honours all 9 pixel_selection methods and returns X-Assets
+/// - GET & POST /mosaicjson/statistics mosaic all intersecting assets through Fold,
+///   honour all 9 pixel_selection methods, and return X-Assets
+/// - Unsupported routes refuse ?pixel_selection= with 400 (while bogus values stay 422)
+#[tokio::test]
+async fn sweep30_ff1_mosaic_bbox_statistics_pixel_selection_and_400_refusal() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep30_ff1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // WebMercator tile 10/163/395 WGS84 bounds (quadkey "0230102033")
+    let bounds = [-122.6953125, 37.71859032558816, -122.34375, 37.996162679728116];
+    let a_path = tmp.join("a.tif");
+    let b_path = tmp.join("b.tif");
+    let c_path = tmp.join("c.tif");
+    write_synthetic_u16_2band_4326_geotiff(&a_path, 64, 64, bounds, 10, 300, Some("left"));
+    write_synthetic_u16_2band_4326_geotiff(&b_path, 64, 64, bounds, 20, 100, None);
+    write_synthetic_u16_2band_4326_geotiff(&c_path, 64, 64, bounds, 30, 200, Some("top"));
+
+    let mj_path = tmp.join("m.json");
+    let mj = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 8,
+        "maxzoom": 12,
+        "quadkey_zoom": 10,
+        "bounds": bounds,
+        "center": [(bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0, 10],
+        "tiles": {
+            "0230102033": [
+                a_path.to_str().unwrap(),
+                b_path.to_str().unwrap(),
+                c_path.to_str().unwrap()
+            ]
+        }
+    });
+    std::fs::write(&mj_path, mj.to_string()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let mp = mj_path.to_string_lossy().to_string();
+    let ap = a_path.to_string_lossy().to_string();
+    let bbox_str = format!("{},{},{},{}", bounds[0], bounds[1], bounds[2], bounds[3]);
+
+    // Expected [TL, TR, BL, BR] for band 1, plus (expected_bands, min, max, mean) for stats
+    // Over 64x64 = 4096 pixels with equal 32x32 quadrants.
+    let cases = [
+        ("first",        [20.0f32, 10.0, 20.0, 10.0], 2usize, 10.0f64, 20.0f64, 15.0f64),
+        ("highest",      [20.0, 20.0, 30.0, 30.0], 2, 20.0, 30.0, 25.0),
+        ("lowest",       [20.0, 10.0, 20.0, 10.0], 2, 10.0, 20.0, 15.0),
+        ("mean",         [20.0, 15.0, 25.0, 20.0], 2, 15.0, 25.0, 20.0),
+        ("median",       [20.0, 15.0, 25.0, 20.0], 2, 15.0, 25.0, 20.0),
+        ("stdev",        [0.0,  5.0,  5.0,  8.164966], 2, 0.0, 8.164966, 4.541241),
+        ("count",        [1.0,  2.0,  2.0,  3.0],  1, 1.0,  3.0,  2.0),
+        ("lastbandhigh", [20.0, 10.0, 30.0, 10.0], 1, 10.0, 30.0, 17.5),
+        ("lastbandlow",  [20.0, 20.0, 20.0, 20.0], 1, 20.0, 20.0, 20.0),
+    ];
+
+    // 1. FF1(a): /mosaicjson/bbox/{bbox}/64x64.npy across all 9 methods + X-Assets
+    for (ps, expected_q, expected_nb, _, _, _) in cases {
+        let r = client
+            .get(format!(
+                "{base}/mosaicjson/bbox/{bbox_str}/64x64.npy?url={mp}&pixel_selection={ps}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "bbox {ps} failed");
+        let x_assets = r
+            .headers()
+            .get("x-assets")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            x_assets.contains("a.tif") && x_assets.contains("b.tif"),
+            "bbox {ps} missing X-Assets: {x_assets:?}"
+        );
+        let body = r.bytes().await.unwrap();
+        let vals = decode_npy_f32(&body);
+        assert_eq!(
+            vals.len(),
+            (expected_nb + 1) * 64 * 64,
+            "bbox {ps} unexpected npy plane count (data+mask)"
+        );
+        let b1 = &vals[..64 * 64];
+        let got_q = [
+            b1[16 * 64 + 16],
+            b1[16 * 64 + 48],
+            b1[48 * 64 + 16],
+            b1[48 * 64 + 48],
+        ];
+        for (i, (&g, &e)) in got_q.iter().zip(expected_q.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "bbox {ps} quadrant {i}: got {got_q:?}, expected {expected_q:?}"
+            );
+        }
+    }
+
+    // 2. FF1(b): GET /mosaicjson/statistics across all 9 methods + X-Assets
+    for (ps, _, expected_nb, exp_min, exp_max, exp_mean) in cases {
+        let r = client
+            .get(format!(
+                "{base}/mosaicjson/statistics?url={mp}&pixel_selection={ps}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "GET statistics {ps} failed");
+        let x_assets = r
+            .headers()
+            .get("x-assets")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            x_assets.contains("a.tif") && x_assets.contains("b.tif"),
+            "GET statistics {ps} missing X-Assets: {x_assets:?}"
+        );
+        if ps != "first" {
+            assert!(
+                x_assets.contains("c.tif"),
+                "GET statistics {ps} should include c.tif in X-Assets: {x_assets:?}"
+            );
+        }
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        let obj = j.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            expected_nb,
+            "GET statistics {ps}: expected {expected_nb} bands, got {j}"
+        );
+        let b1 = &obj["b1"];
+        assert!(
+            (b1["count"].as_f64().unwrap() - 4096.0).abs() < 1e-4,
+            "GET statistics {ps}: expected full mosaic count 4096, got {b1}"
+        );
+        assert!(
+            (b1["min"].as_f64().unwrap() - exp_min).abs() < 1e-3,
+            "GET statistics {ps}: min got {}, expected {exp_min}",
+            b1["min"]
+        );
+        assert!(
+            (b1["max"].as_f64().unwrap() - exp_max).abs() < 1e-3,
+            "GET statistics {ps}: max got {}, expected {exp_max}",
+            b1["max"]
+        );
+        assert!(
+            (b1["mean"].as_f64().unwrap() - exp_mean).abs() < 1e-3,
+            "GET statistics {ps}: mean got {}, expected {exp_mean}",
+            b1["mean"]
+        );
+    }
+
+    // 3. FF1(b): POST /mosaicjson/statistics with polygon covering the mosaic
+    let poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [bounds[0], bounds[1]],
+                [bounds[2], bounds[1]],
+                [bounds[2], bounds[3]],
+                [bounds[0], bounds[3]],
+                [bounds[0], bounds[1]]
+            ]]
+        }
+    });
+    for (ps, _, expected_nb, exp_min, exp_max, exp_mean) in cases {
+        let r = client
+            .post(format!(
+                "{base}/mosaicjson/statistics?url={mp}&pixel_selection={ps}&area_weighted=false"
+            ))
+            .header("content-type", "application/json")
+            .body(poly.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "POST statistics {ps} failed");
+        let x_assets = r
+            .headers()
+            .get("x-assets")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            x_assets.contains("a.tif") && x_assets.contains("b.tif"),
+            "POST statistics {ps} missing X-Assets: {x_assets:?}"
+        );
+        let j: serde_json::Value = serde_json::from_str(&r.text().await.unwrap()).unwrap();
+        let stats = j["properties"]["statistics"].as_object().unwrap();
+        assert_eq!(
+            stats.len(),
+            expected_nb,
+            "POST statistics {ps}: expected {expected_nb} bands, got {j}"
+        );
+        let b1 = &stats["b1"];
+        assert!(
+            (b1["count"].as_f64().unwrap() - 4096.0).abs() < 1e-4,
+            "POST statistics {ps}: expected full mosaic count 4096, got {b1}"
+        );
+        assert!(
+            (b1["min"].as_f64().unwrap() - exp_min).abs() < 1e-3,
+            "POST statistics {ps}: min got {}, expected {exp_min}",
+            b1["min"]
+        );
+        assert!(
+            (b1["max"].as_f64().unwrap() - exp_max).abs() < 1e-3,
+            "POST statistics {ps}: max got {}, expected {exp_max}",
+            b1["max"]
+        );
+        assert!(
+            (b1["mean"].as_f64().unwrap() - exp_mean).abs() < 1e-3,
+            "POST statistics {ps}: mean got {}, expected {exp_mean}",
+            b1["mean"]
+        );
+    }
+
+    // 4. Unsupported routes refuse ?pixel_selection= with 400 (bogus value stays 422)
+    let cx = (bounds[0] + bounds[2]) / 2.0 + 0.01;
+    let cy = (bounds[1] + bounds[3]) / 2.0 - 0.01;
+    for unsupported in [
+        format!("{base}/mosaicjson/point/{cx},{cy}?url={mp}&pixel_selection=highest"),
+        format!("{base}/mosaicjson/info?url={mp}&pixel_selection=highest"),
+        format!("{base}/cog/bbox/{bbox_str}/32x32.npy?url={ap}&pixel_selection=highest"),
+        format!("{base}/cog/statistics?url={ap}&pixel_selection=highest"),
+    ] {
+        let r = client.get(&unsupported).send().await.unwrap();
+        assert_eq!(
+            r.status(),
+            400,
+            "expected 400 for unsupported pixel_selection on {unsupported}, got {}",
+            r.status()
+        );
+    }
+    let r_bogus = client
+        .get(format!(
+            "{base}/mosaicjson/bbox/{bbox_str}/32x32.npy?url={mp}&pixel_selection=bogus"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bogus.status(), 422, "bogus pixel_selection must stay 422");
+
+    // 5. Audit #64 regressions:
+    // (a) POST /mosaicjson/feature.png?pixel_selection=count must succeed (200) and mask outside-polygon corners
+    let tri = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [bounds[0], bounds[1]],
+                [bounds[2], bounds[1]],
+                [bounds[0], bounds[3]],
+                [bounds[0], bounds[1]]
+            ]]
+        }
+    });
+    let r_feat = client
+        .post(format!(
+            "{base}/mosaicjson/feature.npy?url={mp}&width=32&height=32&pixel_selection=count"
+        ))
+        .header("content-type", "application/json")
+        .body(tri.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_feat.status(), 200, "POST /mosaicjson/feature.npy?pixel_selection=count must return 200");
+    let feat_vals = decode_npy_f32(&r_feat.bytes().await.unwrap());
+    // Plane 1 is the mask plane (0 = masked, 255 = valid); top-right corner (row 0, col 31) is outside the triangle
+    let mask_plane = &feat_vals[32 * 32..2 * 32 * 32];
+    assert_eq!(
+        mask_plane[31], 0.0,
+        "Selection::Count on POST /mosaicjson/feature must mask outside-polygon pixels"
+    );
+    assert_eq!(
+        mask_plane[31 * 32], 255.0,
+        "Selection::Count on POST /mosaicjson/feature must keep inside-polygon pixels"
+    );
+
+    // (b) GET /mosaicjson/viewer?pixel_selection=highest -> 200; /mosaicjson/tiles/.../assets?pixel_selection=highest -> 400
+    let r_viewer = client
+        .get(format!("{base}/mosaicjson/viewer?url={mp}&pixel_selection=highest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_viewer.status(), 200, "/mosaicjson/viewer forwards query and must accept pixel_selection");
+    let r_tile_assets = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395/assets?url={mp}&pixel_selection=highest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_tile_assets.status(), 400, "/mosaicjson/tiles/.../assets must refuse pixel_selection with 400");
+    // Audit #72 #1 & #11: TMS-less /mosaicjson/tiles/{z}/{x}/{y}/assets -> 200; bogus TMS -> 422;
+    // mixed-case / percent-encoded resampling accepted
+    let r_assets_notms = client
+        .get(format!("{base}/mosaicjson/tiles/10/163/395/assets?url={mp}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_assets_notms.status(), 200, "/mosaicjson/tiles/z/x/y/assets must return 200");
+    let r_assets_badtms = client
+        .get(format!("{base}/mosaicjson/tiles/BogusTMS/10/163/395/assets?url={mp}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_assets_badtms.status(), 422, "/mosaicjson/tiles/BogusTMS/z/x/y/assets must return 422");
+    let r_resamp_case = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.npy?url={mp}&resampling=Bilinear"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_resamp_case.status(), 200, "mixed-case resampling=Bilinear must return 200");
+
+    // Audit #73: lastbandhigh without explicit bidx on 2-band WebMercator mosaic tile -> 200;
+    // GET /mosaicjson/assets?coord_crs=... -> 200; GET / has Vary: Accept; GET /stats not public cached
+    let r_lbh_nobidx = client
+        .get(format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.png?url={mp}&pixel_selection=lastbandhigh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_lbh_nobidx.status(), 200, "2-band visual lastbandhigh without bidx must return 200");
+    let r_mj_assets_crs = client
+        .get(format!("{base}/mosaicjson/assets?url={mp}&bbox={bbox_str}&coord_crs=EPSG:4326"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_mj_assets_crs.status(), 200, "GET /mosaicjson/assets?coord_crs=... must return 200");
+    let r_root = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(r_root.status(), 200);
+    let vary = r_root
+        .headers()
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(vary.to_ascii_lowercase().contains("accept"), "GET / must include Vary: Accept, got {vary:?}");
+    let r_stats_ep = client.get(format!("{base}/stats")).send().await.unwrap();
+    assert_eq!(r_stats_ep.status(), 200);
+    assert!(
+        r_stats_ep.headers().get("cache-control").is_none(),
+        "GET /stats must not carry public Cache-Control"
+    );
+
+    // (c) POST /mosaicjson/statistics on Point and horizontal LineString with pixel_selection=count
+    let pt = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": { "type": "Point", "coordinates": [cx, cy] }
+    });
+    let r_pt = client
+        .post(format!("{base}/mosaicjson/statistics?url={mp}&pixel_selection=count"))
+        .header("content-type", "application/json")
+        .body(pt.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pt.status(), 200, "POST /mosaicjson/statistics on Point must succeed");
+    let j_pt: serde_json::Value = serde_json::from_str(&r_pt.text().await.unwrap()).unwrap();
+    assert!(
+        j_pt["properties"]["statistics"]["b1"]["count"].as_f64().unwrap() >= 1.0,
+        "Point stats under count must have valid_pixels >= 1, got {j_pt}"
+    );
+    let hline = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[bounds[0] + 0.05, cy], [bounds[2] - 0.05, cy]]
+        }
+    });
+    let r_line = client
+        .post(format!("{base}/mosaicjson/statistics?url={mp}&pixel_selection=count"))
+        .header("content-type", "application/json")
+        .body(hline.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_line.status(), 200, "POST /mosaicjson/statistics on horizontal LineString must succeed");
+    let j_line: serde_json::Value = serde_json::from_str(&r_line.text().await.unwrap()).unwrap();
+    assert!(
+        j_line["properties"]["statistics"]["b1"]["count"].as_f64().unwrap() >= 1.0,
+        "LineString stats under count must have valid_pixels >= 1, got {j_line}"
+    );
+
+    // (d) 2-band visual PNG under lastbandhigh succeeds (200), while 2-band visual PNG under highest returns 400
+    let r_lbh_png = client
+        .get(format!(
+            "{base}/mosaicjson/tiles/WebMercatorQuad/10/163/395.png?url={mp}&bidx=1&bidx=2&pixel_selection=lastbandhigh&rescale=0,100"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_lbh_png.status(), 200, "2-band visual PNG under lastbandhigh must return 200");
+    let r_2b_bad = client
+        .get(format!(
+            "{base}/mosaicjson/bbox/{bbox_str}/32x32.png?url={mp}&bidx=1&bidx=2&pixel_selection=highest"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_2b_bad.status(), 400, "2-band visual PNG under highest must return 400");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Parity Sweep #31 GG1:
+/// - One-file mosaic POST /mosaicjson/statistics equals POST /cog/statistics to 1e-9
+///   (count, mean, std, sum, valid_pixels, valid_percent, masked_pixels, area, category_areas).
+/// - Same-grid and heterogeneous-grid multi-file mosaics keep exact coverage fractions,
+///   ellipsoidal area, and polygon-relative valid_percent == 100.0.
+/// - Heterogeneous-grid POST /stac/statistics with an expression also keeps exact coverage
+///   fractions, ellipsoidal area, and polygon-relative valid_percent == 100.0.
+#[tokio::test]
+async fn sweep31_gg1_mosaic_and_stac_exact_zonal_statistics() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep31_gg1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. One-file projected UTM 10N (EPSG:32610) COG with spatially varying values
+    let utm_path = tmp.join("utm10n.tif");
+    let mut utm_px = vec![0.0f32; 64 * 64];
+    for r in 0..64 {
+        for c in 0..64 {
+            utm_px[r * 64 + c] = ((r * 3 + c * 5) % 17 + 1) as f32;
+        }
+    }
+    write_synthetic_f32_projected_geotiff(
+        &utm_path,
+        64,
+        64,
+        32610,
+        500_000.0,
+        4_200_640.0,
+        10.0,
+        &utm_px,
+    );
+    // Tile covering ~(500_000, 4_200_000) in EPSG:32610 -> ~(-123.0, 37.95)
+    // Querying quadkey at zoom 0 ("") matches any bbox in MosaicJSON.
+    let one_mj_path = tmp.join("one.json");
+    let one_mj = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 0,
+        "maxzoom": 14,
+        "quadkey_zoom": 0,
+        "bounds": [-124.0, 37.0, -122.0, 39.0],
+        "center": [-123.0, 38.0, 10],
+        "tiles": { "": [utm_path.to_str().unwrap()] }
+    });
+    std::fs::write(&one_mj_path, one_mj.to_string()).unwrap();
+
+    // 2. Heterogeneous-grid mosaic & STAC item: 64x64 (val=10) + 32x32 (val=20) over same 4326 bounds
+    let g_bounds = [-122.6953125, 37.71859032558816, -122.34375, 37.996162679728116];
+    let g64_path = tmp.join("g64.tif");
+    let g32_path = tmp.join("g32.tif");
+    write_synthetic_u16_2band_4326_geotiff(&g64_path, 64, 64, g_bounds, 10, 100, None);
+    write_synthetic_u16_2band_4326_geotiff(&g32_path, 32, 32, g_bounds, 20, 200, None);
+    let het_mj_path = tmp.join("het.json");
+    let het_mj = serde_json::json!({
+        "mosaicjson": "0.0.3",
+        "minzoom": 0,
+        "maxzoom": 14,
+        "quadkey_zoom": 0,
+        "bounds": g_bounds,
+        "center": [(g_bounds[0] + g_bounds[2]) / 2.0, (g_bounds[1] + g_bounds[3]) / 2.0, 10],
+        "tiles": { "": [g64_path.to_str().unwrap(), g32_path.to_str().unwrap()] }
+    });
+    std::fs::write(&het_mj_path, het_mj.to_string()).unwrap();
+
+    let stac_path = tmp.join("het_stac.json");
+    let stac = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "het-stac",
+        "bbox": g_bounds,
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [g_bounds[0], g_bounds[1]],
+                [g_bounds[2], g_bounds[1]],
+                [g_bounds[2], g_bounds[3]],
+                [g_bounds[0], g_bounds[3]],
+                [g_bounds[0], g_bounds[1]]
+            ]]
+        },
+        "properties": { "datetime": "2025-01-01T00:00:00Z" },
+        "assets": {
+            "hi": { "href": g64_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" },
+            "lo": { "href": g32_path.to_str().unwrap(), "type": "image/tiff; application=geotiff" }
+        }
+    });
+    std::fs::write(&stac_path, stac.to_string()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Small tilted quadrilateral in UTM 10N (fractional pixel coverage!)
+    let utm_quad = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [500_103.3, 4_200_121.6],
+                [500_412.7, 4_200_154.2],
+                [500_389.4, 4_200_487.8],
+                [500_124.1, 4_200_441.5],
+                [500_103.3, 4_200_121.6]
+            ]]
+        }
+    });
+
+    // A. One-file mosaic POST /mosaicjson/statistics == POST /cog/statistics to 1e-9
+    let utm_u = utm_path.to_string_lossy();
+    let one_u = one_mj_path.to_string_lossy();
+    for extra in ["", "&categorical=true"] {
+        let r_cog = client
+            .post(format!(
+                "{base}/cog/statistics?url={utm_u}&bidx=1&coord_crs=EPSG:32610{extra}"
+            ))
+            .header("content-type", "application/json")
+            .body(utm_quad.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_cog.status(), 200);
+        let j_cog: serde_json::Value = serde_json::from_str(&r_cog.text().await.unwrap()).unwrap();
+
+        let r_mos = client
+            .post(format!(
+                "{base}/mosaicjson/statistics?url={one_u}&bidx=1&coord_crs=EPSG:32610{extra}"
+            ))
+            .header("content-type", "application/json")
+            .body(utm_quad.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mos.status(), 200);
+        let j_mos: serde_json::Value = serde_json::from_str(&r_mos.text().await.unwrap()).unwrap();
+
+        let bc = &j_cog["properties"]["statistics"]["b1"];
+        let bm = &j_mos["properties"]["statistics"]["b1"];
+        for field in [
+            "count",
+            "mean",
+            "std",
+            "sum",
+            "min",
+            "max",
+            "valid_pixels",
+            "masked_pixels",
+            "valid_percent",
+            "area",
+        ] {
+            let vc = bc[field].as_f64().unwrap_or_else(|| panic!("cog missing {field}: {bc}"));
+            let vm = bm[field].as_f64().unwrap_or_else(|| panic!("mosaic missing {field}: {bm}"));
+            assert!(
+                (vc - vm).abs() <= 1e-9,
+                "GG1 one-file mosaic vs /cog/statistics mismatch on {field} ({extra}): cog={vc} mos={vm}"
+            );
+        }
+        assert_eq!(bm["valid_percent"].as_f64().unwrap(), 100.0);
+        assert!(bm["count"].as_f64().unwrap().fract().abs() > 1e-3, "count must be fractional");
+        if !extra.is_empty() {
+            let cc = bc["category_areas"].as_object().expect("cog category_areas");
+            let cm = bm["category_areas"].as_object().expect("mosaic category_areas");
+            assert_eq!(cc.len(), cm.len());
+            for (k, v) in cc {
+                let vc = v.as_f64().unwrap();
+                let vm = cm[k].as_f64().unwrap();
+                assert!(
+                    (vc - vm).abs() <= 1e-9,
+                    "GG1 category_areas[{k}] mismatch: cog={vc} mos={vm}"
+                );
+            }
+        }
+    }
+
+    // B. Heterogeneous-grid mosaic POST /mosaicjson/statistics keeps exact coverage & polygon valid_percent
+    let g_quad = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [-122.62, 37.76],
+                [-122.41, 37.78],
+                [-122.43, 37.94],
+                [-122.60, 37.91],
+                [-122.62, 37.76]
+            ]]
+        }
+    });
+    let het_u = het_mj_path.to_string_lossy();
+    let r_het = client
+        .post(format!(
+            "{base}/mosaicjson/statistics?url={het_u}&bidx=1&pixel_selection=highest"
+        ))
+        .header("content-type", "application/json")
+        .body(g_quad.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_het.status(), 200);
+    let j_het: serde_json::Value = serde_json::from_str(&r_het.text().await.unwrap()).unwrap();
+    let b_het = &j_het["properties"]["statistics"]["b1"];
+    assert!(
+        (b_het["mean"].as_f64().unwrap() - 20.0).abs() < 1e-6,
+        "heterogeneous mosaic highest mean expected 20.0, got {b_het}"
+    );
+    assert_eq!(
+        b_het["valid_percent"].as_f64().unwrap(),
+        100.0,
+        "heterogeneous mosaic valid_percent must be 100.0 against polygon, got {b_het}"
+    );
+    assert_eq!(b_het["masked_pixels"].as_f64().unwrap(), 0.0);
+    assert!(
+        b_het["area"].as_f64().unwrap() > 1e6,
+        "heterogeneous mosaic must include positive ellipsoidal area, got {b_het}"
+    );
+    assert!(
+        b_het["count"].as_f64().unwrap().fract().abs() > 1e-3,
+        "heterogeneous mosaic count must be fractional coverage sum, got {b_het}"
+    );
+
+    // C. Heterogeneous-grid POST /stac/statistics with expression keeps exact coverage & polygon valid_percent
+    let stac_u = stac_path.to_string_lossy();
+    let r_stac = client
+        .post(format!(
+            "{base}/stac/statistics?url={stac_u}&assets=hi&assets=lo&expression=b1%2Bb2"
+        ))
+        .header("content-type", "application/json")
+        .body(g_quad.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stac.status(), 200);
+    let j_stac: serde_json::Value = serde_json::from_str(&r_stac.text().await.unwrap()).unwrap();
+    let b_stac = &j_stac["properties"]["statistics"]["b1"];
+    assert!(
+        (b_stac["mean"].as_f64().unwrap() - 30.0).abs() < 1e-6,
+        "heterogeneous STAC expr mean expected 30.0, got {b_stac}"
+    );
+    assert_eq!(
+        b_stac["valid_percent"].as_f64().unwrap(),
+        100.0,
+        "heterogeneous STAC expr valid_percent must be 100.0 against polygon, got {b_stac}"
+    );
+    assert!(
+        b_stac["area"].as_f64().unwrap() > 1e6,
+        "heterogeneous STAC expr must include positive ellipsoidal area, got {b_stac}"
+    );
+    assert!(
+        b_stac["count"].as_f64().unwrap().fract().abs() > 1e-3,
+        "heterogeneous STAC expr count must be fractional coverage sum, got {b_stac}"
+    );
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn audit75_power_expr_npy_and_unscale_heterogeneous_geotiff_dtypes() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_audit75_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a minimal 1-band EPSG:4326 uncompressed GeoTIFF with optional GDAL_METADATA.
+    let write_1band_4326 = |path: &std::path::Path,
+                            bits: u16,
+                            sample_format: u16,
+                            pixels: &[u8],
+                            gdal_meta: Option<&str>| {
+        let w = 16u32;
+        let h = 16u32;
+        let bounds = [-122.5f64, 37.7, -122.3, 37.9];
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        let meta_bytes = gdal_meta.map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        });
+        let num_entries: u16 = 14 + u16::from(meta_bytes.is_some());
+        let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+        let data_start = 8 + ifd_size;
+
+        let scale_off = data_start as u32;
+        let tiepoint_off = scale_off + 24;
+        let geokey_off = tiepoint_off + 48;
+        let meta_off = geokey_off + 24;
+        let meta_len = meta_bytes.as_ref().map_or(0, Vec::len) as u32;
+        let pixel_off = meta_off + meta_len;
+
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w); // ImageWidth
+        push_entry(&mut buf, 257, 4, 1, h); // ImageLength
+        push_entry(&mut buf, 258, 3, 1, bits as u32); // BitsPerSample
+        push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+        push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+        push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+        push_entry(&mut buf, 277, 3, 1, 1); // SamplesPerPixel = 1
+        push_entry(&mut buf, 278, 4, 1, h); // RowsPerStrip
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32); // StripByteCounts
+        push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+        push_entry(&mut buf, 339, 3, 1, sample_format as u32); // SampleFormat
+        push_entry(&mut buf, 33550, 12, 3, scale_off); // ModelPixelScaleTag
+        push_entry(&mut buf, 33922, 12, 6, tiepoint_off); // ModelTiepointTag
+        push_entry(&mut buf, 34735, 3, 12, geokey_off); // GeoKeyDirectoryTag
+        if meta_len > 0 {
+            push_entry(&mut buf, 42112, 2, meta_len, meta_off); // GDAL_METADATA
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+
+        let sx = (bounds[2] - bounds[0]) / w as f64;
+        let sy = (bounds[3] - bounds[1]) / h as f64;
+        for v in [sx, sy, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(m) = meta_bytes {
+            buf.extend_from_slice(&m);
+        }
+        buf.extend_from_slice(pixels);
+        std::fs::write(path, buf).unwrap();
+    };
+
+    let u8_path = tmp.join("a_u8.tif");
+    let u8_scaled_path = tmp.join("scaled_u8.tif");
+    let u16_path = tmp.join("b_u16.tif");
+    let u16_two_path = tmp.join("two_u16.tif");
+    let f32_path = tmp.join("c_f32.tif");
+
+    let u8_px = vec![50u8; 16 * 16];
+    let u16_px: Vec<u8> = [500u16; 16 * 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let u16_two_px: Vec<u8> = [2u16; 16 * 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let f32_px: Vec<u8> = [1234.5f32; 16 * 16].iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    write_1band_4326(&u8_path, 8, 1, &u8_px, None);
+    write_1band_4326(
+        &u8_scaled_path,
+        8,
+        1,
+        &u8_px,
+        Some(r#"<GDALMetadata><Item name="scale" sample="0" role="scale">0.01</Item><Item name="offset" sample="0" role="offset">10.0</Item></GDALMetadata>"#),
+    );
+    write_1band_4326(&u16_path, 16, 1, &u16_px, None);
+    write_1band_4326(&u16_two_path, 16, 1, &u16_two_px, None);
+    write_1band_4326(&f32_path, 32, 3, &f32_px, None);
+
+    let stac_path = tmp.join("item.json");
+    let stac_json = serde_json::json!({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "audit75-het",
+        "bbox": [-122.5, 37.7, -122.3, 37.9],
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[-122.5, 37.7], [-122.3, 37.7], [-122.3, 37.9], [-122.5, 37.9], [-122.5, 37.7]]]
+        },
+        "properties": {},
+        "assets": {
+            "a_u8": { "href": u8_path.to_string_lossy() },
+            "b_u16": { "href": u16_path.to_string_lossy() },
+            "c_f32": { "href": f32_path.to_string_lossy() }
+        }
+    });
+    std::fs::write(&stac_path, serde_json::to_string(&stac_json).unwrap()).unwrap();
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // A. Power expressions (`**` and `^`) on integer COGs must promote to Float64 (<f8), not Int32.
+    for expr in ["b1**-1", "b1%5E-1"] {
+        let r = client
+            .get(format!(
+                "{base}/cog/preview.npy?url={}&expression={expr}&return_mask=false",
+                u16_two_path.to_string_lossy()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "expr {expr} failed");
+        let bytes = r.bytes().await.unwrap();
+        let hdr_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let hdr = std::str::from_utf8(&bytes[10..10 + hdr_len]).unwrap();
+        assert!(hdr.contains("'<f8'"), "expected Float64 <f8 for {expr}, got header: {hdr}");
+        let body = &bytes[10 + hdr_len..];
+        let v0 = f64::from_le_bytes(body[..8].try_into().unwrap());
+        assert!((v0 - 0.5).abs() < 1e-6, "expected 0.5 for 2^-1 ({expr}), got {v0}");
+    }
+
+    // B. `unscale=true` on a Uint8 COG requesting `.tif` must emit Float32 GeoTIFF, not 8-bit RGBA.
+    let r_unscale = client
+        .get(format!(
+            "{base}/cog/preview.tif?url={}&unscale=true",
+            u8_scaled_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_unscale.status(), 200);
+    let tif_unscale = r_unscale.bytes().await.unwrap();
+    let idx_unscale = cogzilla_tiff::parse_cog(&tif_unscale).unwrap();
+    assert_eq!(
+        idx_unscale.full_res().sample_type,
+        cogzilla_tiff::SampleType::Float32,
+        "unscale=true on Uint8 COG must emit Float32 GeoTIFF"
+    );
+
+    // C. Heterogeneous STAC assets starting with Uint8 requesting `.tif` must emit Float32 GeoTIFF.
+    let r_stac = client
+        .get(format!(
+            "{base}/stac/preview.tif?url={}&assets=a_u8&assets=b_u16&assets=c_f32&return_mask=false",
+            stac_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stac.status(), 200);
+    let tif_stac = r_stac.bytes().await.unwrap();
+    let idx_stac = cogzilla_tiff::parse_cog(&tif_stac).unwrap();
+    assert_eq!(
+        idx_stac.full_res().sample_type,
+        cogzilla_tiff::SampleType::Float32,
+        "heterogeneous STAC (u8, u16, f32) must emit Float32 GeoTIFF"
+    );
+    assert_eq!(idx_stac.full_res().samples_per_pixel, 3);
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn audit77_shown_npy_multiband_palette_and_invalid_formula() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_audit77_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. 2-band uint16 EPSG:4326 GeoTIFF (band1=50, band2=100)
+    let two_band_path = tmp.join("two_band.tif");
+    write_synthetic_u16_2band_4326_geotiff(
+        &two_band_path,
+        16,
+        16,
+        [-122.5, 37.7, -122.3, 37.9],
+        50,
+        100,
+        None,
+    );
+
+    // 2. 3-band RGB uint8 EPSG:4326 GeoTIFF for WebMercator tile invalid color_formula test
+    let rgb_path = tmp.join("rgb3.tif");
+    {
+        let w = 16u32;
+        let h = 16u32;
+        let bounds = [-122.5f64, 37.7, -122.3, 37.9];
+        let rgba = vec![100u8; (w * h * 4) as usize];
+        let tif = cogzilla_server::titiler::encode_geotiff_rgba(w, h, &rgba, bounds, 4326, false);
+        std::fs::write(&rgb_path, tif).unwrap();
+    }
+
+    // 3. 1-band uint8 paletted GeoTIFF with TIFF ColorMap tag (index 1 -> RGB(10, 20, 30))
+    let pal_path = tmp.join("paletted.tif");
+    {
+        let w = 8u32;
+        let h = 8u32;
+        let bounds = [-122.5f64, 37.7, -122.3, 37.9];
+        let pixels = vec![1u8; (w * h) as usize];
+        let mut cmap = vec![0u16; 256 * 3];
+        cmap[1] = 10u16 << 8;
+        cmap[256 + 1] = 20u16 << 8;
+        cmap[512 + 1] = 30u16 << 8;
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let num_entries: u16 = 14;
+        let data_start = 8 + 2 + (num_entries as usize) * 12 + 4;
+        let scale_off = data_start as u32;
+        let tiepoint_off = scale_off + 24;
+        let geokey_off = tiepoint_off + 48;
+        let cmap_off = geokey_off + 24;
+        let pixel_off = cmap_off + (cmap.len() * 2) as u32;
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w);
+        push_entry(&mut buf, 257, 4, 1, h);
+        push_entry(&mut buf, 258, 3, 1, 8);
+        push_entry(&mut buf, 259, 3, 1, 1);
+        push_entry(&mut buf, 262, 3, 1, 3); // Photometric = Palette
+        push_entry(&mut buf, 273, 4, 1, pixel_off);
+        push_entry(&mut buf, 277, 3, 1, 1);
+        push_entry(&mut buf, 278, 4, 1, h);
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32);
+        push_entry(&mut buf, 284, 3, 1, 1);
+        push_entry(&mut buf, 320, 3, (cmap.len()) as u32, cmap_off); // ColorMap
+        push_entry(&mut buf, 33550, 12, 3, scale_off);
+        push_entry(&mut buf, 33922, 12, 6, tiepoint_off);
+        push_entry(&mut buf, 34735, 3, 12, geokey_off);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let sx = (bounds[2] - bounds[0]) / w as f64;
+        let sy = (bounds[3] - bounds[1]) / h as f64;
+        for v in [sx, sy, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in cmap {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(&pixels);
+        std::fs::write(&pal_path, buf).unwrap();
+    }
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // A. 2-band rescaled `.npy` preserves both bands + mask -> shape (3, 16, 16) |u1
+    let r2 = client
+        .get(format!(
+            "{base}/cog/preview.npy?url={}&bidx=1&bidx=2&rescale=0,100&rescale=0,200",
+            two_band_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let b2 = r2.bytes().await.unwrap();
+    let hdr_len = u16::from_le_bytes([b2[8], b2[9]]) as usize;
+    let hdr = std::str::from_utf8(&b2[10..10 + hdr_len]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected |u1, got {hdr}");
+    assert!(hdr.contains("(3, 16, 16)"), "expected 2 bands + mask (3, 16, 16), got {hdr}");
+    let body = &b2[10 + hdr_len..];
+    assert_eq!(body[0], 127);
+    assert_eq!(body[256], 127);
+    assert_eq!(body[512], 255);
+
+    // B. Paletted COG with color_formula on `.npy` resolves embedded TIFF ColorMap -> 3-band RGB + mask
+    let r_pal = client
+        .get(format!(
+            "{base}/cog/preview.npy?url={}&color_formula=gamma%20rgb%201.0",
+            pal_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pal.status(), 200);
+    let b_pal = r_pal.bytes().await.unwrap();
+    let hdr_len = u16::from_le_bytes([b_pal[8], b_pal[9]]) as usize;
+    let hdr = std::str::from_utf8(&b_pal[10..10 + hdr_len]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected |u1, got {hdr}");
+    assert!(hdr.contains("(4, 8, 8)"), "expected RGB + mask (4, 8, 8) from embedded palette, got {hdr}");
+    let body = &b_pal[10 + hdr_len..];
+    assert_eq!((body[0], body[64], body[128], body[192]), (10, 20, 30, 255));
+
+    // C. Invalid color_formula on 3-band RGB WebMercator `.npy` tile returns 400 (not 200 raw <f4)
+    let r_bad = client
+        .get(format!(
+            "{base}/cog/tiles/WebMercatorQuad/12/655/1583.npy?url={}&color_formula=bogus_op",
+            rgb_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_bad.status(), 400, "invalid color_formula on RGB .npy tile must return 400");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn sweeps_34_to_37_kk1_ii1_jj1_hh1_self_contained() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweeps34_37_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. Float32 EPSG:3857 GeoTIFF covering WebMercator tile 10/164/395 (San Francisco) for KK1.
+    let tile_b = cogzilla_proj::tile_bounds_3857(cogzilla_proj::TileCoord { z: 10, x: 164, y: 395 });
+    let f32_path = tmp.join("kk1_f32.tif");
+    {
+        let w = 32u32;
+        let h = 32u32;
+        let raw: Vec<u8> = (0..(w * h))
+            .flat_map(|i| (100.0f32 + (i % 32) as f32).to_le_bytes())
+            .collect();
+        let tif = cogzilla_server::titiler::encode_geotiff_f32(w, h, &raw, tile_b.into(), 3857, false);
+        std::fs::write(&f32_path, tif).unwrap();
+    }
+    let f32_stac_path = tmp.join("kk1_stac.json");
+    let f32_wgs = [-122.4, 37.7, -122.0, 38.0];
+    std::fs::write(
+        &f32_stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "kk1-f32",
+            "bbox": f32_wgs,
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-122.4, 37.7], [-122.0, 37.7], [-122.0, 38.0], [-122.4, 38.0], [-122.4, 37.7]]]
+            },
+            "properties": {},
+            "assets": { "data": { "href": f32_path.to_string_lossy() } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let f32_mj_path = tmp.join("kk1_mosaic.json");
+    // Quadkey for z=10, x=164, y=395
+    let mut qk_sf = String::new();
+    for i in (0..10).rev() {
+        let mut d = 0u8;
+        if (164u32 >> i) & 1 != 0 { d |= 1; }
+        if (395u32 >> i) & 1 != 0 { d |= 2; }
+        qk_sf.push((b'0' + d) as char);
+    }
+    std::fs::write(
+        &f32_mj_path,
+        serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 10,
+            "maxzoom": 10,
+            "bounds": [-122.7, 37.4, -121.9, 38.1],
+            "quadkey_zoom": 10,
+            "tiles": { qk_sf: [f32_path.to_string_lossy()] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 2. EPSG:32701 antimeridian GeoTIFF spanning ~179E..176W (UTM Zone 1S, ~70000..600000 E, ~8000000..8230000 N)
+    //    for II1 (dateline feature at 64x64 / 512x64 / unsized) and JJ1 (symmetric lon norm).
+    let am_path = tmp.join("am32701.tif");
+    {
+        let w = 64u32;
+        let h = 64u32;
+        // Column-coded pixel values so different longitudes return distinct known values.
+        let mut raw = Vec::with_capacity((w * h * 4) as usize);
+        for _r in 0..h {
+            for c in 0..w {
+                raw.extend_from_slice(&((c as f32) * 10.0 + 1.0).to_le_bytes());
+            }
+        }
+        // In EPSG:32701 (central meridian -177°):
+        // lon=179°E (-181°) at lat=-17° -> x ≈ 74_300 m; lon=-176°W at lat=-17° -> x ≈ 606_500 m
+        // lat=-18° -> y ≈ 8_009_000 m; lat=-16° -> y ≈ 8_231_000 m
+        let utm_bbox = [74_300.0, 8_009_000.0, 606_500.0, 8_231_000.0];
+        let tif = cogzilla_server::titiler::encode_geotiff_f32(w, h, &raw, utm_bbox, 32701, false);
+        std::fs::write(&am_path, tif).unwrap();
+    }
+    let am_stac_path = tmp.join("am_stac.json");
+    std::fs::write(
+        &am_stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "am32701",
+            "bbox": [-180.0, -18.0, 180.0, -16.0],
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-180.0, -18.0], [180.0, -18.0], [180.0, -16.0], [-180.0, -16.0], [-180.0, -18.0]]]
+            },
+            "properties": {},
+            "assets": { "data": { "href": am_path.to_string_lossy() } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let am_mj_path = tmp.join("am_mosaic.json");
+    // Quadkeys at z=0 ("") cover the whole world so both sides of antimeridian resolve am32701.tif.
+    std::fs::write(
+        &am_mj_path,
+        serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 0,
+            "maxzoom": 12,
+            "bounds": [-180.0, -18.0, 180.0, -16.0],
+            "quadkey_zoom": 0,
+            "tiles": { "": [am_path.to_string_lossy()] }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 3. File with space in its name ("my scene.tif", 2-band uint16 with b1=10, b2=20) for HH1.
+    let space_path = tmp.join("my scene.tif");
+    write_synthetic_u16_2band_4326_geotiff(
+        &space_path,
+        16,
+        16,
+        [-122.5, 37.7, -122.3, 37.9],
+        10,
+        20,
+        None,
+    );
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // --- KK1: /cog, /stac, and /mosaicjson share identical .npy mask (f32::MAX) and .tif nodata (None) ---
+    let parse_npy_hdr_and_mask_first = |bytes: &[u8]| -> (String, f32) {
+        let hlen = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        let hdr = std::str::from_utf8(&bytes[10..10 + hlen]).unwrap().to_string();
+        let vals = decode_npy_f32(bytes);
+        let half = vals.len() / 2;
+        (hdr, vals[half])
+    };
+    let mut npy_masks = Vec::new();
+    for url in [
+        format!("{base}/cog/tiles/WebMercatorQuad/10/164/395.npy?url={}", f32_path.to_string_lossy()),
+        format!("{base}/stac/tiles/WebMercatorQuad/10/164/395.npy?url={}&assets=data", f32_stac_path.to_string_lossy()),
+        format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/164/395.npy?url={}", f32_mj_path.to_string_lossy()),
+        format!("{base}/mosaicjson/bbox/-122.3,37.75,-122.1,37.9/32x32.npy?url={}", f32_mj_path.to_string_lossy()),
+    ] {
+        let r = client.get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200, "KK1 npy {url} failed");
+        let b = r.bytes().await.unwrap();
+        let (hdr, m0) = parse_npy_hdr_and_mask_first(&b);
+        assert!(hdr.contains("'<f4'"), "KK1 expected <f4 for {url}, got {hdr}");
+        assert_eq!(m0, f32::MAX, "KK1 expected f32::MAX mask for {url}, got {m0}");
+        npy_masks.push(m0);
+    }
+    assert!(npy_masks.iter().all(|&m| m == f32::MAX));
+
+    for url in [
+        format!("{base}/cog/tiles/WebMercatorQuad/10/164/395.tif?url={}", f32_path.to_string_lossy()),
+        format!("{base}/stac/tiles/WebMercatorQuad/10/164/395.tif?url={}&assets=data", f32_stac_path.to_string_lossy()),
+        format!("{base}/mosaicjson/tiles/WebMercatorQuad/10/164/395.tif?url={}", f32_mj_path.to_string_lossy()),
+    ] {
+        let r = client.get(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200, "KK1 tif {url} failed");
+        let tif = r.bytes().await.unwrap();
+        let idx = cogzilla_tiff::parse_cog(&tif).unwrap();
+        assert_eq!(idx.full_res().sample_type, cogzilla_tiff::SampleType::Float32);
+        assert_eq!(idx.nodata, None, "KK1 expected nodata=None for {url}, got {:?}", idx.nodata);
+    }
+    // Styled mosaic .npy with rescale returns |u1 matching /cog
+    let r_mj_styled = client
+        .get(format!(
+            "{base}/mosaicjson/tiles/WebMercatorQuad/10/164/395.npy?url={}&rescale=100,131",
+            f32_mj_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_mj_styled.status(), 200);
+    let b_mj_styled = r_mj_styled.bytes().await.unwrap();
+    let hlen = u16::from_le_bytes([b_mj_styled[8], b_mj_styled[9]]) as usize;
+    assert!(std::str::from_utf8(&b_mj_styled[10..10 + hlen]).unwrap().contains("'|u1'"));
+
+    // --- II1: literal 358-degree dateline ring renders 200 at unsized, 512x64, and 64x64 across /cog, /stac, /mosaicjson ---
+    let dateline_ring = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [179.5, -17.5],
+                [-178.5, -17.5],
+                [-178.5, -16.5],
+                [179.5, -16.5],
+                [179.5, -17.5]
+            ]]
+        }
+    });
+    for url in [
+        format!("{base}/cog/feature.npy?url={}", am_path.to_string_lossy()),
+        format!("{base}/cog/feature/512x64.npy?url={}", am_path.to_string_lossy()),
+        format!("{base}/cog/feature/64x64.npy?url={}", am_path.to_string_lossy()),
+        format!("{base}/cog/feature.npy?url={}&max_size=64", am_path.to_string_lossy()),
+        format!("{base}/cog/feature/64x64.png?url={}", am_path.to_string_lossy()),
+        format!("{base}/stac/feature/64x64.npy?url={}&assets=data", am_stac_path.to_string_lossy()),
+        format!("{base}/mosaicjson/feature/64x64.npy?url={}", am_mj_path.to_string_lossy()),
+    ] {
+        let r = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(dateline_ring.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "II1 expected 200 for {url}, got {}", r.status());
+    }
+    // Genuinely non-overlapping polygon still returns 404
+    let disjoint_poly = serde_json::json!({
+        "type": "Feature",
+        "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[10.0, 10.0], [11.0, 10.0], [11.0, 11.0], [10.0, 11.0], [10.0, 10.0]]]
+        }
+    });
+    let r_disjoint = client
+        .post(format!("{base}/cog/feature/64x64.npy?url={}", am_path.to_string_lossy()))
+        .header("content-type", "application/json")
+        .body(disjoint_poly.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_disjoint.status(), 404, "disjoint polygon must still 404");
+
+    // --- JJ1: symmetric ±2-turn longitude normalisation across /cog/point and /mosaicjson/point ---
+    let mut vals_by_lon = std::collections::HashMap::new();
+    for lon in ["179.5", "180.5", "-180.5", "181.5", "-540.5", "540.5"] {
+        let r_cog = client
+            .get(format!("{base}/cog/point/{lon},-17?url={}", am_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_cog.status(), 200, "JJ1 /cog/point/{lon},-17 failed");
+        let j_cog: serde_json::Value = serde_json::from_str(&r_cog.text().await.unwrap()).unwrap();
+        let v_cog = j_cog["values"][0].as_f64().unwrap();
+
+        let r_mj = client
+            .get(format!("{base}/mosaicjson/point/{lon},-17?url={}", am_mj_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mj.status(), 200, "JJ1 /mosaicjson/point/{lon},-17 failed");
+        let j_mj: serde_json::Value = serde_json::from_str(&r_mj.text().await.unwrap()).unwrap();
+        let v_mj = j_mj["assets"][0]["values"][0].as_f64().unwrap();
+
+        assert_eq!(v_cog, v_mj, "JJ1 /cog vs /mosaicjson mismatch at lon={lon}");
+        vals_by_lon.insert(lon, v_cog);
+    }
+    // Periodic equivalence: 179.5 == -180.5 == -540.5, and 180.5 == 540.5
+    assert_eq!(vals_by_lon["179.5"], vals_by_lon["-180.5"]);
+    assert_eq!(vals_by_lon["179.5"], vals_by_lon["-540.5"]);
+    assert_eq!(vals_by_lon["180.5"], vals_by_lon["540.5"]);
+    // Beyond ±720° returns 404 symmetrically on both routes
+    for far_lon in ["900.5", "-900.5"] {
+        let rc = client
+            .get(format!("{base}/cog/point/{far_lon},-17?url={}", am_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rc.status(), 404, "JJ1 /cog/point/{far_lon} must 404");
+        let rm = client
+            .get(format!("{base}/mosaicjson/point/{far_lon},-17?url={}", am_mj_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rm.status(), 404, "JJ1 /mosaicjson/point/{far_lon} must 404");
+    }
+
+    // --- HH1: `+` in url= decoded as space (quote_plus / httpx params), while raw + and %2B in expression= both work ---
+    let plus_url = space_path.to_string_lossy().replace(' ', "+");
+    let pct_url = space_path.to_string_lossy().replace(' ', "%20");
+    let r_plus = client
+        .get(format!("{base}/cog/info?url={plus_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_plus.status(), 200, "HH1 url with '+' space encoding must return 200");
+    let r_pct = client
+        .get(format!("{base}/cog/info?url={pct_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pct.status(), 200);
+    for expr in ["b1+b2", "b1%2Bb2"] {
+        let r_expr = client
+            .get(format!("{base}/cog/statistics?url={plus_url}&expression={expr}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_expr.status(), 200, "HH1 expression={expr} failed");
+        let j: serde_json::Value = serde_json::from_str(&r_expr.text().await.unwrap()).unwrap();
+        assert!((j["b1"]["mean"].as_f64().unwrap() - 30.0).abs() < 1e-6, "HH1 {expr} got {j}");
+    }
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn sweep40_mm1_validate_ungeoreferenced_and_rpc_tiffs() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_sweep40_mm1_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a minimal 16x16 uint8 TIFF with no GeoTransform/GCPs and optional RPCCoefficientTag (50844).
+    let write_plain_or_rpc_tiff = |path: &std::path::Path, include_rpc: bool| {
+        let w = 16u32;
+        let h = 16u32;
+        let pixels = vec![42u8; (w * h) as usize];
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        let num_entries: u16 = 10 + u16::from(include_rpc);
+        let data_start = (8 + 2 + (num_entries as usize) * 12 + 4) as u32;
+        let rpc_bytes = if include_rpc { 92 * 8u32 } else { 0 };
+        let rpc_off = data_start;
+        let pixel_off = data_start + rpc_bytes;
+
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w); // ImageWidth
+        push_entry(&mut buf, 257, 4, 1, h); // ImageLength
+        push_entry(&mut buf, 258, 3, 1, 8); // BitsPerSample
+        push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+        push_entry(&mut buf, 262, 3, 1, 1); // Photometric = MinIsBlack
+        push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+        push_entry(&mut buf, 277, 3, 1, 1); // SamplesPerPixel
+        push_entry(&mut buf, 278, 4, 1, h); // RowsPerStrip
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32); // StripByteCounts
+        push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+        if include_rpc {
+            push_entry(&mut buf, 50844, 12, 92, rpc_off); // RPCCoefficientTag
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes()); // Next IFD = 0
+        if include_rpc {
+            for _ in 0..92 {
+                buf.extend_from_slice(&0.0f64.to_le_bytes());
+            }
+        }
+        buf.extend_from_slice(&pixels);
+        std::fs::write(path, buf).unwrap();
+    };
+
+    let plain_path = tmp.join("ungeoref.tif");
+    let rpc_path = tmp.join("rpc_only.tif");
+    write_plain_or_rpc_tiff(&plain_path, false);
+    write_plain_or_rpc_tiff(&rpc_path, true);
+
+    let engine = Arc::new(TileEngine::new(16 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_task = tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // 1. Plain ungeoreferenced TIFF: /cog/validate returns 200 with structural report & warning,
+    //    and /cog/point returns 400 naming GeoTransform/GCPs/RPCs.
+    let r_val = client
+        .get(format!("{base}/cog/validate?url={}", plain_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_val.status(), 200, "MM1 /cog/validate must return 200 on ungeoreferenced TIFF");
+    let j_val: serde_json::Value = serde_json::from_str(&r_val.text().await.unwrap()).unwrap();
+    assert_eq!(j_val["COG"], serde_json::json!(true));
+    assert_eq!(j_val["Profile"]["Width"], serde_json::json!(16));
+    assert!(j_val["GEO"]["CRS"].is_null());
+    assert!(j_val["GEO"]["BoundingBox"].is_null());
+    let warns = j_val["COG_warnings"].as_array().unwrap();
+    assert!(
+        warns.iter().any(|w| w.as_str().unwrap_or("").contains("georeferencing")),
+        "expected missing-georeferencing warning, got {warns:?}"
+    );
+    let r_pt = client
+        .get(format!("{base}/cog/point/0,0?url={}", plain_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_pt.status(), 400);
+    let pt_body = r_pt.text().await.unwrap();
+    assert!(pt_body.contains("GeoTransform/GCPs") && pt_body.contains("RPC"), "got {pt_body}");
+
+    // 2. RPC-only TIFF (tag 50844): /cog/validate returns 200 with RPC warning,
+    //    and /cog/point returns 400 naming RPCs.
+    let r_rpc_val = client
+        .get(format!("{base}/cog/validate?url={}", rpc_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_rpc_val.status(), 200, "MM1 /cog/validate must return 200 on RPC-only TIFF");
+    let j_rpc: serde_json::Value = serde_json::from_str(&r_rpc_val.text().await.unwrap()).unwrap();
+    assert_eq!(j_rpc["COG"], serde_json::json!(true));
+    let rpc_warns = j_rpc["COG_warnings"].as_array().unwrap();
+    assert!(
+        rpc_warns.iter().any(|w| w.as_str().unwrap_or("").contains("RPC")),
+        "expected RPC warning in COG_warnings, got {rpc_warns:?}"
+    );
+    let r_rpc_pt = client
+        .get(format!("{base}/cog/point/0,0?url={}", rpc_path.to_string_lossy()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_rpc_pt.status(), 400);
+    let rpc_pt_body = r_rpc_pt.text().await.unwrap();
+    assert!(rpc_pt_body.contains("RPC"), "400 on RPC TIFF must name RPCs, got {rpc_pt_body}");
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn parity_nn1_r2_raster_layers_and_f2_sample_types() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_parity_all4_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Helper: write a minimal 16x16 tiled classic GeoTIFF (EPSG:4326, bounds [0,0,16,16])
+    // with arbitrary (bps, sample_format), raw tile payload, and optional tail-IFD layout.
+    let write_test_geotiff = |path: &std::path::Path, bps: u16, sample_fmt: u16, payload: &[u8], ifd_at_tail: bool| {
+        let write_geo_arrays = |b: &mut Vec<u8>| -> (u32, u32, u32) {
+            let scale_off = b.len() as u32;
+            for v in [1.0f64, 1.0, 0.0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            let tie_off = b.len() as u32;
+            for v in [0.0f64, 0.0, 0.0, 0.0, 16.0, 0.0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            let gk_off = b.len() as u32;
+            let gks: [u16; 16] = [
+                1, 1, 0, 3,
+                1024, 0, 1, 2,    // GTModelTypeGeoKey = Geographic
+                1025, 0, 1, 1,    // GTRasterTypeGeoKey = PixelIsArea
+                2048, 0, 1, 4326, // GeographicTypeGeoKey = WGS84
+            ];
+            for k in gks {
+                b.extend_from_slice(&k.to_le_bytes());
+            }
+            (scale_off, tie_off, gk_off)
+        };
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        let build_ifd = |tile_off: u32, scale_off: u32, tie_off: u32, gk_off: u32| -> Vec<u8> {
+            let mut ifd_bytes: Vec<u8> = Vec::new();
+            ifd_bytes.extend_from_slice(&15u16.to_le_bytes());
+            push_entry(&mut ifd_bytes, 256, 4, 1, 16);                   // ImageWidth
+            push_entry(&mut ifd_bytes, 257, 4, 1, 16);                   // ImageLength
+            push_entry(&mut ifd_bytes, 258, 3, 1, bps as u32);           // BitsPerSample
+            push_entry(&mut ifd_bytes, 259, 3, 1, 1);                    // Compression = None
+            push_entry(&mut ifd_bytes, 262, 3, 1, 1);                    // Photometric = MinIsBlack
+            push_entry(&mut ifd_bytes, 277, 3, 1, 1);                    // SamplesPerPixel
+            push_entry(&mut ifd_bytes, 284, 3, 1, 1);                    // PlanarConfig = Chunky
+            push_entry(&mut ifd_bytes, 322, 4, 1, 16);                   // TileWidth
+            push_entry(&mut ifd_bytes, 323, 4, 1, 16);                   // TileLength
+            push_entry(&mut ifd_bytes, 324, 4, 1, tile_off);             // TileOffsets
+            push_entry(&mut ifd_bytes, 325, 4, 1, payload.len() as u32); // TileByteCounts
+            push_entry(&mut ifd_bytes, 339, 3, 1, sample_fmt as u32);    // SampleFormat
+            push_entry(&mut ifd_bytes, 33550, 12, 3, scale_off);         // ModelPixelScale
+            push_entry(&mut ifd_bytes, 33922, 12, 6, tie_off);           // ModelTiepoint
+            push_entry(&mut ifd_bytes, 34735, 3, 16, gk_off);            // GeoKeyDirectory
+            ifd_bytes.extend_from_slice(&0u32.to_le_bytes());            // next IFD = 0
+            ifd_bytes
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        if ifd_at_tail {
+            let t_off = buf.len() as u32;
+            buf.extend_from_slice(payload);
+            while buf.len() < 400 {
+                buf.push(0);
+            }
+            let (s_off, ti_off, g_off) = write_geo_arrays(&mut buf);
+            let i_off = buf.len() as u32;
+            buf[4..8].copy_from_slice(&i_off.to_le_bytes());
+            buf.extend_from_slice(&build_ifd(t_off, s_off, ti_off, g_off));
+        } else {
+            buf[4..8].copy_from_slice(&8u32.to_le_bytes());
+            let after_ifd = 8 + 2 + 15 * 12 + 4;
+            buf.resize(after_ifd, 0);
+            let (s_off, ti_off, g_off) = write_geo_arrays(&mut buf);
+            let t_off = buf.len() as u32;
+            buf.extend_from_slice(payload);
+            let hdr_ifd = build_ifd(t_off, s_off, ti_off, g_off);
+            buf[8..8 + hdr_ifd.len()].copy_from_slice(&hdr_ifd);
+        }
+        std::fs::write(path, &buf).unwrap();
+    };
+
+    // NN1: valid front-IFD COG vs tail-IFD GTiff
+    let cog_ok_path = tmp.join("cog_front.tif");
+    let gtiff_tail_path = tmp.join("gtiff_tail.tif");
+    write_test_geotiff(&cog_ok_path, 8, 1, &[42u8; 256], false);
+    write_test_geotiff(&gtiff_tail_path, 8, 1, &[42u8; 256], true);
+
+    // F2: 1-bit (alternating 1,0 -> 0b1010_1010 = 0xAA), 4-bit (nibbles 3, 12 -> 0x3C), int64 (-500), uint64 (900)
+    let u1_path = tmp.join("u1.tif");
+    let u4_path = tmp.join("u4.tif");
+    let i64_path = tmp.join("i64.tif");
+    let u64_path = tmp.join("u64.tif");
+    write_test_geotiff(&u1_path, 1, 1, &[0xAAu8; 32], false);
+    write_test_geotiff(&u4_path, 4, 1, &[0x3Cu8; 128], false);
+    let i64_bytes: Vec<u8> = std::iter::repeat((-500i64).to_le_bytes()).take(256).flatten().collect();
+    let u64_bytes: Vec<u8> = std::iter::repeat(900u64.to_le_bytes()).take(256).flatten().collect();
+    write_test_geotiff(&i64_path, 64, 2, &i64_bytes, false);
+    write_test_geotiff(&u64_path, 64, 1, &u64_bytes, false);
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_engine = engine.clone();
+    let srv_task = tokio::spawn(async move {
+        let _ = cogzilla_server::http::serve_listener(srv_engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    // 1. NN1: front-IFD COG is valid; tail-IFD GTiff reports COG: false with 2 layout errors.
+    let v_ok: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/cog/validate?url={}", cog_ok_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v_ok["COG"], serde_json::json!(true), "front-IFD COG must pass: {v_ok}");
+    assert!(v_ok["COG_errors"].as_array().unwrap().is_empty());
+
+    let v_tail: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/cog/validate?url={}", gtiff_tail_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v_tail["COG"], serde_json::json!(false), "tail-IFD GTiff must fail COG check: {v_tail}");
+    let errs = v_tail["COG_errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 2, "expected 2 layout errors, got {errs:?}");
+    assert!(errs[0].as_str().unwrap().contains("< 300"), "{errs:?}");
+    assert!(errs[1].as_str().unwrap().contains("after its IFD"), "{errs:?}");
+
+    // 2. TileJSON raster_layers field
+    let tj: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{base}/cog/WebMercatorQuad/tilejson.json?url={}", cog_ok_path.to_string_lossy()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(tj.get("raster_layers").is_some_and(|v| v.is_object()), "tilejson missing raster_layers: {tj}");
+
+    // 3. F2: 1-bit, 4-bit, int64, uint64 info + point + statistics + .npy dtype
+    for (path, exp_dtype, exp_val, exp_npy_descr) in [
+        (&u1_path, "uint8", 1.0f64, "'descr': '|u1'"),
+        (&u4_path, "uint8", 3.0f64, "'descr': '|u1'"),
+        (&i64_path, "int64", -500.0f64, "'descr': '<i8'"),
+        (&u64_path, "uint64", 900.0f64, "'descr': '<u8'"),
+    ] {
+        let p = path.to_string_lossy();
+        let info_r = client.get(format!("{base}/cog/info?url={p}")).send().await.unwrap();
+        assert_eq!(info_r.status(), 200, "info failed for {p}");
+        let info: serde_json::Value = serde_json::from_str(&info_r.text().await.unwrap()).unwrap();
+        assert_eq!(info["dtype"], serde_json::json!(exp_dtype), "dtype mismatch for {p}");
+
+        let pt_r = client.get(format!("{base}/cog/point/0.5,15.5?url={p}")).send().await.unwrap();
+        assert_eq!(pt_r.status(), 200, "point failed for {p}");
+        let pt: serde_json::Value = serde_json::from_str(&pt_r.text().await.unwrap()).unwrap();
+        assert!((pt["values"][0].as_f64().unwrap() - exp_val).abs() < 1e-4, "point mismatch for {p}: {pt}");
+
+        let st_r = client.get(format!("{base}/cog/statistics?url={p}")).send().await.unwrap();
+        assert_eq!(st_r.status(), 200, "stats failed for {p}");
+
+        let npy_r = client.get(format!("{base}/cog/preview.npy?url={p}")).send().await.unwrap();
+        assert_eq!(npy_r.status(), 200, "preview.npy failed for {p}");
+        let npy_bytes = npy_r.bytes().await.unwrap();
+        let hdr = std::str::from_utf8(&npy_bytes[10..128.min(npy_bytes.len())]).unwrap_or("");
+        assert!(hdr.contains(exp_npy_descr), "expected {exp_npy_descr} in npy header for {p}, got {hdr:?}");
+    }
+
+    // 4. R2: unsized /cog/bbox + dst_crs matches GDAL/TiTiler WarpedVRT dimensions exactly
+    let sat_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/fixtures/satellite_utm10n_rgb_zstd_p3.tif");
+    if sat_fixture.exists() {
+        let sat = sat_fixture.to_string_lossy();
+        for (q, exp_w, exp_h) in [
+            ("", 976u32, 976u32),
+            ("&dst_crs=EPSG:3857", 879, 1111),
+            ("&dst_crs=EPSG:32610", 885, 1113),
+        ] {
+            let r = client
+                .get(format!("{base}/cog/bbox/-122.8,37.6,-122.5,37.9.png?url={sat}&max_size=0{q}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let bytes = r.bytes().await.unwrap();
+            assert_eq!(&bytes[0..8], b"\x89PNG\r\n\x1a\n");
+            let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+            let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+            assert_eq!(
+                (w, h),
+                (exp_w, exp_h),
+                "R2 bbox size mismatch for query '{q}'"
+            );
+        }
+    }
+
+    srv_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_sweep43_oo1_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Write a minimal 8x8 tiled EPSG:4326 GeoTIFF (bounds [0, 0, 8, 8], 1 deg/px).
+    let write_8x8 = |path: &std::path::Path, bps: u16, sample_fmt: u16, payload: &[u8]| {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let after_ifd = 8 + 2 + 15 * 12 + 4;
+        buf.resize(after_ifd, 0);
+        let scale_off = buf.len() as u32;
+        for v in [1.0f64, 1.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let tie_off = buf.len() as u32;
+        for v in [0.0f64, 0.0, 0.0, 0.0, 8.0, 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let gk_off = buf.len() as u32;
+        let gks: [u16; 16] = [
+            1, 1, 0, 3,
+            1024, 0, 1, 2,
+            1025, 0, 1, 1,
+            2048, 0, 1, 4326,
+        ];
+        for k in gks {
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        let tile_off = buf.len() as u32;
+        buf.extend_from_slice(payload);
+
+        let mut ifd: Vec<u8> = Vec::new();
+        let push = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+        ifd.extend_from_slice(&15u16.to_le_bytes());
+        push(&mut ifd, 256, 4, 1, 8);
+        push(&mut ifd, 257, 4, 1, 8);
+        push(&mut ifd, 258, 3, 1, bps as u32);
+        push(&mut ifd, 259, 3, 1, 1);
+        push(&mut ifd, 262, 3, 1, 1);
+        push(&mut ifd, 277, 3, 1, 1);
+        push(&mut ifd, 284, 3, 1, 1);
+        push(&mut ifd, 322, 4, 1, 8);
+        push(&mut ifd, 323, 4, 1, 8);
+        push(&mut ifd, 324, 4, 1, tile_off);
+        push(&mut ifd, 325, 4, 1, payload.len() as u32);
+        push(&mut ifd, 339, 3, 1, sample_fmt as u32);
+        push(&mut ifd, 33550, 12, 3, scale_off);
+        push(&mut ifd, 33922, 12, 6, tie_off);
+        push(&mut ifd, 34735, 3, 16, gk_off);
+        ifd.extend_from_slice(&0u32.to_le_bytes());
+        buf[8..8 + ifd.len()].copy_from_slice(&ifd);
+        std::fs::write(path, &buf).unwrap();
+    };
+
+    // 1. uint32: [16777217, 2147483647, 4294967295, ...]
+    let mut u32_vals = [16_777_217u32; 64];
+    u32_vals[1] = 2_147_483_647;
+    u32_vals[2] = u32::MAX;
+    let u32_bytes: Vec<u8> = u32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let u32_path = tmp.join("u32_big.tif");
+    write_8x8(&u32_path, 32, 1, &u32_bytes);
+
+    // 2. int32: [16777217, 16777219, -2147483648, ...]
+    let mut i32_vals = [16_777_217i32; 64];
+    i32_vals[1] = 16_777_219;
+    i32_vals[2] = i32::MIN;
+    let i32_bytes: Vec<u8> = i32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let i32_path = tmp.join("i32_big.tif");
+    write_8x8(&i32_path, 32, 2, &i32_bytes);
+
+    // 3. int64: [1000000000001, 2^53 - 1, ...]
+    let mut i64_vals = [1_000_000_000_001i64; 64];
+    i64_vals[1] = (1i64 << 53) - 1;
+    let i64_bytes: Vec<u8> = i64_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let i64_path = tmp.join("i64_big.tif");
+    write_8x8(&i64_path, 64, 2, &i64_bytes);
+
+    // 4. float64: [12345678901.234568, -1.7976931348623157e308, ...]
+    let mut f64_vals = [12_345_678_901.234_568_f64; 64];
+    f64_vals[1] = f64::MIN;
+    let f64_bytes: Vec<u8> = f64_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let f64_path = tmp.join("f64_big.tif");
+    write_8x8(&f64_path, 64, 3, &f64_bytes);
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let srv_engine = engine.clone();
+    let srv_task = tokio::spawn(async move {
+        let _ = cogzilla_server::http::serve_listener(srv_engine, listener).await;
+    });
+    let client = reqwest::Client::new();
+
+    fn npy_body(b: &[u8]) -> &[u8] {
+        let hlen = u16::from_le_bytes([b[8], b[9]]) as usize;
+        &b[10 + hlen..]
+    }
+
+    // uint32: point, statistics max == 4294967295, bbox .npy and .tif exact
+    let p_u32 = u32_path.to_string_lossy();
+    let pt: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/point/0.5,7.5?url={p_u32}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert_eq!(pt["values"][0].as_f64().unwrap(), 16_777_217.0);
+
+    let st: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/statistics?url={p_u32}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert_eq!(st["b1"]["max"].as_f64().unwrap(), 4_294_967_295.0);
+
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_u32}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 16_777_217);
+    assert_eq!(u32::from_le_bytes(body[4..8].try_into().unwrap()), 2_147_483_647);
+    assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap()), u32::MAX);
+
+    let tif = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.tif?url={p_u32}&resampling=nearest&return_mask=false")).send().await.unwrap().bytes().await.unwrap();
+    let parsed = cogzilla_tiff::parse_cog(&tif).unwrap();
+    assert_eq!(parsed.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    let dec = cogzilla_codec::decode_tile(
+        &tif[parsed.full_res().tile_offsets[0] as usize..parsed.full_res().tile_offsets[0] as usize + parsed.full_res().tile_byte_counts[0] as usize],
+        parsed.full_res(),
+        parsed.byte_order,
+        None,
+    ).unwrap();
+    assert_eq!(dec.bands[0].data.get_f64(0), 16_777_217.0);
+    assert_eq!(dec.bands[0].data.get_f64(1), 2_147_483_647.0);
+    assert_eq!(dec.bands[0].data.get_f64(2), 4_294_967_295.0);
+
+    // int32: exact 16777217, 16777219, i32::MIN
+    let p_i32 = i32_path.to_string_lossy();
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_i32}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(i32::from_le_bytes(body[0..4].try_into().unwrap()), 16_777_217);
+    assert_eq!(i32::from_le_bytes(body[4..8].try_into().unwrap()), 16_777_219);
+    assert_eq!(i32::from_le_bytes(body[8..12].try_into().unwrap()), i32::MIN);
+
+    // int64: exact 1000000000001 and 2^53 - 1
+    let p_i64 = i64_path.to_string_lossy();
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_i64}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(i64::from_le_bytes(body[0..8].try_into().unwrap()), 1_000_000_000_001);
+    assert_eq!(i64::from_le_bytes(body[8..16].try_into().unwrap()), (1i64 << 53) - 1);
+
+    // float64: exact 17-sig-digit value and f64::MIN (-1.7976931348623157e308)
+    let p_f64 = f64_path.to_string_lossy();
+    let st_f64: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/statistics?url={p_f64}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert_eq!(st_f64["b1"]["min"].as_f64().unwrap(), f64::MIN);
+
+    let npy = client.get(format!("{base}/cog/bbox/0,0,8,8/8x8.npy?url={p_f64}&resampling=nearest")).send().await.unwrap().bytes().await.unwrap();
+    let body = npy_body(&npy);
+    assert_eq!(f64::from_le_bytes(body[0..8].try_into().unwrap()), 12_345_678_901.234_568_f64);
+    assert_eq!(f64::from_le_bytes(body[8..16].try_into().unwrap()), f64::MIN);
+
+    // Audit #94 regression checks:
+    // 1. Default return_mask=true on wide-dtype GeoTIFF must NOT invert masked pixels to u32::MAX.
+    let tif_masked = client
+        .get(format!("{base}/cog/bbox/0,0,16,8/16x8.tif?url={p_u32}&resampling=nearest"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let idx_m = cogzilla_tiff::parse_cog(&tif_masked).unwrap();
+    assert_eq!(idx_m.full_res().samples_per_pixel, 2);
+    assert_eq!(idx_m.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+    let mask_off = idx_m.full_res().tile_offsets[1] as usize;
+    let mask_len = idx_m.full_res().tile_byte_counts[1] as usize;
+    let mask_slice = &tif_masked[mask_off..mask_off + mask_len];
+    // Pixel (0, 0) is inside [0,8]x[0,8] -> u32::MAX; pixel (12, 0) is outside -> 0 (u32::MIN).
+    assert_eq!(u32::from_le_bytes(mask_slice[0..4].try_into().unwrap()), u32::MAX);
+    assert_eq!(u32::from_le_bytes(mask_slice[12 * 4..12 * 4 + 4].try_into().unwrap()), 0);
+
+    // 2. Styled .npy (rescale / colormap_name) on wide-dtype COG must return painted |u1 bytes, not raw <u4.
+    let styled_npy = client
+        .get(format!("{base}/cog/preview.npy?url={p_u32}&rescale=0,4294967295"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let hlen = u16::from_le_bytes([styled_npy[8], styled_npy[9]]) as usize;
+    let hdr = std::str::from_utf8(&styled_npy[10..10 + hlen]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected painted |u1 npy header, got: {hdr}");
+
+    // 3. Multi-COG wide-dtype .tif must produce a valid 2-band uint32 GeoTIFF (not bit-garbled f64).
+    let multi_tif = client
+        .get(format!("{base}/cog/bbox/0,0,8,8/8x8.tif?url={p_u32}&url={p_u32}&return_mask=false&resampling=nearest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(multi_tif.status(), 200);
+    let multi_bytes = multi_tif.bytes().await.unwrap();
+    let idx_multi = cogzilla_tiff::parse_cog(&multi_bytes).unwrap();
+    assert_eq!(idx_multi.full_res().samples_per_pixel, 2);
+    assert_eq!(idx_multi.full_res().sample_type, cogzilla_tiff::SampleType::Uint32);
+
+    // 4. Extreme f64 statistics (f64::MIN + f64::MAX) must produce finite mean, std, and histogram edges (no JSON null).
+    let mut f64_ext_raw = Vec::with_capacity(64 * 8);
+    for i in 0..64 {
+        let v = if i % 2 == 0 { f64::MIN } else { f64::MAX };
+        f64_ext_raw.extend_from_slice(&v.to_le_bytes());
+    }
+    let f64_ext_path = tmp.join("f64_ext.tif");
+    write_8x8(&f64_ext_path, 64, 3, &f64_ext_raw);
+    let p_f64_ext = f64_ext_path.to_string_lossy();
+    let st_ext: serde_json::Value = serde_json::from_str(
+        &client.get(format!("{base}/cog/statistics?url={p_f64_ext}")).send().await.unwrap().text().await.unwrap()
+    ).unwrap();
+    assert!(st_ext["b1"]["mean"].as_f64().is_some_and(f64::is_finite), "mean must be finite: {st_ext}");
+    assert!(st_ext["b1"]["std"].as_f64().is_some_and(f64::is_finite), "std must be finite: {st_ext}");
+    let edges = st_ext["b1"]["histogram"][1].as_array().unwrap();
+    assert!(edges.iter().all(|e| e.as_f64().is_some_and(f64::is_finite)), "all histogram edges must be finite: {edges:?}");
 
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);

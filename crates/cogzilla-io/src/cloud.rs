@@ -137,6 +137,19 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
             });
         }
     }
+    if let Ok(conn) = std::env::var("AZURE_STORAGE_CONNECTION_STRING") {
+        let parsed = parse_azure_connection_string(&conn);
+        if let Some(acct) = parsed.inferred_account_name() {
+            if !is_valid_azure_account(&acct) || !is_valid_azure_container(first) {
+                return None;
+            }
+            return Some(AzureTarget {
+                account: acct,
+                container: first.to_string(),
+                blob: tail.to_string(),
+            });
+        }
+    }
     // Fallback: az://account/container/blob
     let (container, blob) = tail.split_once('/')?;
     if !is_valid_azure_account(first)
@@ -152,14 +165,193 @@ pub fn parse_azure_uri(uri: &str, account_override: Option<&str>) -> Option<Azur
     })
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AzureConnectionString {
+    pub account_name: Option<String>,
+    pub account_key: Option<String>,
+    pub sas_token: Option<String>,
+    pub blob_endpoint: Option<String>,
+    pub endpoint_suffix: Option<String>,
+    pub protocol: Option<String>,
+}
+
+/// Parse an Azure Storage connection string
+/// (`DefaultEndpointsProtocol=...;AccountName=...;AccountKey=...;SharedAccessSignature=...;BlobEndpoint=...;EndpointSuffix=...`).
+pub fn parse_azure_connection_string(raw: &str) -> AzureConnectionString {
+    let mut out = AzureConnectionString::default();
+    for part in raw.split(';') {
+        let part = part.trim();
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        if k.eq_ignore_ascii_case("AccountName") {
+            out.account_name = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("AccountKey") {
+            out.account_key = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("SharedAccessSignature") {
+            out.sas_token = Some(v.trim_start_matches('?').to_string());
+        } else if k.eq_ignore_ascii_case("BlobEndpoint") {
+            out.blob_endpoint = Some(v.trim_end_matches('/').to_string());
+        } else if k.eq_ignore_ascii_case("EndpointSuffix") {
+            out.endpoint_suffix = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("DefaultEndpointsProtocol") {
+            out.protocol = Some(v.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+impl AzureConnectionString {
+    pub fn inferred_account_name(&self) -> Option<String> {
+        if let Some(acct) = &self.account_name {
+            return Some(acct.clone());
+        }
+        let ep = self.blob_endpoint.as_deref()?;
+        let after_scheme = ep.split_once("://").map(|(_, r)| r).unwrap_or(ep);
+        let host = after_scheme.split('/').next()?;
+        let host_no_port = host.split(':').next()?;
+        let first_label = host_no_port.split('.').next()?;
+        if is_valid_azure_account(first_label) {
+            Some(first_label.to_string())
+        } else {
+            None
+        }
+    }
+
+    pub fn resolved_endpoint(&self) -> Option<String> {
+        if let Some(ep) = &self.blob_endpoint {
+            return Some(ep.clone());
+        }
+        let acct = self.account_name.as_deref()?;
+        let proto = self.protocol.as_deref().unwrap_or("https");
+        let suffix = self.endpoint_suffix.as_deref().unwrap_or("core.windows.net");
+        if proto != "https" || !suffix.eq_ignore_ascii_case("core.windows.net") {
+            Some(format!("{proto}://{acct}.blob.{suffix}"))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GcsServiceAccount {
+    pub client_email: String,
+    pub private_key_pem: String,
+    pub private_key_id: Option<String>,
+    pub token_uri: String,
+}
+
+/// Parse a Google Cloud service-account JSON key file (`GOOGLE_APPLICATION_CREDENTIALS`).
+pub fn parse_gcs_service_account_json(json: &str) -> Option<GcsServiceAccount> {
+    let client_email = extract_json_str(json, "client_email").filter(|s| !s.is_empty())?;
+    let private_key_pem = extract_json_str(json, "private_key").filter(|s| !s.is_empty())?;
+    let private_key_id = extract_json_str(json, "private_key_id").filter(|s| !s.is_empty());
+    let token_uri = extract_json_str(json, "token_uri")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://oauth2.googleapis.com/token".to_string());
+    Some(GcsServiceAccount {
+        client_email,
+        private_key_pem,
+        private_key_id,
+        token_uri,
+    })
+}
+
+fn base64url_encode_nopad(input: &[u8]) -> String {
+    base64_encode(input)
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+fn decode_pem_pkcs8_der(pem: &str) -> Option<Vec<u8>> {
+    let b64: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect();
+    if b64.is_empty() {
+        return None;
+    }
+    base64_decode(&b64)
+}
+
+/// Sign an RS256 OAuth2 JWT assertion for a Google Cloud service account.
+pub fn sign_gcs_jwt_rs256(sa: &GcsServiceAccount, now_secs: u64) -> Option<String> {
+    let der = decode_pem_pkcs8_der(&sa.private_key_pem)?;
+    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der).ok()?;
+    let header_json = match &sa.private_key_id {
+        Some(kid) => format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{kid}"}}"#),
+        None => r#"{"alg":"RS256","typ":"JWT"}"#.to_string(),
+    };
+    let exp = now_secs + 3600;
+    let claims_json = format!(
+        r#"{{"iss":"{}","scope":"https://www.googleapis.com/auth/devstorage.read_only","aud":"{}","iat":{},"exp":{}}}"#,
+        sa.client_email, sa.token_uri, now_secs, exp
+    );
+    let signing_input = format!(
+        "{}.{}",
+        base64url_encode_nopad(header_json.as_bytes()),
+        base64url_encode_nopad(claims_json.as_bytes())
+    );
+    let rng = ring::rand::SystemRandom::new();
+    let mut sig = vec![0u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &rng,
+            signing_input.as_bytes(),
+            &mut sig,
+        )
+        .ok()?;
+    Some(format!("{signing_input}.{}", base64url_encode_nopad(&sig)))
+}
+
+/// Exchange a Google Cloud service-account JSON key for an OAuth2 bearer token + TTL seconds.
+pub async fn exchange_gcs_service_account_token(
+    client: &reqwest::Client,
+    sa: &GcsServiceAccount,
+) -> Option<(String, u64)> {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let jwt = sign_gcs_jwt_rs256(sa, now_secs)?;
+    let body = format!(
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}"
+    );
+    let resp = client
+        .post(&sa.token_uri)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .timeout(Duration::from_secs(5))
+        .body(body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let tok = extract_json_str(&text, "access_token").filter(|s| !s.is_empty())?;
+    let ttl = extract_json_u64(&text, "expires_in").unwrap_or(3600);
+    Some((tok, ttl))
+}
+
 enum CachedGcsToken {
     Token(String, Instant),
-    /// Negative-cache failed GCE metadata probes so non-GCE hosts don't serialize
+    /// Negative-cache failed metadata/SA probes so non-GCE hosts don't serialize
     /// every public `gs://` range request behind a 2-second timeout.
     Unavailable(Instant),
 }
 
-/// Cached GCE / GKE / Cloud Run metadata OAuth2 bearer token with singleflighted refresh.
+/// Cached GCS OAuth2 bearer token (service-account JSON exchange or GCE/GKE/Cloud Run metadata)
+/// with singleflighted refresh.
 #[derive(Default)]
 pub struct GcsTokenCache {
     cached: Mutex<Option<CachedGcsToken>>,
@@ -175,12 +367,6 @@ impl GcsTokenCache {
             if !t.is_empty() {
                 return Some(t.to_string());
             }
-        }
-        if std::env::var("GCE_METADATA_DISABLED")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false)
-        {
-            return None;
         }
         {
             let lock = self.cached.lock();
@@ -211,32 +397,231 @@ impl GcsTokenCache {
                 _ => {}
             }
         }
-        let fetched = async {
-            let resp = client
-                .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-                .header("Metadata-Flavor", "Google")
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await
-                .ok()?;
-            if !resp.status().is_success() {
-                return None;
-            }
-            let text = resp.text().await.ok()?;
-            let tok = extract_json_str(&text, "access_token")?;
-            let ttl = extract_json_u64(&text, "expires_in").unwrap_or(300);
-            Some((tok, ttl))
+
+        // 1. GOOGLE_APPLICATION_CREDENTIALS service-account JSON key exchange
+        if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            && !path.trim().is_empty()
+            && let Ok(raw) = std::fs::read_to_string(path.trim())
+            && let Some(sa) = parse_gcs_service_account_json(&raw)
+            && let Some((tok, ttl)) = exchange_gcs_service_account_token(client, &sa).await
+        {
+            let exp = Instant::now() + Duration::from_secs(ttl);
+            *self.cached.lock() = Some(CachedGcsToken::Token(tok.clone(), exp));
+            return Some(tok);
         }
-        .await;
+
+        // 2. GCE / GKE / Cloud Run metadata server
+        if !std::env::var("GCE_METADATA_DISABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+        {
+            let fetched = async {
+                let resp = client
+                    .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+                    .header("Metadata-Flavor", "Google")
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let text = resp.text().await.ok()?;
+                let tok = extract_json_str(&text, "access_token")?;
+                let ttl = extract_json_u64(&text, "expires_in").unwrap_or(300);
+                Some((tok, ttl))
+            }
+            .await;
+            if let Some((tok, ttl)) = fetched {
+                let exp = Instant::now() + Duration::from_secs(ttl);
+                *self.cached.lock() = Some(CachedGcsToken::Token(tok.clone(), exp));
+                return Some(tok);
+            }
+        }
+
+        *self.cached.lock() =
+            Some(CachedGcsToken::Unavailable(Instant::now() + Duration::from_secs(60)));
+        None
+    }
+}
+
+enum CachedAzureToken {
+    Token(String, Instant),
+    Unavailable(Instant),
+}
+
+/// Cached Azure Managed Identity (IMDS / MSI_ENDPOINT / IDENTITY_ENDPOINT) OAuth2 token
+/// for `https://storage.azure.com/` with singleflighted refresh.
+#[derive(Default)]
+pub struct AzureTokenCache {
+    cached: Mutex<Option<CachedAzureToken>>,
+    refresh_lock: tokio::sync::Mutex<()>,
+}
+
+static GLOBAL_AZURE_TOKEN_CACHE: std::sync::OnceLock<AzureTokenCache> = std::sync::OnceLock::new();
+
+pub async fn fetch_azure_imds_token_from(
+    client: &reqwest::Client,
+    endpoint: &str,
+    secret_header: Option<(&str, &str)>,
+    client_id: Option<&str>,
+) -> Option<(String, u64)> {
+    fetch_azure_token_with_params(
+        client,
+        endpoint,
+        "2018-02-01",
+        "client_id",
+        secret_header,
+        client_id,
+        Duration::from_millis(500),
+    )
+    .await
+}
+
+async fn fetch_azure_token_with_params(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_version: &str,
+    client_id_param: &str,
+    secret_header: Option<(&str, &str)>,
+    client_id: Option<&str>,
+    timeout: Duration,
+) -> Option<(String, u64)> {
+    let sep = if endpoint.contains('?') { '&' } else { '?' };
+    let mut url = format!(
+        "{endpoint}{sep}api-version={api_version}&resource=https%3A%2F%2Fstorage.azure.com%2F"
+    );
+    if let Some(cid) = client_id.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push('&');
+        url.push_str(client_id_param);
+        url.push('=');
+        url.push_str(&encode_query_value(cid));
+    }
+    let mut req = client.get(&url).timeout(timeout);
+    if let Some((hk, hv)) = secret_header {
+        req = req.header(hk, hv);
+    } else {
+        req = req.header("Metadata", "true");
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let tok = extract_json_str(&text, "access_token").filter(|s| !s.is_empty())?;
+    let ttl = extract_json_u64(&text, "expires_on")
+        .or_else(|| {
+            extract_json_str(&text, "expires_on")
+                .and_then(|s| crate::s3::parse_iso8601_utc_epoch(&s))
+        })
+        .and_then(|exp_epoch| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(exp_epoch.saturating_sub(now))
+        })
+        .or_else(|| extract_json_u64(&text, "expires_in"))
+        .unwrap_or(300);
+    Some((tok, ttl))
+}
+
+impl AzureTokenCache {
+    pub async fn get_bearer(&self, client: &reqwest::Client) -> Option<String> {
+        if std::env::var("AZURE_IMDS_DISABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        {
+            let lock = self.cached.lock();
+            match lock.as_ref() {
+                Some(CachedAzureToken::Token(tok, exp))
+                    if Instant::now() + Duration::from_secs(60) < *exp =>
+                {
+                    return Some(tok.clone());
+                }
+                Some(CachedAzureToken::Unavailable(retry_after))
+                    if Instant::now() < *retry_after =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let _refresh_guard = self.refresh_lock.lock().await;
+        {
+            let lock = self.cached.lock();
+            match lock.as_ref() {
+                Some(CachedAzureToken::Token(tok, exp))
+                    if Instant::now() + Duration::from_secs(60) < *exp =>
+                {
+                    return Some(tok.clone());
+                }
+                Some(CachedAzureToken::Unavailable(retry_after))
+                    if Instant::now() < *retry_after =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        let client_id = std::env::var("AZURE_CLIENT_ID").ok();
+        let fetched = if let (Ok(ep), Ok(hdr)) = (
+            std::env::var("IDENTITY_ENDPOINT"),
+            std::env::var("IDENTITY_HEADER"),
+        ) && !ep.trim().is_empty()
+            && !hdr.trim().is_empty()
+        {
+            fetch_azure_token_with_params(
+                client,
+                ep.trim(),
+                "2019-08-01",
+                "client_id",
+                Some(("X-IDENTITY-HEADER", hdr.trim())),
+                client_id.as_deref(),
+                Duration::from_secs(5),
+            )
+            .await
+        } else if let (Ok(ep), Ok(sec)) = (
+            std::env::var("MSI_ENDPOINT"),
+            std::env::var("MSI_SECRET"),
+        ) && !ep.trim().is_empty()
+            && !sec.trim().is_empty()
+        {
+            fetch_azure_token_with_params(
+                client,
+                ep.trim(),
+                "2017-09-01",
+                "clientid",
+                Some(("Secret", sec.trim())),
+                client_id.as_deref(),
+                Duration::from_secs(5),
+            )
+            .await
+        } else {
+            let imds_ep = std::env::var("AZURE_IMDS_ENDPOINT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    "http://169.254.169.254/metadata/identity/oauth2/token".to_string()
+                });
+            fetch_azure_imds_token_from(client, &imds_ep, None, client_id.as_deref()).await
+        };
+
         match fetched {
             Some((tok, ttl)) => {
                 let exp = Instant::now() + Duration::from_secs(ttl);
-                *self.cached.lock() = Some(CachedGcsToken::Token(tok.clone(), exp));
+                *self.cached.lock() = Some(CachedAzureToken::Token(tok.clone(), exp));
                 Some(tok)
             }
             None => {
-                *self.cached.lock() =
-                    Some(CachedGcsToken::Unavailable(Instant::now() + Duration::from_secs(60)));
+                *self.cached.lock() = Some(CachedAzureToken::Unavailable(
+                    Instant::now() + Duration::from_secs(60),
+                ));
                 None
             }
         }
@@ -248,6 +633,8 @@ pub struct GcsConfig {
     pub endpoint: String,
     pub no_sign: bool,
     pub bearer_token: Option<String>,
+    pub hmac_access_key: Option<String>,
+    pub hmac_secret_key: Option<String>,
     pub user_project: Option<String>,
     pub max_retries: u32,
 }
@@ -275,6 +662,14 @@ impl GcsConfig {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let hmac_access_key = std::env::var("GS_ACCESS_KEY_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let hmac_secret_key = std::env::var("GS_SECRET_ACCESS_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let user_project = std::env::var("GS_USER_PROJECT")
             .ok()
             .map(|s| s.trim().to_string())
@@ -288,6 +683,8 @@ impl GcsConfig {
             endpoint,
             no_sign,
             bearer_token,
+            hmac_access_key,
+            hmac_secret_key,
             user_project,
             max_retries,
         }
@@ -306,17 +703,23 @@ pub struct AzureConfig {
 
 impl AzureConfig {
     pub fn from_env() -> Self {
+        let conn = std::env::var("AZURE_STORAGE_CONNECTION_STRING")
+            .ok()
+            .map(|s| parse_azure_connection_string(&s))
+            .unwrap_or_default();
         let endpoint_override = std::env::var("AZURE_STORAGE_ENDPOINT")
             .ok()
             .map(|s| s.trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .or_else(|| conn.resolved_endpoint());
         let no_sign = std::env::var("AZURE_NO_SIGN_REQUEST")
             .map(|v| v.eq_ignore_ascii_case("YES") || v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
         let sas_token = std::env::var("AZURE_STORAGE_SAS_TOKEN")
             .ok()
             .map(|s| s.trim().trim_start_matches('?').to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .or(conn.sas_token);
         let bearer_token = std::env::var("AZURE_STORAGE_ACCESS_TOKEN")
             .ok()
             .map(|s| s.trim().to_string())
@@ -324,7 +727,8 @@ impl AzureConfig {
         let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY")
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .or(conn.account_key);
         let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -434,12 +838,18 @@ async fn fetch_gcs_inner(
     metrics: &IoMetrics,
     limiter: &AimdLimiter,
 ) -> Result<Bytes, IoError> {
-    let url = format!("{}/{}/{}", cfg.endpoint, bucket, encode_path(key));
+    let canonical_uri = format!("/{}/{}", bucket, encode_path(key));
+    let url = format!("{}{}", cfg.endpoint, canonical_uri);
     let range_hdr = range.map(|(start, end)| format!("bytes={start}-{}", end.saturating_sub(1)));
+    let hmac_pair = (!cfg.no_sign)
+        .then(|| cfg.hmac_access_key.as_deref().zip(cfg.hmac_secret_key.as_deref()))
+        .flatten();
     let bearer = if cfg.no_sign {
         None
     } else if let Some(t) = &cfg.bearer_token {
         Some(t.clone())
+    } else if hmac_pair.is_some() {
+        None
     } else {
         token_cache.get_bearer(client).await
     };
@@ -454,8 +864,42 @@ async fn fetch_gcs_inner(
         }
         if let Some(tok) = &bearer {
             req = req.header("Authorization", format!("Bearer {tok}"));
+        } else if let Some((ak, sk)) = hmac_pair {
+            let (scheme, after_scheme) = cfg
+                .endpoint
+                .split_once("://")
+                .unwrap_or(("https", cfg.endpoint.as_str()));
+            let (raw_host, ep_path) = match after_scheme.find('/') {
+                Some(i) => (&after_scheme[..i], after_scheme[i..].trim_end_matches('/')),
+                None => (after_scheme, ""),
+            };
+            let host_lower = raw_host.to_ascii_lowercase();
+            let norm_host = if (scheme.eq_ignore_ascii_case("https") && host_lower.ends_with(":443"))
+                || (scheme.eq_ignore_ascii_case("http") && host_lower.ends_with(":80"))
+            {
+                host_lower.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host_lower)
+            } else {
+                host_lower.as_str()
+            };
+            let full_canonical = format!("{ep_path}{canonical_uri}");
+            let sig_headers = crate::s3::sign_s3_get(
+                ak,
+                sk,
+                None,
+                "auto",
+                norm_host,
+                &full_canonical,
+                range_hdr.as_deref(),
+                false,
+            );
+            for (k, v) in sig_headers {
+                req = req.header(k, v);
+            }
         }
-        if let Some(proj) = &cfg.user_project {
+        // GCS XML API forbids mixing `x-amz-*` (HMAC SigV4) with `x-goog-*` headers.
+        if hmac_pair.is_none()
+            && let Some(proj) = &cfg.user_project
+        {
             req = req.header("x-goog-user-project", proj);
         }
 
@@ -501,6 +945,14 @@ async fn fetch_gcs_inner(
                 url: crate::backend::redact_http_url(&url),
             });
         }
+        if status == 206
+            && let Some((start, _)) = range
+            && !crate::backend::validate_content_range_start(&resp, start)
+        {
+            return Err(IoError::RangeNotSupported {
+                url: crate::backend::redact_http_url(&url),
+            });
+        }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus {
                 status,
@@ -522,6 +974,11 @@ async fn fetch_gcs_inner(
                     .remote_bytes_fetched
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 return Ok(data);
+            }
+            Err(IoError::ResponseTooLarge { .. }) if status == 200 && range.is_some() => {
+                return Err(IoError::RangeNotSupported {
+                    url: crate::backend::redact_http_url(&url),
+                });
             }
             Err(IoError::Http(e)) => {
                 if is_retryable_transport_error(&e) {
@@ -613,6 +1070,18 @@ async fn fetch_azure_inner(
         }
     }
     let range_hdr = range.map(|(start, end)| format!("bytes={start}-{}", end.saturating_sub(1)));
+    let managed_bearer = if !cfg.no_sign
+        && cfg.sas_token.is_none()
+        && cfg.bearer_token.is_none()
+        && cfg.access_key.is_none()
+    {
+        GLOBAL_AZURE_TOKEN_CACHE
+            .get_or_init(AzureTokenCache::default)
+            .get_bearer(client)
+            .await
+    } else {
+        None
+    };
 
     for attempt in 0..=cfg.max_retries {
         let permit = limiter.acquire().await;
@@ -624,7 +1093,7 @@ async fn fetch_azure_inner(
         }
 
         if !cfg.no_sign && cfg.sas_token.is_none() {
-            if let Some(tok) = &cfg.bearer_token {
+            if let Some(tok) = cfg.bearer_token.as_deref().or(managed_bearer.as_deref()) {
                 req = req.header("Authorization", format!("Bearer {tok}"));
             } else if let Some(key) = &cfg.access_key {
                 let date_hdr = format_rfc1123_now();
@@ -685,6 +1154,12 @@ async fn fetch_azure_inner(
         {
             return Err(IoError::RangeNotSupported { url: clean_url });
         }
+        if status == 206
+            && let Some((start, _)) = range
+            && !crate::backend::validate_content_range_start(&resp, start)
+        {
+            return Err(IoError::RangeNotSupported { url: clean_url });
+        }
         if status != 200 && status != 206 {
             return Err(IoError::HttpStatus {
                 status,
@@ -706,6 +1181,9 @@ async fn fetch_azure_inner(
                     .remote_bytes_fetched
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
                 return Ok(data);
+            }
+            Err(IoError::ResponseTooLarge { .. }) if status == 200 && range.is_some() => {
+                return Err(IoError::RangeNotSupported { url: clean_url });
             }
             Err(IoError::Http(e)) => {
                 if is_retryable_transport_error(&e) {
@@ -754,8 +1232,38 @@ fn extract_json_str(json: &str, key: &str) -> Option<String> {
     let colon = rest.find(':')?;
     let after = rest[colon + 1..].trim_start();
     let after = after.strip_prefix('"')?;
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
+    let mut out = String::new();
+    let mut chars = after.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                other => out.push(other),
+            }
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
@@ -764,8 +1272,26 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     let rest = &json[pos + needle.len()..];
     let colon = rest.find(':')?;
     let after = rest[colon + 1..].trim_start();
-    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
+    let (quoted, after) = match after.strip_prefix('"') {
+        Some(s) => (true, s),
+        None => (false, after),
+    };
+    let digits_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+    let tail = &after[digits_len..];
+    if quoted {
+        // Reject date strings like "2026-11-27T02:00:00Z" or "11/27/2026 ..."
+        if !tail.starts_with('"') {
+            return None;
+        }
+    } else if let Some(next) = tail.bytes().next()
+        && !matches!(next, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+    {
+        return None;
+    }
+    after[..digits_len].parse().ok()
 }
 
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -955,6 +1481,8 @@ mod tests {
             endpoint: format!("http://{addr}"),
             no_sign: false,
             bearer_token: Some("gcs-secret-token".into()),
+            hmac_access_key: None,
+            hmac_secret_key: None,
             user_project: Some("my-gcp-proj".into()),
             max_retries: 2,
         };
@@ -1022,6 +1550,151 @@ mod tests {
             "abfss://bad..cont@pcdata.dfs.core.windows.net/b",
         ] {
             assert!(parse_azure_uri(bad, None).is_none(), "expected Azure rejection for {bad}");
+        }
+    }
+
+    #[test]
+    fn ss1_parse_azure_connection_string_extracts_all_fields() {
+        let cs = parse_azure_connection_string(
+            "DefaultEndpointsProtocol=https;AccountName=myacct;AccountKey=abc123==;EndpointSuffix=core.usgovcloudapi.net",
+        );
+        assert_eq!(cs.account_name.as_deref(), Some("myacct"));
+        assert_eq!(cs.account_key.as_deref(), Some("abc123=="));
+        assert_eq!(
+            cs.resolved_endpoint().as_deref(),
+            Some("https://myacct.blob.core.usgovcloudapi.net")
+        );
+
+        let cs_sas = parse_azure_connection_string(
+            "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1/;SharedAccessSignature=?sv=2020-10-02&sig=xyz%3D",
+        );
+        assert_eq!(
+            cs_sas.resolved_endpoint().as_deref(),
+            Some("http://127.0.0.1:10000/devstoreaccount1")
+        );
+        assert_eq!(cs_sas.sas_token.as_deref(), Some("sv=2020-10-02&sig=xyz%3D"));
+
+        // SAS-only connection string infers AccountName from BlobEndpoint host.
+        let cs_sas_cloud = parse_azure_connection_string(
+            "BlobEndpoint=https://myacct.blob.core.windows.net;SharedAccessSignature=sv=2020-10-02&sig=abc",
+        );
+        assert_eq!(cs_sas_cloud.inferred_account_name().as_deref(), Some("myacct"));
+
+        // Non-epoch date string in expires_on must NOT parse as Unix epoch 2026 or 11.
+        assert_eq!(extract_json_u64(r#"{"expires_on":"2026-11-27T02:00:00Z"}"#, "expires_on"), None);
+        assert_eq!(extract_json_u64(r#"{"expires_on":"11/27/2026 02:00:00 +00:00"}"#, "expires_on"), None);
+        assert_eq!(extract_json_u64(r#"{"expires_on":"4102444800"}"#, "expires_on"), Some(4102444800));
+    }
+
+    #[tokio::test]
+    async fn ss1_azure_imds_and_gcs_hmac_and_sa_jwt_work_end_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Azure IMDS managed identity token fetch + quoted expires_on parsing
+        let imds_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let imds_addr = imds_listener.local_addr().unwrap();
+        let imds_srv = tokio::spawn(async move {
+            let (mut sock, _) = imds_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("resource=https%3A%2F%2Fstorage.azure.com%2F"), "{req}");
+            assert!(req.contains("client_id=cid-123"), "{req}");
+            assert!(req.to_ascii_lowercase().contains("metadata: true"), "{req}");
+            let body = r#"{"access_token":"az-imds-tok","expires_on":"4102444800"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let (az_tok, az_ttl) = fetch_azure_imds_token_from(
+            &client,
+            &format!("http://{imds_addr}/metadata/identity/oauth2/token"),
+            None,
+            Some("cid-123"),
+        )
+        .await
+        .expect("Azure IMDS token");
+        assert_eq!(az_tok, "az-imds-tok");
+        assert!(az_ttl > 3600);
+        imds_srv.await.unwrap();
+
+        // 2. GCS HMAC keys (SigV4 signing against storage.googleapis.com / custom endpoint)
+        let hmac_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hmac_addr = hmac_listener.local_addr().unwrap();
+        let hmac_srv = tokio::spawn(async move {
+            let (mut sock, _) = hmac_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.contains("AWS4-HMAC-SHA256 Credential=GOOG1ETEST/"), "{req}");
+            assert!(req.contains("/auto/s3/aws4_request"), "{req}");
+            let resp = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/8\r\nContent-Length: 8\r\nConnection: close\r\n\r\nHMACDATA";
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let gcs_hmac_cfg = GcsConfig {
+            endpoint: format!("http://{hmac_addr}"),
+            no_sign: false,
+            bearer_token: None,
+            hmac_access_key: Some("GOOG1ETEST".into()),
+            hmac_secret_key: Some("supersecretkey".into()),
+            user_project: None,
+            max_retries: 0,
+        };
+        let bytes = fetch_gcs_range(
+            &client,
+            "my-gcs-bucket",
+            "tile.tif",
+            &gcs_hmac_cfg,
+            &GcsTokenCache::default(),
+            0,
+            8,
+            &IoMetrics::default(),
+            &AimdLimiter::new(8, 4),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes.as_ref(), b"HMACDATA");
+        hmac_srv.await.unwrap();
+
+        // 3. GCS service-account JSON key -> RS256 JWT -> OAuth2 token exchange
+        if let Ok(out) = std::process::Command::new("openssl")
+            .args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"])
+            .output()
+            && out.status.success()
+        {
+            let pem = String::from_utf8(out.stdout).unwrap();
+            let escaped_pem = pem.replace('\n', "\\n");
+            let tok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let tok_addr = tok_listener.local_addr().unwrap();
+            let tok_srv = tokio::spawn(async move {
+                let (mut sock, _) = tok_listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(req.starts_with("POST /token HTTP/1.1"), "{req}");
+                assert!(req.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="), "{req}");
+                let body = r#"{"access_token":"sa-oauth2-tok","expires_in":3599}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            });
+            let sa_json = format!(
+                r#"{{"client_email":"sa@proj.iam.gserviceaccount.com","private_key_id":"kid1","private_key":"{escaped_pem}","token_uri":"http://{tok_addr}/token"}}"#
+            );
+            let sa = parse_gcs_service_account_json(&sa_json).expect("parse SA JSON");
+            let (tok, ttl) = exchange_gcs_service_account_token(&client, &sa)
+                .await
+                .expect("SA OAuth2 token");
+            assert_eq!(tok, "sa-oauth2-tok");
+            assert_eq!(ttl, 3599);
+            tok_srv.await.unwrap();
         }
     }
 }

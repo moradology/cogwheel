@@ -68,6 +68,172 @@ unsafe fn prefix_sum_stride1_neon(row: &mut [u8]) {
     }
 }
 
+/// 16-lane NEON Kogge-Stone prefix sum for stride-3 interleaved byte streams (e.g. 3-band chunky
+/// float32 Predictor 3 rows) using `vld3q_u8`/`vst3q_u8` to deinterleave all 3 channels in hardware.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefix_sum_stride3_neon(row: &mut [u8]) {
+    use std::arch::aarch64::*;
+    let len = row.len();
+    let ptr = row.as_mut_ptr();
+    let zero = unsafe { vdupq_n_u8(0) };
+    let mut c0 = zero;
+    let mut c1 = zero;
+    let mut c2 = zero;
+    let mut i = 0usize;
+
+    while i + 48 <= len {
+        unsafe {
+            let mut v = vld3q_u8(ptr.add(i));
+            macro_rules! kstone {
+                ($ch:expr, $carry:expr) => {
+                    $ch = vaddq_u8($ch, vextq_u8::<15>(zero, $ch));
+                    $ch = vaddq_u8($ch, vextq_u8::<14>(zero, $ch));
+                    $ch = vaddq_u8($ch, vextq_u8::<12>(zero, $ch));
+                    $ch = vaddq_u8($ch, vextq_u8::<8>(zero, $ch));
+                    $ch = vaddq_u8($ch, $carry);
+                    $carry = vdupq_laneq_u8::<15>($ch);
+                };
+            }
+            kstone!(v.0, c0);
+            kstone!(v.1, c1);
+            kstone!(v.2, c2);
+            vst3q_u8(ptr.add(i), v);
+        }
+        i += 48;
+    }
+
+    if i < len {
+        let mut idx = i.max(3);
+        while idx < len {
+            row[idx] = row[idx].wrapping_add(row[idx - 3]);
+            idx += 1;
+        }
+    }
+}
+
+/// Single-pass NEON 3-band chunky `uint8` horizontal differencing (optional) + min/max/nodata stats.
+/// Uses `vld3q_u8`/`vst3q_u8` to eliminate both the scalar prefix-sum and the second pass over RAM.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reconstruct_u8_rgb3_neon(
+    slice: &mut [u8],
+    w: usize,
+    h: usize,
+    horizontal_diff: bool,
+    nd_u8: Option<u8>,
+    any_valid: &mut [bool; 3],
+    any_nodata: &mut [bool; 3],
+    min_u8: &mut [u8; 3],
+    max_u8: &mut [u8; 3],
+) {
+    use std::arch::aarch64::*;
+    let zero = unsafe { vdupq_n_u8(0) };
+    let v255 = unsafe { vdupq_n_u8(255) };
+    let mut vmin = [v255; 3];
+    let mut vmax = [zero; 3];
+    let mut v_any_valid = [zero; 3];
+    let mut v_any_nodata = [zero; 3];
+    let v_nd = unsafe { vdupq_n_u8(nd_u8.unwrap_or(0)) };
+    let has_nd = nd_u8.is_some();
+
+    for y in 0..h {
+        let row = &mut slice[y * w * 3..(y + 1) * w * 3];
+        let ptr = row.as_mut_ptr();
+        let mut c0 = zero;
+        let mut c1 = zero;
+        let mut c2 = zero;
+        let mut x = 0usize;
+
+        while x + 16 <= w {
+            unsafe {
+                let mut v = vld3q_u8(ptr.add(x * 3));
+                if horizontal_diff {
+                    macro_rules! kstone {
+                        ($ch:expr, $carry:expr) => {
+                            $ch = vaddq_u8($ch, vextq_u8::<15>(zero, $ch));
+                            $ch = vaddq_u8($ch, vextq_u8::<14>(zero, $ch));
+                            $ch = vaddq_u8($ch, vextq_u8::<12>(zero, $ch));
+                            $ch = vaddq_u8($ch, vextq_u8::<8>(zero, $ch));
+                            $ch = vaddq_u8($ch, $carry);
+                            $carry = vdupq_laneq_u8::<15>($ch);
+                        };
+                    }
+                    kstone!(v.0, c0);
+                    kstone!(v.1, c1);
+                    kstone!(v.2, c2);
+                    vst3q_u8(ptr.add(x * 3), v);
+                }
+
+                let chs = [v.0, v.1, v.2];
+                if has_nd {
+                    for b in 0..3 {
+                        let is_nd = vceqq_u8(chs[b], v_nd);
+                        let is_val = vmvnq_u8(is_nd);
+                        v_any_nodata[b] = vorrq_u8(v_any_nodata[b], is_nd);
+                        v_any_valid[b] = vorrq_u8(v_any_valid[b], is_val);
+                        vmin[b] = vminq_u8(vmin[b], vbslq_u8(is_val, chs[b], v255));
+                        vmax[b] = vmaxq_u8(vmax[b], vbslq_u8(is_val, chs[b], zero));
+                    }
+                } else {
+                    for b in 0..3 {
+                        vmin[b] = vminq_u8(vmin[b], chs[b]);
+                        vmax[b] = vmaxq_u8(vmax[b], chs[b]);
+                    }
+                }
+            }
+            x += 16;
+        }
+
+        if x < w {
+            let mut acc = if horizontal_diff && x > 0 {
+                [row[(x - 1) * 3], row[(x - 1) * 3 + 1], row[(x - 1) * 3 + 2]]
+            } else {
+                [0u8; 3]
+            };
+            for px in row[x * 3..].chunks_exact_mut(3) {
+                for b in 0..3 {
+                    let v = if horizontal_diff {
+                        acc[b] = acc[b].wrapping_add(px[b]);
+                        px[b] = acc[b];
+                        acc[b]
+                    } else {
+                        px[b]
+                    };
+                    if nd_u8 == Some(v) {
+                        any_nodata[b] = true;
+                    } else {
+                        any_valid[b] = true;
+                        if v < min_u8[b] { min_u8[b] = v; }
+                        if v > max_u8[b] { max_u8[b] = v; }
+                    }
+                }
+            }
+        }
+    }
+
+    if w >= 16 && h > 0 {
+        unsafe {
+            for b in 0..3 {
+                if has_nd {
+                    if vmaxvq_u8(v_any_nodata[b]) != 0 {
+                        any_nodata[b] = true;
+                    }
+                    if vmaxvq_u8(v_any_valid[b]) != 0 {
+                        any_valid[b] = true;
+                        min_u8[b] = min_u8[b].min(vminvq_u8(vmin[b]));
+                        max_u8[b] = max_u8[b].max(vmaxvq_u8(vmax[b]));
+                    }
+                } else {
+                    any_valid[b] = true;
+                    min_u8[b] = min_u8[b].min(vminvq_u8(vmin[b]));
+                    max_u8[b] = max_u8[b].max(vmaxvq_u8(vmax[b]));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn transpose_and_store_16_f32_neon(
@@ -464,6 +630,160 @@ unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
         for b in &mut row[i..] {
             acc = acc.wrapping_add(*b);
             *b = acc;
+        }
+    }
+}
+
+/// 12-byte (4-triplet) AVX2/SSSE3 Kogge-Stone prefix sum for stride-3 interleaved byte streams
+/// (3-band chunky float32 Predictor 3 rows on x86_64 cloud servers).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn prefix_sum_stride3_avx2(row: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let len = row.len();
+    let ptr = row.as_mut_ptr();
+    let mut carry = _mm_setzero_si128();
+    // Broadcast lanes [9, 10, 11] across all four 3-byte triplets in lanes 0..12.
+    let bcast_last3 = _mm_setr_epi8(9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10, 11, -1, -1, -1, -1);
+    let mut i = 0usize;
+
+    while i + 16 <= len {
+        let mut v = unsafe { _mm_loadu_si128(ptr.add(i) as *const __m128i) };
+        v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+        v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+        v = _mm_add_epi8(v, carry);
+        // Write exact 12 bytes (8 + 4) so bytes i+12..i+16 are never clobbered before next load.
+        unsafe {
+            _mm_storel_epi64(ptr.add(i) as *mut __m128i, v);
+            (ptr.add(i + 8) as *mut i32).write_unaligned(_mm_extract_epi32::<2>(v));
+        }
+        carry = _mm_shuffle_epi8(v, bcast_last3);
+        i += 12;
+    }
+
+    if i < len {
+        let mut idx = i.max(3);
+        while idx < len {
+            row[idx] = row[idx].wrapping_add(row[idx - 3]);
+            idx += 1;
+        }
+    }
+}
+
+/// Single-pass AVX2 3-band chunky `uint8` horizontal differencing (optional) + min/max/nodata stats.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn reconstruct_u8_rgb3_avx2(
+    slice: &mut [u8],
+    w: usize,
+    h: usize,
+    horizontal_diff: bool,
+    nd_u8: Option<u8>,
+    any_valid: &mut [bool; 3],
+    any_nodata: &mut [bool; 3],
+    min_u8: &mut [u8; 3],
+    max_u8: &mut [u8; 3],
+) {
+    use std::arch::x86_64::*;
+    let zero = _mm_setzero_si128();
+    let v255 = _mm_set1_epi8(-1i8);
+    let bcast_last3 = _mm_setr_epi8(9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10, 11, -1, -1, -1, -1);
+    let mut vmin = v255;
+    let mut vmax = zero;
+    let mut v_any_valid = zero;
+    let mut v_any_nodata = zero;
+    let has_nd = nd_u8.is_some();
+    let v_nd = _mm_set1_epi8(nd_u8.unwrap_or(0) as i8);
+    let mut simd_ran = false;
+
+    for y in 0..h {
+        let row = &mut slice[y * w * 3..(y + 1) * w * 3];
+        let row_bytes = w * 3;
+        let ptr = row.as_mut_ptr();
+        let mut carry = zero;
+        let mut byte_i = 0usize;
+
+        while byte_i + 16 <= row_bytes {
+            simd_ran = true;
+            let mut v = unsafe { _mm_loadu_si128(ptr.add(byte_i) as *const __m128i) };
+            if horizontal_diff {
+                v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+                v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+                v = _mm_add_epi8(v, carry);
+                unsafe {
+                    _mm_storel_epi64(ptr.add(byte_i) as *mut __m128i, v);
+                    (ptr.add(byte_i + 8) as *mut i32).write_unaligned(_mm_extract_epi32::<2>(v));
+                }
+                carry = _mm_shuffle_epi8(v, bcast_last3);
+            }
+            if has_nd {
+                let is_nd = _mm_cmpeq_epi8(v, v_nd);
+                let is_val = _mm_andnot_si128(is_nd, v255);
+                v_any_nodata = _mm_or_si128(v_any_nodata, is_nd);
+                v_any_valid = _mm_or_si128(v_any_valid, is_val);
+                vmin = _mm_min_epu8(vmin, _mm_blendv_epi8(v255, v, is_val));
+                vmax = _mm_max_epu8(vmax, _mm_blendv_epi8(zero, v, is_val));
+            } else {
+                vmin = _mm_min_epu8(vmin, v);
+                vmax = _mm_max_epu8(vmax, v);
+            }
+            byte_i += 12;
+        }
+
+        if byte_i < row_bytes {
+            let mut acc = if horizontal_diff && byte_i >= 3 {
+                [row[byte_i - 3], row[byte_i - 2], row[byte_i - 1]]
+            } else {
+                [0u8; 3]
+            };
+            for px in row[byte_i..].chunks_exact_mut(3) {
+                for b in 0..3 {
+                    let v = if horizontal_diff {
+                        acc[b] = acc[b].wrapping_add(px[b]);
+                        px[b] = acc[b];
+                        acc[b]
+                    } else {
+                        px[b]
+                    };
+                    if nd_u8 == Some(v) {
+                        any_nodata[b] = true;
+                    } else {
+                        any_valid[b] = true;
+                        if v < min_u8[b] { min_u8[b] = v; }
+                        if v > max_u8[b] { max_u8[b] = v; }
+                    }
+                }
+            }
+        }
+    }
+
+    if simd_ran {
+        let mut mn_arr = [0u8; 16];
+        let mut mx_arr = [0u8; 16];
+        let mut av_arr = [0u8; 16];
+        let mut an_arr = [0u8; 16];
+        unsafe {
+            _mm_storeu_si128(mn_arr.as_mut_ptr() as *mut __m128i, vmin);
+            _mm_storeu_si128(mx_arr.as_mut_ptr() as *mut __m128i, vmax);
+            _mm_storeu_si128(av_arr.as_mut_ptr() as *mut __m128i, v_any_valid);
+            _mm_storeu_si128(an_arr.as_mut_ptr() as *mut __m128i, v_any_nodata);
+        }
+        for k in 0..12 {
+            let b = k % 3;
+            if has_nd {
+                if an_arr[k] != 0 {
+                    any_nodata[b] = true;
+                }
+                if av_arr[k] != 0 {
+                    any_valid[b] = true;
+                    min_u8[b] = min_u8[b].min(mn_arr[k]);
+                    max_u8[b] = max_u8[b].max(mx_arr[k]);
+                }
+            } else {
+                any_valid[b] = true;
+                min_u8[b] = min_u8[b].min(mn_arr[k]);
+                max_u8[b] = max_u8[b].max(mx_arr[k]);
+            }
         }
     }
 }
@@ -1189,6 +1509,19 @@ pub fn reconstruct_predictor3(
 
         for y in 0..h {
             let row = &mut raw[y * row_bytes..(y + 1) * row_bytes];
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                prefix_sum_stride3_neon(row);
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if has_avx2 {
+                    unsafe { prefix_sum_stride3_avx2(row) };
+                } else {
+                    prefix_sum_scalar(row, 3);
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             prefix_sum_scalar(row, 3);
 
             let p0 = &row[0..samples_per_row];
@@ -2020,6 +2353,28 @@ pub fn reconstruct_i8(
 }
 
 /// Reconstruct `uint32` or `int32` Predictor 1 or Predictor 2 -> `AlignedF32Slab`.
+#[inline(always)]
+fn check_val_f64(v: f64, finite_nodata: Option<f64>) -> (f64, bool) {
+    if !v.is_finite() {
+        return (f64::NAN, true);
+    }
+    if let Some(nd) = finite_nodata
+        && v == nd
+    {
+        return (f64::NAN, true);
+    }
+    (v, false)
+}
+
+#[inline(always)]
+fn clamp_f64_stat(v: f64) -> f32 {
+    if !v.is_finite() {
+        v as f32
+    } else {
+        (v as f32).clamp(f32::MIN, f32::MAX)
+    }
+}
+
 pub fn reconstruct_int32(
     raw: &[u8],
     tile_w: u32,
@@ -2028,19 +2383,19 @@ pub fn reconstruct_int32(
     byte_order: ByteOrder,
     signed: bool,
     horizontal_diff: bool,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
     let mut acc = vec![0u32; bands_in_tile];
 
     for y in 0..h {
@@ -2062,8 +2417,8 @@ pub fn reconstruct_int32(
                 } else {
                     raw_u32
                 };
-                let vf = if signed { (bits as i32) as f32 } else { bits as f32 };
-                let (v, is_nd) = check_val(vf, finite_nodata);
+                let vf = if signed { (bits as i32) as f64 } else { bits as f64 };
+                let (v, is_nd) = check_val_f64(vf, finite_nodata);
                 slabs[b][row_off + x] = v;
                 if is_nd {
                     any_nodata[b] = true;
@@ -2079,7 +2434,159 @@ pub fn reconstruct_int32(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
+        })
+        .collect()
+}
+
+/// Reconstruct 64-bit unsigned (`Uint64`) or signed (`Int64`) integer tiles into `BandData::F64`,
+/// supporting both `Predictor::None` and `Predictor::HorizontalInt`.
+pub fn reconstruct_int64(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    signed: bool,
+    horizontal_diff: bool,
+    nodata: Option<f64>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
+    let mut acc = vec![0u64; bands_in_tile];
+
+    for y in 0..h {
+        if horizontal_diff {
+            acc.fill(0);
+        }
+        let row_off = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let off = ((row_off + x) * bands_in_tile + b) * 8;
+                let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
+                let raw_u64 = match byte_order {
+                    ByteOrder::Little => u64::from_le_bytes(bytes),
+                    ByteOrder::Big => u64::from_be_bytes(bytes),
+                };
+                let bits = if horizontal_diff {
+                    acc[b] = acc[b].wrapping_add(raw_u64);
+                    acc[b]
+                } else {
+                    raw_u64
+                };
+                let vf = if signed { (bits as i64) as f64 } else { bits as f64 };
+                let (v, is_nd) = check_val_f64(vf, finite_nodata);
+                slabs[b][row_off + x] = v;
+                if is_nd {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    if v < min_val[b] {
+                        min_val[b] = v;
+                    }
+                    if v > max_val[b] {
+                        max_val[b] = v;
+                    }
+                }
+            }
+        }
+    }
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data: BandData::F64(data.into_boxed_slice()),
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
+        })
+        .collect()
+}
+
+/// Unpack MSB-first sub-byte (`bits == 1` or `bits == 4`) TIFF tiles into compact `BandData::U8`
+/// bands (`0..=1` for 1-bit, `0..=15` for 4-bit), respecting TIFF's per-scanline byte padding.
+pub fn reconstruct_subbyte(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    bits: u8,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let nd_u8: Option<u8> = nodata
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 255.0 && v.fract() == 0.0)
+        .map(|v| v as u8);
+    let samples_per_row = w * bands_in_tile;
+    let row_bytes = if bits == 1 {
+        samples_per_row.div_ceil(8)
+    } else {
+        samples_per_row.div_ceil(2)
+    };
+    let mut bufs: Vec<Vec<u8>> = (0..bands_in_tile).map(|_| vec![0u8; pixels]).collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    for y in 0..h {
+        let row = &raw[y * row_bytes..(y + 1) * row_bytes];
+        let row_px = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let s = x * bands_in_tile + b;
+                let v = if bits == 1 {
+                    (row[s >> 3] >> (7 - (s & 7))) & 1
+                } else {
+                    (row[s >> 1] >> (4 * (1 - (s & 1)))) & 0x0F
+                };
+                bufs[b][row_px + x] = v;
+                if nd_u8 == Some(v) {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    let vf = v as f32;
+                    if vf < min_val[b] {
+                        min_val[b] = vf;
+                    }
+                    if vf > max_val[b] {
+                        max_val[b] = vf;
+                    }
+                }
+            }
+        }
+    }
+    bufs.into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data: BandData::U8 {
+                data: data.into_boxed_slice(),
+                nodata: nd_u8,
+            },
             width: tile_w,
             height: tile_h,
             stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
@@ -2087,34 +2594,34 @@ pub fn reconstruct_int32(
         .collect()
 }
 
-/// Zero-copy `float64` (`Predictor::None`) decode directly from an immutable slice.
+/// Zero-copy `float64` (`Predictor::None`) decode directly into exact `BandData::F64`.
 pub fn reconstruct_f64_uncompressed(
     raw: &[u8],
     tile_w: u32,
     tile_h: u32,
     bands_in_tile: usize,
     byte_order: ByteOrder,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let pixels = (tile_w as usize) * (tile_h as usize);
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
 
     for i in 0..pixels {
         for b in 0..bands_in_tile {
             let off = (i * bands_in_tile + b) * 8;
             let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
             let vf = match byte_order {
-                ByteOrder::Little => f64::from_le_bytes(bytes) as f32,
-                ByteOrder::Big => f64::from_be_bytes(bytes) as f32,
+                ByteOrder::Little => f64::from_le_bytes(bytes),
+                ByteOrder::Big => f64::from_be_bytes(bytes),
             };
-            let (v, is_nd) = check_val(vf, finite_nodata);
+            let (v, is_nd) = check_val_f64(vf, finite_nodata);
             slabs[b][i] = v;
             if is_nd {
                 any_nodata[b] = true;
@@ -2134,15 +2641,20 @@ pub fn reconstruct_f64_uncompressed(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
         })
         .collect()
 }
 
-/// Reconstruct `float64` (Predictor 1, Predictor 2, or 8-plane Predictor 3) -> `AlignedF32Slab`.
+/// Reconstruct `float64` (Predictor 1, Predictor 2, or 8-plane Predictor 3) -> exact `BandData::F64`.
 pub fn reconstruct_f64(
     raw: &mut [u8],
     tile_w: u32,
@@ -2150,19 +2662,19 @@ pub fn reconstruct_f64(
     bands_in_tile: usize,
     byte_order: ByteOrder,
     predictor: cogzilla_tiff::Predictor,
-    nodata: Option<f32>,
+    nodata: Option<f64>,
 ) -> Vec<DecodedBand> {
     let finite_nodata = nodata.filter(|v| !v.is_nan());
     let w = tile_w as usize;
     let h = tile_h as usize;
     let pixels = w * h;
-    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
-        .map(|_| AlignedF32Slab::new_uninit(pixels))
+    let mut slabs: Vec<Vec<f64>> = (0..bands_in_tile)
+        .map(|_| vec![0.0f64; pixels])
         .collect();
     let mut any_valid = vec![false; bands_in_tile];
     let mut any_nodata = vec![false; bands_in_tile];
-    let mut min_val = vec![f32::INFINITY; bands_in_tile];
-    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+    let mut min_val = vec![f64::INFINITY; bands_in_tile];
+    let mut max_val = vec![f64::NEG_INFINITY; bands_in_tile];
 
     match predictor {
         cogzilla_tiff::Predictor::FloatingPoint => {
@@ -2186,8 +2698,8 @@ pub fn reconstruct_f64(
                             row[samples_per_row + idx],
                             row[idx],
                         ];
-                        let vf = f64::from_le_bytes(bytes) as f32;
-                        let (v, is_nd) = check_val(vf, finite_nodata);
+                        let vf = f64::from_le_bytes(bytes);
+                        let (v, is_nd) = check_val_f64(vf, finite_nodata);
                         slabs[b][row_off + x] = v;
                         if is_nd {
                             any_nodata[b] = true;
@@ -2214,8 +2726,8 @@ pub fn reconstruct_f64(
                             ByteOrder::Big => u64::from_be_bytes(bytes),
                         };
                         acc[b] = acc[b].wrapping_add(delta);
-                        let vf = f64::from_bits(acc[b]) as f32;
-                        let (v, is_nd) = check_val(vf, finite_nodata);
+                        let vf = f64::from_bits(acc[b]);
+                        let (v, is_nd) = check_val_f64(vf, finite_nodata);
                         slabs[b][row_off + x] = v;
                         if is_nd {
                             any_nodata[b] = true;
@@ -2234,10 +2746,10 @@ pub fn reconstruct_f64(
                     let off = (i * bands_in_tile + b) * 8;
                     let bytes: [u8; 8] = raw[off..off + 8].try_into().unwrap();
                     let vf = match byte_order {
-                        ByteOrder::Little => f64::from_le_bytes(bytes) as f32,
-                        ByteOrder::Big => f64::from_be_bytes(bytes) as f32,
+                        ByteOrder::Little => f64::from_le_bytes(bytes),
+                        ByteOrder::Big => f64::from_be_bytes(bytes),
                     };
-                    let (v, is_nd) = check_val(vf, finite_nodata);
+                    let (v, is_nd) = check_val_f64(vf, finite_nodata);
                     slabs[b][i] = v;
                     if is_nd {
                         any_nodata[b] = true;
@@ -2255,10 +2767,15 @@ pub fn reconstruct_f64(
         .into_iter()
         .enumerate()
         .map(|(b, data)| DecodedBand {
-            data: BandData::F32(data),
+            data: BandData::F64(data.into_boxed_slice()),
             width: tile_w,
             height: tile_h,
-            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+            stats: finalize_stats(
+                any_valid[b],
+                any_nodata[b],
+                clamp_f64_stat(min_val[b]),
+                clamp_f64_stat(max_val[b]),
+            ),
         })
         .collect()
 }
@@ -2294,44 +2811,89 @@ pub fn reconstruct_u8(
         let mut min_u8 = [255u8; 3];
         let mut max_u8 = [0u8; 3];
 
-        if horizontal_diff {
+        #[cfg(target_arch = "aarch64")]
+        let handled = {
             let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
-            for y in 0..h {
-                let row = &mut slice[y * w * 3..(y + 1) * w * 3];
-                let mut acc = [0u8; 3];
-                for px in row.chunks_exact_mut(3) {
-                    acc[0] = acc[0].wrapping_add(px[0]);
-                    acc[1] = acc[1].wrapping_add(px[1]);
-                    acc[2] = acc[2].wrapping_add(px[2]);
-                    px[0] = acc[0];
-                    px[1] = acc[1];
-                    px[2] = acc[2];
-                }
+            unsafe {
+                reconstruct_u8_rgb3_neon(
+                    slice,
+                    w,
+                    h,
+                    horizontal_diff,
+                    nd_u8,
+                    &mut any_valid,
+                    &mut any_nodata,
+                    &mut min_u8,
+                    &mut max_u8,
+                );
             }
-        }
+            true
+        };
 
-        if let Some(nd) = nd_u8 {
-            for px in rgb.chunks_exact(3) {
-                for b in 0..3 {
-                    let v = px[b];
-                    if v == nd {
-                        any_nodata[b] = true;
-                    } else {
-                        any_valid[b] = true;
-                        if v < min_u8[b] { min_u8[b] = v; }
-                        if v > max_u8[b] { max_u8[b] = v; }
+        #[cfg(target_arch = "x86_64")]
+        let handled = if std::is_x86_feature_detected!("avx2") {
+            let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
+            unsafe {
+                reconstruct_u8_rgb3_avx2(
+                    slice,
+                    w,
+                    h,
+                    horizontal_diff,
+                    nd_u8,
+                    &mut any_valid,
+                    &mut any_nodata,
+                    &mut min_u8,
+                    &mut max_u8,
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let handled = false;
+
+        if !handled {
+            if horizontal_diff {
+                let slice = std::sync::Arc::get_mut(&mut rgb).expect("unique Arc");
+                for y in 0..h {
+                    let row = &mut slice[y * w * 3..(y + 1) * w * 3];
+                    let mut acc = [0u8; 3];
+                    for px in row.chunks_exact_mut(3) {
+                        acc[0] = acc[0].wrapping_add(px[0]);
+                        acc[1] = acc[1].wrapping_add(px[1]);
+                        acc[2] = acc[2].wrapping_add(px[2]);
+                        px[0] = acc[0];
+                        px[1] = acc[1];
+                        px[2] = acc[2];
                     }
                 }
             }
-        } else {
-            any_valid = [pixels > 0; 3];
-            for px in rgb.chunks_exact(3) {
-                if px[0] < min_u8[0] { min_u8[0] = px[0]; }
-                if px[0] > max_u8[0] { max_u8[0] = px[0]; }
-                if px[1] < min_u8[1] { min_u8[1] = px[1]; }
-                if px[1] > max_u8[1] { max_u8[1] = px[1]; }
-                if px[2] < min_u8[2] { min_u8[2] = px[2]; }
-                if px[2] > max_u8[2] { max_u8[2] = px[2]; }
+
+            if let Some(nd) = nd_u8 {
+                for px in rgb.chunks_exact(3) {
+                    for b in 0..3 {
+                        let v = px[b];
+                        if v == nd {
+                            any_nodata[b] = true;
+                        } else {
+                            any_valid[b] = true;
+                            if v < min_u8[b] { min_u8[b] = v; }
+                            if v > max_u8[b] { max_u8[b] = v; }
+                        }
+                    }
+                }
+            } else {
+                any_valid = [pixels > 0; 3];
+                for px in rgb.chunks_exact(3) {
+                    if px[0] < min_u8[0] { min_u8[0] = px[0]; }
+                    if px[0] > max_u8[0] { max_u8[0] = px[0]; }
+                    if px[1] < min_u8[1] { min_u8[1] = px[1]; }
+                    if px[1] > max_u8[1] { max_u8[1] = px[1]; }
+                    if px[2] < min_u8[2] { min_u8[2] = px[2]; }
+                    if px[2] > max_u8[2] { max_u8[2] = px[2]; }
+                }
             }
         }
         return (0..3u8)
@@ -2475,4 +3037,107 @@ pub fn reconstruct_u8(
             ),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u8_rgb3_pred1_and_pred2_match_scalar_across_widths_and_nodata() {
+        for &(w, h) in &[(1u32, 1u32), (7, 3), (15, 2), (16, 4), (17, 5), (63, 7), (256, 4)] {
+            let pixels = (w * h) as usize;
+            let raw: Vec<u8> = (0..pixels * 3)
+                .map(|i| ((i.wrapping_mul(37) ^ (i >> 3)) & 0xFF) as u8)
+                .collect();
+
+            for horizontal_diff in [false, true] {
+                for nodata in [None, Some(0.0f32), Some(255.0f32)] {
+                    let bands = reconstruct_u8(&raw, w, h, 3, horizontal_diff, nodata);
+                    assert_eq!(bands.len(), 3);
+
+                    // Scalar reference
+                    let mut expected = raw.clone();
+                    if horizontal_diff {
+                        for y in 0..h as usize {
+                            let row = &mut expected[y * (w as usize) * 3..(y + 1) * (w as usize) * 3];
+                            let mut acc = [0u8; 3];
+                            for px in row.chunks_exact_mut(3) {
+                                for b in 0..3 {
+                                    acc[b] = acc[b].wrapping_add(px[b]);
+                                    px[b] = acc[b];
+                                }
+                            }
+                        }
+                    }
+                    let nd_u8 = nodata.map(|v| v as u8);
+                    let mut av = [false; 3];
+                    let mut an = [false; 3];
+                    let mut mn = [255u8; 3];
+                    let mut mx = [0u8; 3];
+                    for px in expected.chunks_exact(3) {
+                        for b in 0..3 {
+                            if nd_u8 == Some(px[b]) {
+                                an[b] = true;
+                            } else {
+                                av[b] = true;
+                                mn[b] = mn[b].min(px[b]);
+                                mx[b] = mx[b].max(px[b]);
+                            }
+                        }
+                    }
+
+                    for b in 0..3 {
+                        let BandData::RgbU8Channel { ref rgb, .. } = bands[b].data else {
+                            panic!("expected RgbU8Channel");
+                        };
+                        assert_eq!(rgb.as_ref(), expected.as_slice());
+                        let exp_stats = finalize_stats(
+                            av[b],
+                            an[b],
+                            if av[b] { mn[b] as f32 } else { f32::INFINITY },
+                            if av[b] { mx[b] as f32 } else { f32::NEG_INFINITY },
+                        );
+                        assert_eq!(bands[b].stats.all_nodata, exp_stats.all_nodata);
+                        assert_eq!(bands[b].stats.no_nodata, exp_stats.no_nodata);
+                        assert_eq!(bands[b].stats.min.to_bits(), exp_stats.min.to_bits());
+                        assert_eq!(bands[b].stats.max.to_bits(), exp_stats.max.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn prefix_sum_stride3_neon_matches_scalar() {
+        for len in [0usize, 3, 6, 45, 48, 51, 96, 1536, 6144] {
+            let input: Vec<u8> = (0..len)
+                .map(|i| ((i.wrapping_mul(29) ^ (i >> 2)) & 0xFF) as u8)
+                .collect();
+            let mut a = input.clone();
+            let mut b = input;
+            prefix_sum_scalar(&mut a, 3);
+            unsafe { prefix_sum_stride3_neon(&mut b) };
+            assert_eq!(a, b, "mismatch for len={len}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefix_sum_stride3_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for len in [0usize, 3, 6, 12, 15, 18, 24, 48, 51, 96, 1536, 6144] {
+            let input: Vec<u8> = (0..len)
+                .map(|i| ((i.wrapping_mul(29) ^ (i >> 2)) & 0xFF) as u8)
+                .collect();
+            let mut a = input.clone();
+            let mut b = input;
+            prefix_sum_scalar(&mut a, 3);
+            unsafe { prefix_sum_stride3_avx2(&mut b) };
+            assert_eq!(a, b, "mismatch for len={len}");
+        }
+    }
 }

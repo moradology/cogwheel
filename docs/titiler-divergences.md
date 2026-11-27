@@ -57,11 +57,11 @@ This document is the living record of every intentional divergence, **why** it e
   - Non-integer factors weight every overlapped source pixel by its exact overlap area.
 - **Client significance:** Physically area-true downsampled previews and tiles.
 
-### 1.6 Physical Ground-Metre Terrain Hillshade & Slope (`N2`)
+### 1.6 Physical Ground-Metre Terrain Hillshade & Slope with Seamless Full-Size Tiles (`N2`, Sweep #45)
 
-- **TiTiler:** Computes hillshade/slope gradients in pixel units rather than physical ground metres, which distorts shading away from the equator.
-- **`cogzilla`:** Computes Horn 3×3 gradients in true ground metres (accounting for latitude `cos(lat)` scaling on geographic/Mercator grids and CRS linear units).
-- **Client significance:** Physically accurate hillshade and slope across all latitudes.
+- **TiTiler:** Computes hillshade/slope gradients in pixel units rather than physical ground metres (distorting shading away from the equator), and shrinks `hillshade` / `slope` tiles by 3 px per edge (e.g. `250×250` instead of `256×256`, `970×970` instead of `976×976`) unless the caller adds `buffer=3`.
+- **`cogzilla`:** Computes Horn 3×3 gradients in true ground metres (accounting for latitude `cos(lat)` scaling on geographic/Mercator grids and CRS linear units), and fetches its own 1-pixel neighbor halo internally so every tile, preview, bbox, and feature output stays full-size (`256×256`) and seamless across tile boundaries. When a TiTiler client explicitly passes `?algorithm=hillshade&buffer=3`, `cogzilla` subtracts the 3 px default crop so it still outputs `256×256`.
+- **Client significance:** Physically accurate hillshade and slope across all latitudes without broken 250×250 slippy-map tiles or tile-boundary seams.
 
 ### 1.7 Legacy GeoJSON `crs` Member & Safe `400` on Projected Coordinates Without `coord_crs` (`L2`, PR #167)
 
@@ -71,17 +71,35 @@ This document is the living record of every intentional divergence, **why** it e
   2. If neither `?coord_crs=` nor `"crs"` is provided and coordinates fall outside WGS84 lon/lat bounds (`[-360, 360] × [-90, 90]`), returns **`400 Bad Request`** with an explicit hint to pass `?coord_crs=EPSG:<code>`.
 - **Client significance:** Never OOMs, supports legacy CRS-tagged GeoJSON out of the box, and gives immediate actionable feedback when `?coord_crs=` was forgotten.
 
-### 1.8 Proxy Headers & Extra Endpoint Flexibility (Sweeps #10–#11)
+### 1.8 Proxy Headers, HTTP Caching, Content Negotiation & Extra Endpoint Flexibility (Sweeps #10–#11, #45)
 
-- **`X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Prefix`:** Honoured when constructing TileJSON and WMTS URLs (TiTiler ignores them).
-- **`POST /*/feature` body types:** Accepts `FeatureCollection` and bare `Geometry` in addition to `Feature` (TiTiler returns `422`).
-- **`reproject=gauss`:** Supported as a resampling extension (TiTiler returns `422`).
+- **`X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Prefix`:** Honoured when constructing TileJSON, WMTS, and landing/viewer URLs (TiTiler ignores them), with strict validation rejecting protocol-relative prefixes (`//...`) and invalid host authorities.
+- **Conditional requests, `ETag`, `HEAD`, and `Vary: Accept` (Sweep #45):** Image responses emit `ETag` (reflecting all render parameters) and `Cache-Control`, returning `304 Not Modified` on exact, strong-form, or `*` `If-None-Match` with `ETag` and `Cache-Control` preserved (TiTiler sends no `ETag` and answers `200`). `HEAD` on tiles and metadata routes returns `200` with headers and no body (TiTiler returns `405`). All HTML-negotiated routes (`/`, `/conformance`, `/tileMatrixSets`, `/colorMaps`, `/algorithms`, and OGC tileset endpoints) send `Vary: Accept` (TiTiler sends only `Vary: Origin`, risking shared-cache confusion between browser HTML and API JSON).
+- **CORS preflight & trailing slashes:** `OPTIONS` preflight returns `204 No Content` (vs TiTiler `200`), and trailing slashes (e.g. `/cog/info/`) are served directly (`200`) without a `307` redirect.
+- **Flexible STAC expressions, `contours`, `histogram_bins`, and convenience routes:**
+  - `POST /*/feature` accepts `FeatureCollection` and bare `Geometry` in addition to `Feature` (TiTiler returns `422`).
+  - `reproject=gauss` is supported as a resampling extension (TiTiler returns `422`).
+  - STAC `expression=` auto-infers referenced assets (no redundant `?assets=` required) and supports both `asset_b1` and `asset_as_band=true` syntax.
+  - `algorithm=contours` accepts fractional `increment` (e.g. `0.05` for surface-reflectance COGs where TiTiler requires integer), and `histogram_bins` accepts floating-point custom bin edge lists (e.g. `0,0.1,0.2,0.5`).
+  - Extra convenience endpoints & syntax: `/docs`, `/openapi.json`, `/cog/bounds`, `/cog/tilejson.json`, `/cog/map.html`, `/cog/WebMercatorQuad/WMTSCapabilities.xml`, `/mosaicjson/bounds`, `/mosaicjson/assets`, `/mosaicjson/statistics`, `/mosaicjson/bbox`, `/mosaicjson/feature`, and `@2x`/`@3x`/`@4x` retina tile scale suffixes.
+  - Enriched metadata fields: `/cog/info` and `/mosaicjson/info` include `minzoom`, `maxzoom`, and `wgs84_bounds`; `GET /cog/stac` returns `application/geo+json` (the STAC Item media type).
 
-### 1.9 Pure-Rust GCP Georeferencing & Ungeoreferenced Pixel-Space Support (`U2(b)`, `U3`)
+### 1.9 Pure-Rust GCP Georeferencing, Ungeoreferenced & RPC-Only TIFF Support (`U2(b)`, `U3`, `MM1`)
 
-- **TiTiler / GDAL:** On GCP-only GeoTIFFs (e.g. `odd/gcp_affine.tif`), GDAL's default GCP warper can disagree with the exact affine twin (`2088` vs `2600` at `-122.4, 37.8`).
+- **TiTiler / GDAL:** On GCP-only GeoTIFFs (e.g. `odd/gcp_affine.tif`), GDAL's default GCP warper can disagree with the exact affine twin (`2088` vs `2600` at `-122.4, 37.8`). On ungeoreferenced or RPC-only (`RPCCoefficientTag 50844`, e.g. Pléiades/WorldView L1B) TIFFs, TiTiler returns `500 Internal Server Error` on `/cog/info`, `/cog/preview`, `/cog/tiles`, and `/cog/point`.
 - **`cogzilla`:** Fits GCPs in pure Rust (zero C dependencies): when the order-1 least-squares affine residual is `< 0.05 px`, stores an exact `Affine2D` (zero runtime overhead on hot paths and bit-identical pixels/point values to the affine twin); otherwise fits a normalized order-2 (`>= 6` GCPs) or order-3 (`>= 10` GCPs) forward & inverse polynomial warp. Exposes `gcp_residual_px` in `/cog/info`.
-- **Ungeoreferenced TIFFs (`U3`):** Serves `/cog/info` (`crs: null`, `bounds: null`), `/cog/preview`, and `GET /cog/statistics` directly in pixel space while returning `400 Bad Request` on geographic routes (`/tiles`, `/point`, `/bbox`, `/feature`, `/bounds`).
+- **Ungeoreferenced & RPC-only TIFFs (`U3`, `MM1`):** Serves `/cog/info` (`crs: null`, `bounds: null`), `/cog/validate` (full structural COG report with `GEO: null` and an explicit warning), `/cog/preview`, and `GET /cog/statistics` directly in pixel space, while returning `400 Bad Request` naming the missing georeferencing / RPCs on geographic routes (`/tiles`, `/point`, `/bbox`, `/feature`, `/bounds`).
+
+### 1.10 Anonymous `s3://` Fallback & Cloud Credential Chain (Sweep #44, `PP1`)
+
+- **TiTiler / GDAL:** Opening a public `s3://` URI without AWS credentials fails with `500 InvalidCredentials: No valid AWS credentials found`.
+- **`cogzilla`:** Falls back automatically to unsigned HTTPS with S3 bucket-region discovery for public `s3://` buckets, while supporting static env vars, `AWS_PROFILE`, ECS task roles, EKS Pod Identity (`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`), EKS IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`), and EC2 IMDSv2 for private buckets.
+
+### 1.11 Exact `grayscale` of Whole Numbers, and Algorithms TiTiler Cannot Finish
+
+- **TiTiler:** `grayscale` sums `r*299/1000 + g*587/1000 + b*114/1000` term by term in float64 and truncates, so a grey picture stored as RGB (three equal bands) comes out one lower than its own value on about 5.5% of pixels (`0.299·a + 0.587·a + 0.114·a` lands just under `a`). `sum` over unsigned integer bands answers `500`, as does `grayscale` over a single band; `std` and `var` over a single band mask every pixel (`ddof=1` over one value).
+- **`cogzilla`:** Sums whole-number bands exactly (`(r*299 + g*587 + b*114) / 1000`) before truncating, so equal bands give back their value, and otherwise matches TiTiler's type and values (`ddof=1` spread, truncation, `astype` wrapping for `cast`/`ceil`/`floor`). `sum` of unsigned bands is written as `uint64`; `grayscale` of one band is that band; `std`/`var` of one band is `0`.
+- **Client significance:** Grey RGB imagery keeps its values through `grayscale`, and the algorithms answer where TiTiler fails.
 
 ---
 
@@ -91,6 +109,7 @@ This document is the living record of every intentional divergence, **why** it e
 |---|---|---|---|
 | **Uniform semantic HTTP statuses** (all routes, all 13 TMSs) | Out-of-matrix `x`/`y` returns `404`; out-of-footprint non-Mercator tiles can return `200` empty | **`400`** when tile address is invalid for the grid (`x`/`y`/`z` out of matrix, unknown TMS, unsupported CRS); **`404`** with JSON detail naming tile & dataset bounds when valid address lies outside dataset footprint (exact densified-outline test, independent of TMS, including `/point`, `/bbox`, `/feature`); **`204`** empty body when inside advertised mosaic/STAC bounds with no covering asset; **`200`** only when inside footprint (including all-nodata pixels) | Makes status codes a semantic fact about the request rather than a quirk of the TileMatrixSet or framework. |
 | **Mismatched `rescale` count** (`N4`, PR #161) | Silently accepts e.g. 2 rescale ranges for 3 bands | **`400 Bad Request`** naming the range count and band count (`0`, `1`, and `N` remain valid) | Silent leniency hides bugs on ambiguous input; explicit error is safer for clients. |
+| **Safe size bounds & `pixel_selection` validation** (Sweeps #30, #45) | Silently accepts `max_size=-1` (1×1 PNG), `width=0` (ignored), unbounded `tilesize=4096`, and `pixel_selection=lastbandlow`/`lastbandhigh` on 1-band mosaics (blank image) | **`422`** for `tilesize > 2048`, `max_size < 0`, `width = 0`; **`400`** for `lastband*` on 1-band mosaics or `pixel_selection` on routes that cannot honour it (`/point`, `/info`, `/assets`) | Prevents silent wrong/blank output and unbounded memory allocations. |
 | **Mosaic `/point` outside coverage** (`D1`/`M4`, PR #162) | `204 No Content` (empty body) | **`404 Not Found`** with JSON `{"detail": "No asset covers point (lon, lat)"}` (empty mosaic *tiles* stay `204`) | Point callers are scripts that benefit from a diagnostic body; `204` fits map tiles only. |
 | **Unsupported CRS on `/tiles`** (`M1`, PR #167) | Returns `404` or GDAL error depending on route | **`400 Bad Request`** (`unsupported CRS`) uniformly across `/info`, `/bounds`, `/preview`, `/point`, and `/tiles` | Debugging blank map tiles immediately reveals the unsupported CRS instead of claiming "outside image bounds". |
 | **Upstream HTTP & URI scheme errors** (`V1`–`V3`) | Returns `500` for upstream 403/404/5xx/network faults and treats unknown URI schemes as missing files | **`403`** (`origin refused access (HTTP 401/403)`) for upstream auth refusal; **`404`** for upstream 404; **`502 Bad Gateway`** for upstream 5xx, truncated body, redirect loop, unreachable host, or origin ignoring `Range` (`origin does not support HTTP range requests`); **`504 Gateway Timeout`** on upstream timeout; **`400 Bad Request`** naming unsupported `<scheme>://` URIs | Separates client mistakes (`400`), origin access/missingness (`403`/`404`), and upstream faults (`502`/`504`) from server bugs (`500`). |
@@ -106,3 +125,6 @@ This document is the living record of every intentional divergence, **why** it e
 - **JPEG 2000 (`B7`):** Requires C++ codec dependencies (`OpenJPEG`) and is rare in Cloud Optimized GeoTIFFs. *(Pure-Rust LERC / LERC_DEFLATE / LERC_ZSTD **is** supported via PR #164 with zero C/C++ dependencies, verified bit-exact on 18 GDAL-written files.)*
 - **`/zarr/*` routes (`C6`):** Outside the scope of a COG / STAC / MosaicJSON server.
 - **Brotli on `.npy` (Sweep #11):** `gzip` (`Accept-Encoding: gzip` and `*`) is supported across JSON, XML, HTML, `.npy`, and `.tif`, covering all standard HTTP clients without adding a Brotli encoder dependency.
+- **Antimeridian `west > east` geographic bboxes vs literal GeoJSON rings (Sweeps #26 DD1 & #34 EE1):** For geographic `coord_crs` (`EPSG:4326` / CRS84), cogzilla unwraps `minx > maxx` (`maxx += 360`) per RFC 7946 §5.2 across all 15 geographic bbox entry points (`/cog/bbox`, `/stac/bbox`, `/mosaicjson/bbox` sized and unsized, and `?bbox=` on `/cog/statistics`, `/cog/map`, `/stac/map`, `/stac/assets`, `/mosaicjson/assets`, `/cog/preview`) so requests like `179.5,-17.5,-178.5,-16.5` return the exact same pixels as `179.5,-17.5,181.5,-16.5` (where TiTiler returns an empty 1 px wide image). For projected `coord_crs`, `minx >= maxx` returns `400 Bad Request` stating that `minx` must be less than `maxx`. By contrast, GeoJSON polygon rings are read literally per RFC 7946 §3.1.9 (splitting an antimeridian-crossing polygon is the producer's responsibility, and refusing wide rings would reject legal GeoJSON such as a `-180..180` world rectangle).
+- **Symmetric ±2-turn geographic longitude normalisation (Sweep #34 JJ1):** Every point and geographic bbox entry point (`/cog/point`, `/stac/point`, `/mosaicjson/point`, `/mosaicjson/point/.../assets`, and geographic bboxes) shares a single symmetric longitude normaliser (`normalize_geographic_lon`) that wraps finite longitudes within `[-720°, +720°]` into `[-180°, +180°]` identically eastward and westward, returning `404` for `|lon| > 720°` (where TiTiler returns `500` at e.g. `900.5`).
+- **Query string `+` decoding (Sweep #34 HH1):** `url=` and `asset_href=` decode `+` as a space per `application/x-www-form-urlencoded` (with literal `+` encoded as `%2B`, matching `httpx`, `requests`, and `urllib.parse.urlencode`), while `expression=` accepts both `%2B` and hand-typed `+` (returning the exact sum where TiTiler 400s on raw `+` and mis-masks `%2B`).
