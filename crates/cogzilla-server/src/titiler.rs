@@ -1634,6 +1634,9 @@ pub struct StatsOptions {
     /// The type numpy builds the histogram's bin edges in, for paths that only see `f32` values;
     /// `None` infers it from the values (see [`HistDtype::infer`]).
     pub hist_dtype: Option<HistDtype>,
+    /// `resampling`: how a whole raster's statistics read it at a size between its levels
+    /// (rio-tiler reads its preview with it). Nearest picks the pixel under each centre.
+    pub resample: ResampleMode,
 }
 
 impl StatsOptions {
@@ -1665,6 +1668,7 @@ impl Default for StatsOptions {
             max_size_explicit: false,
             area_weighted: true,
             hist_dtype: None,
+            resample: ResampleMode::Nearest,
         }
     }
 }
@@ -3494,6 +3498,142 @@ fn compute_expression_statistics_cpu(
     serde_json::Value::Object(out)
 }
 
+/// A whole raster's statistics read at `out_w`×`out_h` with a resampling other than nearest,
+/// as rio-tiler takes them: from its preview, which GDAL reads with that resampling. The read
+/// is the one `/preview` draws (GDAL's kernels, widened when shrinking); a resampled value
+/// is put into an integer band's type as GDAL puts it, rounded to the nearest and held to
+/// the type's range, and one that lands on the nodata value is masked, as rio-tiler masks
+/// it (a cubic kernel's undershoot beside nodata 0); then scales and offsets (`unscale`) and
+/// band math are applied to those values, as rio-tiler applies them after the read.
+#[allow(clippy::too_many_arguments)]
+async fn compute_resampled_statistics(
+    engine: &TileEngine,
+    cog: &Arc<OpenedCog>,
+    crs: &cogzilla_proj::CrsModel,
+    out_w: usize,
+    out_h: usize,
+    unscale: bool,
+    nodata_override: Option<f32>,
+    opts: &StatsOptions,
+) -> Result<serde_json::Value, EngineError> {
+    let full = cog.index.full_res();
+    let count = full.samples_per_pixel;
+    let alpha_idx = cogzilla_codec::alpha_channel_index(count as usize, &full.extra_samples);
+    let read_bands: Vec<u16> = if let Some(exprs) = &opts.expressions {
+        let mut used: Vec<u16> = exprs.iter().flat_map(|(_, prog)| prog.used_bands.iter().copied()).collect();
+        used.sort_unstable();
+        used.dedup();
+        used
+    } else if let Some(bidx) = opts.bidx.as_ref().filter(|b| !b.is_empty()) {
+        bidx.clone()
+    } else {
+        (1..=count).filter(|&b| Some((b - 1) as usize) != alpha_idx).collect()
+    };
+    if read_bands.is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    let bbox = crs.wgs84_bounds_with_gcp(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
+    let request = BandRequest::MultiBand { bands_1based: read_bands.clone() };
+    let raw = render_native_preview(
+        engine,
+        std::slice::from_ref(cog),
+        bbox,
+        out_w as u32,
+        out_h as u32,
+        &request,
+        opts.resample,
+        OutputFormat::RawF32,
+        nodata_override,
+        None,
+        None,
+        false,
+        false,
+    )
+    .await?;
+    let n_px = out_w * out_h;
+    if raw.len() < n_px * 4 * read_bands.len() {
+        return Err(EngineError::BadRequest("statistics read returned fewer bands than asked".into()));
+    }
+    // An integer band's range, as GDAL holds a resampled value to it.
+    let whole = crate::http::array_type_range(full.sample_type);
+    let nodata = nodata_override.map(f64::from).or(cog.index.nodata_f64).or(cog.index.nodata.map(f64::from));
+    let opts = opts.clone();
+    let sample_type = full.sample_type;
+    let scales: Vec<(f64, f64)> = read_bands
+        .iter()
+        .map(|&b| {
+            let i = (b - 1) as usize;
+            (
+                f64::from(cog.index.scales.get(i).copied().unwrap_or(1.0)),
+                f64::from(cog.index.offsets.get(i).copied().unwrap_or(0.0)),
+            )
+        })
+        .collect();
+    let compute = move || -> serde_json::Value {
+        // Each band as read: GDAL rounds a resampled value into an integer type; NaN is masked.
+        let planes: Vec<Vec<f32>> = raw
+            .chunks_exact(n_px * 4)
+            .take(read_bands.len())
+            .zip(&scales)
+            .map(|(plane, &(scale, offset))| {
+                plane
+                    .chunks_exact(4)
+                    .map(|c| {
+                        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                        let v = match whole {
+                            Some((lo, hi)) if v.is_finite() => {
+                                let r = f64::from(v).round().clamp(lo, hi);
+                                if nodata == Some(r) { f32::NAN } else { r as f32 }
+                            }
+                            _ => v,
+                        };
+                        if unscale && v.is_finite() { (f64::from(v) * scale + offset) as f32 } else { v }
+                    })
+                    .collect()
+            })
+            .collect();
+        let band_dtype = HistDtype::for_sample_type(sample_type, unscale);
+        let finish = |values: Vec<f32>, desc: &str, dtype: HistDtype| {
+            BandStatsAcc::Floats(values.into_iter().filter(|v| v.is_finite()).collect())
+                .finalize(n_px, false, 1.0, 0.0, None, desc, &opts, Some(opts.hist_dtype.unwrap_or(dtype)))
+        };
+        let mut out = serde_json::Map::new();
+        if let Some(exprs) = &opts.expressions {
+            let slot = |b: u16| read_bands.iter().position(|&r| r == b);
+            for (i, (expr_str, prog)) in exprs.iter().enumerate() {
+                let width = prog.used_bands.iter().copied().max().unwrap_or(1) as usize;
+                let mut px = vec![f32::NAN; width];
+                let values: Vec<f32> = (0..n_px)
+                    .map(|p| {
+                        for &b in &prog.used_bands {
+                            px[(b - 1) as usize] = slot(b).map_or(f32::NAN, |s| planes[s][p]);
+                        }
+                        if prog.used_bands.iter().any(|&b| px[(b - 1) as usize].is_nan()) {
+                            f32::NAN
+                        } else {
+                            prog.eval(&px)
+                        }
+                    })
+                    .collect();
+                let dtype = HistDtype::for_expression(expr_str, band_dtype);
+                out.insert(format!("b{}", i + 1), finish(values, expr_str, dtype));
+            }
+        } else {
+            for (plane, &b) in planes.into_iter().zip(&read_bands) {
+                let name = format!("b{b}");
+                let val = finish(plane, &name, band_dtype);
+                out.insert(name, val);
+            }
+        }
+        serde_json::Value::Object(out)
+    };
+    if n_px > 256 * 256 {
+        Ok(engine.store.run_heavy_cpu(compute).await?)
+    } else {
+        Ok(compute())
+    }
+}
+
 /// Encode an RGBA buffer as a spec-compliant uncompressed Classic GeoTIFF (`EPSG:3857` or `EPSG:4326`).
 pub fn encode_geotiff_rgba(
     width: u32,
@@ -4268,6 +4408,9 @@ pub async fn compute_statistics_with_options(
         } else {
             Some((out_w, out_h))
         };
+        if dims.is_some() && opts.resample != ResampleMode::Nearest {
+            return compute_resampled_statistics(engine, cog, &crs, out_w, out_h, unscale, nodata_override, opts).await;
+        }
         (idx, 1usize, dims, out_w * out_h, 0usize)
     };
     let ifd = &cog.index.ifds[ifd_idx];

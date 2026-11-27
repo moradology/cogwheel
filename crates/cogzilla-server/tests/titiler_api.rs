@@ -6406,3 +6406,48 @@ async fn sweep43_oo1_exact_wide_dtype_roundtrip() {
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Statistics at a size between a raster's levels are those of its preview read with the
+/// resampling asked for, as rio-tiler takes them; a uint16 band's resampled values are whole
+/// numbers, as GDAL rounds them into the band's type, in the statistics and the array alike.
+#[tokio::test]
+async fn statistics_follow_the_resampling_of_the_preview() {
+    let path = fixture("landsat_c2_B4.tif");
+    if !path.exists() {
+        eprintln!("fixtures not generated; skipping");
+        return;
+    }
+    let url = path.canonicalize().unwrap().to_string_lossy().to_string();
+    let engine = Arc::new(TileEngine::new(128 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let get = |q: String| {
+        let client = client.clone();
+        async move {
+            let resp = client.get(q).send().await.unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            resp.bytes().await.unwrap()
+        }
+    };
+    let mut means = Vec::new();
+    for resampling in ["nearest", "bilinear", "average"] {
+        let q = format!("url={url}&max_size=300&resampling={resampling}");
+        let stats: serde_json::Value = serde_json::from_slice(&get(format!("{base}/cog/statistics?{q}")).await).unwrap();
+        let npy = get(format!("{base}/cog/preview.npy?{q}")).await;
+        let values = decode_npy_f32(&npy);
+        let (data, mask) = values.split_at(values.len() / 2);
+        let valid: Vec<f64> = data.iter().zip(mask).filter(|(_, m)| **m > 0.0).map(|(v, _)| f64::from(*v)).collect();
+        assert!(valid.iter().all(|v| v.fract() == 0.0), "{resampling}: a uint16 read is whole");
+        let mean = valid.iter().sum::<f64>() / valid.len() as f64;
+        let b1 = &stats["b1"];
+        assert_eq!(b1["count"].as_f64().unwrap(), valid.len() as f64, "{resampling}");
+        assert!((b1["mean"].as_f64().unwrap() - mean).abs() < 1e-6 * mean, "{resampling}: {} vs {mean}", b1["mean"]);
+        means.push(mean);
+    }
+    assert!(means[0] != means[1] && means[1] != means[2], "the resampling changes the numbers: {means:?}");
+}
