@@ -45,28 +45,34 @@ fn is_finite_f32(v: f32) -> bool {
 }
 
 @compute @workgroup_size(256, 1, 1)
-fn weighted_expr_eval(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.len) {
-        return;
-    }
-    if (cov[i] <= params.cov_eps) {
-        dst_expr[i] = nan_f32();
-        return;
-    }
-
-    var bvals: array<f32, 8>;
-    let mask = params.band_mask;
-    for (var b: u32 = 0u; b < 8u; b = b + 1u) {
-        if ((mask & (1u << b)) != 0u) {
-            let v = raw_bands[b * params.len + i];
-            if (!is_finite_f32(v)) {
-                dst_expr[i] = nan_f32();
-                return;
-            }
-            bvals[b] = v;
+fn weighted_expr_eval(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let stride = nwg.x * 256u;
+    for (var i: u32 = gid.x; i < params.len; i = i + stride) {
+        if (cov[i] <= params.cov_eps) {
+            dst_expr[i] = nan_f32();
+            continue;
         }
-    }
+
+        var bvals: array<f32, 8>;
+        var all_valid = true;
+        let mask = params.band_mask;
+        for (var b: u32 = 0u; b < 8u; b = b + 1u) {
+            if ((mask & (1u << b)) != 0u) {
+                let v = raw_bands[b * params.len + i];
+                if (!is_finite_f32(v)) {
+                    dst_expr[i] = nan_f32();
+                    all_valid = false;
+                    break;
+                }
+                bvals[b] = v;
+            }
+        }
+        if (!all_valid) {
+            continue;
+        }
 
     var stack: array<f32, 32>;
     var sp: u32 = 0u;
@@ -96,15 +102,31 @@ fn weighted_expr_eval(@builtin(global_invocation_id) gid: vec3<u32>) {
             case 5u: { // Div
                 sp -= 1u;
                 let denom = stack[sp];
-                if (denom == 0.0 || !is_finite_f32(denom)) {
+                if (abs(denom) < 1e-12 || is_nan_f32(denom)) {
                     stack[sp - 1u] = nan_f32();
                 } else {
                     stack[sp - 1u] = stack[sp - 1u] / denom;
                 }
             }
-            case 6u: { // Pow
+            case 6u: { // Pow (safe for a <= 0.0, matching f32::powf)
                 sp -= 1u;
-                stack[sp - 1u] = pow(stack[sp - 1u], stack[sp]);
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                if (is_nan_f32(a) || is_nan_f32(b)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (b == 0.0) {
+                    stack[sp - 1u] = 1.0;
+                } else if (a > 0.0) {
+                    stack[sp - 1u] = pow(a, b);
+                } else if (a == 0.0) {
+                    stack[sp - 1u] = select(nan_f32(), 0.0, b > 0.0);
+                } else if (trunc(b) == b) {
+                    let mag = pow(-a, b);
+                    let is_odd = abs(b - 2.0 * floor(b * 0.5)) >= 0.5;
+                    stack[sp - 1u] = select(mag, -mag, is_odd);
+                } else {
+                    stack[sp - 1u] = nan_f32();
+                }
             }
             case 7u: { // Neg
                 stack[sp - 1u] = -stack[sp - 1u];
@@ -144,17 +166,30 @@ fn weighted_expr_eval(@builtin(global_invocation_id) gid: vec3<u32>) {
             case 17u: { // Tan
                 stack[sp - 1u] = tan(stack[sp - 1u]);
             }
-            case 18u: { // Min
+            case 18u: { // Min (NaN-propagating)
                 sp -= 1u;
-                stack[sp - 1u] = min(stack[sp - 1u], stack[sp]);
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                stack[sp - 1u] = select(min(a, b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
             }
-            case 19u: { // Max
+            case 19u: { // Max (NaN-propagating)
                 sp -= 1u;
-                stack[sp - 1u] = max(stack[sp - 1u], stack[sp]);
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                stack[sp - 1u] = select(max(a, b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
             }
-            case 20u: { // Clip
+            case 20u: { // Clip (NaN-propagating, handles lo > hi)
                 sp -= 2u;
-                stack[sp - 1u] = clamp(stack[sp - 1u], stack[sp], stack[sp + 1u]);
+                let x = stack[sp - 1u];
+                let lo = stack[sp];
+                let hi = stack[sp + 1u];
+                if (is_nan_f32(x) || is_nan_f32(lo) || is_nan_f32(hi)) {
+                    stack[sp - 1u] = nan_f32();
+                } else {
+                    let a = min(lo, hi);
+                    let b = max(lo, hi);
+                    stack[sp - 1u] = clamp(x, a, b);
+                }
             }
             case 21u: { // Lt
                 sp -= 1u;
@@ -218,9 +253,10 @@ fn weighted_expr_eval(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    if (sp == 0u) {
-        dst_expr[i] = nan_f32();
-    } else {
-        dst_expr[i] = stack[sp - 1u];
+        if (sp == 0u) {
+            dst_expr[i] = nan_f32();
+        } else {
+            dst_expr[i] = stack[sp - 1u];
+        }
     }
 }

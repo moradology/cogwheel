@@ -115,16 +115,19 @@ impl GpuProfile {
             let _ = tx.send(r);
         });
         ctx.device.poll(wgpu::Maintain::Wait);
-        let _ = rx.recv();
-        {
-            let mapped = slice.get_mapped_range();
-            // Touch first and last byte to ensure pages are faulted
-            std::hint::black_box(mapped[0]);
-            std::hint::black_box(mapped[mapped.len() - 1]);
-        }
-        staging_buf.unmap();
-        let dn_s = t_dn0.elapsed().as_secs_f64().max(1e-6);
-        let readback_gb_s = ((probe_bytes as f64 / 1e9) / dn_s).clamp(0.5, 200.0);
+        let readback_gb_s = if matches!(rx.recv(), Ok(Ok(()))) {
+            {
+                let mapped = slice.get_mapped_range();
+                // Touch first and last byte to ensure pages are faulted
+                std::hint::black_box(mapped[0]);
+                std::hint::black_box(mapped[mapped.len() - 1]);
+            }
+            staging_buf.unmap();
+            let dn_s = t_dn0.elapsed().as_secs_f64().max(1e-6);
+            ((probe_bytes as f64 / 1e9) / dn_s).clamp(0.5, 200.0)
+        } else {
+            upload_gb_s
+        };
 
         Self {
             dispatch_floor_us,

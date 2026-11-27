@@ -92,8 +92,13 @@ impl GpuSlabCache {
     }
 
     pub fn insert(&self, key: SlabKey, slab: Arc<GpuSlab>) {
-        let bytes = (slab.height as usize) * (slab.stride as usize) * std::mem::size_of::<f32>();
+        let bytes = (slab.height as usize)
+            .saturating_mul(slab.stride as usize)
+            .saturating_mul(std::mem::size_of::<f32>());
         let mut g = self.inner.lock().expect("slab cache mutex poisoned");
+        if bytes > g.max_bytes {
+            return;
+        }
         if let Some(old) = g.map.remove(&key) {
             g.used_bytes = g.used_bytes.saturating_sub(old.bytes);
         }

@@ -1741,16 +1741,26 @@ pub fn compute_weighted_band_stats_with_geom(
 fn weighted_gpu_stats_to_json(
     gs: &cogzilla_gpu::GpuWeightedBandStats,
     area_scale: f64,
+    total_poly_area_px: Option<f64>,
     description: &str,
     opts: &StatsOptions,
 ) -> serde_json::Value {
-    let total_touched = gs.valid_pixels + gs.masked_pixels;
-    let valid_percent = if total_touched > 0 {
-        ((gs.valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
-    } else {
-        0.0
-    };
     let count_out = snap_near_int(gs.count_cov);
+    let poly_area = total_poly_area_px.unwrap_or(0.0).max(gs.count_cov);
+    let (valid_percent, masked_pixels) = if poly_area > 0.0 {
+        (
+            ((gs.count_cov / poly_area) * 100.0).clamp(0.0, 100.0),
+            (poly_area - gs.count_cov).max(0.0),
+        )
+    } else {
+        let total_touched = gs.valid_pixels + gs.masked_pixels;
+        let vp = if total_touched > 0 {
+            ((gs.valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        (vp, gs.masked_pixels as f64)
+    };
     let mut obj = serde_json::Map::new();
     obj.insert("min".into(), serde_json::json!(gs.min));
     obj.insert("max".into(), serde_json::json!(gs.max));
@@ -1767,7 +1777,7 @@ fn weighted_gpu_stats_to_json(
         serde_json::json!([gs.hist_counts, gs.hist_edges]),
     );
     obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
-    obj.insert("masked_pixels".into(), serde_json::json!(gs.masked_pixels as f64));
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
     obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels as f64));
     obj.insert("area".into(), serde_json::json!(gs.area_valid_m2 * area_scale));
     for &(p, val) in &gs.percentiles {
@@ -1779,11 +1789,14 @@ fn weighted_gpu_stats_to_json(
         obj.insert(key, serde_json::json!(val));
     }
     let _ = opts;
-    obj.insert("description".into(), serde_json::json!(description));
+    if !description.is_empty() {
+        obj.insert("description".into(), serde_json::json!(description));
+    }
     serde_json::Value::Object(obj)
 }
 
 #[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
 fn try_gpu_weighted_polygon_bands(
     gpu: &crate::gpu_backend::GpuBackend,
     bands: &[(&str, &[f32])],
@@ -1791,6 +1804,7 @@ fn try_gpu_weighted_polygon_bands(
     win_w: usize,
     win_h: usize,
     area_model: &PixelAreaModel,
+    total_poly_area_px: Option<f64>,
     opts: &StatsOptions,
 ) -> Option<Vec<serde_json::Value>> {
     if opts.categorical || opts.histogram_edges.is_some() || bands.is_empty() {
@@ -1856,7 +1870,9 @@ fn try_gpu_weighted_polygon_bands(
         gs_list
             .iter()
             .zip(bands.iter())
-            .map(|(gs, &(desc, _))| weighted_gpu_stats_to_json(gs, area_scale, desc, opts))
+            .map(|(gs, &(desc, _))| {
+                weighted_gpu_stats_to_json(gs, area_scale, total_poly_area_px, desc, opts)
+            })
             .collect(),
     )
 }
@@ -1871,6 +1887,7 @@ fn try_gpu_weighted_polygon_exprs(
     win_w: usize,
     win_h: usize,
     area_model: &PixelAreaModel,
+    total_poly_area_px: Option<f64>,
     opts: &StatsOptions,
 ) -> Option<Vec<serde_json::Value>> {
     if opts.categorical
@@ -1878,6 +1895,9 @@ fn try_gpu_weighted_polygon_exprs(
         || exprs.is_empty()
         || band_bufs.is_empty()
         || band_bufs.len() > 8
+        || exprs
+            .iter()
+            .any(|(_, prog)| prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where))
     {
         return None;
     }
@@ -1967,7 +1987,9 @@ fn try_gpu_weighted_polygon_exprs(
         gs_list
             .iter()
             .zip(exprs.iter())
-            .map(|(gs, (desc, _))| weighted_gpu_stats_to_json(gs, area_scale, desc, opts))
+            .map(|(gs, (desc, _))| {
+                weighted_gpu_stats_to_json(gs, area_scale, total_poly_area_px, desc, opts)
+            })
             .collect(),
     )
 }
@@ -2326,14 +2348,17 @@ pub async fn compute_native_exact_polygon_stats(
                     }
                 }
                 cogzilla_codec::BandData::U16 { data, nodata } => {
-                    let nd_u16 = nd_finite.or(nodata.map(|n| n as f32));
+                    let nd_internal = *nodata;
                     for row in ry0..ry1 {
                         let s0 = (row - tile_y0) * tw + lx0;
                         let d0 = (row - r0) * win_w + dst_x0;
                         let dst = &mut pixels[d0..d0 + span];
                         for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
                             let v = raw as f32;
-                            if let Some(nd) = nd_u16
+                            if let Some(nd) = nd_finite
                                 && v == nd
                             {
                                 continue;
@@ -2343,14 +2368,17 @@ pub async fn compute_native_exact_polygon_stats(
                     }
                 }
                 cogzilla_codec::BandData::U8 { data, nodata } => {
-                    let nd_u8 = nd_finite.or(nodata.map(|n| n as f32));
+                    let nd_internal = *nodata;
                     for row in ry0..ry1 {
                         let s0 = (row - tile_y0) * tw + lx0;
                         let d0 = (row - r0) * win_w + dst_x0;
                         let dst = &mut pixels[d0..d0 + span];
                         for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
                             let v = raw as f32;
-                            if let Some(nd) = nd_u8
+                            if let Some(nd) = nd_finite
                                 && v == nd
                             {
                                 continue;
@@ -2558,6 +2586,7 @@ pub async fn compute_native_exact_polygon_stats(
                     win_w,
                     win_h,
                     &area_model,
+                    total_poly_area_px,
                     &opts_owned,
                 )
             {
@@ -2642,6 +2671,7 @@ pub async fn compute_native_exact_polygon_stats(
                     win_w,
                     win_h,
                     &area_model,
+                    total_poly_area_px,
                     &opts_owned,
                 ) {
                     gpu_stats_counter
@@ -2772,6 +2802,7 @@ pub async fn compute_native_exact_polygon_stats(
                     win_w,
                     win_h,
                     &area_model,
+                    total_poly_area_px,
                     &opts_owned,
                 ) {
                     gpu_stats_counter
@@ -3174,14 +3205,17 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                     }
                 }
                 cogzilla_codec::BandData::U16 { data, nodata } => {
-                    let nd_u16 = nd_finite.or(nodata.map(|n| n as f32));
+                    let nd_internal = *nodata;
                     for row in ry0..ry1 {
                         let s0 = (row - tile_y0) * asset_tw + lx0;
                         let d0 = (row - r0) * win_w + dst_x0;
                         let dst = &mut pixels[d0..d0 + span];
                         for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
                             let v = raw as f32;
-                            if let Some(nd) = nd_u16
+                            if let Some(nd) = nd_finite
                                 && v == nd
                             {
                                 continue;
@@ -3191,14 +3225,17 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                     }
                 }
                 cogzilla_codec::BandData::U8 { data, nodata } => {
-                    let nd_u8 = nd_finite.or(nodata.map(|n| n as f32));
+                    let nd_internal = *nodata;
                     for row in ry0..ry1 {
                         let s0 = (row - tile_y0) * asset_tw + lx0;
                         let d0 = (row - r0) * win_w + dst_x0;
                         let dst = &mut pixels[d0..d0 + span];
                         for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
                             let v = raw as f32;
-                            if let Some(nd) = nd_u8
+                            if let Some(nd) = nd_finite
                                 && v == nd
                             {
                                 continue;
@@ -3290,6 +3327,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 win_w,
                 win_h,
                 &area_model,
+                total_poly_area_px,
                 &opts_owned,
             )
         {
@@ -3374,6 +3412,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 win_w,
                 win_h,
                 &area_model,
+                total_poly_area_px,
                 &opts_owned,
             ) {
                 gpu_stats_counter

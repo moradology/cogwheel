@@ -2758,6 +2758,7 @@ fn compute_statistics_cpu(
                 ifd.sample_type,
                 cogzilla_tiff::SampleType::Uint8 | cogzilla_tiff::SampleType::Uint16
             )
+            && !ifd.sample_type.needs_f64()
             && let Some(gpu_ref) = gpu
         {
             let alpha_idx = cogzilla_codec::alpha_channel_index(count, &ifd.extra_samples);
@@ -7410,10 +7411,10 @@ async fn render_bbox_core(
         None
     };
     #[cfg(feature = "gpu")]
-    let gpu_ctx = engine
-        .gpu
-        .as_ref()
-        .map(|g| (Arc::clone(g), Arc::clone(&engine.stats), primary.id));
+    let gpu_ctx = engine.gpu.as_ref().map(|g| {
+        let asset_ids: Vec<u64> = cogs.iter().map(|c| c.id).collect();
+        (Arc::clone(g), Arc::clone(&engine.stats), primary.id, asset_ids)
+    });
     let render_cpu = move |coord_map: BboxCoordMap,
                            cog_tiles: Vec<Vec<Option<Arc<cogzilla_codec::DecodedTile>>>>,
                            bands: &BandRequest,
@@ -7674,7 +7675,15 @@ async fn render_bbox_core(
         // Real RawF32 / Npy output for single-band / expression / DEM / Terrain / RGB requests
         if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
             #[cfg(feature = "gpu")]
-            if let Some((ref gpu, ref stats, primary_id)) = gpu_ctx {
+            if let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx {
+                let single_band_key = |b1: u16| -> (u64, u16) {
+                    if num_cogs > 1 {
+                        let slot = (b1.saturating_sub(1) as usize).min(asset_ids.len().saturating_sub(1));
+                        (asset_ids[slot], 0)
+                    } else {
+                        (primary_id, b1.saturating_sub(1))
+                    }
+                };
                 let coords = match &coord_map {
                     BboxCoordMap::Separable { u_cols, v_rows } => {
                         crate::gpu_backend::BboxCoordSource::Separable {
@@ -7729,10 +7738,11 @@ async fn render_bbox_core(
                         BandRequest::Single { band_1based, .. } => {
                             let refs = get_band_refs(*band_1based, 0);
                             let src = make_src!(&refs);
+                            let (cid, b0) = single_band_key(*band_1based);
                             gpu.try_render_bbox_single_band_stats(
-                                primary_id,
+                                cid,
                                 ifd_idx,
-                                band_1based.saturating_sub(1),
+                                b0,
                                 coords,
                                 &src,
                                 resample,
@@ -7779,10 +7789,11 @@ async fn render_bbox_core(
                             let (inv_8dx, inv_8dy) = dem_inv_8dxy();
                             let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
                             let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                            let (cid, b0) = single_band_key(*band_1based);
                             gpu.try_render_bbox_dem_stats(
-                                primary_id,
+                                cid,
                                 ifd_idx,
-                                band_1based.saturating_sub(1),
+                                b0,
                                 coords,
                                 &src,
                                 *algorithm,
@@ -7893,10 +7904,11 @@ async fn render_bbox_core(
                     BandRequest::Single { band_1based, .. } => {
                         let refs = get_band_refs(*band_1based, 0);
                         let src = make_src!(&refs);
+                        let (cid, b0) = single_band_key(*band_1based);
                         gpu.try_render_bbox_single_band_f32(
-                            primary_id,
+                            cid,
                             ifd_idx,
-                            band_1based.saturating_sub(1),
+                            b0,
                             coords,
                             &src,
                             resample,
@@ -7912,10 +7924,11 @@ async fn render_bbox_core(
                         let (inv_8dx, inv_8dy) = dem_inv_8dxy();
                         let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
                         let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                        let (cid, b0) = single_band_key(*band_1based);
                         gpu.try_render_bbox_dem_f32(
-                            primary_id,
+                            cid,
                             ifd_idx,
-                            band_1based.saturating_sub(1),
+                            b0,
                             coords,
                             &src,
                             *algorithm,
@@ -8081,10 +8094,18 @@ async fn render_bbox_core(
                         .gpu_dispatches
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if format == OutputFormat::Npy {
+                        let nb = match bands {
+                            BandRequest::Rgb { .. }
+                            | BandRequest::SarRgb { .. }
+                            | BandRequest::Terrain { .. }
+                            | BandRequest::CustomExprRgb { .. } => 3,
+                            BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+                            _ => 1,
+                        };
                         return BboxRenderOutput::Bytes(
                             cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
                                 raw,
-                                1,
+                                nb,
                                 h as u32,
                                 w as u32,
                                 return_mask,
@@ -8376,8 +8397,16 @@ async fn render_bbox_core(
                 | OutputFormat::Webp { .. }
                 | OutputFormat::Jpeg { .. }
                 | OutputFormat::RawRgba
-        ) && let Some((ref gpu, ref stats, primary_id)) = gpu_ctx
+        ) && let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx
         {
+            let single_band_key = |b1: u16| -> (u64, u16) {
+                if num_cogs > 1 {
+                    let slot = (b1.saturating_sub(1) as usize).min(asset_ids.len().saturating_sub(1));
+                    (asset_ids[slot], 0)
+                } else {
+                    (primary_id, b1.saturating_sub(1))
+                }
+            };
             let coords = match &coord_map {
                 BboxCoordMap::Separable { u_cols, v_rows } => {
                     crate::gpu_backend::BboxCoordSource::Separable {
@@ -8442,10 +8471,11 @@ async fn render_bbox_core(
                         resample,
                         format,
                     };
+                    let (cid, b0) = single_band_key(*band_1based);
                     gpu.try_render_bbox_single_band_with_lut(
-                        primary_id,
+                        cid,
                         ifd_idx,
-                        band_1based.saturating_sub(1),
+                        b0,
                         coords,
                         &src,
                         &style,
@@ -8476,10 +8506,11 @@ async fn render_bbox_core(
                         resample,
                         format,
                     };
+                    let (cid, b0) = single_band_key(*band_1based);
                     gpu.try_render_bbox_dem_with_lut(
-                        primary_id,
+                        cid,
                         ifd_idx,
-                        band_1based.saturating_sub(1),
+                        b0,
                         coords,
                         &src,
                         *algorithm,
@@ -8496,10 +8527,11 @@ async fn render_bbox_core(
                 } if custom_lut.is_none() && color_formula.is_none() => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
+                    let (cid, b0) = single_band_key(*band_1based);
                     gpu.try_render_bbox_terrain(
-                        primary_id,
+                        cid,
                         ifd_idx,
-                        band_1based.saturating_sub(1),
+                        b0,
                         coords,
                         &src,
                         *encoding,

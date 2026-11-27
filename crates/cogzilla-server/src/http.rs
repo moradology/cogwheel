@@ -3815,10 +3815,47 @@ async fn render_mosaic_tile_pixel_selection(
     {
         return Err(err);
     }
-    let selected = fold.and_then(Fold::finish).unwrap_or_else(|| {
-        let bands = default_raw_band_count(&treq.bands, method);
-        Selected { bands, values: vec![f32::NAN; bands * n_px] }
-    });
+    #[cfg(feature = "gpu")]
+    let gpu_selected: Option<Selected<f32>> = if let Some(ref gpu) = engine.gpu
+        && let Some(ref f) = fold
+        && let Some((nb, scenes)) = f.median_scenes()
+        && scenes.len() <= 32
+    {
+        let band_planes: Vec<Vec<&[f32]>> = (0..nb)
+            .map(|b| {
+                let b_off = b * n_px;
+                scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect()
+            })
+            .collect();
+        gpu.try_composite_mosaic_f32_bands(
+            out_dim,
+            out_dim,
+            &band_planes,
+            cogzilla_gpu::GpuPixelSelection::Median,
+        )
+        .map(|gpu_bands| {
+            engine
+                .stats
+                .gpu_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut values = Vec::with_capacity(nb * n_px);
+            for band_out in gpu_bands {
+                values.extend_from_slice(&band_out);
+            }
+            Selected { bands: nb, values }
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_selected: Option<Selected<f32>> = None;
+
+    let selected = gpu_selected
+        .or_else(|| fold.and_then(Fold::finish))
+        .unwrap_or_else(|| {
+            let bands = default_raw_band_count(&treq.bands, method);
+            Selected { bands, values: vec![f32::NAN; bands * n_px] }
+        });
 
     if matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy) {
         let mut out = bytes::BytesMut::with_capacity(selected.values.len() * 4);
@@ -5481,9 +5518,14 @@ where
         match engine.aimd.try_acquire() {
             Some(permit) => Some(permit),
             None => {
+                let body = if is_head {
+                    Bytes::new()
+                } else {
+                    Bytes::from_static(br#"{"detail":"server overloaded; retry shortly"}"#)
+                };
                 let mut resp = plain_resp(
                     StatusCode::TOO_MANY_REQUESTS,
-                    Bytes::from_static(br#"{"detail":"server overloaded; retry shortly"}"#),
+                    body,
                     "application/json",
                 );
                 resp.headers_mut()
@@ -5533,7 +5575,9 @@ where
         resp.headers_mut().remove("x-cogzilla-retry");
     }
     if let Some(permit) = aimd_permit.as_mut()
-        && resp.status().is_client_error()
+        && (resp.status().is_client_error()
+            || resp.status().is_server_error()
+            || resp.status() == StatusCode::NOT_MODIFIED)
     {
         permit.ignore_rtt();
     }

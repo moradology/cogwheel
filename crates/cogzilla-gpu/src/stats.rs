@@ -502,7 +502,11 @@ pub fn decode_stats_readback(
         .map(|i| h_min + h_span * (i as f64 / n_bins as f64))
         .collect();
     let masked_pixels = total_pixels.saturating_sub(valid_px);
-    let valid_percent = ((valid_px as f64 / total_pixels as f64) * 100.0 * 100.0).round() / 100.0;
+    let valid_percent = if total_pixels > 0 {
+        ((valid_px as f64 / total_pixels as f64) * 100.0 * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
 
     let mut maj_cnt = 0u64;
     let mut maj_bin = 0usize;

@@ -33,7 +33,8 @@ pub struct AimdLimiter {
     min_limit: usize,
     max_limit: usize,
     target_us: u64,
-    last_adjust_ms: AtomicI64,
+    last_inc_ms: AtomicI64,
+    last_dec_ms: AtomicI64,
     epoch: Instant,
     admitted: AtomicU64,
     rejected_429: AtomicU64,
@@ -121,7 +122,8 @@ impl AimdLimiter {
             min_limit,
             max_limit,
             target_us: target_ms.max(1) * 1000,
-            last_adjust_ms: AtomicI64::new(-1000),
+            last_inc_ms: AtomicI64::new(-1000),
+            last_dec_ms: AtomicI64::new(-1000),
             epoch: Instant::now(),
             admitted: AtomicU64::new(0),
             rejected_429: AtomicU64::new(0),
@@ -177,15 +179,18 @@ impl AimdLimiter {
             let lim = self.limit.load(Ordering::Relaxed);
             if prev_in_flight >= lim / 2 && lim < self.max_limit {
                 let now_ms = self.epoch.elapsed().as_millis() as i64;
-                let prev = self.last_adjust_ms.load(Ordering::Relaxed);
-                if now_ms - prev >= 20
+                // Do not increase immediately after a recent multiplicative decrease.
+                let last_dec = self.last_dec_ms.load(Ordering::Relaxed);
+                let prev_inc = self.last_inc_ms.load(Ordering::Relaxed);
+                if now_ms - last_dec >= 100
+                    && now_ms - prev_inc >= 50
                     && self
-                        .last_adjust_ms
-                        .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+                        .last_inc_ms
+                        .compare_exchange(prev_inc, now_ms, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                 {
-                    let step = (lim / 16).max(2);
-                    let next = (lim + step).min(self.max_limit);
+                    // True additive increase (+2 per 50 ms window under >=50% load).
+                    let next = (lim + 2).min(self.max_limit);
                     self.limit.store(next, Ordering::Relaxed);
                 }
             }
@@ -194,10 +199,10 @@ impl AimdLimiter {
 
     fn decrease_limit(&self) {
         let now_ms = self.epoch.elapsed().as_millis() as i64;
-        let prev = self.last_adjust_ms.load(Ordering::Relaxed);
+        let prev = self.last_dec_ms.load(Ordering::Relaxed);
         if now_ms - prev >= 100
             && self
-                .last_adjust_ms
+                .last_dec_ms
                 .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
@@ -270,5 +275,25 @@ mod tests {
         let permits: Vec<_> = (0..100).filter_map(|_| lim.try_acquire()).collect();
         assert_eq!(permits.len(), 100);
         assert_eq!(lim.snapshot().rejected_429, 0);
+    }
+
+    #[test]
+    fn aimd_fast_completions_do_not_starve_decrease() {
+        let lim = AimdLimiter::new(true, 40, 4, 100, 50);
+        // Trigger a fast additive increase (updates last_inc_ms)
+        let mut guards = Vec::new();
+        for _ in 0..25 {
+            guards.push(lim.try_acquire().unwrap());
+        }
+        drop(guards);
+        let after_inc = lim.current_limit();
+        assert_eq!(after_inc, 42, "additive increase should add +2");
+
+        // Immediately record overload without waiting for 100ms — separate last_dec_ms must allow it!
+        lim.record_overload();
+        assert!(
+            lim.current_limit() < after_inc,
+            "fast increase must not starve multiplicative decrease"
+        );
     }
 }

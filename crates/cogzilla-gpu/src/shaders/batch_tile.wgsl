@@ -176,8 +176,22 @@ fn sample_lanczos3(u: f32, v: f32) -> f32 {
     return sample_bilinear_raw(u, v);
 }
 
+fn sample_nearest(u: f32, v: f32) -> f32 {
+    if (!is_finite_f32(u) || !is_finite_f32(v)
+        || u < -0.5 || v < -0.5
+        || u > f32(params.src_w) - 0.5
+        || v > f32(params.src_h) - 0.5) {
+        return nan_f32();
+    }
+    let xi = clamp(i32(floor(u + 0.5)), 0, i32(params.src_w) - 1);
+    let yi = clamp(i32(floor(v + 0.5)), 0, i32(params.src_h) - 1);
+    return sample_checked(xi, yi);
+}
+
 fn sample_mode(u: f32, v: f32) -> f32 {
-    if (params.mode == 0u) {
+    if (params.mode == 3u) {
+        return sample_nearest(u, v);
+    } else if (params.mode == 0u) {
         if (!is_finite_f32(u) || !is_finite_f32(v)
             || u < -0.5 || v < -0.5
             || u > f32(params.src_w) - 0.5

@@ -246,15 +246,31 @@ fn eval_expr_vm_range(
             case 5u: { // Div
                 sp -= 1u;
                 let denom = stack[sp];
-                if (denom == 0.0 || !is_finite_f32(denom)) {
+                if (abs(denom) < 1e-12 || is_nan_f32(denom)) {
                     stack[sp - 1u] = nan_f32();
                 } else {
                     stack[sp - 1u] = stack[sp - 1u] / denom;
                 }
             }
-            case 6u: { // Pow
+            case 6u: { // Pow (safe for a <= 0.0, matching f32::powf)
                 sp -= 1u;
-                stack[sp - 1u] = pow(stack[sp - 1u], stack[sp]);
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                if (is_nan_f32(a) || is_nan_f32(b)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (b == 0.0) {
+                    stack[sp - 1u] = 1.0;
+                } else if (a > 0.0) {
+                    stack[sp - 1u] = pow(a, b);
+                } else if (a == 0.0) {
+                    stack[sp - 1u] = select(nan_f32(), 0.0, b > 0.0);
+                } else if (trunc(b) == b) {
+                    let mag = pow(-a, b);
+                    let is_odd = abs(b - 2.0 * floor(b * 0.5)) >= 0.5;
+                    stack[sp - 1u] = select(mag, -mag, is_odd);
+                } else {
+                    stack[sp - 1u] = nan_f32();
+                }
             }
             case 7u: { // Neg
                 stack[sp - 1u] = -stack[sp - 1u];
@@ -294,17 +310,30 @@ fn eval_expr_vm_range(
             case 17u: { // Tan
                 stack[sp - 1u] = tan(stack[sp - 1u]);
             }
-            case 18u: { // Min
+            case 18u: { // Min (NaN-propagating)
                 sp -= 1u;
-                stack[sp - 1u] = min(stack[sp - 1u], stack[sp]);
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                stack[sp - 1u] = select(min(a, b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
             }
-            case 19u: { // Max
+            case 19u: { // Max (NaN-propagating)
                 sp -= 1u;
-                stack[sp - 1u] = max(stack[sp - 1u], stack[sp]);
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                stack[sp - 1u] = select(max(a, b), nan_f32(), is_nan_f32(a) || is_nan_f32(b));
             }
-            case 20u: { // Clip (val, lo, hi)
+            case 20u: { // Clip (val, lo, hi) — NaN-propagating, handles lo > hi
                 sp -= 2u;
-                stack[sp - 1u] = clamp(stack[sp - 1u], stack[sp], stack[sp + 1u]);
+                let x = stack[sp - 1u];
+                let lo = stack[sp];
+                let hi = stack[sp + 1u];
+                if (is_nan_f32(x) || is_nan_f32(lo) || is_nan_f32(hi)) {
+                    stack[sp - 1u] = nan_f32();
+                } else {
+                    let a = min(lo, hi);
+                    let b = max(lo, hi);
+                    stack[sp - 1u] = clamp(x, a, b);
+                }
             }
             case 21u: { // Lt
                 sp -= 1u;
@@ -447,8 +476,12 @@ fn expr_eval_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let uv = eval_uv(px, py);
-    let val = eval_expr_vm(uv.x, uv.y);
     let out_idx = py * params.dst_w + px;
+    if (!is_finite_f32(uv.x) || !is_finite_f32(uv.y)) {
+        dst_words[out_idx] = 0u;
+        return;
+    }
+    let val = eval_expr_vm(uv.x, uv.y);
     if (!is_finite_f32(val)) {
         dst_words[out_idx] = 0u;
     } else {
@@ -465,6 +498,10 @@ fn expr_eval_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let uv = eval_uv(px, py);
+    if (!is_finite_f32(uv.x) || !is_finite_f32(uv.y)) {
+        dst_words[py * params.dst_w + px] = bitcast<u32>(nan_f32());
+        return;
+    }
     let val = eval_expr_vm(uv.x, uv.y);
     dst_words[py * params.dst_w + px] = bitcast<u32>(val);
 }
@@ -484,11 +521,13 @@ fn expr_eval_indexed_u8(@builtin(global_invocation_id) gid: vec3<u32>) {
         let px = base_x + k;
         if (px < params.dst_w) {
             let uv = eval_uv(px, py);
-            let val = eval_expr_vm(uv.x, uv.y);
             var idx: u32 = 0u;
-            if (is_finite_f32(val)) {
-                let scaled = clamp((val - params.rescale_min) * params.inv_range_254, 0.0, 254.0);
-                idx = 1u + u32(scaled);
+            if (is_finite_f32(uv.x) && is_finite_f32(uv.y)) {
+                let val = eval_expr_vm(uv.x, uv.y);
+                if (is_finite_f32(val)) {
+                    let scaled = clamp((val - params.rescale_min) * params.inv_range_254, 0.0, 254.0);
+                    idx = 1u + u32(scaled);
+                }
             }
             packed = packed | ((idx & 0xffu) << (k * 8u));
         }
@@ -652,6 +691,11 @@ fn expr_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let uv = eval_uv(px, py);
+    let out_idx = py * params.dst_w + px;
+    if (!is_finite_f32(uv.x) || !is_finite_f32(uv.y)) {
+        dst_words[out_idx] = 0u;
+        return;
+    }
     var bvals: array<f32, 8>;
     let nb = min(params.num_bands, 8u);
     for (var b: u32 = 0u; b < nb; b = b + 1u) {
@@ -664,7 +708,6 @@ fn expr_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vr = eval_expr_vm_range(&bvals, 0u, len0);
     let vg = eval_expr_vm_range(&bvals, len0, len0 + len1);
     let vb = eval_expr_vm_range(&bvals, len0 + len1, len0 + len1 + len2);
-    let out_idx = py * params.dst_w + px;
 
     if (!is_finite_f32(vr) || !is_finite_f32(vg) || !is_finite_f32(vb)) {
         dst_words[out_idx] = 0u;
@@ -715,6 +758,15 @@ fn expr_rgb_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let uv = eval_uv(px, py);
+    let plane_pix = params.dst_w * params.dst_h;
+    let pix = py * params.dst_w + px;
+    if (!is_finite_f32(uv.x) || !is_finite_f32(uv.y)) {
+        let nan_bits = bitcast<u32>(nan_f32());
+        dst_words[pix] = nan_bits;
+        dst_words[plane_pix + pix] = nan_bits;
+        dst_words[2u * plane_pix + pix] = nan_bits;
+        return;
+    }
     var bvals: array<f32, 8>;
     let nb = min(params.num_bands, 8u);
     for (var b: u32 = 0u; b < nb; b = b + 1u) {
@@ -726,8 +778,6 @@ fn expr_rgb_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vr = eval_expr_vm_range(&bvals, 0u, len0);
     let vg = eval_expr_vm_range(&bvals, len0, len0 + len1);
     let vb = eval_expr_vm_range(&bvals, len0 + len1, len0 + len1 + len2);
-    let plane_pix = params.dst_w * params.dst_h;
-    let pix = py * params.dst_w + px;
     dst_words[pix] = bitcast<u32>(vr);
     dst_words[plane_pix + pix] = bitcast<u32>(vg);
     dst_words[2u * plane_pix + pix] = bitcast<u32>(vb);

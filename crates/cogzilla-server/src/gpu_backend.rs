@@ -5,9 +5,9 @@ use bytes::Bytes;
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuBandStats, GpuCoalescer,
     GpuColorFormula, GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
-    GpuExprRenderer, GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
+    GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
     GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuStatsReducer,
-    GpuTerrainRenderer, GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
+    GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
     MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
 };
 use cogzilla_kernel::expr_vm::Op;
@@ -103,12 +103,6 @@ pub struct GpuBackend {
     pub multi_slab_cache: GpuMultiBandCache,
     pub coalescer: GpuCoalescer,
     resampler: GpuResampler,
-    #[allow(dead_code)]
-    colormap: Mutex<GpuColormapRenderer>,
-    #[allow(dead_code)]
-    terrain: Mutex<GpuTerrainRenderer>,
-    #[allow(dead_code)]
-    expr: Mutex<GpuExprRenderer>,
     mosaic: Mutex<GpuMosaicCompositor>,
     batcher: Mutex<GpuTileBatcher>,
     jpeg: Mutex<GpuJpegEncoder>,
@@ -744,14 +738,21 @@ fn to_owned_plan(coords: BboxCoordSource<'_>, bc: f32, br: f32) -> OwnedCoordPla
     }
 }
 
-fn source_slab_key(cog_id: u64, ifd_idx: usize, band0: u16, src: &BandSource<'_>) -> SlabKey {
-    SlabKey {
+fn source_slab_key(cog_id: u64, ifd_idx: usize, band0: u16, src: &BandSource<'_>) -> Option<SlabKey> {
+    if src.nodata_override.is_some()
+        || src.scale_offset.is_some()
+        || src.grid_w >= 256
+        || src.grid_h >= 256
+    {
+        return None;
+    }
+    Some(SlabKey {
         dataset_id: cog_id,
         ifd_idx: ifd_idx as u16,
         band: band0,
         tx: (src.tx0 << 8) | (src.grid_w & 0xff),
         ty: (src.ty0 << 8) | (src.grid_h & 0xff),
-    }
+    })
 }
 
 impl GpuBackend {
@@ -787,9 +788,6 @@ impl GpuBackend {
         let resampler = GpuResampler::new(&ctx);
         let coalesce_us = if ctx.info.unified_memory { 400 } else { 250 };
         let coalescer = GpuCoalescer::new(&ctx, 32, coalesce_us);
-        let colormap = Mutex::new(GpuColormapRenderer::new(&ctx));
-        let terrain = Mutex::new(GpuTerrainRenderer::new(&ctx));
-        let expr = Mutex::new(GpuExprRenderer::new(&ctx));
         let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
         let batcher = Mutex::new(GpuTileBatcher::new(&ctx));
         let jpeg = Mutex::new(GpuJpegEncoder::new(&ctx));
@@ -802,9 +800,6 @@ impl GpuBackend {
             multi_slab_cache: GpuMultiBandCache::new(slab_cache_bytes),
             coalescer,
             resampler,
-            colormap,
-            terrain,
-            expr,
             mosaic,
             batcher,
             jpeg,
@@ -818,7 +813,7 @@ impl GpuBackend {
     /// (zero-copy upload) or a stitched multi-block / `U8` / `U16` neighborhood.
     fn resolve_source_slab(
         &self,
-        key: SlabKey,
+        key: Option<SlabKey>,
         warm: Option<Arc<GpuSlab>>,
         src: &BandSource<'_>,
     ) -> Option<(Arc<GpuSlab>, u32, u32)> {
@@ -828,9 +823,17 @@ impl GpuBackend {
                 None => {
                     let height = (slice.len() / stride) as u32;
                     let width = stride as u32;
-                    self.slab_cache
-                        .get_or_upload(key, slice, width, height, stride as u32, &self.resampler)
-                        .ok()?
+                    if let Some(k) = key {
+                        self.slab_cache
+                            .get_or_upload(k, slice, width, height, stride as u32, &self.resampler)
+                            .ok()?
+                    } else {
+                        Arc::new(
+                            self.resampler
+                                .upload_slab(slice, width, height, stride as u32)
+                                .ok()?,
+                        )
+                    }
                 }
             };
             return Some((slab, base_col, base_row));
@@ -849,7 +852,9 @@ impl GpuBackend {
             })
             .ok()?,
         );
-        self.slab_cache.insert(key, Arc::clone(&slab));
+        if let Some(k) = key {
+            self.slab_cache.insert(k, Arc::clone(&slab));
+        }
         Some((slab, bc, br))
     }
 
@@ -919,22 +924,38 @@ impl GpuBackend {
         custom_lut: Option<&CustomColormap>,
         color_formula: Option<&ColorFormula>,
     ) -> Option<[[u8; 3]; 256]> {
-        let mut rgb = match custom_lut {
-            None => colormap.lut().rgb,
+        match custom_lut {
+            None => {
+                // Match TiTiler / rio-tiler CPU rule: apply `color_formula` to the rescaled
+                // grayscale byte `[i, i, i]` BEFORE looking up the built-in colormap.
+                let base = colormap.lut().rgb;
+                if let Some(cf) = color_formula {
+                    let mut out = [[0u8; 3]; 256];
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        let (r, _, _) = cf.apply_rgb(i as u8, i as u8, i as u8);
+                        *slot = base[r as usize];
+                    }
+                    Some(out)
+                } else {
+                    Some(base)
+                }
+            }
             Some(CustomColormap::Discrete {
                 lut,
                 extra,
                 direct_lookup: false,
-            }) if extra.is_empty() && lut.rgba_u32.iter().all(|&p| (p >> 24) == 255) => lut.rgb,
-            Some(_) => return None,
-        };
-        if let Some(cf) = color_formula {
-            for entry in &mut rgb {
-                let (r, g, b) = cf.apply_rgb(entry[0], entry[1], entry[2]);
-                *entry = [r, g, b];
+            }) if extra.is_empty() && lut.rgba_u32.iter().all(|&p| (p >> 24) == 255) => {
+                let mut rgb = lut.rgb;
+                if let Some(cf) = color_formula {
+                    for entry in &mut rgb {
+                        let (r, g, b) = cf.apply_rgb(entry[0], entry[1], entry[2]);
+                        *entry = [r, g, b];
+                    }
+                }
+                Some(rgb)
             }
+            Some(_) => None,
         }
-        Some(rgb)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -965,7 +986,7 @@ impl GpuBackend {
         };
 
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
@@ -1419,7 +1440,7 @@ impl GpuBackend {
         };
 
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
@@ -1563,7 +1584,7 @@ impl GpuBackend {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::ResampleLanczos3,
@@ -1829,6 +1850,8 @@ impl GpuBackend {
                 || s.tile_h != s0.tile_h
                 || s.nodata_override.is_some()
                 || s.scale_offset.is_some()
+                || s.grid_w >= 256
+                || s.grid_h >= 256
             {
                 return None;
             }
@@ -2706,7 +2729,7 @@ impl GpuBackend {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
@@ -2768,7 +2791,7 @@ impl GpuBackend {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let _ = coord_upload_bytes;
         let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
@@ -2960,7 +2983,7 @@ impl GpuBackend {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         let _guard = InFlightGuard(&self.in_flight);
 
@@ -3030,7 +3053,7 @@ impl GpuBackend {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::DemHornLanczos3,
@@ -3172,7 +3195,7 @@ impl GpuBackend {
         };
 
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = self.slab_cache.get(&key);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src);
         let per_tile_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => tile_size * tile_size,
@@ -4930,5 +4953,38 @@ mod tests {
             st.max
         );
         assert_eq!(st.hist_counts.iter().sum::<u64>(), (n * n) as u64);
+    }
+
+    #[test]
+    fn resolve_styled_rgb_lut_applies_formula_before_builtin_colormap() {
+        let cf = ColorFormula::parse("Gamma RGB 2.0").expect("parse gamma");
+        let gpu_lut =
+            GpuBackend::resolve_styled_rgb_lut(ColormapName::Viridis, None, Some(&cf)).unwrap();
+        let viridis = ColormapName::Viridis.lut().rgb;
+        for i in 0..256 {
+            let (mapped_idx, _, _) = cf.apply_rgb(i as u8, i as u8, i as u8);
+            assert_eq!(
+                gpu_lut[i], viridis[mapped_idx as usize],
+                "mismatch at byte {i}: color_formula must apply before built-in colormap lookup"
+            );
+        }
+    }
+
+    #[test]
+    fn source_slab_key_bypasses_cache_on_unscale_nodata_or_huge_grid() {
+        let blocks: Vec<Option<&cogzilla_codec::DecodedBand>> = vec![None];
+        let base = BandSource::new(256, 256, 256, 256, 0, 0, 1, 1, &blocks);
+        assert!(source_slab_key(42, 0, 0, &base).is_some());
+
+        let with_nd =
+            BandSource::new(256, 256, 256, 256, 0, 0, 1, 1, &blocks).with_nodata_override(Some(0.0));
+        assert!(source_slab_key(42, 0, 0, &with_nd).is_none());
+
+        let with_unscale =
+            BandSource::new(256, 256, 256, 256, 0, 0, 1, 1, &blocks).with_scale_offset(0.001, 10.0);
+        assert!(source_slab_key(42, 0, 0, &with_unscale).is_none());
+
+        let huge_grid = BandSource::new(256, 2048, 256, 8, 0, 0, 1, 256, &blocks);
+        assert!(source_slab_key(42, 0, 0, &huge_grid).is_none());
     }
 }

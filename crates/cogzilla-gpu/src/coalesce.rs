@@ -570,23 +570,27 @@ impl JobSlot {
     }
 
     fn ensure_caps(&mut self, device: &wgpu::Device, u_len: usize, v_len: usize, out_words: usize) {
+        let max_words = (device.limits().max_storage_buffer_binding_size / 4) as usize;
         if u_len > self.u_cap {
-            self.u_cap = u_len.next_power_of_two();
+            self.u_cap = u_len.next_power_of_two().min(max_words.max(u_len));
             self.u_buf = Self::alloc_coord(device, self.u_cap);
         }
         if v_len > self.v_cap {
-            self.v_cap = v_len.next_power_of_two();
+            self.v_cap = v_len.next_power_of_two().min(max_words.max(v_len));
             self.v_buf = Self::alloc_coord(device, self.v_cap);
         }
         if out_words > self.out_words_cap {
-            self.out_words_cap = out_words.next_power_of_two();
+            self.out_words_cap = out_words.next_power_of_two().min(max_words.max(out_words));
             self.out_buf = Self::alloc_out(device, self.out_words_cap);
         }
     }
 
     fn ensure_jpeg_caps(&mut self, device: &wgpu::Device, jpeg_words: usize) {
+        let max_words = (device.limits().max_storage_buffer_binding_size / 4) as usize;
         if jpeg_words > self.jpeg_out_cap_words || self.jpeg_out_buf.is_none() {
-            self.jpeg_out_cap_words = jpeg_words.next_power_of_two();
+            self.jpeg_out_cap_words = jpeg_words
+                .next_power_of_two()
+                .min(max_words.max(jpeg_words));
             self.jpeg_out_buf = Some(Self::alloc_out(device, self.jpeg_out_cap_words));
         }
     }

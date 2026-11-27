@@ -684,10 +684,21 @@ impl GpuJpegEncoder {
         }
         let mcu_w = width.div_ceil(16);
         let mcu_h = height.div_ceil(16);
-        let total_mcus = (mcu_w as usize) * (mcu_h as usize);
-        let total_words = total_mcus * 192;
+        let total_mcus = (mcu_w as usize)
+            .checked_mul(mcu_h as usize)
+            .ok_or_else(|| GpuError::InvalidDimensions("JPEG MCU count overflow".into()))?;
+        let total_words = total_mcus
+            .checked_mul(192)
+            .ok_or_else(|| GpuError::InvalidDimensions("JPEG coeff buffer overflow".into()))?;
+        let max_words = (self.device.limits().max_storage_buffer_binding_size / 4) as usize;
+        if total_words > max_words {
+            return Err(GpuError::InvalidDimensions(format!(
+                "JPEG coeff output ({} bytes) exceeds adapter max_storage_buffer_binding_size",
+                total_words.saturating_mul(4)
+            )));
+        }
         if total_words > self.out_cap_words {
-            self.out_cap_words = total_words.next_power_of_two();
+            self.out_cap_words = total_words.next_power_of_two().min(max_words);
             let (o, s) = Self::alloc_out(&self.device, self.out_cap_words);
             self.out_buf = o;
             self.staging_buf = s;

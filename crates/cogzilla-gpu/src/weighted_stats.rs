@@ -458,10 +458,11 @@ impl GpuWeightedStatsReducer {
         buf: &mut wgpu::Buffer,
         cap: &mut usize,
         need: usize,
+        max_elems: usize,
         label: &'static str,
     ) {
         if need > *cap {
-            let new_cap = need.next_power_of_two().max(1024);
+            let new_cap = need.next_power_of_two().max(1024).min(max_elems.max(need));
             *buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: (new_cap * 4) as u64,
@@ -470,6 +471,27 @@ impl GpuWeightedStatsReducer {
             });
             *cap = new_cap;
         }
+    }
+
+    fn wait_map_async(
+        device: &wgpu::Device,
+        slice: &wgpu::BufferSlice<'_>,
+        sub_idx: wgpu::SubmissionIndex,
+    ) -> Result<(), GpuError> {
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_cb = std::sync::Arc::clone(&ready);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            ready_cb.store(true, std::sync::atomic::Ordering::Release);
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::WaitForSubmissionIndex(sub_idx));
+        if !ready.load(std::sync::atomic::Ordering::Acquire) {
+            device.poll(wgpu::Maintain::Wait);
+        }
+        rx.recv()
+            .map_err(|_| GpuError::BufferMap("wstats channel dropped".into()))?
+            .map_err(|e| GpuError::BufferMap(format!("{e:?}")))
     }
 
     /// Reduce one or more aligned band buffers sharing the same coverage mask `covs` and
@@ -489,11 +511,19 @@ impl GpuWeightedStatsReducer {
         percentiles: &[f64],
     ) -> Result<Vec<GpuWeightedBandStats>, GpuError> {
         let len = covs.len();
-        if len == 0 || win_w == 0 || row_areas.is_empty() || bands.is_empty() {
+        if len == 0 || win_w == 0 || row_areas.len() < len.div_ceil(win_w) || bands.is_empty() {
             return Err(GpuError::InvalidDimensions(
-                "weighted stats requires non-empty bands, covs, win_w, and row_areas".into(),
+                "weighted stats requires non-empty bands, covs, win_w, and valid row_areas".into(),
             ));
         }
+        let needed_bytes = (len as u64).saturating_mul(4);
+        if needed_bytes > self.max_storage_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "weighted stats buffer {needed_bytes} B exceeds adapter limit {} B",
+                self.max_storage_bytes
+            )));
+        }
+        let max_elems = (self.max_storage_bytes / 4) as usize;
         for b in bands {
             if b.len() != len {
                 return Err(GpuError::InvalidDimensions(
@@ -506,7 +536,10 @@ impl GpuWeightedStatsReducer {
         let n_bands = bands.len();
 
         while self.slots.len() < n_bands {
-            self.slots.push(WeightedBandSlot::new(&self.device, len.next_power_of_two().max(1024)));
+            self.slots.push(WeightedBandSlot::new(
+                &self.device,
+                len.next_power_of_two().max(1024).min(max_elems),
+            ));
         }
         if n_bands > self.staging_cap_bands {
             self.staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -523,6 +556,7 @@ impl GpuWeightedStatsReducer {
                 &mut slot.src_buf,
                 &mut slot.src_cap_elems,
                 len,
+                max_elems,
                 "wstats-src",
             );
         }
@@ -531,6 +565,7 @@ impl GpuWeightedStatsReducer {
             &mut self.cov_buf,
             &mut self.cov_cap_elems,
             len,
+            max_elems,
             "wstats-cov",
         );
         Self::ensure_buf(
@@ -538,6 +573,7 @@ impl GpuWeightedStatsReducer {
             &mut self.row_area_buf,
             &mut self.row_area_cap_elems,
             row_areas.len(),
+            max_elems,
             "wstats-row-areas",
         );
 
@@ -663,15 +699,7 @@ impl GpuWeightedStatsReducer {
         let sub_idx = self.queue.submit(Some(enc.finish()));
         let total_readback = per_band_bytes * (n_bands as u64);
         let slice = self.staging_buf.slice(0..total_readback);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(sub_idx));
-        rx.recv()
-            .map_err(|_| GpuError::BufferMap("wstats channel dropped".into()))?
-            .map_err(|e| GpuError::BufferMap(format!("{e:?}")))?;
+        Self::wait_map_async(&self.device, &slice, sub_idx)?;
 
         let mapped = slice.get_mapped_range();
         let stride_bytes = per_band_bytes as usize;
@@ -719,15 +747,16 @@ impl GpuWeightedStatsReducer {
         let len = covs.len();
         if len == 0
             || win_w == 0
-            || row_areas.is_empty()
+            || row_areas.len() < len.div_ceil(win_w)
             || raw_bands.is_empty()
             || raw_bands.len() > 8
             || exprs.is_empty()
         {
             return Err(GpuError::InvalidDimensions(
-                "weighted expr stats requires 1..=8 raw bands, non-empty exprs, covs, win_w, and row_areas".into(),
+                "weighted expr stats requires 1..=8 raw bands, non-empty exprs, covs, win_w, and valid row_areas".into(),
             ));
         }
+        let max_elems = (self.max_storage_bytes / 4) as usize;
         for b in raw_bands {
             if b.len() != len {
                 return Err(GpuError::InvalidDimensions(
@@ -754,12 +783,14 @@ impl GpuWeightedStatsReducer {
 
         let n_bins = num_bins.clamp(1, 1000);
         let num_wg = ((len as u32).div_ceil(256)).clamp(1, MAX_WG);
-        let expr_wg = (len as u32).div_ceil(256);
+        let expr_wg = ((len as u32).div_ceil(256)).clamp(1, 65535);
         let n_exprs = exprs.len();
 
         while self.slots.len() < n_exprs {
-            self.slots
-                .push(WeightedBandSlot::new(&self.device, len.next_power_of_two().max(1024)));
+            self.slots.push(WeightedBandSlot::new(
+                &self.device,
+                len.next_power_of_two().max(1024).min(max_elems),
+            ));
         }
         if n_exprs > self.staging_cap_bands {
             self.staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -776,6 +807,7 @@ impl GpuWeightedStatsReducer {
                 &mut slot.src_buf,
                 &mut slot.src_cap_elems,
                 len,
+                max_elems,
                 "wstats-src",
             );
         }
@@ -784,6 +816,7 @@ impl GpuWeightedStatsReducer {
             &mut self.cov_buf,
             &mut self.cov_cap_elems,
             len,
+            max_elems,
             "wstats-cov",
         );
         Self::ensure_buf(
@@ -791,6 +824,7 @@ impl GpuWeightedStatsReducer {
             &mut self.row_area_buf,
             &mut self.row_area_cap_elems,
             row_areas.len(),
+            max_elems,
             "wstats-row-areas",
         );
         if total_raw_elems > self.raw_bands_cap_elems {
@@ -1007,15 +1041,7 @@ impl GpuWeightedStatsReducer {
         let sub_idx = self.queue.submit(Some(enc.finish()));
         let total_readback = per_band_bytes * (n_exprs as u64);
         let slice = self.staging_buf.slice(0..total_readback);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(sub_idx));
-        rx.recv()
-            .map_err(|_| GpuError::BufferMap("wstats channel dropped".into()))?
-            .map_err(|e| GpuError::BufferMap(format!("{e:?}")))?;
+        Self::wait_map_async(&self.device, &slice, sub_idx)?;
 
         let mapped = slice.get_mapped_range();
         let stride_bytes = per_band_bytes as usize;
