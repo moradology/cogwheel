@@ -5,8 +5,10 @@ pub mod ellipsoid;
 pub mod epsg;
 pub mod epsg_table;
 pub mod mercator;
+pub mod plan;
 
-pub use crs::{CoordPlan, CrsModel, GRID_DIM, ProjError};
+pub use crs::{CrsModel, ProjError};
+pub use plan::{CoordPlan, GRID_DIM};
 pub use epsg::{EpsgDef, lookup as lookup_epsg};
 pub use ellipsoid::{
     AlbersEqualArea, CylindricalEqualArea, Ellipsoid, EqualEarth, Equirectangular,
