@@ -1633,7 +1633,7 @@ fn entry_selections(pairs: &[(String, String)]) -> Vec<Option<Vec<u16>>> {
             let name = options.next().unwrap_or_default();
             let own = options
                 .filter_map(|o| o.strip_prefix("bidx=").or_else(|| o.strip_prefix("indexes=")))
-                .last()
+                .next_back()
                 .map(|bands| bands.split(',').filter_map(|b| b.trim().parse().ok()).collect::<Vec<u16>>());
             own.or_else(|| {
                 let of_it: Vec<u16> = by_name.iter().filter(|(n, _)| n == name).flat_map(|(_, b)| b.clone()).collect();
