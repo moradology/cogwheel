@@ -2057,6 +2057,7 @@ fn wants_f32_geotiff(
         }
         BandRequest::CustomExpr { .. }
         | BandRequest::CustomExprRgb { .. }
+        | BandRequest::CustomExprMulti { .. }
         | BandRequest::MultiBand { .. }
         | BandRequest::Spectral1 { .. }
         | BandRequest::Spectral2 { .. }
@@ -2843,10 +2844,22 @@ fn build_band_request(
                 rescale_max: rmax,
             });
         } else if parts.len() != 1 {
-            return Err(EngineError::BadRequest(format!(
-                "multi-band tile expression must have 1 or 3 semicolon-separated expressions (got {})",
-                parts.len()
-            )));
+            if parts.len() > 15 {
+                return Err(EngineError::BadRequest(format!(
+                    "multi-band tile expression count ({}) exceeds maximum of 15",
+                    parts.len()
+                )));
+            }
+            if pq.colormap_explicit || pq.custom_colormap_json.is_some() {
+                return Err(EngineError::BadRequest(
+                    "colormap cannot be applied to multi-band expression output".into(),
+                ));
+            }
+            let mut progs = Vec::with_capacity(parts.len());
+            for p in &parts {
+                progs.push(ExprProgram::compile(p).map_err(EngineError::BadRequest)?);
+            }
+            return Ok(BandRequest::CustomExprMulti { progs });
         }
         if pq.rescale.len() > 1 {
             return Err(EngineError::BadRequest(format!(
@@ -3643,6 +3656,7 @@ fn default_raw_band_count(bands: &BandRequest, pixel_selection: Selection) -> us
         | BandRequest::Terrain { .. }
         | BandRequest::CustomExprRgb { .. } => 3,
         BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+        BandRequest::CustomExprMulti { progs } => progs.len().max(1),
         _ => 1,
     };
     if pixel_selection.by_last_band() {
@@ -3937,7 +3951,12 @@ async fn render_mosaic_tile_styled(
                     | BandRequest::CustomExprRgb { .. }
                     | BandRequest::Terrain { .. }
             ))
-        || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+        || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
         || (treq.tile_size != 256 && treq.tile_size != 512);
     if !needs_bbox_mosaic
         && !pq.colormap_explicit
@@ -4217,6 +4236,29 @@ fn stac_asset_expr<'a>(pq: &'a ParsedQuery, asset_name: &str) -> Option<&'a str>
         .map(|(_, e)| e.as_str())
 }
 
+fn replace_band1_token(expr: &str, slot: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] == b'b' || bytes[i] == b'B')
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'1'
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && (i + 2 == bytes.len()
+                || !(bytes[i + 2].is_ascii_alphanumeric() || bytes[i + 2] == b'_'))
+        {
+            out.push_str(slot);
+            i += 2;
+        } else {
+            let ch = expr[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 fn expand_stac_asset_bidx(
     pq: &mut ParsedQuery,
     names: &[String],
@@ -4227,7 +4269,7 @@ fn expand_stac_asset_bidx(
             if let Some(expr) = stac_asset_expr(pq, &names[0]) {
                 pq.expr_raw = Some(expr.to_string());
             }
-        } else if names.len() == 3
+        } else if names.len() >= 2
             && names.iter().any(|n| stac_asset_expr(pq, n).is_some())
         {
             let parts: Vec<String> = names
@@ -4236,7 +4278,7 @@ fn expand_stac_asset_bidx(
                 .map(|(i, n)| {
                     let slot = format!("b{}", i + 1);
                     match stac_asset_expr(pq, n) {
-                        Some(expr) => expr.replace("b1", &slot),
+                        Some(expr) => replace_band1_token(expr, &slot),
                         None => slot,
                     }
                 })
@@ -7291,7 +7333,8 @@ where
                             let needs_general_path = pq.nodata.is_some()
                                 || pq.custom_colormap_json.is_some()
                                 || pq.buffer > 0.0
-                                || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
+                                || (!pq.return_mask
+                                && matches!(treq.format, OutputFormat::Npy | OutputFormat::NpyF64))
                                 || (pq.color_formula.is_some()
                                     && !matches!(
                                         treq.bands,
@@ -7301,7 +7344,12 @@ where
                                             | BandRequest::Terrain { .. }
                                     ))
                                 || (treq.tile_size != 256 && treq.tile_size != 512)
-                                || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                                || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
                                 || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                                 || !crate::engine::cogs_share_base_grid(&cogs);
                             if needs_general_path {
@@ -7806,7 +7854,7 @@ where
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
-                        cogs[0].index.full_res().samples_per_pixel
+                        data_band_count(cogs[0].index.full_res())
                     };
                     expr_progs = build_stats_options_with_bands(&pq, true, db)?.expressions;
                 }
@@ -7881,13 +7929,17 @@ where
                 for (name, slot) in names.iter().zip(ordered.into_iter()) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
-                        let bands_iter: Vec<usize> = match stac_asset_selected_bands(&pq, name) {
-                            Some(sel) => sel.iter().map(|&b| b as usize).collect(),
-                            None if pq.asset_as_band => vec![1],
-                            None if !pq.bidx.is_empty() => {
-                                pq.bidx.iter().map(|&b| b as usize).collect()
+                        let bands_iter: Vec<usize> = if stac_asset_expr(&pq, name).is_some() {
+                            vec![1]
+                        } else {
+                            match stac_asset_selected_bands(&pq, name) {
+                                Some(sel) => sel.iter().map(|&b| b as usize).collect(),
+                                None if pq.asset_as_band => vec![1],
+                                None if !pq.bidx.is_empty() => {
+                                    pq.bidx.iter().map(|&b| b as usize).collect()
+                                }
+                                None => (1..=nb).collect(),
                             }
-                            None => (1..=nb).collect(),
                         };
                         for i in bands_iter {
                             if let Some(v) = obj.get(&format!("b{i}")) {
@@ -7943,7 +7995,7 @@ where
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
                     } else {
-                        cogs[0].index.full_res().samples_per_pixel
+                        data_band_count(cogs[0].index.full_res())
                     };
                     build_stats_options_with_bands(&pq, true, db)?.expressions
                 } else {
@@ -7974,7 +8026,7 @@ where
                         if is_dem_alg || expr_progs_c.is_some() {
                             if is_dem_alg {
                                 let full = cogs_c[0].index.full_res();
-                                let db = if cogs_c.len() > 1 { cogs_c.len() as u16 } else { full.samples_per_pixel };
+                                let db = if cogs_c.len() > 1 { cogs_c.len() as u16 } else { data_band_count(full) };
                                 let mut bands = build_band_request(&pq_clone, db, full.sample_type)?;
                                 if mask.is_empty() {
                                     let alg_name = alg_c.as_deref().unwrap_or("algorithm");
@@ -8679,7 +8731,8 @@ where
                             || pq_stac.buffer > 0.0
                             || pq_stac.nodata.is_some()
                             || pq_stac.custom_colormap_json.is_some()
-                            || (!pq_stac.return_mask && matches!(treq.format, OutputFormat::Npy))
+                            || (!pq_stac.return_mask
+                                && matches!(treq.format, OutputFormat::Npy | OutputFormat::NpyF64))
                             || (pq_stac.color_formula.is_some()
                                 && !matches!(
                                     treq.bands,
@@ -8688,7 +8741,12 @@ where
                                         | BandRequest::CustomExprRgb { .. }
                                         | BandRequest::Terrain { .. }
                                 ))
-                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                            || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq_stac, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);
@@ -9140,7 +9198,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let (fmt, ct) = parse_ext_format(
                     ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
                     pq_stac.webp_quality,
@@ -9242,7 +9300,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
@@ -9332,7 +9390,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
@@ -9398,7 +9456,7 @@ where
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
-                let db = if cogs.len() > 1 { cogs.len() as u16 } else { cogs[0].index.full_res().samples_per_pixel };
+                let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
@@ -10009,7 +10067,8 @@ where
                             || pq.buffer > 0.0
                             || pq.nodata.is_some()
                             || pq.custom_colormap_json.is_some()
-                            || (!pq.return_mask && matches!(treq.format, OutputFormat::Npy))
+                            || (!pq.return_mask
+                                && matches!(treq.format, OutputFormat::Npy | OutputFormat::NpyF64))
                             || (pq.color_formula.is_some()
                                 && !matches!(
                                     treq.bands,
@@ -10018,7 +10077,12 @@ where
                                         | BandRequest::CustomExprRgb { .. }
                                         | BandRequest::Terrain { .. }
                                 ))
-                            || matches!(treq.bands, BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. })
+                            || matches!(
+            treq.bands,
+            BandRequest::CustomExprRgb { .. }
+                | BandRequest::CustomExprMulti { .. }
+                | BandRequest::MultiBand { .. }
+        )
                             || (treq.tile_size != 256 && treq.tile_size != 512)
                             || has_embedded_palette(&pq, &cogs[0], &treq.bands)
                             || !crate::engine::cogs_share_base_grid(&cogs);

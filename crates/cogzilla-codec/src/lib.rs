@@ -1225,7 +1225,7 @@ fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
         let mut mx = f64::NEG_INFINITY;
         for i in 0..n.min(slice.len()) {
             let a = alpha.get_f32(i);
-            if a == 0.0 || a.is_nan() {
+            if !(a > 0.0) {
                 slice[i] = f64::NAN;
                 no_nd = false;
             } else {
@@ -1257,7 +1257,7 @@ fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
     let mut mx = f32::NEG_INFINITY;
     for i in 0..n.min(slice.len()) {
         let a = alpha.get_f32(i);
-        if a == 0.0 || a.is_nan() {
+        if !(a > 0.0) {
             slice[i] = f32::NAN;
             no_nd = false;
         } else {
