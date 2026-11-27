@@ -409,13 +409,28 @@ impl TmsDef {
 
     pub fn matrix(&self, z: u8) -> Option<&'static TileMatrixDef> {
         let zs = z.to_string();
-        self.matrices.iter().find(|m| m.id == zs)
+        self.matrix_by_id(&zs)
+    }
+
+    pub fn matrix_by_id(&self, id: &str) -> Option<&'static TileMatrixDef> {
+        self.matrices.iter().find(|m| m.id == id)
     }
 
     /// Return `[min_x, min_y, max_x, max_y]` in the TMS's native `(easting/lon, northing/lat)` CRS,
     /// expanded by `buffer` pixels on all 4 sides.
     pub fn tile_bounds(&self, z: u8, x: u32, y: u32, buffer: f32, tile_size: u32) -> Option<[f64; 4]> {
         let m = self.matrix(z)?;
+        self.tile_bounds_for_matrix(m, x, y, buffer, tile_size)
+    }
+
+    pub fn tile_bounds_for_matrix(
+        &self,
+        m: &TileMatrixDef,
+        x: u32,
+        y: u32,
+        buffer: f32,
+        tile_size: u32,
+    ) -> Option<[f64; 4]> {
         if (x as u64) >= m.matrix_width || (y as u64) >= m.matrix_height {
             return None;
         }
