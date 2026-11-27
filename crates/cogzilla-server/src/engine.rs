@@ -15,10 +15,65 @@ use cogzilla_proj::{
 };
 use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
 use dashmap::DashMap;
+use futures_util::stream::{FuturesOrdered, StreamExt};
 use thiserror::Error;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog};
 use crate::tile_cache::TileCache;
+
+/// The most scenes of a mosaic that are read at once.
+pub const MOSAIC_SCENES_AHEAD: usize = 8;
+
+/// A mosaic's scenes, rendered in order with some read ahead of the one being waited for.
+/// Dropping it drops the scenes still being read.
+struct ScenesInOrder<'a> {
+    engine: &'a TileEngine,
+    scenes: &'a [Vec<String>],
+    base: &'a TileRequest,
+    unscale: bool,
+    next: usize,
+    window: usize,
+    reading: FuturesOrdered<SceneRead<'a>>,
+}
+
+/// One scene of a mosaic on its way.
+type SceneRead<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Bytes, SceneFailure>> + Send + 'a>>;
+
+/// Why a scene of a mosaic gave no pixels: it could not be opened, or it was open and
+/// could not be read. A mosaic of a list of URLs passes over the first and goes on to
+/// the next scene; one whose scenes were chosen for the tile fails on either.
+enum SceneFailure {
+    Unopened(EngineError),
+    Unread(EngineError),
+}
+
+/// Whether opening a scene failed because the allowlist refuses its asset.
+fn refused(e: &EngineError) -> bool {
+    matches!(e, EngineError::Io(io) if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)))
+}
+
+impl SceneFailure {
+    fn into_error(self) -> EngineError {
+        match self {
+            Self::Unopened(e) | Self::Unread(e) => e,
+        }
+    }
+}
+
+impl<'a> ScenesInOrder<'a> {
+    /// The next scene in order, or `None` after the last.
+    async fn next(&mut self) -> Option<Result<Bytes, SceneFailure>> {
+        while self.reading.len() < self.window && self.next < self.scenes.len() {
+            let scene = &self.scenes[self.next];
+            self.reading.push_back(Box::pin(self.engine.render_mosaic_scene(scene, self.base, self.unscale)));
+            self.next += 1;
+        }
+        let scene = self.reading.next().await;
+        // Being asked again means the tile is not full yet: read twice as many at once.
+        self.window = (self.window * 2).min(MOSAIC_SCENES_AHEAD);
+        scene
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -166,6 +221,7 @@ pub struct TileEngine {
     pub tile_cache: Arc<TileCache>,
     tile_cache_epoch: AtomicU64,
     pub stats: Arc<EngineStats>,
+    pgstac: std::sync::OnceLock<Arc<cogzilla_pgstac::PgStac>>,
     pub aimd: crate::aimd::AimdLimiter,
     #[cfg(feature = "gpu")]
     pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
@@ -390,10 +446,32 @@ impl TileEngine {
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             tile_cache_epoch: AtomicU64::new(0),
             stats: Arc::new(EngineStats::default()),
+            pgstac: std::sync::OnceLock::new(),
             aimd: crate::aimd::AimdLimiter::from_env(has_gpu),
             #[cfg(feature = "gpu")]
             gpu,
         }
+    }
+
+    /// Attach the pgSTAC database behind the `/searches` routes. The first call wins.
+    pub fn set_pgstac(&self, pgstac: Arc<cogzilla_pgstac::PgStac>) -> bool {
+        self.pgstac.set(pgstac).is_ok()
+    }
+
+    /// The pgSTAC database, when one is configured.
+    pub fn pgstac(&self) -> Option<&Arc<cogzilla_pgstac::PgStac>> {
+        self.pgstac.get()
+    }
+
+    /// Attach the pgSTAC database named by `DATABASE_URL` or the `PG*` variables, if any.
+    /// `Ok(false)` means none is configured. No connection is opened here.
+    pub fn attach_pgstac_from_env(&self) -> Result<bool, String> {
+        let Some(config) = cogzilla_pgstac::PgStacConfig::from_env().map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let pgstac = cogzilla_pgstac::PgStac::new(config).map_err(|e| e.to_string())?;
+        Ok(self.set_pgstac(Arc::new(pgstac)))
     }
 
     /// Replace the engine's AIMD concurrency limiter (useful for tests and custom deployments).
@@ -2451,8 +2529,10 @@ impl TileEngine {
 
     /// Render a dynamic front-to-back mosaic across `urls` with **early-exit pixel coverage**:
     /// walks scenes in priority order, composites only into unfilled (`alpha == 0`) pixels, and
-    /// stops immediately once all `tile_size * tile_size` pixels are opaque — never opening,
-    /// fetching, or decoding remaining background scenes!
+    /// stops once all `tile_size * tile_size` pixels are opaque. The first scene is read
+    /// alone, so a tile it fills opens nothing else; after it, scenes are read a few at a
+    /// time (see [`Self::render_mosaic_scenes_ahead`]), so at most that few are opened beyond
+    /// the one that fills the tile.
     pub async fn render_mosaic_tile(
         &self,
         urls: &[String],
@@ -2477,7 +2557,291 @@ impl TileEngine {
         // Bound per-tile scene fan-out so a huge MosaicJSON/catalog of transparent or OOB COGs
         // cannot trigger thousands of sequential open_uri + render_tile calls on a single GET.
         const MAX_MOSAIC_SCENES_PER_TILE: usize = 64;
-        let urls = &urls[..urls.len().min(MAX_MOSAIC_SCENES_PER_TILE)];
+        let scenes: Vec<Vec<String>> = urls
+            .iter()
+            .take(MAX_MOSAIC_SCENES_PER_TILE)
+            .map(|u| vec![u.clone()])
+            .collect();
+        self.render_mosaic(&scenes, req, 1, true).await
+    }
+
+    /// Open every asset of one mosaic scene, concurrently when there is more than one.
+    async fn open_scene(&self, scene: &[String]) -> Result<Vec<Arc<OpenedCog>>, EngineError> {
+        if let [only] = scene {
+            return Ok(vec![self.store.open_uri(only).await.map_err(|e| asset_fetch_error(only, e))?]);
+        }
+        let mut js = tokio::task::JoinSet::new();
+        for (idx, uri) in scene.iter().enumerate() {
+            let store = self.store.clone();
+            let uri = uri.clone();
+            js.spawn(async move { Ok::<_, IoError>((idx, store.open_uri(&uri).await?)) });
+        }
+        let mut slots: Vec<Option<Arc<OpenedCog>>> = vec![None; scene.len()];
+        while let Some(res) = js.join_next().await {
+            let (idx, cog) = res
+                .map_err(|e| EngineError::BadRequest(format!("open task failed: {e}")))??;
+            slots[idx] = Some(cog);
+        }
+        Ok(slots.into_iter().flatten().collect())
+    }
+
+    /// One scene of a mosaic, as the tile `base` asks for.
+    async fn render_mosaic_scene(
+        &self,
+        scene: &[String],
+        base: &TileRequest,
+        unscale: bool,
+    ) -> Result<Bytes, SceneFailure> {
+        let cogs = self.open_scene(scene).await.map_err(SceneFailure::Unopened)?;
+        let cog = &cogs[0];
+        // Fold each scene's own GDAL scale/offset into Single/Rgb rescale bounds when
+        // `?unscale=true` so heterogeneous mosaic scenes unscale accurately at zero per-pixel cost.
+        // Band indices address one file, so this applies to single-asset scenes only.
+        let scene_req = if unscale
+            && cogs.len() == 1
+            && matches!(
+                base.bands,
+                BandRequest::Single { .. } | BandRequest::Rgb { .. }
+            ) {
+            let mut sr = base.clone();
+            let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
+                let i = b1.saturating_sub(1) as usize;
+                let sc = cog.index.scales.get(i).copied().unwrap_or(1.0);
+                let off = cog.index.offsets.get(i).copied().unwrap_or(0.0);
+                if ((sc - 1.0).abs() < 1e-9 && off.abs() < 1e-9) || sc.abs() < 1e-12 {
+                    (mn, mx)
+                } else {
+                    ((mn - off) / sc, (mx - off) / sc)
+                }
+            };
+            match &mut sr.bands {
+                BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    ..
+                } => {
+                    *rescale = adj(*band_1based, rescale.0, rescale.1);
+                }
+                BandRequest::Rgb {
+                    bands_1based,
+                    rescale_min,
+                    rescale_max,
+                } => {
+                    for k in 0..3 {
+                        let (mn, mx) = adj(bands_1based[k], rescale_min[k], rescale_max[k]);
+                        rescale_min[k] = mn;
+                        rescale_max[k] = mx;
+                    }
+                }
+                _ => {}
+            }
+            sr
+        } else {
+            base.clone()
+        };
+        self.render_multi_cog_tile(&cogs, &scene_req).await.map_err(SceneFailure::Unread)
+    }
+
+    /// The scenes of a mosaic rendered in order, up to a growing number of them at once.
+    fn mosaic_scenes_in_order<'a>(
+        &'a self,
+        scenes: &'a [Vec<String>],
+        base: &'a TileRequest,
+        unscale: bool,
+        ahead: usize,
+    ) -> ScenesInOrder<'a> {
+        ScenesInOrder {
+            engine: self,
+            scenes,
+            base,
+            unscale,
+            next: 0,
+            window: ahead.clamp(1, MOSAIC_SCENES_AHEAD),
+            reading: FuturesOrdered::new(),
+        }
+    }
+
+    /// Whether rasters lie on one grid, pixel for pixel at every overview and in the same
+    /// place, so that they can be read as the bands of one image.
+    pub fn on_one_grid(cogs: &[Arc<OpenedCog>]) -> bool {
+        let Some(first) = cogs.first() else {
+            return true;
+        };
+        let placed = |c: &OpenedCog| {
+            let t = &c.index.full_res().crs_to_pixel;
+            [t.a, t.b, t.c, t.d, t.e, t.f]
+        };
+        let origin = placed(first);
+        cogs.iter().all(|c| {
+            c.index.ifds.len() == first.index.ifds.len()
+                && placed(c).iter().zip(&origin).all(|(a, b)| (a - b).abs() <= 1e-9 * b.abs().max(1.0))
+        }) && (0..first.index.ifds.len()).all(|ifd| validate_multi_cog_grid(cogs, ifd).is_ok())
+    }
+
+    /// The bands to read of a raster that has `count`, `extra` of them extra samples: those
+    /// asked for, counted from one, or all of its own when none is. Refuses a band the raster has not, and more than
+    /// [`Self::MAX_PLANES_PER_RASTER`].
+    pub fn wanted_bands(count: u16, extra: usize, bands_1based: &[u16]) -> Result<Vec<u16>, EngineError> {
+        // With none asked for: every band that is not an extra sample (alpha), as rio-tiler
+        // leaves those out. They come last.
+        let own = count.saturating_sub(extra.min(usize::from(u16::MAX)) as u16).max(1).min(count);
+        let wanted: Vec<u16> =
+            if bands_1based.is_empty() { (1..=own).collect() } else { bands_1based.to_vec() };
+        if let Some(bad) = wanted.iter().find(|b| **b == 0 || **b > count) {
+            let known: Vec<String> = (1..=count).map(|b| b.to_string()).collect();
+            let tail = if count == 1 { "," } else { "" };
+            return Err(EngineError::BadRequest(format!(
+                "band index {bad} out of range (not in ({}{tail}))",
+                known.join(", ")
+            )));
+        }
+        if wanted.len() > Self::MAX_PLANES_PER_RASTER {
+            return Err(EngineError::BadRequest(format!(
+                "{} bands of one asset are too many to read at once (at most {}); choose bands with `bidx`",
+                wanted.len(),
+                Self::MAX_PLANES_PER_RASTER
+            )));
+        }
+        Ok(wanted)
+    }
+
+    /// The most bands of one raster [`Self::raster_planes`] reads for one tile.
+    pub const MAX_PLANES_PER_RASTER: usize = 32;
+
+    /// Bands of one raster over a tile, each a plane of `f32` on the tile's grid whatever
+    /// the raster's own, NaN where it has no data. An empty `bands_1based` asks for every
+    /// band. `req` gives the tile, its size and `unscale`; `resampling` is used for a raster
+    /// already in the tile's projection and `reproject` for one that has to be warped into
+    /// it. The raster's sample type comes back with the planes.
+    pub async fn raster_planes(
+        &self,
+        uri: &str,
+        bands_1based: &[u16],
+        req: &TileRequest,
+        resampling: ResampleMode,
+        reproject: ResampleMode,
+    ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
+        let cog = self.store.open_uri(uri).await?;
+        let full = cog.index.full_res();
+        let sample_type = full.sample_type;
+        let wanted = Self::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
+        let mut one = req.clone();
+        one.format = OutputFormat::RawF32;
+        one.resample = match self.get_or_build_crs(&cog)? {
+            CrsModel::Epsg3857 => resampling,
+            _ => reproject,
+        };
+        let pixels = (req.tile_size as usize).pow(2);
+        let mut planes = Vec::with_capacity(wanted.len());
+        // One band at a time: read three together and the renderer gives none of them
+        // where it finds one of them empty.
+        for band in &wanted {
+            one.bands = BandRequest::Single {
+                band_1based: *band,
+                rescale: (0.0, 255.0),
+                colormap: ColormapName::Grayscale,
+            };
+            let values = self.render_tile(&cog, &one).await?;
+            if values.len() != pixels * 4 {
+                return Err(EngineError::BadRequest("unexpected plane size from the renderer".into()));
+            }
+            planes.push(values.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]])).collect());
+        }
+        if planes.len() != wanted.len() {
+            return Err(EngineError::BadRequest("unexpected number of planes from the renderer".into()));
+        }
+        Ok((planes, sample_type))
+    }
+
+    /// How many bands of values a request's scenes hold: three for a colour composite, else one.
+    pub fn value_bands(bands: &BandRequest) -> usize {
+        match bands {
+            BandRequest::Rgb { .. } | BandRequest::SarRgb { .. } => 3,
+            BandRequest::MultiBand { bands_1based } => bands_1based.len().max(1),
+            _ => 1,
+        }
+    }
+
+    /// Every scene of a mosaic as the values its bands hold over the tile, before any
+    /// rescaling or colour, handed to `each` in the mosaic's order: band after band
+    /// ([`Self::value_bands`] of them) of little-endian `f32`, NaN where the scene has no
+    /// data. A scene that does not reach the tile is not handed over. This is what a mosaic
+    /// that has to look at every scene is made from; one that takes the first value it finds
+    /// should use [`Self::render_mosaic_scenes_ahead`], which stops when the tile is full.
+    pub async fn mosaic_scene_values(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        mut each: impl FnMut(&[u8]),
+    ) -> Result<(), EngineError> {
+        if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one asset per scene".into(),
+            ));
+        }
+        let len = Self::value_bands(&req.bands) * (req.tile_size as usize).pow(2) * 4;
+        let mut scene_req = req.clone();
+        scene_req.format = OutputFormat::RawF32;
+        let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, MOSAIC_SCENES_AHEAD);
+        // A scene that misses the tile comes back as nothing but no data. It is not a scene
+        // of this tile: counted, it would make a tile of zeros out of nothing.
+        let nothing = |scene: &[u8]| {
+            scene.chunks_exact(4).all(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]).is_nan())
+        };
+        while let Some(scene) = reading.next().await {
+            let scene = scene.map_err(SceneFailure::into_error)?;
+            if scene.len() == len && !nothing(&scene) {
+                each(&scene);
+            }
+        }
+        Ok(())
+    }
+
+    /// The mosaic behind [`Self::render_mosaic_tile`], over scenes that are each one asset or
+    /// two to three co-registered single-band assets (rendered as one multi-asset composite).
+    /// The caller bounds how many scenes it passes.
+    pub async fn render_mosaic_scenes(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+    ) -> Result<Bytes, EngineError> {
+        Ok(self.render_mosaic(scenes, req, 1, true).await?.0)
+    }
+
+    /// [`Self::render_mosaic_scenes`], reading up to `ahead` scenes at once from the start.
+    ///
+    /// Scenes are always composited in order, and a tile's answer does not depend on
+    /// `ahead`. What it changes is the wait: a scene is mostly time spent on its storage,
+    /// and scenes read one after another add those waits up. With `ahead` of one, the first
+    /// scene is read alone, so a tile it fills opens nothing else, and each scene that
+    /// does not fill the tile doubles how many are read at once, up to
+    /// [`MOSAIC_SCENES_AHEAD`]. A caller whose list is already only the scenes that add to
+    /// the tile (pgSTAC's, chosen by footprint) passes the limit and reads them together.
+    pub async fn render_mosaic_scenes_ahead(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        ahead: usize,
+    ) -> Result<Bytes, EngineError> {
+        Ok(self.render_mosaic(scenes, req, ahead, false).await?.0)
+    }
+
+    /// The mosaic itself. With `skip_unopened`, a scene that cannot be opened is passed
+    /// over, and its error is the answer only when no scene could be opened at all: a
+    /// list of URLs may hold a dead one. Without, it fails the tile, as any scene that
+    /// cannot be read does.
+    async fn render_mosaic(
+        &self,
+        scenes: &[Vec<String>],
+        req: &TileRequest,
+        ahead: usize,
+        skip_unopened: bool,
+    ) -> Result<(Bytes, Vec<String>), EngineError> {
+        if scenes.is_empty() || scenes.iter().any(|s| s.is_empty()) {
+            return Err(EngineError::BadRequest(
+                "mosaic requires at least one asset per scene".into(),
+            ));
+        }
         let n = req.tile_size as usize;
         let total_pixels = n * n;
         let f32_bands: usize = match req.bands {
@@ -2538,12 +2902,12 @@ impl TileEngine {
 
         // 1-scene fast path: skip canvas allocation, pixel compositing, and re-encoding so single-scene
         // mosaic tiles keep zero-decode JPEG/WebP passthrough and 8-bit indexed PLTE PNG encoding!
-        if urls.len() == 1 {
+        if scenes.len() == 1 && scenes[0].len() == 1 {
             let cog = self
                 .store
-                .open_uri(&urls[0])
+                .open_uri(&scenes[0][0])
                 .await
-                .map_err(|e| asset_fetch_error(&urls[0], e))?;
+                .map_err(|e| asset_fetch_error(&scenes[0][0], e))?;
             let scene_req = fold_scene_unscale(&cog, req);
             let bytes = self.render_tile(&cog, &scene_req).await?;
             return Ok((bytes, Vec::new()));
@@ -2561,35 +2925,34 @@ impl TileEngine {
             let mut opened_any = false;
             let mut last_open_err: Option<EngineError> = None;
             let mut failed_assets: Vec<String> = Vec::new();
-            for (scene_i, url) in urls.iter().enumerate() {
-                if filled >= total_pixels {
+            let mut scene_i = 0usize;
+            let mut reading = self.mosaic_scenes_in_order(scenes, &scene_req, false, ahead);
+            while filled < total_pixels {
+                let scene_urls = &scenes[scene_i.min(scenes.len() - 1)];
+                scene_i += 1;
+                let Some(src) = reading.next().await else {
                     break;
-                }
-                if scene_i > 0 {
-                    tokio::task::consume_budget().await;
-                }
-                let cog = match self.store.open_uri(url).await {
-                    Ok(c) => {
-                        opened_any = true;
-                        c
-                    }
-                    Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                        return Err(EngineError::Io(e));
-                    }
-                    Err(e) => {
-                        failed_assets.push(cogzilla_io::redact_http_url(url));
-                        last_open_err = Some(asset_fetch_error(url, e));
-                        continue;
-                    }
                 };
-                let src = match self.render_tile(&cog, &scene_req).await {
-                    Ok(b) => b,
-                    Err(EngineError::Io(e)) if !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                        failed_assets.push(cogzilla_io::redact_http_url(url));
-                        last_open_err = Some(asset_fetch_error(url, e));
+                let src = match src {
+                    Ok(src) => {
+                        opened_any = true;
+                        src
+                    }
+                    // An asset the allowlist refuses fails the tile, as on `main`, rather than being
+                    // passed over as one that could not be read.
+                    Err(SceneFailure::Unopened(e)) if skip_unopened && !refused(&e) => {
+                        failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                        last_open_err = Some(e);
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    // As on `main`: a scene that opened but could not be read is passed over
+                    // too, unless the allowlist refused what it reads.
+                    Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                        last_open_err = Some(asset_fetch_error(&scene_urls[0], e));
+                        continue;
+                    }
+                    Err(failure) => return Err(failure.into_error()),
                 };
                 if src.len() != f32_bands * total_pixels * 4
                     || src.as_ptr() == empty_f32_sentinel.as_ptr()
@@ -2683,36 +3046,32 @@ impl TileEngine {
         let mut opened_any = false;
         let mut last_open_err: Option<EngineError> = None;
         let mut failed_assets: Vec<String> = Vec::new();
-        for (scene_i, url) in urls.iter().enumerate() {
-            if filled >= total_pixels {
+        let mut scene_i = 0usize;
+        let mut reading = self.mosaic_scenes_in_order(scenes, &base_scene_req, req.unscale, ahead);
+        while filled < total_pixels {
+            let scene_urls = &scenes[scene_i.min(scenes.len() - 1)];
+            scene_i += 1;
+            let Some(src) = reading.next().await else {
                 break;
-            }
-            if scene_i > 0 {
-                tokio::task::consume_budget().await;
-            }
-            let cog = match self.store.open_uri(url).await {
-                Ok(c) => {
-                    opened_any = true;
-                    c
-                }
-                Err(e) if matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                    return Err(EngineError::Io(e));
-                }
-                Err(e) => {
-                    failed_assets.push(cogzilla_io::redact_http_url(url));
-                    last_open_err = Some(asset_fetch_error(url, e));
-                    continue;
-                }
             };
-            let scene_req = fold_scene_unscale(&cog, &base_scene_req);
-            let src = match self.render_tile(&cog, &scene_req).await {
-                Ok(b) => b,
-                Err(EngineError::Io(e)) if !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
-                    failed_assets.push(cogzilla_io::redact_http_url(url));
-                    last_open_err = Some(asset_fetch_error(url, e));
+            let src = match src {
+                Ok(src) => {
+                    opened_any = true;
+                    src
+                }
+                // An asset the allowlist refuses fails the tile, as on `main`, rather than being
+                // passed over as one that could not be read.
+                Err(SceneFailure::Unopened(e)) if skip_unopened && !refused(&e) => {
+                    failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                    last_open_err = Some(e);
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
+                    last_open_err = Some(asset_fetch_error(&scene_urls[0], e));
+                    continue;
+                }
+                Err(failure) => return Err(failure.into_error()),
             };
             if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
                 continue;

@@ -731,7 +731,7 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
 }
 
 /// Escape XML text and attribute special characters.
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -5411,6 +5411,30 @@ pub(crate) fn encode_rgba_output(
     format: OutputFormat,
     return_mask: bool,
 ) -> Bytes {
+    encode_rgba_output_as(w, h, rgba, format, return_mask, true)
+}
+
+/// [`encode_rgba_output`] for a picture known to be of three bands: it is written in
+/// colour whatever its pixels hold, where the other writes a grey picture when every
+/// pixel that is there happens to be grey (which an empty picture always is).
+pub(crate) fn encode_rgba_output_colour(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: OutputFormat,
+    return_mask: bool,
+) -> Bytes {
+    encode_rgba_output_as(w, h, rgba, format, return_mask, false)
+}
+
+fn encode_rgba_output_as(
+    w: usize,
+    h: usize,
+    rgba: &[u8],
+    format: OutputFormat,
+    return_mask: bool,
+    grey_if_grey: bool,
+) -> Bytes {
     thread_local! {
         static PNG_SCRATCH: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
             const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
@@ -5419,10 +5443,11 @@ pub(crate) fn encode_rgba_output(
     match format {
         OutputFormat::Png => {
             let pixels = w.saturating_mul(h);
-            let is_gray = rgba
-                .chunks_exact(4)
-                .take(pixels)
-                .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
+            let is_gray = grey_if_grey
+                && rgba
+                    .chunks_exact(4)
+                    .take(pixels)
+                    .all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
             let all_opaque = return_mask
                 && rgba.chunks_exact(4).take(pixels).all(|p| p[3] == 255);
             PNG_SCRATCH.with(|cell| {
@@ -5521,7 +5546,10 @@ pub(crate) fn encode_rgba_output(
                 encode_webp_rgba(w as u32, h as u32, rgba, quality)
             }
         }
-        OutputFormat::Jpeg { quality } => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
+        OutputFormat::Jpeg { quality } if grey_if_grey => encode_jpeg_rgba(w as u32, h as u32, rgba, quality),
+        OutputFormat::Jpeg { quality } => {
+            cogzilla_kernel::jpeg_fast::encode_jpeg_rgba_colour(w as u32, h as u32, rgba, quality)
+        }
         OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 | OutputFormat::RawRgba => {
             Bytes::copy_from_slice(rgba)
         }

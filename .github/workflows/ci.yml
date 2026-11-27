@@ -23,6 +23,25 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # A throwaway pgSTAC database for the /searches HTTP tests, which skip themselves
+    # when COGZILLA_TEST_DATABASE_URL is unset.
+    services:
+      pgstac:
+        image: ghcr.io/stac-utils/pgstac:v0.10.2
+        env:
+          POSTGRES_USER: username
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgis
+          PGUSER: username
+          PGPASSWORD: password
+          PGDATABASE: postgis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "psql -U username -d postgis -tAc 'SELECT pgstac.get_version()'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +64,39 @@ jobs:
           uv run --no-project --python 3.12 --with rasterio --with numpy benches/generate_landsat_sar_fixtures.py
 
       - run: cargo test --workspace --locked
+        env:
+          COGZILLA_TEST_DATABASE_URL: postgresql://username:password@127.0.0.1:5432/postgis
+          RUST_MIN_STACK: "8388608"
+
+  # The pgSTAC HTTP tests again, on the 0.9 line most deployments still run. The lean
+  # lookup's test forces that lookup on, so its queries are exercised here too.
+  pgstac-09:
+    name: Test (pgSTAC 0.9)
+    runs-on: ubuntu-latest
+    services:
+      pgstac:
+        image: ghcr.io/stac-utils/pgstac:v0.9.11
+        env:
+          POSTGRES_USER: username
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgis
+          PGUSER: username
+          PGPASSWORD: password
+          PGDATABASE: postgis
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "psql -U username -d postgis -tAc 'SELECT pgstac.get_version()'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p cogzilla-server --test pgstac_api --locked
+        env:
+          COGZILLA_TEST_DATABASE_URL: postgresql://username:password@127.0.0.1:5432/postgis
 
   clippy:
     name: Clippy
