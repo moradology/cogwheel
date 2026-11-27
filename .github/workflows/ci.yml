@@ -69,6 +69,11 @@ jobs:
           COGZILLA_TEST_DATABASE_URL: postgresql://username:password@127.0.0.1:5432/postgis
           RUST_MIN_STACK: "8388608"
 
+      - name: Test CPU-only server (--no-default-features)
+        run: cargo test -p cogzilla-server --no-default-features --locked
+        env:
+          RUST_MIN_STACK: "8388608"
+
   # The pgSTAC HTTP tests again, on the 0.9 line most deployments still run. The lean
   # lookup's test forces that lookup on, so its queries are exercised here too.
   pgstac-09:
