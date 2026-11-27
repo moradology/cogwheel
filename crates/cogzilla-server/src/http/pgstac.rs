@@ -2119,11 +2119,13 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
 /// The two steps an array of [`item_asset_math`] is typed by, as numpy types them: each
 /// `assets` entry's band math over its own raster (`None` for a plain asset, which is its
 /// raster's type), the results stacked at the widest of their types, then the request
-/// expression over that stack. `None` without a request expression, when the results are
-/// the answer.
+/// expression over that stack, which is empty without one: the results are then the answer.
 pub(super) fn item_asset_math_stages(rest: &[&str], pairs: &[(String, String)]) -> Option<(Vec<Option<String>>, String)> {
-    let request = request_expression(pairs)?;
+    let request = request_expression(pairs).unwrap_or_default();
     let specs = parse_assets(pairs).ok()?;
+    if specs.iter().all(|s| s.expression.is_none()) {
+        return None;
+    }
     let own: Vec<Option<String>> = specs.into_iter().map(|spec| spec.expression).collect();
     item_asset_math_route(rest).then(|| (own, request.to_string()))
 }
@@ -8146,7 +8148,8 @@ mod tests {
         let stages = |q: &str| item_asset_math_stages(&["preview.npy"], &query_pairs(q));
         assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some((vec![Some("b1/2;b1".into())], "b2".into())));
         assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some((vec![Some("b1*2".into()), None], "b1-b2".into())));
-        assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), None, "the results are the answer");
+        assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), Some((vec![Some("b1*2".into())], String::new())), "the results are the answer");
+        assert_eq!(stages("assets=red&expression=b1*2"), None, "no asset's own band math");
     }
 
     /// Band math is an `|expression=` option of an asset, not an option whose name ends so.
