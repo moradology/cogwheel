@@ -1094,6 +1094,13 @@ fn radix_sort_u32(data: &mut [u32]) {
     radix_sort_by_u32(data, |&k| k);
 }
 
+/// Sort finite `f32` slices in ascending numerical order using 4-pass 8-bit LSD radix sort
+/// (`O(N)`, skipping uniform byte passes). For slices shorter than 1,024 elements, falls back
+/// to `sort_unstable_by_key`.
+pub(crate) fn sort_f32_radix(data: &mut [f32]) {
+    radix_sort_by_u32(data, |&v| f32_to_sortable_u32(v));
+}
+
 fn radix_sort_u32_f64(data: &mut [(u32, f64)]) {
     radix_sort_by_u32(data, |&(k, _)| k);
 }
