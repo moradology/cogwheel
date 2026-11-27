@@ -38,7 +38,10 @@ impl GpuMultiBandSlab {
         let total_elems = band_stride
             .checked_mul(num_bands)
             .ok_or_else(|| GpuError::InvalidDimensions("total_elems overflow".into()))?;
-        let byte_size = (total_elems * std::mem::size_of::<f32>()) as u64;
+        let byte_size = total_elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| GpuError::InvalidDimensions("multi-band slab byte size overflow".into()))?
+            as u64;
         let limits = device.limits();
         let max_bytes =
             (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);

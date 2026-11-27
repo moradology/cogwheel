@@ -1,5 +1,3 @@
-use wgpu::util::DeviceExt;
-
 use crate::context::GpuError;
 
 /// GPU-resident `f32` raster slab (e.g. a decoded COG block or stitched tile neighborhood).
@@ -33,7 +31,10 @@ impl GpuSlab {
         let total_elems = (height as usize)
             .checked_mul(stride as usize)
             .ok_or_else(|| GpuError::InvalidDimensions("slab size overflow".into()))?;
-        let byte_size = (total_elems * std::mem::size_of::<f32>()) as u64;
+        let byte_size = total_elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| GpuError::InvalidDimensions("slab byte size overflow".into()))?
+            as u64;
         let limits = device.limits();
         let max_bytes = limits
             .max_buffer_size
@@ -75,22 +76,15 @@ impl GpuSlab {
         let min_elems = (height as usize)
             .checked_mul(stride as usize)
             .ok_or_else(|| GpuError::InvalidDimensions("height * stride overflow".into()))?;
-        if width == 0 || height == 0 || stride < width || data.len() < min_elems {
+        if data.len() < min_elems {
             return Err(GpuError::InvalidDimensions(format!(
                 "invalid slab: width={width}, height={height}, stride={stride}, len={}",
                 data.len()
             )));
         }
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("cogzilla-gpu-slab"),
-            contents: bytemuck::cast_slice(&data[..min_elems]),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        Ok(Self {
-            buffer,
-            width,
-            height,
-            stride,
+        Self::from_mapped_fill(device, width, height, stride, |dst| {
+            dst.copy_from_slice(&data[..min_elems]);
+            Ok(())
         })
     }
 }
