@@ -3227,7 +3227,33 @@ fn expand_stac_asset_bidx(
                 pq.asset_bidx.clear();
                 pq.bidx.clear();
             }
-            (None, Some(sel)) if pq.bidx.is_empty() => pq.bidx = sel.clone(),
+            // Band math over the bands chosen reads them in their order: `bN` is the Nth
+            // chosen (an asset's name, written for its own band, is left to it).
+            (None, Some(sel)) if pq.bidx.is_empty() => match pq.expr_raw.as_deref() {
+                Some(expr) if !named => {
+                    let mut beyond = None;
+                    let parts: Vec<String> = expression_parts(expr)
+                        .map(|part| {
+                            substitute_band_tokens(part, |k| match sel.get(k.wrapping_sub(1)) {
+                                Some(b) => Some(format!("b{b}")),
+                                None => {
+                                    beyond.get_or_insert(k);
+                                    None
+                                }
+                            })
+                        })
+                        .collect();
+                    if let Some(k) = beyond {
+                        return Err(EngineError::BadRequest(format!(
+                            "band {k} out of range for asset '{}' ({} bands chosen)",
+                            names[0],
+                            sel.len()
+                        )));
+                    }
+                    pq.expr_raw = Some(parts.join(";"));
+                }
+                _ => pq.bidx = sel.clone(),
+            },
             _ => {}
         }
         return Ok((cogs, None));
@@ -7193,8 +7219,10 @@ where
                         Some(request) => expression_parts(request)
                             .map(|part| {
                                 substitute_band_tokens(part, |k| {
+                                    // On `/stac` an asset may be named like a band; it is read
+                                    // as the asset, and stays as written.
                                     let token = format!("b{k}");
-                                    if names.contains(&token) {
+                                    if stac_prefix == "stac" && names.contains(&token) {
                                         return None;
                                     }
                                     stack_names.get(k.wrapping_sub(1)).cloned()

@@ -6728,6 +6728,14 @@ async fn stac_stacks_every_band_of_several_assets() {
         means("&assets=a&assets=b").await,
         described(&[(3.0, "a_b1"), (5.0, "a_b2"), (11.0, "b_b1"), (13.0, "b_b2")])
     );
+    // One asset's chosen bands are read in their order by band math.
+    assert_eq!(means("&assets=a%7Cbidx%3D2&expression=b1").await, described(&[(5.0, "a_b2")]));
+    assert_eq!(
+        means("&assets=a%7Cbidx%3D2,1&expression=b1;b2*2").await,
+        described(&[(5.0, "a_b2"), (6.0, "a_b1*2")])
+    );
+    let past = client.get(format!("{base}/stac/statistics?url={url}&assets=a%7Cbidx%3D2&expression=b2")).send().await.unwrap();
+    assert_eq!(past.status().as_u16(), 400);
     // An asset named like a band (`b2`) stays as written.
     assert_eq!(means("&assets=a&assets=b2&expression=b2%2B1").await[0].1, "b2+1");
     // Sixteen bands are read for band math, but an answer of them all holds at most fifteen.
