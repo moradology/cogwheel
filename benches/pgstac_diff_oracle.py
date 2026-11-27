@@ -372,6 +372,9 @@ def main() -> int:
         # A tile of a size the renderer does not draw, under an algorithm: drawn as its box.
         o.check("contours, 300 pixels", "image", f"{base12}.png?assets=red&algorithm=contours&tilesize=300")
         o.check("terrarium, 128 pixels", "image", f"{base12}.png?assets=red&algorithm=terrarium&tilesize=128")
+        # A terrain algorithm over band math reads the expression's first output.
+        o.check("terrarium over band math", "image", f"{base12}.png?assets=red&expression=b1*2&algorithm=terrarium")
+        o.check("terrarium over band math of two assets", "image", f"{base12}.png?assets=red&assets=nir&expression=(b1%2Bb2)/2&algorithm=terrarium")
         o.check("normalizedIndex over two assets, 384 pixels", "image", f"{base12}.png?{ndi}&rescale=-1,1&tilesize=384")
         o.check("algorithm parameters of the wrong type", "status",
                 f"{base12}.png?assets=red&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A%22x%22%7D")

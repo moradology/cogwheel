@@ -231,6 +231,7 @@ fn make_mixed_request(tile: TileCoord, seed: u64, ndvi_prog: &ExprProgram) -> Ti
                 },
                 rescale: (0.0, 255.0),
                 colormap: ColormapName::Grayscale,
+                math: None,
             },
             resample: ResampleMode::Lanczos,
             format: OutputFormat::Png,

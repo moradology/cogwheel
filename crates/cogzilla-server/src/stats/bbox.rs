@@ -1927,6 +1927,12 @@ async fn render_bbox_core(
             Ok(())
         };
         match bands {
+            // A terrain algorithm over band math reads the bands of the band math.
+            BandRequest::Dem { math: Some(prog), .. } | BandRequest::Terrain { math: Some(prog), .. } => {
+                for &b in &prog.used_bands {
+                    check_band(b)?;
+                }
+            }
             BandRequest::Single { band_1based, .. }
             | BandRequest::Terrain { band_1based, .. }
             | BandRequest::Dem { band_1based, .. }
@@ -2281,6 +2287,40 @@ async fn render_bbox_core(
             }};
         }
 
+        // A terrain algorithm over band math reads it block by block as one band (on the CPU):
+        // each band with the request's nodata and its own scale and offset first.
+        let dem_math_blocks = match bands {
+            BandRequest::Dem { math: Some(prog), .. } | BandRequest::Terrain { math: Some(prog), .. } => {
+                let reads: Vec<_> = prog.used_bands.iter().map(|&b| get_band_refs(b, 0)).collect();
+                let inputs: Vec<_> = reads
+                    .iter()
+                    .map(|(refs, (sc, off))| (&refs[..], nodata_override, (*sc != 1.0 || *off != 0.0).then_some((*sc, *off))))
+                    .collect();
+                Some(cogzilla_kernel::band_math_blocks(prog, &inputs))
+            }
+            _ => None,
+        };
+        let dem_math_refs: Option<Vec<Option<&cogzilla_codec::DecodedBand>>> =
+            dem_math_blocks.as_ref().map(|blocks| blocks.iter().map(Option::as_ref).collect());
+        macro_rules! dem_src {
+            ($refs:expr) => {{
+                match &dem_math_refs {
+                    Some(blocks) => BandSource::new(
+                        ifd_width,
+                        ifd_height,
+                        ifd_tile_width,
+                        ifd_tile_height,
+                        tx0,
+                        ty0,
+                        grid_w,
+                        grid_h,
+                        blocks,
+                    ),
+                    None => make_src!($refs),
+                }
+            }};
+        }
+
         // Sample a (w + 2) x (h + 2) elevation ring by linearly extrapolating (u, v) 1 px past
         // each edge so Horn 3x3 gradients stay seamless across adjacent tiles (WorldCRS84Quad /
         // render_mercator_bbox) and non-square bboxes.
@@ -2451,6 +2491,7 @@ async fn render_bbox_core(
                         BandRequest::Dem {
                             band_1based,
                             algorithm,
+                            math: None,
                             ..
                         } => {
                             let refs = get_band_refs(*band_1based, 0);
@@ -2536,6 +2577,7 @@ async fn render_bbox_core(
                     BandRequest::Dem {
                         band_1based,
                         algorithm,
+                        math: None,
                         ..
                     } => {
                         let refs = get_band_refs(*band_1based, 0);
@@ -2688,7 +2730,7 @@ async fn render_bbox_core(
                     ..
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
-                    let src = make_src!(&refs);
+                    let src = dem_src!(&refs);
                     let ring = sample_dem_ring(&src, &coord_map);
                     let rw = w + 2;
                     let (dx_m, dy_m) = dem_dxy();
@@ -2719,9 +2761,10 @@ async fn render_bbox_core(
                 BandRequest::Terrain {
                     band_1based,
                     algorithm,
+                    ..
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
-                    let src = make_src!(&refs);
+                    let src = dem_src!(&refs);
                     let mut g_plane = Vec::with_capacity(w * h * 4);
                     let mut b_plane = Vec::with_capacity(w * h * 4);
                     coord_map.for_each_uv(w, h, |_, u, v| {
@@ -3061,6 +3104,7 @@ async fn render_bbox_core(
                     algorithm,
                     rescale,
                     colormap,
+                    math: None,
                 } => crate::gpu_backend::GpuBackend::resolve_styled_rgb_lut(
                     *colormap,
                     custom_lut,
@@ -3100,6 +3144,7 @@ async fn render_bbox_core(
                 BandRequest::Terrain {
                     band_1based,
                     algorithm,
+                    math: None,
                 } if custom_lut.is_none() && color_formula.is_none() => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
@@ -3329,9 +3374,10 @@ async fn render_bbox_core(
             BandRequest::Terrain {
                 band_1based,
                 algorithm,
+                ..
             } => {
                 let refs = get_band_refs(*band_1based, 0);
-                let src = make_src!(&refs);
+                let src = dem_src!(&refs);
                 coord_map.for_each_uv(w, h, |i, u, v| {
                     let val = sample(&src, u, v);
                     if !val.is_nan() {
@@ -3348,9 +3394,10 @@ async fn render_bbox_core(
                 algorithm,
                 rescale,
                 colormap,
+                ..
             } => {
                 let refs = get_band_refs(*band_1based, 0);
-                let src = make_src!(&refs);
+                let src = dem_src!(&refs);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let ring = sample_dem_ring(&src, &coord_map);
                 let rw = w + 2;

@@ -101,12 +101,17 @@ pub enum BandRequest {
     Terrain {
         band_1based: u16,
         algorithm: DemAlgorithm,
+        /// Band math in place of `band_1based`, as for [`BandRequest::Dem`].
+        math: Option<ExprProgram>,
     },
     Dem {
         band_1based: u16,
         algorithm: DemAlgorithm,
         rescale: (f32, f32),
         colormap: ColormapName,
+        /// Band math the algorithm reads in place of `band_1based`: an expression's first
+        /// output, as rio-tiler gives a terrain algorithm the expression's results.
+        math: Option<ExprProgram>,
     },
     /// Arbitrary N-band semicolon-separated custom expressions (e.g. 2-band or 4..=15-band)
     /// for scientific `.tif`/`.npy`/`.npz`/`.f32` output.
@@ -117,6 +122,91 @@ pub enum BandRequest {
     MultiBand {
         bands_1based: Vec<u16>,
     },
+}
+
+/// The blocks a terrain algorithm reads over a tile's window: one band's, or band math's
+/// over the bands it reads, block by block ([`cogzilla_kernel::band_math_blocks`]).
+struct TerrainBlocks {
+    tiles: Vec<Option<Arc<cogzilla_codec::DecodedTile>>>,
+    planar: bool,
+    planes: Vec<u16>,
+    per_plane: usize,
+    math: Option<Vec<Option<cogzilla_codec::DecodedBand>>>,
+}
+
+impl TerrainBlocks {
+    fn band(&self, b_1based: u16) -> Vec<Option<&cogzilla_codec::DecodedBand>> {
+        let (blocks, in_decoded) = if self.planar {
+            let at = self.planes.iter().position(|&p| p + 1 == b_1based).unwrap_or(0);
+            (&self.tiles[at * self.per_plane..(at + 1) * self.per_plane], 0)
+        } else {
+            (&self.tiles[..], usize::from(b_1based - 1))
+        };
+        blocks.iter().map(|opt| opt.as_ref().and_then(|t| t.bands.get(in_decoded))).collect()
+    }
+
+    /// The blocks read as the algorithm's one band.
+    fn refs(&self, band_1based: u16) -> Vec<Option<&cogzilla_codec::DecodedBand>> {
+        match &self.math {
+            Some(blocks) => blocks.iter().map(Option::as_ref).collect(),
+            None => self.band(band_1based),
+        }
+    }
+}
+
+fn band_scale_offset(cog: &OpenedCog, b_1based: u16) -> (f32, f32) {
+    let b = usize::from(b_1based.saturating_sub(1));
+    (cog.index.scales.get(b).copied().unwrap_or(1.0), cog.index.offsets.get(b).copied().unwrap_or(0.0))
+}
+
+impl TileEngine {
+    async fn read_terrain_blocks(
+        &self,
+        cog: &OpenedCog,
+        ifd_idx: usize,
+        (tx0, tx1, ty0, ty1): (u32, u32, u32, u32),
+        band_1based: u16,
+        math: Option<&ExprProgram>,
+        unscale: bool,
+    ) -> Result<TerrainBlocks, EngineError> {
+        let ifd = &cog.index.ifds[ifd_idx];
+        // The bands read: the one asked for, or those of the band math over them.
+        let wanted: Vec<u16> = math.map_or_else(|| vec![band_1based], |prog| prog.used_bands.clone());
+        for &b in &wanted {
+            if b == 0 || b > ifd.samples_per_pixel {
+                return Err(EngineError::BadRequest(format!(
+                    "band {} out of range (dataset has {} bands)",
+                    b, ifd.samples_per_pixel
+                )));
+            }
+        }
+        // A chunky raster's blocks hold every band; a planar one's, one band each.
+        let planar = matches!(ifd.planar_config, PlanarConfig::Planar);
+        let planes: Vec<u16> = if planar { wanted.iter().map(|b| b - 1).collect() } else { vec![wanted[0] - 1] };
+        let per_plane = ((tx1 - tx0 + 1) * (ty1 - ty0 + 1)) as usize;
+        let mut indices = Vec::with_capacity(per_plane * planes.len());
+        for &plane in &planes {
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    indices.push(Some(ifd.tile_index(tx, ty, plane) as u32));
+                }
+            }
+        }
+        let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+        let mut read = TerrainBlocks { tiles, planar, planes, per_plane, math: None };
+        if let Some(prog) = math {
+            let refs: Vec<_> = prog.used_bands.iter().map(|&b| read.band(b)).collect();
+            let inputs: Vec<_> = prog
+                .used_bands
+                .iter()
+                .zip(&refs)
+                .map(|(&b, r)| (&r[..], None, unscale.then(|| band_scale_offset(cog, b))))
+                .collect();
+            let blocks = cogzilla_kernel::band_math_blocks(prog, &inputs);
+            read.math = Some(blocks);
+        }
+        Ok(read)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1013,37 +1103,53 @@ impl TileEngine {
             BandRequest::Terrain {
                 band_1based,
                 algorithm,
+                math,
             } => {
                 let band0 = band_1based.saturating_sub(1);
-                if band0 >= ifd.samples_per_pixel {
-                    return Err(EngineError::BadRequest(format!(
-                        "band {} out of range (dataset has {} bands)",
-                        band_1based, ifd.samples_per_pixel
-                    )));
-                }
-                let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
-                        let idx = ifd.tile_index(tx, ty, band0) as u32;
-                        indices.push(Some(idx));
-                    }
-                }
-                let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
-                let band_in_decoded = match ifd.planar_config {
-                    PlanarConfig::Chunky => band0 as usize,
-                    PlanarConfig::Planar => 0,
+                // Band math reads its bands through the shared (boxed) reader; one band keeps
+                // the inline read, which the tile path is timed on.
+                let math_read = match math {
+                    Some(prog) => Some(
+                        Box::pin(self.read_terrain_blocks(cog, ifd_idx, (tx0, tx1, ty0, ty1), *band_1based, Some(prog), req.unscale))
+                            .await?,
+                    ),
+                    None => None,
                 };
-                let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
-                    .iter()
-                    .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
-                    .collect();
-                let (sc, off) = if req.unscale {
-                    (
-                        cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
-                        cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
-                    )
+                let tiles;
+                let (block_refs, (sc, off)) = if let Some(read) = &math_read {
+                    (read.refs(*band_1based), (1.0, 0.0))
                 } else {
-                    (1.0, 0.0)
+                    if band0 >= ifd.samples_per_pixel {
+                        return Err(EngineError::BadRequest(format!(
+                            "band {} out of range (dataset has {} bands)",
+                            band_1based, ifd.samples_per_pixel
+                        )));
+                    }
+                    let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            let idx = ifd.tile_index(tx, ty, band0) as u32;
+                            indices.push(Some(idx));
+                        }
+                    }
+                    tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                    let band_in_decoded = match ifd.planar_config {
+                        PlanarConfig::Chunky => band0 as usize,
+                        PlanarConfig::Planar => 0,
+                    };
+                    let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                        .iter()
+                        .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+                        .collect();
+                    let so = if req.unscale {
+                        (
+                            cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
+                            cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    (block_refs, so)
                 };
                 let src = BandSource::new(
                     ifd.width,
@@ -1060,7 +1166,7 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(gpu) = &self.gpu
+                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none())
                     && let Some(bytes) = gpu
                         .try_render_terrain::<N>(
                             cog.id,
@@ -1088,37 +1194,53 @@ impl TileEngine {
                 algorithm,
                 rescale,
                 colormap,
+                math,
             } => {
                 let band0 = band_1based.saturating_sub(1);
-                if band0 >= ifd.samples_per_pixel {
-                    return Err(EngineError::BadRequest(format!(
-                        "band {} out of range (dataset has {} bands)",
-                        band_1based, ifd.samples_per_pixel
-                    )));
-                }
-                let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
-                        let idx = ifd.tile_index(tx, ty, band0) as u32;
-                        indices.push(Some(idx));
-                    }
-                }
-                let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
-                let band_in_decoded = match ifd.planar_config {
-                    PlanarConfig::Chunky => band0 as usize,
-                    PlanarConfig::Planar => 0,
+                // Band math reads its bands through the shared (boxed) reader; one band keeps
+                // the inline read, which the tile path is timed on.
+                let math_read = match math {
+                    Some(prog) => Some(
+                        Box::pin(self.read_terrain_blocks(cog, ifd_idx, (tx0, tx1, ty0, ty1), *band_1based, Some(prog), req.unscale))
+                            .await?,
+                    ),
+                    None => None,
                 };
-                let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
-                    .iter()
-                    .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
-                    .collect();
-                let (sc, off) = if req.unscale {
-                    (
-                        cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
-                        cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
-                    )
+                let tiles;
+                let (block_refs, (sc, off)) = if let Some(read) = &math_read {
+                    (read.refs(*band_1based), (1.0, 0.0))
                 } else {
-                    (1.0, 0.0)
+                    if band0 >= ifd.samples_per_pixel {
+                        return Err(EngineError::BadRequest(format!(
+                            "band {} out of range (dataset has {} bands)",
+                            band_1based, ifd.samples_per_pixel
+                        )));
+                    }
+                    let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
+                    for ty in ty0..=ty1 {
+                        for tx in tx0..=tx1 {
+                            let idx = ifd.tile_index(tx, ty, band0) as u32;
+                            indices.push(Some(idx));
+                        }
+                    }
+                    tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+                    let band_in_decoded = match ifd.planar_config {
+                        PlanarConfig::Chunky => band0 as usize,
+                        PlanarConfig::Planar => 0,
+                    };
+                    let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                        .iter()
+                        .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+                        .collect();
+                    let so = if req.unscale {
+                        (
+                            cog.index.scales.get(band0 as usize).copied().unwrap_or(1.0),
+                            cog.index.offsets.get(band0 as usize).copied().unwrap_or(0.0),
+                        )
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    (block_refs, so)
                 };
                 let src = BandSource::new(
                     ifd.width,
@@ -1146,7 +1268,7 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                if let Some(gpu) = &self.gpu
+                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none())
                     && let Some(bytes) = gpu
                         .try_render_dem::<N>(
                             cog.id,
@@ -2454,6 +2576,7 @@ mod tests {
             TileEngine::value_bands(&BandRequest::Terrain {
                 band_1based: 1,
                 algorithm: cogzilla_kernel::DemAlgorithm::Terrarium,
+                math: None,
             }),
             3
         );

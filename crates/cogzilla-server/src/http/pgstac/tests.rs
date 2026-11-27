@@ -546,7 +546,7 @@ fn selected_values_are_painted_with_the_requests_own_rescale() {
     let count = Selected { bands: 1, values: vec![0.0, 255.0] };
     assert_eq!(rgb.rgba(&count, 2), [0, 0, 0, 255, 255, 255, 255, 255]);
 
-    let terrain = BandRequest::Terrain { band_1based: 1, algorithm: cogzilla_kernel::DemAlgorithm::Terrarium };
+    let terrain = BandRequest::Terrain { band_1based: 1, algorithm: cogzilla_kernel::DemAlgorithm::Terrarium, math: None };
     assert!(Paint::of(&terrain).is_none());
 }
 
@@ -1663,6 +1663,7 @@ fn the_renderers_grey_takes_the_formula_and_then_the_map() {
         algorithm: cogzilla_kernel::DemAlgorithm::Hillshade { azimuth_deg: 315.0, altitude_deg: 45.0, z_factor: 1.0 },
         rescale: (0.0, 255.0),
         colormap: ColormapName::Viridis,
+        math: None,
     };
     assert!(!one_grey_band(&dem));
     let dem_after = MapAfterFormula::take(&formula, &mut dem).unwrap();

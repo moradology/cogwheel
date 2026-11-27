@@ -6683,6 +6683,11 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b").await, [5.0, 11.0, 13.0]);
     assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b").await, [8.0, 11.0, 13.0]);
     assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await, [104.0]);
+    // A terrain algorithm over band math reads its first output, as rio-tiler does: terrarium
+    // encodes 32768 + the value as red, green and blue.
+    assert_eq!(pixel("&assets=a&algorithm=terrarium").await, [128.0, 3.0, 0.0]);
+    assert_eq!(pixel("&assets=a&expression=b2*2&algorithm=terrarium").await, [128.0, 10.0, 0.0]);
+    assert_eq!(pixel("&assets=a&assets=b&expression=b3-b1;b1&algorithm=terrarium").await, [128.0, 8.0, 0.0]);
     // An asset's name in the request expression is its first band.
     assert_eq!(pixel("&assets=a&assets=b&expression=b_b1-a_b1").await, [8.0]);
     // ... and `bN` beside it is still the Nth band of the stack.

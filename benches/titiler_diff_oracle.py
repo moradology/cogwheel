@@ -472,6 +472,8 @@ def main(argv: list[str] | None = None):
             ("GET /cog/tiles/...?algorithm=hillshade&buffer=3", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=hillshade&buffer=3", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=normalizedIndex", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={sat}&bidx=1&bidx=2&algorithm=normalizedIndex&rescale=-1,1&colormap_name=viridis&reproject=bilinear", None, "png"),
             ("GET /cog/tiles/...?algorithm=terrarium", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=terrarium", None, "png"),
+            ("GET /cog/tiles/...?expression=b1*2&algorithm=terrarium", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&expression=b1*2&algorithm=terrarium", None, "png"),
+            ("GET /cog/tiles/...?expression=b1*3&algorithm=hillshade&buffer=3", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&expression=b1*3&algorithm=hillshade&buffer=3", None, "png_mask"),
             ("GET /cog/tiles/...?algorithm=terrainrgb", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={merc}&algorithm=terrainrgb", None, "png"),
             ("GET /cog/tiles/...?algorithm=ceil (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=ceil&rescale=0,255", None, "png"),
             ("GET /cog/tiles/...?algorithm=floor (uint8)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={u8_path}&algorithm=floor&rescale=0,255", None, "png"),
