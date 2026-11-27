@@ -34,7 +34,9 @@ S3 and HTTP behavior is set through the same environment variables GDAL and the 
 | :--- | :--- |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Static or temporary credentials. |
 | `AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE` | Credentials from a shared credentials file. |
-| (none) | ECS task roles and EC2 instance roles (IMDSv2) are picked up automatically. Set `AWS_EC2_METADATA_DISABLED=true` to skip the instance lookup. |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | ECS task roles and EKS Pod Identity container credentials (reads `_FILE` when the plain token variable is unset). |
+| `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_ROLE_SESSION_NAME`, `AWS_STS_REGIONAL_ENDPOINTS` | EKS IRSA web-identity credentials via STS `AssumeRoleWithWebIdentity`, cached to `Expiration` ahead of EC2 IMDSv2. |
+| (none) | EC2 instance roles (IMDSv2) are picked up automatically when earlier providers are unset. Set `AWS_EC2_METADATA_DISABLED=true` to skip the instance lookup. |
 | `AWS_NO_SIGN_REQUEST=YES` | Send unsigned requests, for public buckets. |
 | `AWS_REQUEST_PAYER=requester` | Access requester-pays buckets. |
 | `AWS_REGION`, `AWS_DEFAULT_REGION` | Default region. A bucket in another region is discovered from S3's redirect and remembered. |
