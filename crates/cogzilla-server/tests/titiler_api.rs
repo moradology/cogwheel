@@ -6665,7 +6665,8 @@ async fn stac_stacks_every_band_of_several_assets() {
     });
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
-    let pixel = |q: &'static str| {
+    let pixel = |q: &str| {
+        let q = q.to_string();
         let (client, base, url) = (client.clone(), base.clone(), url.clone());
         async move {
             let resp = client.get(format!("{base}/stac/preview.npy?url={url}&max_size=16{q}")).send().await.unwrap();
@@ -6691,6 +6692,11 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=a%7Cbidx%3D1").await, [5.0, 3.0]);
     // `asset_bidx` for one asset beside another's own `|bidx=`.
     assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b&asset_bidx=b%7C2").await, [5.0, 13.0]);
+    // Sixteen bands are read for band math, but an answer of them all holds at most fifteen.
+    let sixteen = "&assets=a".repeat(8);
+    let too_many = client.get(format!("{base}/stac/preview.npy?url={url}{sixteen}")).send().await.unwrap();
+    assert_eq!(too_many.status().as_u16(), 400, "sixteen bands with no band math");
+    assert_eq!(pixel(&format!("{sixteen}&expression=b1%2Bb16")).await, [8.0]);
     // Under `asset_as_band` each asset gives one band, however it is chosen.
     assert_eq!(pixel("&assets=a%7Cbidx%3D1&assets=b%7Cexpression%3Db2&asset_as_band=true").await, [3.0, 13.0]);
     for q in ["&assets=a&assets=b", "&assets=a%7Cexpression%3Db1;b2&assets=b%7Cbidx%3D1", "&assets=a%7Cbidx%3D1,2&assets=b%7Cbidx%3D1", "&assets=a"] {

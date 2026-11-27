@@ -3197,6 +3197,12 @@ fn expand_stac_asset_bidx(
             "{slots} bands over the assets are more than the 16 read at once; choose bands with `|bidx=`"
         )));
     }
+    // Without band math every band read is an output, and an answer holds at most 15.
+    if pq.expr_raw.is_none() && slots > 15 {
+        return Err(EngineError::BadRequest(format!(
+            "{slots} bands over the assets are more than the 15 an answer holds; choose bands with `|bidx=` or `expression`"
+        )));
+    }
     let mut expanded_cogs = Vec::with_capacity(slots);
     let mut slot_bands = Vec::with_capacity(slots);
     for (cog, bands) in cogs.into_iter().zip(picked) {
