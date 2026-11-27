@@ -6179,6 +6179,9 @@ where
     let mut pgstac_item: Option<Arc<StacItem>> = None;
     let mut pgstac_item_extent: Option<pgstac::ItemExtent> = None;
     let mut stac_prefix = String::from("stac");
+    // An item's preview or statistics whose assets carry band math of their own, rewritten
+    // as the request's expression (`pgstac::item_asset_math`).
+    let mut item_asset_math = false;
     let item_preview: Option<String>;
     let item_rest: Option<Vec<&str>> = match segs.as_slice() {
         ["collections", c, "items", i, rest @ ..] if !rest.is_empty() => {
@@ -6231,6 +6234,26 @@ where
                             pq.asset_bidx = per_asset;
                         }
                         Ok(None) => {}
+                    }
+                    // Each asset's band math on a preview or the statistics: one expression
+                    // over the stacked bands, read whole.
+                    let math = if pq.asset_exprs.is_empty() { Ok(None) } else { pgstac::item_asset_math(rest, &pgstac::query_pairs(&raw_query)) };
+                    match math {
+                        Err(message) => return Ok(pgstac::bad_request(message)),
+                        Ok(Some((expression, _))) => {
+                            item_asset_math = true;
+                            pq.expr_raw = Some(expression);
+                            pq.asset_exprs.clear();
+                            pq.asset_bidx.clear();
+                            pq.bidx.clear();
+                        }
+                        Ok(None) => {}
+                    }
+                    // Each asset's band math on a point is applied by `pgstac::item_fixup` to
+                    // every band of the asset, named as such; `asset_as_band` names them there.
+                    if matches!(rest, ["point", _]) && !pq.asset_exprs.is_empty() {
+                        pq.asset_exprs.clear();
+                        pq.asset_as_band = false;
                     }
                     if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
                         pq.bidx.clear();
@@ -8049,7 +8072,9 @@ where
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
-                if stac_prefix != "stac"
+                if item_asset_math {
+                    pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
+                } else if stac_prefix != "stac"
                     && let Some(expression) = pq.expr_raw.as_deref()
                 {
                     let bands: Vec<usize> = cogs.iter().map(|c| usize::from(c.index.full_res().samples_per_pixel)).collect();
@@ -9318,6 +9343,9 @@ where
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
+                if item_asset_math {
+                    pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
+                }
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -9405,6 +9433,9 @@ where
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
+                if item_asset_math {
+                    pgstac::check_item_asset_math(&raw_query, &names, &cogs)?;
+                }
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;

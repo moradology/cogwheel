@@ -159,7 +159,7 @@ pub(super) fn engine_error(err: &EngineError) -> Resp {
 }
 
 /// Decoded `key=value` pairs in request order.
-fn query_pairs(raw_query: &str) -> Vec<(String, String)> {
+pub(super) fn query_pairs(raw_query: &str) -> Vec<(String, String)> {
     raw_query
         .split('&')
         .filter(|p| !p.is_empty())
@@ -1889,20 +1889,31 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// parser adds every asset's `|bidx=` to one list, which is right for one asset and reads
 /// the wrong bands for several; here each asset keeps its own. Band math on one asset is
 /// not something those handlers do. A tile or a box with it never gets here: the search
-/// routes draw those (`item_picture_by_asset`). On what is left, a preview or an image
-/// over a posted shape, it is refused, not left out of the picture.
+/// routes draw those (`item_picture_by_asset`). A point reads every band of such an asset
+/// and works it out afterwards (`item_fixup`); a preview and the statistics read it as one
+/// expression over the stacked bands (`item_asset_math`). On what is left, an image over a
+/// posted shape or the info, it is refused, not left out.
 ///
 /// Returns each asset's bands and the request's own `bidx`, or `None` when no asset has
 /// options. Only the info, statistics and point handlers read bands asset by asset; on
 /// the others several assets with bands of their own are refused too.
 pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
     let pairs = query_pairs(raw_query);
-    let specs = parse_assets(&pairs)?;
+    let mut specs = parse_assets(&pairs)?;
     if let Some(spec) = specs.iter().find(|s| s.expression.is_some()) {
-        return Err(detail(
-            StatusCode::BAD_REQUEST,
-            format!("assets={}|expression= is not supported on this item route yet; use `expression`", spec.name),
-        ));
+        if item_asset_math_route(rest) {
+            return Ok(None);
+        }
+        if !matches!(rest, ["point", _]) {
+            return Err(detail(
+                StatusCode::BAD_REQUEST,
+                format!("assets={}|expression= is not supported on this item route yet; use `expression`", spec.name),
+            ));
+        }
+        // An asset's band math is over all of its bands, and wins over its `bidx`.
+        for spec in specs.iter_mut().filter(|s| s.expression.is_some()) {
+            spec.indexes = None;
+        }
     }
     if specs.iter().all(|s| s.indexes.is_none()) {
         return Ok(None);
@@ -1921,6 +1932,113 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
         .filter_map(|b| b.trim().parse().ok())
         .collect();
     Ok(Some((specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect(), own)))
+}
+
+/// Whether an `assets` option may be band math (`red|expression=b1*2`): a look at the
+/// decoded values that spares the requests without it a parse of their assets.
+fn asset_math_asked(pairs: &[(String, String)]) -> bool {
+    pairs.iter().any(|(k, v)| k == "assets" && v.contains("expression="))
+}
+
+/// The item routes whose `/stac` handler reads an asset's band math as one expression over
+/// the stacked bands: the preview and the statistics.
+fn item_asset_math_route(rest: &[&str]) -> bool {
+    match rest {
+        ["preview", ..] | ["statistics"] => true,
+        [one] => one.starts_with("preview."),
+        _ => false,
+    }
+}
+
+/// Band math on the assets of an item's preview or statistics (`assets=red|expression=b1*2`),
+/// as one expression over the bands the `/stac` handler stacks, with what titiler-pgstac
+/// calls each result: `{asset}_{part}` for an asset's own band math, `{asset}_b1` for a
+/// plain asset, and a request `expression` over those with each `bN` replaced by the Nth
+/// name. Each result is worked out as titiler-pgstac does, an asset's band math first.
+///
+/// One asset is read whole, so its band math may read any of its bands. Of several, the
+/// handler stacks each asset's first band, so each asset's band math may read only `b1`,
+/// and none of them may choose bands; the rest is refused, not read wrong.
+///
+/// `None` when no asset has band math or the route is not one of these.
+pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Result<Option<(String, Vec<String>)>, String> {
+    if !item_asset_math_route(rest) || !asset_math_asked(pairs) {
+        return Ok(None);
+    }
+    let Ok(specs) = parse_assets(pairs) else { return Ok(None) };
+    if specs.iter().all(|s| s.expression.is_none()) {
+        return Ok(None);
+    }
+    let as_band = query_value(pairs, "asset_as_band").and_then(parse_bool).unwrap_or(false);
+    let mut parts: Vec<String> = Vec::new();
+    let mut described: Vec<String> = Vec::new();
+    let several = specs.len() > 1;
+    for (slot, spec) in specs.iter().enumerate() {
+        let first = [format!("b{}", slot + 1)];
+        let (own, names): (Vec<String>, Vec<String>) = match &spec.expression {
+            Some(expression) => {
+                let program = Program::parse(expression, if several { 1 } else { MAX_BANDS_PER_ITEM }).map_err(|e| {
+                    if several {
+                        format!("assets={}|expression= reads past the asset's first band, which an item's preview or statistics of several assets does not stack yet", spec.name)
+                    } else {
+                        e
+                    }
+                })?;
+                let own = if several { program.describe(&first) } else { program.sources().map(str::to_string).collect() };
+                (own, program.sources().map(|part| format!("{}_{part}", spec.name)).collect())
+            }
+            None if spec.indexes.is_some() => {
+                return Err(format!(
+                    "assets={}|bidx= with band math on another asset is not supported on an item's preview or statistics yet",
+                    spec.name
+                ));
+            }
+            None => (first.to_vec(), vec![format!("{}_b1", spec.name)]),
+        };
+        let names = if as_band {
+            if names.len() != 1 {
+                return Err("Can't use `asset_as_band` for multibands asset".into());
+            }
+            vec![spec.name.clone()]
+        } else {
+            names
+        };
+        parts.extend(own);
+        described.extend(names);
+    }
+    match request_expression(pairs) {
+        None => Ok(Some((parts.join(";"), described))),
+        Some(request) => {
+            let program = Program::parse(request, parts.len())?;
+            let wrapped: Vec<String> = parts.iter().map(|p| format!("({p})")).collect();
+            Ok(Some((program.describe(&wrapped).join(";"), program.describe(&described))))
+        }
+    }
+}
+
+/// [`item_asset_math`] over several assets reads each asset's first band, which is the
+/// whole of an asset with band math over `b1` alone, but not of a plain asset of more bands
+/// than one: titiler-pgstac stacks all of those, which the `/stac` preview and statistics do
+/// not yet. Such a request is refused rather than read short.
+pub(super) fn check_item_asset_math(
+    raw_query: &str,
+    names: &[String],
+    cogs: &[Arc<cogzilla_io::OpenedCog>],
+) -> Result<(), EngineError> {
+    let Ok(specs) = parse_assets(&query_pairs(raw_query)) else { return Ok(()) };
+    if specs.len() < 2 {
+        return Ok(());
+    }
+    for (name, cog) in names.iter().zip(cogs) {
+        let bands = cog.index.full_res().samples_per_pixel;
+        let plain = specs.iter().any(|s| &s.name == name && s.expression.is_none());
+        if plain && bands > 1 {
+            return Err(EngineError::BadRequest(format!(
+                "assets={name} has {bands} bands: an item's preview or statistics of several assets with band math of their own takes plain assets of one band only, for now"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The parameters the shared parser checks that FastAPI validates on titiler-pgstac's
@@ -5005,6 +5123,59 @@ fn point_expression(
     Ok((values, names, described))
 }
 
+/// Each asset's own band math (`assets=red|expression=b1*2`) over an item's point, which the
+/// `/stac` handler answers with every band of such an asset: the bands of each asset are
+/// the run of values its description names (`{asset}_b{k}`, or the asset under
+/// `asset_as_band`), worked out and described as the search routes do (`asset_bands`).
+fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), String> {
+    if !asset_math_asked(pairs) {
+        return Ok(());
+    }
+    let Ok(specs) = parse_assets(pairs) else { return Ok(()) };
+    if specs.iter().all(|s| s.expression.is_none()) {
+        return Ok(());
+    }
+    let as_band = query_value(pairs, "asset_as_band").and_then(parse_bool).unwrap_or(false);
+    let values: Vec<f64> =
+        doc["values"].as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect();
+    let descriptions: Vec<String> =
+        doc["band_descriptions"].as_array().into_iter().flatten().map(|d| d.as_str().unwrap_or_default().to_string()).collect();
+    if values.len() != descriptions.len() {
+        return Ok(());
+    }
+    let of = |name: &str, d: &str| {
+        d == name || d.strip_prefix(name).and_then(|r| r.strip_prefix("_b")).is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (mut out, mut described) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for spec in &specs {
+        let n = descriptions[at..].iter().take_while(|d| of(&spec.name, d)).count();
+        let bands = &values[at..at + n];
+        at += n;
+        if spec.expression.is_none() {
+            out.extend_from_slice(bands);
+            match (as_band, n) {
+                (false, _) => described.extend_from_slice(&descriptions[at - n..at]),
+                (true, 1) => described.push(spec.name.clone()),
+                (true, _) => return Err("Can't use `asset_as_band` for multibands asset".into()),
+            }
+            continue;
+        }
+        let (plan, names) = asset_bands(spec, n, as_band)?;
+        let mut results = Vec::new();
+        plan.pixel(bands, &mut results);
+        out.extend(results);
+        described.extend(names);
+    }
+    if at != values.len() {
+        return Ok(());
+    }
+    doc["values"] = json!(out.iter().map(|v| if v.is_finite() { json!(v) } else { Value::Null }).collect::<Vec<_>>());
+    doc["band_names"] = json!((1..=out.len()).map(|i| format!("b{i}")).collect::<Vec<_>>());
+    doc["band_descriptions"] = json!(described);
+    Ok(())
+}
+
 /// How many items of a point query are read at once.
 const POINT_ITEMS_IN_FLIGHT: usize = 8;
 
@@ -6285,9 +6456,12 @@ pub(super) fn item_fixup(
     if let ["statistics"] = sub {
         let pairs = query_pairs(raw_query);
         let names = item_band_names(&pairs);
-        let described = query_value(&pairs, "expression")
-            .and_then(|e| Program::parse(e, names.len()).ok())
-            .map(|program| program.describe(&names));
+        let described = match item_asset_math(sub, &pairs) {
+            Ok(Some((_, described))) => Some(described),
+            _ => query_value(&pairs, "expression")
+                .and_then(|e| Program::parse(e, names.len()).ok())
+                .map(|program| program.describe(&names)),
+        };
         if let (Some(described), Ok(mut doc)) = (described, serde_json::from_slice::<Value>(&body)) {
             describe_item_statistics(&mut doc, &described);
             return Ok((Bytes::from(doc.to_string()), content_type));
@@ -6331,8 +6505,12 @@ pub(super) fn item_fixup(
                     *name = json!(format!("b{}", i + 1));
                 }
             }
-            // The `/stac` handler returns the bands as they are; band math is applied here.
+            // The `/stac` handler returns the bands as they are; band math is applied here,
+            // each asset's own first.
             let pairs = query_pairs(raw_query);
+            if let Err(message) = point_asset_math(&mut doc, &pairs) {
+                return Err(detail(StatusCode::BAD_REQUEST, message));
+            }
             if let Some(expression) = request_expression(&pairs) {
                 let values = doc["values"].as_array().cloned().unwrap_or_default();
                 let descriptions: Vec<String> = doc["band_descriptions"]
@@ -7252,6 +7430,55 @@ async fn mosaic_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An asset's own band math on an item's preview or statistics is one expression over the
+    /// stacked bands, described as titiler-pgstac describes it (each asked of it, 2026-11-27).
+    #[test]
+    fn asset_math_is_one_expression_with_titiler_pgstacs_names() {
+        let math = |q: &str| item_asset_math(&["statistics"], &query_pairs(q));
+        let some = |e: &str, d: &[&str]| Ok(Some((e.to_string(), d.iter().map(|s| s.to_string()).collect())));
+        assert_eq!(math("assets=red%7Cexpression%3Db1*2"), some("b1*2", &["red_b1*2"]));
+        assert_eq!(math("assets=visual%7Cexpression%3Db1%2Bb2%3Bb3"), some("b1+b2;b3", &["visual_b1+b2", "visual_b3"]));
+        // The request's expression is over the assets' results: worked out in brackets,
+        // described without.
+        assert_eq!(math("assets=red%7Cexpression%3Db1*2&expression=b1/2"), some("(b1*2)/2", &["red_b1*2/2"]));
+        // Of several assets, each is one band of the stack.
+        assert_eq!(
+            math("assets=red%7Cexpression%3Db1*2&assets=nir&expression=(b1-b2)/(b1%2Bb2)"),
+            some("((b1*2)-(b2))/((b1*2)+(b2))", &["(red_b1*2-nir_b1)/(red_b1*2+nir_b1)"])
+        );
+        assert_eq!(math("assets=red%7Cexpression%3Db1*2&assets=nir&asset_as_band=true"), some("b1*2;b2", &["red", "nir"]));
+        // An asset's band math wins over its band selection.
+        assert_eq!(math("assets=red%7Cexpression%3Db1*2%7Cbidx%3D1"), some("b1*2", &["red_b1*2"]));
+        assert!(math("assets=visual%7Cexpression%3Db3&assets=red%7Cexpression%3Db1").is_err(), "past an asset's first band");
+        assert!(math("assets=red%7Cexpression%3Db1&assets=nir%7Cbidx%3D1").is_err(), "a band selection beside band math");
+        assert!(math("assets=visual%7Cexpression%3Db1%3Bb2&asset_as_band=true").is_err());
+        assert_eq!(math("assets=red&expression=b1*2"), Ok(None), "no asset's own band math");
+        assert_eq!(item_asset_math(&["point", "1,2"], &query_pairs("assets=red%7Cexpression%3Db1*2")), Ok(None));
+    }
+
+    /// An item's point is read band by band and each asset's band math applied afterwards.
+    #[test]
+    fn point_asset_math_applies_each_assets_band_math() {
+        let mut doc = json!({
+            "values": [77.0, 81.0, 83.0, 750.0, 1234.0],
+            "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "red_b1", "nir_b1"],
+        });
+        let q = "assets=visual%7Cexpression%3Db1%2Bb2%3Bb3&assets=red%7Cexpression%3Db1*2&assets=nir";
+        point_asset_math(&mut doc, &query_pairs(q)).unwrap();
+        assert_eq!(doc["values"], json!([158.0, 83.0, 1500.0, 1234.0]));
+        assert_eq!(doc["band_names"], json!(["b1", "b2", "b3", "b4"]));
+        assert_eq!(doc["band_descriptions"], json!(["visual_b1+b2", "visual_b3", "red_b1*2", "nir_b1"]));
+
+        let mut doc = json!({ "values": [77.0, 81.0, 83.0, 750.0], "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "red_b1"] });
+        let as_band = "assets=visual%7Cexpression%3Db3&assets=red&asset_as_band=true";
+        point_asset_math(&mut doc, &query_pairs(as_band)).unwrap();
+        assert_eq!((&doc["values"], &doc["band_descriptions"]), (&json!([83.0, 750.0]), &json!(["visual", "red"])));
+
+        let mut doc = json!({ "values": [77.0, 81.0, 83.0, 750.0], "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "red_b1"] });
+        let plain_many = "assets=visual&assets=red%7Cexpression%3Db1&asset_as_band=true";
+        assert!(point_asset_math(&mut doc, &query_pairs(plain_many)).is_err(), "a plain asset of three bands is not one band");
+    }
 
     #[test]
     fn every_resampling_method_is_its_own_kernel() {

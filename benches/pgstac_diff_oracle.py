@@ -1481,8 +1481,14 @@ def main() -> int:
         o.check("item tile off the grid, band math on one asset", "json", f"{it}/tiles/WebMercatorQuad/1/5/5.png?assets=red%7Cexpression=b1*2")
         o.check("item tile, band math on one asset, a search's options passed over", "image",
                 f"{itile}.png?assets=red%7Cexpression=b1*2&rescale=0,6000&pixel_selection=count&items_limit=many&scan_limit=-1")
-        o.check("item preview, band math on one asset", "image", f"{it}/preview.png?assets=red%7Cexpression=b1*2&rescale=0,6000",
-                known="a preview is read on the raster's own grid, which only the /stac routes do, and they do no band math on one asset; cogzilla answers 400")
+        o.check("item preview, band math on one asset", "image", f"{it}/preview.png?assets=red%7Cexpression=b1*2&rescale=0,6000")
+        o.check("item preview, band math on two assets", "image",
+                f"{it}/preview.png?assets=red%7Cexpression=b1*2&assets=nir%7Cexpression=b1&expression=(b2-b1)/(b2%2Bb1)&rescale=-1,1")
+        o.check("item point, band math on each of two assets", "json",
+                f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual%7Cexpression=b1%2Bb2;b3&assets=red%7Cexpression=b1*2&expression=b1/b3")
+        o.check("item statistics, band math on one asset's own bands", "stats", f"{it}/statistics?assets=visual%7Cexpression=b1%2Bb2;b3&max_size=64")
+        o.check("item statistics, band math on an asset beside a plain one", "stats",
+                f"{it}/statistics?assets=red%7Cexpression=b1*2&assets=nir&expression=(b1-b2)/(b1%2Bb2)&max_size=64")
         o.check("item point", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual")
         o.check("item point, two assets", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir")
         o.check("item point, spaces around the numbers", "json", f"{it}/point/{ilon:.4f}%20,%20{ilat:.4f}?assets=red")
