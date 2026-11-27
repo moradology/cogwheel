@@ -6541,3 +6541,77 @@ async fn encoded_query_keys_and_grey_mosaic_tiles() {
     let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0 | 0xC1 | 0xC2)).unwrap();
     assert_eq!(jpg[sof + 9], 1, "a grey JPEG");
 }
+
+#[tokio::test]
+async fn ogc_wms_getcapabilities_and_getmap_end_to_end() {
+    let sat = fixture("satellite_utm10n_rgb_zstd_p3.tif");
+    if !sat.exists() {
+        eprintln!("fixtures not generated; skipping");
+        return;
+    }
+    let sat = sat.canonicalize().unwrap();
+    let sat_url = sat.to_string_lossy();
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. GetCapabilities XML (uppercase WMS keys)
+    let cap_resp = client
+        .get(format!("{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cap_resp.status().as_u16(), 200);
+    let cap_xml = cap_resp.text().await.unwrap();
+    assert!(cap_xml.contains("<WMS_Capabilities version=\"1.3.0\""));
+    assert!(!cap_xml.contains("REQUEST=GetCapabilities"));
+
+    // 2. GetMap WMS 1.3.0 with uppercase keys & EPSG:4326 (lat,lon axis order) vs CRS:84 (lon,lat)
+    let png_4326 = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=EPSG:4326&BBOX=37.6,-122.8,37.8,-122.5&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(png_4326.status().as_u16(), 200);
+    let b_4326 = png_4326.bytes().await.unwrap();
+    assert_eq!(&b_4326[0..8], b"\x89PNG\r\n\x1a\n");
+
+    let png_crs84 = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&CRS=CRS:84&BBOX=-122.8,37.6,-122.5,37.8&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(png_crs84.status().as_u16(), 200);
+    let b_crs84 = png_crs84.bytes().await.unwrap();
+    assert_eq!(b_4326, b_crs84, "WMS 1.3.0 EPSG:4326 (lat,lon) and CRS:84 (lon,lat) must produce identical PNGs");
+
+    // 3. GetMap WMS 1.1.1 SRS=EPSG:4326 (lon,lat)
+    let png_111 = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&SERVICE=WMS&REQUEST=GetMap&VERSION=1.1.1&SRS=EPSG:4326&BBOX=-122.8,37.6,-122.5,37.8&WIDTH=64&HEIGHT=64&FORMAT=image/png"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(png_111.status().as_u16(), 200);
+    assert_eq!(png_111.bytes().await.unwrap(), b_crs84, "WMS 1.1.1 SRS=EPSG:4326 must match CRS:84");
+
+    // 4. Invalid TRANSPARENT & missing BBOX return 400
+    let bad_t = client
+        .get(format!(
+            "{base}/cog/wms?url={sat_url}&REQUEST=GetMap&CRS=CRS:84&BBOX=-122.8,37.6,-122.5,37.8&WIDTH=64&HEIGHT=64&TRANSPARENT=maybe"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_t.status().as_u16(), 400);
+}
