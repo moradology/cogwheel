@@ -341,6 +341,14 @@ struct ParsedQuery {
     errors: Vec<String>,
 }
 
+fn parse_bool_param(v: &str) -> Option<bool> {
+    match percent_decode(v).trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "t" | "y" => Some(true),
+        "false" | "0" | "no" | "off" | "f" | "n" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_query(q: Option<&str>) -> ParsedQuery {
     let mut pq = ParsedQuery {
         urls: Vec::new(),
@@ -506,10 +514,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected asset_bidx=name|1,2,3");
                 }
             }
-            "asset_as_band" => match percent_decode(v).to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => pq.asset_as_band = true,
-                "false" | "0" | "no" => pq.asset_as_band = false,
-                _ => bad("expected boolean"),
+            "asset_as_band" => match parse_bool_param(v) {
+                Some(b) => pq.asset_as_band = b,
+                None => bad("expected boolean"),
             },
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
             "bbox" => {
@@ -696,21 +703,26 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected a number, nan, inf, or -inf");
                 }
             }
-            "unscale" => {
-                pq.unscale = v.eq_ignore_ascii_case("true") || v == "1";
-            }
-            "strict" => {
-                pq.strict = v.eq_ignore_ascii_case("true") || v == "1";
-            }
-            "return_mask" => {
-                pq.return_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
-            }
-            "shape_mask" => {
-                pq.shape_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
-            }
-            "area_weighted" => {
-                pq.area_weighted = !(v.eq_ignore_ascii_case("false") || v == "0");
-            }
+            "unscale" => match parse_bool_param(v) {
+                Some(b) => pq.unscale = b,
+                None => bad("expected boolean"),
+            },
+            "strict" => match parse_bool_param(v) {
+                Some(b) => pq.strict = b,
+                None => bad("expected boolean"),
+            },
+            "return_mask" => match parse_bool_param(v) {
+                Some(b) => pq.return_mask = b,
+                None => bad("expected boolean"),
+            },
+            "shape_mask" => match parse_bool_param(v) {
+                Some(b) => pq.shape_mask = b,
+                None => bad("expected boolean"),
+            },
+            "area_weighted" => match parse_bool_param(v) {
+                Some(b) => pq.area_weighted = b,
+                None => bad("expected boolean"),
+            },
             "cover_scale" | "all_touched" => {
                 // Exact analytical coverage weighting needs no supersampling or binary all_touched toggle;
                 // accepted and ignored for TiTiler/rasterio client compatibility.
@@ -897,9 +909,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 "vertical" => pq.orientation_vertical = true,
                 _ => bad("expected horizontal or vertical"),
             },
-            "use_epsg" => {
-                pq.use_epsg = v.eq_ignore_ascii_case("true") || v == "1";
-            }
+            "use_epsg" => match parse_bool_param(v) {
+                Some(b) => pq.use_epsg = b,
+                None => bad("expected boolean"),
+            },
             "p" => {
                 let dec = percent_decode(v);
                 for tok in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -959,9 +972,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected histogram_range=min,max with min < max");
                 }
             }
-            "categorical" => {
-                pq.categorical = v.eq_ignore_ascii_case("true") || v == "1";
-            }
+            "categorical" => match parse_bool_param(v) {
+                Some(b) => pq.categorical = b,
+                None => bad("expected boolean"),
+            },
             "c" => {
                 let dec = percent_decode(v);
                 for tok in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -2421,7 +2435,11 @@ fn attach_x_assets(resp: &mut Response<Full<Bytes>>, assets: &[String]) {
     if assets.is_empty() || !resp.status().is_success() {
         return;
     }
-    let joined = assets.join(",");
+    let joined = assets
+        .iter()
+        .map(|u| cogzilla_io::redact_http_url(u))
+        .collect::<Vec<_>>()
+        .join(",");
     if let Ok(hv) = hyper::header::HeaderValue::from_str(&joined) {
         resp.headers_mut().insert("x-assets", hv);
     }
@@ -5530,10 +5548,14 @@ where
     } else {
         None
     };
-    // `f=html` on a route that describes something: its JSON, written out as a page.
-    let as_page = (is_get_or_head
-        && html::wants_html(req.uri().query().unwrap_or(""))
-        && html::offers_html(req.uri().path()))
+    // `f=html` or `Accept: text/html` on a route that describes something: its JSON, written out as a page.
+    let offers_page = is_get_or_head && html::offers_html(req.uri().path());
+    let accept_hdr = req
+        .headers()
+        .get(hyper::header::ACCEPT)
+        .and_then(|v| v.to_str().ok());
+    let as_page = (offers_page
+        && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
     .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
     let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
@@ -5567,6 +5589,9 @@ where
             }
             Err(_) => Response::from_parts(parts, Full::new(raw)),
         };
+    }
+    if offers_page && resp.status().is_success() {
+        html::append_vary_accept(resp.headers_mut());
     }
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if let Ok(hv) = HeaderValue::from_str(&format!("total;dur={dur_ms:.2}")) {
@@ -5671,19 +5696,24 @@ where
                 .map(|s| s.to_ascii_lowercase())
         })
         .unwrap_or_else(|| "http".to_string());
+    let valid_host = |s: &&str| {
+        !s.is_empty()
+            && !s.contains('@')
+            && s.parse::<hyper::http::uri::Authority>().is_ok()
+    };
     let host_raw = req
         .headers()
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
+        .filter(valid_host)
         .or_else(|| {
             req.headers()
                 .get("host")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
+                .filter(valid_host)
         })
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .unwrap_or("127.0.0.1:8080");
@@ -5695,6 +5725,7 @@ where
         .filter(|s| {
             !s.is_empty()
                 && s.starts_with('/')
+                && !s.contains("//")
                 && !s.contains("..")
                 && s.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~'))
@@ -7552,9 +7583,17 @@ where
                 "application/json",
             )),
             ["colorMaps", id] => match pq.format_param.as_deref() {
-                None | Some("json") => {
+                None | Some("json") | Some("html") => {
                     get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
                 }
+                Some("npy") => get_colormap_image(
+                    id,
+                    OutputFormat::Npy,
+                    pq.orientation_vertical,
+                    pq.width,
+                    pq.height,
+                )
+                .map(|b| (b, "application/x-binary")),
                 Some("png") => get_colormap_image(
                     id,
                     OutputFormat::Png,
@@ -7580,7 +7619,7 @@ where
                 )
                 .map(|b| (b, "image/webp")),
                 Some(other) => Err(EngineError::BadRequest(format!(
-                    "unsupported colormap format '{other}' (use json, png, jpg, or webp)"
+                    "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
                 ))),
             },
             _ => Err(EngineError::NotFound(path.clone())),
@@ -12550,5 +12589,144 @@ mod tests {
         let ifd_am = make_ifd(512, 512, (x1 - x0) / 512.0, (y1 - y0) / 512.0, x0, y0);
         let (aw, ah) = native_bbox_dims_in_crs(&ifd_am, &utm60, &geo, [179.0, -1.0, 181.0, 1.0], [179.0, -1.0, 181.0, 1.0]);
         assert!((450..=580).contains(&aw) && (450..=580).contains(&ah), "got ({aw}, {ah})");
+    }
+
+    #[test]
+    fn attach_x_assets_redacts_secrets_and_preserves_plain_names() {
+        let mut resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        attach_x_assets(
+            &mut resp,
+            &[
+                "https://user:secret@example.com/a.tif?X-Amz-Signature=deadbeef&sig=123".to_string(),
+                "red".to_string(),
+                "B04".to_string(),
+            ],
+        );
+        let hv = resp.headers().get("x-assets").unwrap().to_str().unwrap();
+        assert_eq!(hv, "https://example.com/a.tif,red,B04");
+        assert!(!hv.contains("secret") && !hv.contains("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn forwarded_prefix_rejects_protocol_relative_and_invalid_host() {
+        let engine = Arc::new(TileEngine::new(4 * 1024 * 1024));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/docs")
+            .header("x-forwarded-prefix", "//evil.com")
+            .header("x-forwarded-host", "attacker@evil.com/bad")
+            .header("host", "127.0.0.1:8080")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(!html.contains("//evil.com"), "protocol-relative prefix leaked into HTML: {html}");
+        assert!(!html.contains("attacker@"), "invalid forwarded host leaked into HTML: {html}");
+    }
+
+    #[tokio::test]
+    async fn sweep45_qq1_colormaps_html_npy_and_rr1_accept_negotiation_vary() {
+        let engine = Arc::new(TileEngine::new(4 * 1024 * 1024));
+        let browser_accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+
+        // QQ1: /colorMaps/viridis?f=html -> 200 text/html + Vary: Accept
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/colorMaps/viridis?f=html")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap().starts_with("text/html"));
+        let vary = resp.headers().get(hyper::header::VARY).unwrap().to_str().unwrap().to_ascii_lowercase();
+        assert!(vary.contains("accept"), "missing Vary: Accept: {vary}");
+
+        // QQ1: /colorMaps/viridis?f=npy -> 200 (4, 20, 256) uint8 NumPy array
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/colorMaps/viridis?f=npy")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        assert_eq!(&body[0..6], b"\x93NUMPY");
+        let hlen = u16::from_le_bytes([body[8], body[9]]) as usize;
+        let hdr = std::str::from_utf8(&body[10..10 + hlen]).unwrap();
+        assert!(hdr.contains("'|u1'") && hdr.contains("(4, 20, 256)"), "unexpected npy header: {hdr}");
+        assert_eq!(body.len(), 10 + hlen + 4 * 20 * 256);
+
+        // RR1: browser Accept -> text/html + Vary: Accept on all offers_html routes
+        for uri in [
+            "/tileMatrixSets",
+            "/tileMatrixSets/WebMercatorQuad",
+            "/conformance",
+            "/algorithms",
+            "/colorMaps/viridis",
+        ] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(hyper::header::ACCEPT, browser_accept)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = handle_request(engine.clone(), req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert!(
+                resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap().starts_with("text/html"),
+                "expected text/html for {uri}"
+            );
+            let vary = resp.headers().get(hyper::header::VARY).unwrap().to_str().unwrap().to_ascii_lowercase();
+            assert!(vary.contains("accept"), "missing Vary: Accept for {uri}: {vary}");
+        }
+
+        // RR1: explicit ?f=json wins over browser Accept, and still carries Vary: Accept
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/tileMatrixSets?f=json")
+            .header(hyper::header::ACCEPT, browser_accept)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap().starts_with("application/json"));
+        let vary = resp.headers().get(hyper::header::VARY).unwrap().to_str().unwrap().to_ascii_lowercase();
+        assert!(vary.contains("accept"), "missing Vary: Accept on ?f=json: {vary}");
+
+        // RR1: API client (no Accept or Accept: */*) gets application/json + Vary: Accept
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/tileMatrixSets")
+            .header(hyper::header::ACCEPT, "*/*")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = handle_request(engine, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap().starts_with("application/json"));
+        let vary = resp.headers().get(hyper::header::VARY).unwrap().to_str().unwrap().to_ascii_lowercase();
+        assert!(vary.contains("accept"), "missing Vary: Accept on */*: {vary}");
+
+        // Strict boolean query parameter validation (rejects bogus booleans with 422).
+        for q in [
+            "return_mask=bogus",
+            "unscale=maybe",
+            "strict=nope",
+            "categorical=2",
+            "area_weighted=invalid",
+            "use_epsg=nah",
+            "asset_as_band=wat",
+        ] {
+            let pq = parse_query(Some(q));
+            assert!(!pq.errors.is_empty(), "expected validation error for {q}");
+        }
+        assert!(parse_query(Some("return_mask=false&unscale=1&categorical=yes")).errors.is_empty());
     }
 }

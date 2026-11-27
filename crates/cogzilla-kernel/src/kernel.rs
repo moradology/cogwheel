@@ -14,21 +14,15 @@ use crate::png_fast::{
 };
 
 #[inline]
-fn build_plte_opaque(lut: &ColormapLut) -> [u8; 768] {
-    let mut plte = [0u8; 768];
-    for i in 0..256 {
-        plte[i * 3] = lut.rgb[i][0];
-        plte[i * 3 + 1] = lut.rgb[i][1];
-        plte[i * 3 + 2] = lut.rgb[i][2];
-    }
-    plte
+fn build_plte_opaque(lut: &ColormapLut) -> &[u8] {
+    lut.rgb.as_flattened()
 }
 
 /// A palette for a colour-mapped tile that may have empty pixels, and the colour-map entry
 /// that gives up its index (see `ColormapLut::nodata_plte`; `nodata_index` places a byte value).
 #[inline]
-fn build_plte_nodata(lut: &ColormapLut) -> ([u8; 768], u8) {
-    (lut.nodata_plte, lut.nodata_merged)
+fn build_plte_nodata(lut: &ColormapLut) -> (&[u8; 768], u8) {
+    (&lut.nodata_plte, lut.nodata_merged)
 }
 
 use crate::source::BandSource;
@@ -2008,7 +2002,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
                             encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                         } else {
-                            encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                            encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
                         }
                     });
                 }
@@ -2148,7 +2142,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
                             encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                         } else {
-                            encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                            encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
                         }
                     });
                 }
@@ -2229,7 +2223,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                         encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                     } else {
                         let plte = build_plte_opaque(lut);
-                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
                     }
                 } else if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
                     let ga_stride = 1 + N * 2;
@@ -2276,7 +2270,7 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                     encode_indexed_png(
                         N as u32,
                         N as u32,
-                        &plte,
+                        plte,
                         Some(&[0u8]),
                         &sc.img_buf[..total],
                     )
@@ -4159,7 +4153,7 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
                     encode_indexed_png(
                         N as u32,
                         N as u32,
-                        &plte,
+                        plte,
                         Some(&[0u8]),
                         &sc.img_buf[..total],
                     )
@@ -4751,7 +4745,7 @@ pub fn render_expr_vm<const N: usize>(
                     encode_indexed_png(
                         N as u32,
                         N as u32,
-                        &plte,
+                        plte,
                         Some(&[0u8]),
                         &sc.img_buf[..total],
                     )
@@ -5679,13 +5673,52 @@ pub fn render_dem_algorithm<const N: usize>(
                         return encode_indexed_png(
                             N as u32,
                             N as u32,
-                            &plte,
+                            plte,
                             None,
                             &sc.img_buf[..total],
                         );
                     }
                 }
                 let is_opaque_dem = clean && !matches!(alg, DemAlgorithm::Aspect);
+                let is_gray = matches!(style.colormap, crate::colormap::ColormapName::Grayscale);
+                if is_gray && !is_opaque_dem {
+                    let ga_stride = 1 + N * 2;
+                    let ga_total = N * ga_stride;
+                    if sc.img_buf.len() < ga_total {
+                        sc.img_buf.resize(ga_total, 0);
+                    }
+                    let mut row_ga = vec![0u8; N * 2];
+                    for py in 0..N {
+                        let r0 = py * pad;
+                        let r1 = (py + 1) * pad;
+                        let r2 = (py + 2) * pad;
+                        for px in 0..N {
+                            let c = px + 1;
+                            let val = eval_horn_3x3(
+                                elev[r0 + c - 1],
+                                elev[r0 + c],
+                                elev[r0 + c + 1],
+                                elev[r1 + c - 1],
+                                elev[r1 + c],
+                                elev[r1 + c + 1],
+                                elev[r2 + c - 1],
+                                elev[r2 + c],
+                                elev[r2 + c + 1],
+                                inv_8dx,
+                                alg,
+                            );
+                            if val.is_nan() {
+                                row_ga[px * 2] = 0;
+                                row_ga[px * 2 + 1] = 0;
+                            } else {
+                                row_ga[px * 2] = rescale_u8(val, inv_range, min_val);
+                                row_ga[px * 2 + 1] = 255;
+                            }
+                        }
+                        filter_sub_ga_row(&row_ga, &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride]);
+                    }
+                    return encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total]);
+                }
                 let (nodata_plte, merged) = build_plte_nodata(lut);
                 for py in 0..N {
                     let r0 = py * pad;
@@ -5719,15 +5752,87 @@ pub fn render_dem_algorithm<const N: usize>(
                     filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
                 }
                 if !has_nodata && is_opaque_dem {
-                    if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                    if is_gray {
                         encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
                     } else {
                         let plte = build_plte_opaque(lut);
-                        encode_indexed_png(N as u32, N as u32, &plte, None, &sc.img_buf[..total])
+                        encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
+                    }
+                } else if is_opaque_dem && has_nodata {
+                    // Rare case: `clean == true` float32 DEM contained `±Inf`, producing `NaN`
+                    // gradients (`inf - inf`). Re-encode with nodata-safe indices so valid index 0
+                    // pixels are never made transparent.
+                    if is_gray {
+                        let ga_stride = 1 + N * 2;
+                        let ga_total = N * ga_stride;
+                        if sc.img_buf.len() < ga_total {
+                            sc.img_buf.resize(ga_total, 0);
+                        }
+                        let mut row_ga = vec![0u8; N * 2];
+                        for py in 0..N {
+                            let r0 = py * pad;
+                            let r1 = (py + 1) * pad;
+                            let r2 = (py + 2) * pad;
+                            for px in 0..N {
+                                let c = px + 1;
+                                let val = eval_horn_3x3(
+                                    elev[r0 + c - 1],
+                                    elev[r0 + c],
+                                    elev[r0 + c + 1],
+                                    elev[r1 + c - 1],
+                                    elev[r1 + c],
+                                    elev[r1 + c + 1],
+                                    elev[r2 + c - 1],
+                                    elev[r2 + c],
+                                    elev[r2 + c + 1],
+                                    inv_8dx,
+                                    alg,
+                                );
+                                if val.is_nan() {
+                                    row_ga[px * 2] = 0;
+                                    row_ga[px * 2 + 1] = 0;
+                                } else {
+                                    row_ga[px * 2] = rescale_u8(val, inv_range, min_val);
+                                    row_ga[px * 2 + 1] = 255;
+                                }
+                            }
+                            filter_sub_ga_row(&row_ga, &mut sc.img_buf[py * ga_stride..(py + 1) * ga_stride]);
+                        }
+                        encode_filtered_png(N as u32, N as u32, 4, &sc.img_buf[..ga_total])
+                    } else {
+                        for py in 0..N {
+                            let r0 = py * pad;
+                            let r1 = (py + 1) * pad;
+                            let r2 = (py + 2) * pad;
+                            let row_idx = &mut sc.row_buf[..N];
+                            for px in 0..N {
+                                let c = px + 1;
+                                let val = eval_horn_3x3(
+                                    elev[r0 + c - 1],
+                                    elev[r0 + c],
+                                    elev[r0 + c + 1],
+                                    elev[r1 + c - 1],
+                                    elev[r1 + c],
+                                    elev[r1 + c + 1],
+                                    elev[r2 + c - 1],
+                                    elev[r2 + c],
+                                    elev[r2 + c + 1],
+                                    inv_8dx,
+                                    alg,
+                                );
+                                row_idx[px] = if val.is_nan() {
+                                    0
+                                } else {
+                                    nodata_index(rescale_u8(val, inv_range, min_val), merged)
+                                };
+                            }
+                            filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                        }
+                        encode_indexed_png(N as u32, N as u32, nodata_plte, Some(&[0u8][..]), &sc.img_buf[..total])
                     }
                 } else {
                     let trns = has_nodata.then_some(&[0u8][..]);
-                    encode_indexed_png(N as u32, N as u32, &nodata_plte, trns, &sc.img_buf[..total])
+                    encode_indexed_png(N as u32, N as u32, nodata_plte, trns, &sc.img_buf[..total])
                 }
             }
             OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
