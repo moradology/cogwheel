@@ -2807,6 +2807,7 @@ impl MapAfterFormula {
     fn take(formula: &cogzilla_kernel::ColorFormula, bands: &mut BandRequest) -> Option<Self> {
         let colormap = match bands {
             BandRequest::Single { colormap, .. }
+            | BandRequest::Dem { colormap, .. }
             | BandRequest::Spectral1 { colormap, .. }
             | BandRequest::Spectral2 { colormap, .. }
             | BandRequest::Spectral3 { colormap, .. }
@@ -2839,6 +2840,7 @@ fn one_grey_band(bands: &BandRequest) -> bool {
     matches!(
         bands,
         BandRequest::Single { colormap: ColormapName::Grayscale, .. }
+            | BandRequest::Dem { colormap: ColormapName::Grayscale, .. }
             | BandRequest::Spectral1 { colormap: ColormapName::Grayscale, .. }
             | BandRequest::Spectral2 { colormap: ColormapName::Grayscale, .. }
             | BandRequest::Spectral3 { colormap: ColormapName::Grayscale, .. }
@@ -6360,7 +6362,7 @@ fn encode_picture(
 /// at most. What the samples are taken for goes by how many there are, as in GDAL's PNG
 /// driver: one is grey, two grey and alpha, three colour, four colour and alpha, so that
 /// two bands and their mask make a colour picture. A value that is not there is zero.
-fn png_of_16_bits(values: &[f32], bands: usize, width: usize, height: usize, alpha: bool) -> Bytes {
+pub(super) fn png_of_16_bits(values: &[f32], bands: usize, width: usize, height: usize, alpha: bool) -> Bytes {
     let pixels = width * height;
     let samples = bands + usize::from(alpha);
     let mut rows = Vec::with_capacity(height * (1 + width * samples * 2));
@@ -6373,7 +6375,8 @@ fn png_of_16_bits(values: &[f32], bands: usize, width: usize, height: usize, alp
             for band in 0..bands {
                 let v = values.get(band * pixels + i).copied().unwrap_or(f32::NAN);
                 there |= !v.is_nan();
-                rows.extend_from_slice(&(if v.is_nan() { 0 } else { v as u16 }).to_be_bytes());
+                let sample = if v.is_nan() { 0u16 } else { v.round().clamp(0.0, 65535.0) as u16 };
+                rows.extend_from_slice(&sample.to_be_bytes());
             }
             if alpha {
                 rows.extend_from_slice(&(if there { u16::MAX } else { 0 }).to_be_bytes());
@@ -9282,6 +9285,19 @@ mod tests {
         assert!(MapAfterFormula::take(&formula, &mut bands).is_none());
         let mut rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
         assert!(MapAfterFormula::take(&formula, &mut rgb).is_none());
+        // DEM algorithms (hillshade / slope) also apply color_formula before colormap and emit grey when unmapped.
+        let mut dem = BandRequest::Dem {
+            band_1based: 1,
+            algorithm: cogzilla_kernel::DemAlgorithm::Hillshade { azimuth_deg: 315.0, altitude_deg: 45.0, z_factor: 1.0 },
+            rescale: (0.0, 255.0),
+            colormap: ColormapName::Viridis,
+        };
+        assert!(!one_grey_band(&dem));
+        let dem_after = MapAfterFormula::take(&formula, &mut dem).unwrap();
+        assert!(one_grey_band(&dem));
+        let mut dem_px = [64u8, 64, 64, 255];
+        dem_after.colour(&mut dem_px);
+        assert_eq!(dem_px[..3], ColormapName::Viridis.lut().rgb[usize::from(level)]);
     }
 
     #[test]
