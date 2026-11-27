@@ -11,7 +11,9 @@ use cogzilla_gpu::{
     pack_rgb_lut,
 };
 use cogzilla_kernel::expr_vm::Op;
-use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
+use cogzilla_kernel::png_fast::{
+    encode_filtered_png, encode_indexed_png, filter_sub_ga_row, filter_sub_u8_row,
+};
 use cogzilla_kernel::{
     BandSource, ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram,
     OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr, TerrainEncoding,
@@ -246,13 +248,48 @@ fn build_plte_nodata(rgb: &[[u8; 3]; 256]) -> [u8; 768] {
 fn encode_indexed_u8_png(idx_bytes: &[u8], width: u32, height: u32, rgb: &[[u8; 3]; 256]) -> Bytes {
     let w = width as usize;
     let h = height as usize;
+    let plte = build_plte_nodata(rgb);
+    if rgb.iter().all(|c| c[0] == c[1] && c[1] == c[2]) {
+        // Grayscale LUT: emit PNG L (color_type=0) when opaque or LA (color_type=4) when any
+        // nodata pixel is present, matching CPU/TiTiler's L/LA PNG mode instead of palette `P`.
+        let all_opaque = !idx_bytes.contains(&0);
+        if all_opaque {
+            let mut row_l = vec![0u8; w];
+            let mut filtered = vec![0u8; h * (1 + w)];
+            for py in 0..h {
+                let src_row = &idx_bytes[py * w..(py + 1) * w];
+                for (px, &idx) in src_row.iter().enumerate() {
+                    row_l[px] = plte[idx as usize * 3];
+                }
+                let dst_row = &mut filtered[py * (1 + w)..(py + 1) * (1 + w)];
+                filter_sub_u8_row(&row_l, dst_row);
+            }
+            return encode_filtered_png(width, height, 0, &filtered);
+        }
+        let mut row_ga = vec![0u8; w * 2];
+        let mut filtered = vec![0u8; h * (1 + w * 2)];
+        for py in 0..h {
+            let src_row = &idx_bytes[py * w..(py + 1) * w];
+            for (px, &idx) in src_row.iter().enumerate() {
+                if idx == 0 {
+                    row_ga[px * 2] = 0;
+                    row_ga[px * 2 + 1] = 0;
+                } else {
+                    row_ga[px * 2] = plte[idx as usize * 3];
+                    row_ga[px * 2 + 1] = 255;
+                }
+            }
+            let dst_row = &mut filtered[py * (1 + w * 2)..(py + 1) * (1 + w * 2)];
+            filter_sub_ga_row(&row_ga, dst_row);
+        }
+        return encode_filtered_png(width, height, 4, &filtered);
+    }
     let mut filtered = vec![0u8; h * (1 + w)];
     for py in 0..h {
         let src_row = &idx_bytes[py * w..(py + 1) * w];
         let dst_row = &mut filtered[py * (1 + w)..(py + 1) * (1 + w)];
         filter_sub_u8_row(src_row, dst_row);
     }
-    let plte = build_plte_nodata(rgb);
     let trns = [0u8];
     encode_indexed_png(width, height, &plte, Some(&trns), &filtered)
 }
@@ -4410,5 +4447,26 @@ mod tests {
 
         let huge_grid = BandSource::new(256, 2048, 256, 8, 0, 0, 1, 256, &blocks);
         assert!(source_slab_key(42, 0, 0, &huge_grid).is_none());
+    }
+
+    #[test]
+    fn encode_indexed_u8_png_emits_l_and_la_for_grayscale_lut() {
+        let mut gray = [[0u8; 3]; 256];
+        for (i, c) in gray.iter_mut().enumerate() {
+            *c = [i as u8; 3];
+        }
+        // Opaque grayscale -> PNG color_type 0 (L)
+        let opaque = encode_indexed_u8_png(&[1, 128, 200, 255], 2, 2, &gray);
+        assert_eq!(&opaque[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(opaque[25], 0, "opaque grayscale PNG must use color_type 0 (L)");
+
+        // Masked grayscale -> PNG color_type 4 (LA)
+        let masked = encode_indexed_u8_png(&[0, 128, 200, 255], 2, 2, &gray);
+        assert_eq!(masked[25], 4, "masked grayscale PNG must use color_type 4 (LA)");
+
+        // Colored LUT -> PNG color_type 3 (Indexed P)
+        let viridis = ColormapName::Viridis.lut().rgb;
+        let colored = encode_indexed_u8_png(&[0, 128, 200, 255], 2, 2, &viridis);
+        assert_eq!(colored[25], 3, "colored LUT PNG must use color_type 3 (Indexed P)");
     }
 }
