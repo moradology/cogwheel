@@ -3551,11 +3551,12 @@ mod tests {
             band_metadata: vec![Vec::new(); 3],
             band_descriptions: vec![String::new(); 3],
             color_map: None,
-            ifds: vec![ifd],
+            ifds: vec![ifd].into(),
         };
         let source = cogzilla_io::CogSource::open_local(&tmp_path).unwrap();
         let cog = OpenedCog {
             id: 999_999,
+            source_id: 999_999,
             uri: tmp_path.to_string_lossy().into_owned(),
             index,
             source,

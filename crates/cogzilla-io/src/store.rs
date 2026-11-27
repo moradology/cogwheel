@@ -172,7 +172,11 @@ impl SourceFreshness {
 }
 
 pub struct OpenedCog {
+    /// Identity of these decoded blocks in the block and GPU caches.
     pub id: u64,
+    /// `id` of the opened source the URI cache holds: `id` itself, but a `?nodata=` view's
+    /// parent's, so a source found changed through a view evicts the parent.
+    pub source_id: u64,
     pub uri: String,
     pub index: CogIndex,
     pub source: CogSource,
@@ -568,8 +572,10 @@ impl CogStore {
             CogSource::LocalMmap { mmap } => parse_cog(mmap)?,
             _ => unreachable!(),
         };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cog = Arc::new(OpenedCog {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            id,
+            source_id: id,
             uri: uri.clone(),
             index,
             source,
@@ -600,8 +606,9 @@ impl CogStore {
         const MAX_NODATA_VIEWS: usize = 256;
         let Some(nd) = nodata else { return cog.clone() };
         // NaN is no data whatever the file says, so a NaN override over no nodata is no change.
-        let same = match cog.index.nodata {
-            Some(own) => own.to_bits() == nd.to_bits() || (own.is_nan() && nd.is_nan()),
+        // The file's value is compared at full precision (`nodata` is its f32 rounding).
+        let same = match cog.index.nodata_f64.or(cog.index.nodata.map(f64::from)) {
+            Some(own) => own == f64::from(nd) || (own.is_nan() && nd.is_nan()),
             None => nd.is_nan(),
         };
         if same {
@@ -619,6 +626,7 @@ impl CogStore {
         index.nodata_f64 = Some(f64::from(nd));
         let view = Arc::new(OpenedCog {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            source_id: cog.source_id,
             uri: cog.uri.clone(),
             index,
             source: cog.source.clone(),
@@ -1006,8 +1014,10 @@ impl CogStore {
                     }
                 };
 
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 Ok(Arc::new(OpenedCog {
-                    id: self.next_id.fetch_add(1, Ordering::Relaxed),
+                    id,
+                    source_id: id,
                     uri: uri.to_string(),
                     index,
                     source,
@@ -1757,7 +1767,7 @@ impl CogStore {
                             Ok(resp) => Some((span, resp.bytes)),
                             Err(e) => {
                                 if matches!(e.root(), IoError::SourceChanged { .. }) {
-                                    self.invalidate_uri(&cog.uri, Some(cog.id));
+                                    self.invalidate_uri(&cog.uri, Some(cog.source_id));
                                 }
                                 fetch_err = Some(e);
                                 None
@@ -2244,7 +2254,7 @@ impl CogStore {
 
                     if let Some(e) = fetch_err {
                         if matches!(e.root(), IoError::SourceChanged { .. }) {
-                            self.invalidate_uri(&cog.uri, Some(cog.id));
+                            self.invalidate_uri(&cog.uri, Some(cog.source_id));
                         }
                         let shared = Arc::new(e);
                         // Broadcast the explicit upstream/decode error to all parked waiters for
@@ -2389,7 +2399,7 @@ impl CogStore {
         {
             Ok(resp) => resp.bytes,
             Err(e @ IoError::SourceChanged { .. }) => {
-                self.invalidate_uri(&cog.uri, Some(cog.id));
+                self.invalidate_uri(&cog.uri, Some(cog.source_id));
                 return Err(e);
             }
             Err(e) => return Err(e),

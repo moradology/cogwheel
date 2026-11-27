@@ -8726,7 +8726,7 @@ where
             (Method::GET, ["map"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let (names, cogs, rewritten_expr) =
-                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), None).await?;
+                    resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
                 pq_stac.expr_raw = rewritten_expr;
                 let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs)?;
@@ -10659,7 +10659,7 @@ where
             .await,
             // GET /cog/map (OGC API - Maps)
             (Method::GET, ["map"]) => async {
-                let cogs = open_query_urls(&engine, &pq.urls, None).await?;
+                let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
                 let (native_crs, native_epsg, native_bounds) =
                     dataset_native_crs_and_bounds(&engine, &cogs[0])?;
                 let full = cogs[0].index.full_res();

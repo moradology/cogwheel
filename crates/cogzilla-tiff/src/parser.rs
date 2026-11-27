@@ -1243,7 +1243,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
         band_descriptions,
         color_map,
         geo_keys,
-        ifds,
+        ifds: ifds.into(),
     })
 }
 
