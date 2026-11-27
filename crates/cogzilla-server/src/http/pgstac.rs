@@ -3738,7 +3738,7 @@ async fn part_image_of(
                 continue;
             }
             if pq.unscale {
-                apply_unscale_cogs(&mut bands, &cogs);
+                apply_unscale_cogs(&mut bands, &cogs, None);
             }
             let rgba = render_crs_bbox(
                 engine,
@@ -5452,6 +5452,7 @@ pub(super) fn point_asset_math_reads(pq: &mut ParsedQuery, raw_query: &str) {
     pq.assets = specs.into_iter().map(|s| s.name).collect();
     pq.bidx.clear();
     pq.asset_exprs.clear();
+    pq.forget_asset_entries();
     pq.asset_as_band = false;
 }
 
@@ -5840,7 +5841,7 @@ async fn render_non_mercator_tms_tile(
                 continue;
             }
             if pq.unscale {
-                apply_unscale_cogs(&mut bands, &cogs);
+                apply_unscale_cogs(&mut bands, &cogs, None);
             }
             let rgba = render_crs_bbox(
                 engine,

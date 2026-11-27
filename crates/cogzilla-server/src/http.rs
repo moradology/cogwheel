@@ -1178,17 +1178,21 @@ fn parse_ext_format(
 
 /// Fold GDAL `scale`/`offset` into rescale bounds when `?unscale=true` (zero per-pixel cost!).
 /// Supports both single multi-band COGs and multi-asset STAC/multi-COG composites.
-fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCog>]) {
+/// `slot_bands`: the band each of several `cogs` is read for, when not its first
+/// ([`expand_stac_asset_bidx`]), whose scale and offset are then that band's.
+fn apply_unscale_cogs(bands: &mut BandRequest, cogs: &[Arc<cogzilla_io::OpenedCog>], slot_bands: Option<&[u16]>) {
     if cogs.is_empty() {
         return;
     }
     let adj = |b1: u16, mn: f32, mx: f32| -> (f32, f32) {
         let i = b1.saturating_sub(1) as usize;
         let (sc, off) = if cogs.len() > 1 {
-            let c = &cogs[i.min(cogs.len() - 1)];
+            let slot = i.min(cogs.len() - 1);
+            let c = &cogs[slot];
+            let band = slot_bands.and_then(|s| s.get(slot)).map_or(0, |b| usize::from(b.saturating_sub(1)));
             (
-                c.index.scales.first().copied().unwrap_or(1.0),
-                c.index.offsets.first().copied().unwrap_or(0.0),
+                c.index.scales.get(band).copied().unwrap_or(1.0),
+                c.index.offsets.get(band).copied().unwrap_or(0.0),
             )
         } else {
             (
@@ -2447,7 +2451,7 @@ async fn render_mosaic_tile_pixel_selection(
             };
         }
         if pq.unscale {
-            apply_unscale_cogs(&mut scene_bands, &cogs);
+            apply_unscale_cogs(&mut scene_bands, &cogs, None);
         }
         if first_lut.is_none()
             && !(matches!(method, Selection::Count | Selection::Stdev)
@@ -2760,7 +2764,7 @@ async fn render_mosaic_tile_styled(
                 let cogs = vec![cog];
                 let mut scene_bands = treq.bands.clone();
                 if pq.unscale {
-                    apply_unscale_cogs(&mut scene_bands, &cogs);
+                    apply_unscale_cogs(&mut scene_bands, &cogs, None);
                 }
                 let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
                 let raw = match render_mercator_bbox(
@@ -2889,7 +2893,7 @@ async fn render_mosaic_tile_styled(
             let cogs = vec![cog];
             let mut scene_bands = treq.bands.clone();
             if pq.unscale {
-                apply_unscale_cogs(&mut scene_bands, &cogs);
+                apply_unscale_cogs(&mut scene_bands, &cogs, None);
             }
             let scene_lut = resolve_custom_lut(pq, &cogs[0], &scene_bands)?;
             let resample = resolve_resample(Some(engine), pq, Some(&cogs[0]), 3857);
@@ -2979,13 +2983,6 @@ async fn render_mosaic_tile_styled(
     }
 }
 
-fn stac_asset_expr<'a>(pq: &'a ParsedQuery, asset_name: &str) -> Option<&'a str> {
-    pq.asset_exprs
-        .iter()
-        .find(|(n, _)| n == asset_name)
-        .map(|(_, e)| e.as_str())
-}
-
 /// The band math of the `nth` time (from 0) `asset_name` is asked for, or of the last time.
 fn stac_asset_expr_nth<'a>(pq: &'a ParsedQuery, asset_name: &str, nth: usize) -> Option<&'a str> {
     let mut of_it = pq.asset_exprs.iter().filter(|(n, _)| n == asset_name).map(|(_, e)| e.as_str());
@@ -3044,6 +3041,17 @@ fn compose_over_results(request: &str, results: &[String]) -> Result<String, Eng
     }
 }
 
+/// Whether `expr` names any of `names` (as `{asset}` or `{asset}_b{k}`), even where the name
+/// is spelled as its band would be (an asset named `b2`).
+fn names_in_expression(expr: &str, names: &[String]) -> bool {
+    let found = std::cell::Cell::new(false);
+    let _ = crate::stac::rewrite_stac_expr_to(expr, names, |asset, _, _| {
+        found.set(true);
+        Ok(asset)
+    });
+    found.get()
+}
+
 /// Each of `names`' own band math and own bands: by entry when the query's entries are
 /// `names` (an asset asked for twice keeps what each time asked), else by name. An entry's
 /// own `|bidx=` wins over what `asset_bidx` gives its asset.
@@ -3084,9 +3092,10 @@ fn expand_stac_asset_bidx(
     names: &[String],
     cogs: Vec<Arc<cogzilla_io::OpenedCog>>,
     rewritten: Option<String>,
+    read_names: bool,
 ) -> Result<(Vec<Arc<cogzilla_io::OpenedCog>>, Option<Vec<u16>>), EngineError> {
-    let named = rewritten != pq.expr_raw;
     let original = std::mem::replace(&mut pq.expr_raw, rewritten);
+    let named = read_names && original.as_deref().is_some_and(|expr| names_in_expression(expr, names));
     let options = stac_entry_options(pq, names);
     let mut picked: Vec<Vec<u16>> = Vec::with_capacity(names.len());
     for ((name, cog), (own, sel)) in names.iter().zip(&cogs).zip(&options) {
@@ -3198,7 +3207,7 @@ fn expand_stac_asset_bidx(
         )));
     }
     // Without band math every band read is an output, and an answer holds at most 15.
-    if pq.expr_raw.is_none() && slots > 15 {
+    if pq.expr_raw.is_none() && pq.bidx.is_empty() && slots > 15 {
         return Err(EngineError::BadRequest(format!(
             "{slots} bands over the assets are more than the 15 an answer holds; choose bands with `|bidx=` or `expression`"
         )));
@@ -3404,7 +3413,7 @@ async fn render_mosaic_bbox_composite(
             };
         }
         if pq.unscale {
-            apply_unscale_cogs(&mut bands, &cogs);
+            apply_unscale_cogs(&mut bands, &cogs, None);
         }
         let custom_lut = if matches!(method, Selection::Count | Selection::Stdev)
             && pq.custom_colormap_json.is_none()
@@ -5124,6 +5133,7 @@ where
                         Ok(Some((per_asset, own))) => {
                             pq.bidx = own;
                             pq.asset_bidx = per_asset;
+                            pq.forget_asset_entries();
                         }
                         Ok(None) => {}
                     }
@@ -5147,6 +5157,7 @@ where
                             pq.expr_raw = Some(expression);
                             pq.asset_exprs.clear();
                             pq.asset_bidx.clear();
+                            pq.forget_asset_entries();
                             pq.bidx.clear();
                         }
                         Ok(None) => {}
@@ -6574,7 +6585,7 @@ where
                                 Some(&cogs[0]),
                             )?;
                             if pq.unscale {
-                                apply_unscale_cogs(&mut treq.bands, &cogs);
+                                apply_unscale_cogs(&mut treq.bands, &cogs, None);
                             }
                             let needs_general_path = pq.nodata.is_some()
                                 || pq.custom_colormap_json.is_some()
@@ -6923,6 +6934,7 @@ where
                     resolve_stac_assets(&engine, &item, &pq.assets, None, pq.nodata).await?;
                 let n = names.len();
                 let stats_opts = build_stats_options(&pq, false)?;
+                let entry_opts = stac_entry_options(&pq, &names);
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
@@ -6930,10 +6942,10 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let mut opts_c = stats_opts.clone();
-                    if let Some(expr_str) = stac_asset_expr(&pq, &names[idx]) {
+                    if let Some(expr_str) = entry_opts[idx].0.as_deref() {
                         let prog = ExprProgram::compile(expr_str).map_err(EngineError::BadRequest)?;
                         opts_c.expressions = Some(vec![(expr_str.to_string(), prog)]);
-                    } else if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
+                    } else if let Some(sel) = entry_opts[idx].1.as_deref() {
                         opts_c.bidx = Some(sel.to_vec());
                     }
                     set.spawn(async move {
@@ -7001,7 +7013,7 @@ where
                     let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                     let mut bands = build_band_request(&pq, db, full.sample_type)?;
                     if pq.unscale {
-                        apply_unscale_cogs(&mut bands, &cogs);
+                        apply_unscale_cogs(&mut bands, &cogs, None);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
                     let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
@@ -7130,7 +7142,7 @@ where
                             colormap: ColormapName::Grayscale,
                         };
                         if pq.unscale {
-                            apply_unscale_cogs(&mut bands, &cogs);
+                            apply_unscale_cogs(&mut bands, &cogs, None);
                         }
                         let stat = render_native_preview_stats(
                             &engine,
@@ -7152,6 +7164,7 @@ where
                 }
                 let n = cogs.len();
                 let stats_opts = build_stats_options(&pq, false)?;
+                let entry_opts = stac_entry_options(&pq, &names);
                 let mut set = tokio::task::JoinSet::new();
                 for (idx, cog) in cogs.into_iter().enumerate() {
                     let eng = engine.clone();
@@ -7159,10 +7172,10 @@ where
                     let unscale = pq.unscale;
                     let nodata = pq.nodata;
                     let mut opts_c = stats_opts.clone();
-                    if let Some(expr_str) = stac_asset_expr(&pq, &names[idx]) {
+                    if let Some(expr_str) = entry_opts[idx].0.as_deref() {
                         let prog = ExprProgram::compile(expr_str).map_err(EngineError::BadRequest)?;
                         opts_c.expressions = Some(vec![(expr_str.to_string(), prog)]);
-                    } else if let Some(sel) = stac_asset_selected_bands(&pq, &names[idx]) {
+                    } else if let Some(sel) = entry_opts[idx].1.as_deref() {
                         opts_c.bidx = Some(sel.to_vec());
                     }
                     set.spawn(async move {
@@ -7181,13 +7194,13 @@ where
                 }
                 let mut map = serde_json::Map::new();
                 let mut band_idx = 1usize;
-                for (name, slot) in names.iter().zip(ordered) {
+                for ((name, slot), (own, sel)) in names.iter().zip(ordered).zip(&entry_opts) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
-                        let bands_iter: Vec<usize> = if stac_asset_expr(&pq, name).is_some() {
+                        let bands_iter: Vec<usize> = if own.is_some() {
                             vec![1]
                         } else {
-                            match stac_asset_selected_bands(&pq, name) {
+                            match sel.as_deref() {
                                 Some(sel) => sel.iter().map(|&b| b as usize).collect(),
                                 None if pq.asset_as_band => vec![1],
                                 None if !pq.bidx.is_empty() => {
@@ -7268,7 +7281,6 @@ where
                     let nodata = pq_stac.nodata;
                     let resample = pq_stac.resample;
                     let stats_opts = stats_opts_post.clone();
-                    let asset_bidx_c = pq_stac.asset_bidx.clone();
                     let pq_bidx_c = pq_stac.bidx.clone();
                     let asset_as_band = pq_stac.asset_as_band;
                     let expr_progs_c = post_expr_progs.clone();
@@ -7305,7 +7317,7 @@ where
                                 let (out_w, out_h) = resolve_query_dims(def_w, def_h, width_opt, height_opt);
                                 let n_px = (out_w as usize) * (out_h as usize);
                                 if unscale {
-                                    apply_unscale_cogs(&mut bands, &cogs_c);
+                                    apply_unscale_cogs(&mut bands, &cogs_c, None);
                                 }
                                 let alg_name = alg_c.as_deref().unwrap_or("algorithm");
                                 if matches!(
@@ -7415,7 +7427,7 @@ where
                                     colormap: ColormapName::Grayscale,
                                 };
                                 if unscale {
-                                    apply_unscale_cogs(&mut bands, &cogs_c);
+                                    apply_unscale_cogs(&mut bands, &cogs_c, None);
                                 }
                                 let raw = render_wgs84_bbox(
                                     &eng, &cogs_c, eff_bbox, out_w, out_h, None, &bands,
@@ -7443,18 +7455,17 @@ where
                                 ),
                             );
                         }
+                        let entry_opts = stac_entry_options(&pq_clone, &names_c);
                         let mut set = tokio::task::JoinSet::new();
                         for (idx, cog) in cogs_c.into_iter().enumerate() {
                             let eng_c = eng.clone();
                             let mask_c = mask.clone();
                             let mut opts_c = stats_opts.clone();
-                            if let Some(expr_str) = stac_asset_expr(&pq_clone, &names_c[idx]) {
+                            if let Some(expr_str) = entry_opts[idx].0.as_deref() {
                                 let prog = ExprProgram::compile(expr_str)
                                     .map_err(EngineError::BadRequest)?;
                                 opts_c.expressions = Some(vec![(expr_str.to_string(), prog)]);
-                            } else if let Some((_, sel)) =
-                                asset_bidx_c.iter().find(|(n, _)| n == &names_c[idx])
-                            {
+                            } else if let Some(sel) = entry_opts[idx].1.as_deref() {
                                 opts_c.bidx = Some(sel.to_vec());
                             }
                             let nb = cog.index.full_res().samples_per_pixel as usize;
@@ -7481,15 +7492,15 @@ where
                         // Merge bands in numeric order 1..=nb across assets to match TiTiler's POST /stac/statistics.
                         let mut merged = serde_json::Map::new();
                         let mut b_counter = 1usize;
-                        for (name, slot) in names_c.iter().zip(ordered) {
+                        for ((name, slot), (own, sel)) in names_c.iter().zip(ordered).zip(&entry_opts) {
                             let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
                                 let bands_iter: Vec<usize> =
-                                    if stac_asset_expr(&pq_clone, name).is_some() {
+                                    if own.is_some() {
                                         vec![1]
                                     } else {
-                                        match asset_bidx_c.iter().find(|(n, _)| n == name) {
-                                            Some((_, sel)) => {
+                                        match sel.as_deref() {
+                                            Some(sel) => {
                                                 sel.iter().map(|&b| b as usize).collect()
                                             }
                                             None if asset_as_band => vec![1],
@@ -7686,7 +7697,7 @@ where
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, true)?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let (dst_crs, dst_epsg) = pq_stac
@@ -7729,7 +7740,7 @@ where
                     cogs.len() == 1 && slot_bands.is_none(),
                 );
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -7864,7 +7875,7 @@ where
                             return Err(EngineError::BadRequest("invalid z/x/y tile coord".into()));
                         };
                         let mut pq_stac = pq;
-                        let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                        let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, true)?;
                         let db = if cogs.len() > 1 {
                             cogs.len() as u16
                         } else {
@@ -7890,7 +7901,7 @@ where
                         let item_auto_format =
                             item_route && ext.is_none() && pq_stac.format_param.is_none();
                         if pq_stac.unscale {
-                            apply_unscale_cogs(&mut treq.bands, &cogs);
+                            apply_unscale_cogs(&mut treq.bands, &cogs, slot_bands.as_deref());
                         }
                         if cogs.len() == 1
                             && slot_bands.is_none()
@@ -8129,10 +8140,11 @@ where
                 let single_asset_expr = names.len() == 1 && rewritten_expr.is_some();
                 let single_band_per_asset = (names.len() > 1 && rewritten_expr.is_some()) || pq.asset_as_band;
                 let mut used_asset_bidx = false;
-                for (name, pt) in names.into_iter().zip(ordered) {
+                let entry_opts = stac_entry_options(&pq, &names);
+                for ((name, pt), (own, sel)) in names.into_iter().zip(ordered).zip(entry_opts) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         if !single_asset_expr
-                            && let Some(expr_str) = stac_asset_expr(&pq, &name)
+                            && let Some(expr_str) = own.as_deref()
                         {
                             let parts: Vec<&str> = expr_str
                                 .split(';')
@@ -8165,7 +8177,7 @@ where
                                 all_names.push(format!("{name}_{expr}"));
                             }
                         } else if !single_asset_expr
-                            && let Some(sel) = stac_asset_selected_bands(&pq, &name)
+                            && let Some(sel) = sel.as_deref()
                         {
                             used_asset_bidx = true;
                             let iter_sel = if single_band_per_asset {
@@ -8232,7 +8244,7 @@ where
                 let mut pq_stac = pq;
                 // An item's band math is over `b1..bn`: its asset names are not rewritten.
                 let rewritten_expr = if stac_prefix != "stac" { pq_stac.expr_raw.clone() } else { rewritten_expr };
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, stac_prefix == "stac")?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -8255,7 +8267,7 @@ where
                     )
                 };
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -8320,7 +8332,7 @@ where
                 let mut pq_stac = pq;
                 // An item's band math is over `b1..bn`: its asset names are not rewritten.
                 let rewritten_expr = if stac_prefix != "stac" { pq_stac.expr_raw.clone() } else { rewritten_expr };
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, stac_prefix == "stac")?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
                 let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
@@ -8339,7 +8351,7 @@ where
                     cogs.len() == 1 && slot_bands.is_none(),
                 );
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -8402,7 +8414,7 @@ where
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, true)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let (fmt, ct) = parse_ext_format(
                     ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png"),
@@ -8425,7 +8437,7 @@ where
                     )
                 };
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -8497,7 +8509,7 @@ where
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, true)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -8513,7 +8525,7 @@ where
                     cogs.len() == 1 && slot_bands.is_none(),
                 );
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -8580,7 +8592,7 @@ where
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, true)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -8596,7 +8608,7 @@ where
                     cogs.len() == 1 && slot_bands.is_none(),
                 );
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -8639,7 +8651,7 @@ where
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref(), pq.nodata).await?;
                 let mut pq_stac = pq;
-                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr)?;
+                let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, true)?;
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(cogs[0].index.full_res()) };
                 let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -8659,7 +8671,7 @@ where
                     )
                 };
                 if pq_stac.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, slot_bands.as_deref());
                 }
                 let custom_lut = resolve_custom_lut(&pq_stac, &cogs[0], &bands)?;
                 let cf = pq_stac.parse_color_formula()?;
@@ -8890,7 +8902,7 @@ where
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
                     let mut bands = build_band_request(&pq, db, full.sample_type)?;
                     if pq.unscale {
-                        apply_unscale_cogs(&mut bands, &cogs);
+                        apply_unscale_cogs(&mut bands, &cogs, None);
                     }
                     let stats_opts = build_stats_options(&pq, false)?;
                     let alg_name = pq.algorithm.as_deref().unwrap_or("algorithm");
@@ -9189,7 +9201,7 @@ where
                             true,
                         )?;
                         if pq.unscale {
-                            apply_unscale_cogs(&mut treq.bands, &cogs);
+                            apply_unscale_cogs(&mut treq.bands, &cogs, None);
                         }
                         if cogs.len() == 1
                             && matches!(treq.format, OutputFormat::RawF32 | OutputFormat::Npy)
@@ -9721,7 +9733,7 @@ where
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;
@@ -9879,7 +9891,7 @@ where
                     render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;
@@ -9977,7 +9989,7 @@ where
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;
@@ -10066,7 +10078,7 @@ where
                     render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;
@@ -10143,7 +10155,7 @@ where
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;
@@ -10222,7 +10234,7 @@ where
                     render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;
@@ -10277,7 +10289,7 @@ where
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
                 let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
-                    apply_unscale_cogs(&mut bands, &cogs);
+                    apply_unscale_cogs(&mut bands, &cogs, None);
                 }
                 let custom_lut = resolve_custom_lut(&pq, &cogs[0], &bands)?;
                 let cf = pq.parse_color_formula()?;

@@ -6652,7 +6652,7 @@ async fn stac_stacks_every_band_of_several_assets() {
         "type": "Feature", "stac_version": "1.0.0", "id": "two", "bbox": bounds,
         "geometry": {"type": "Polygon", "coordinates": [[[10.0, 40.0], [10.64, 40.0], [10.64, 40.64], [10.0, 40.64], [10.0, 40.0]]]},
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
-        "assets": {"a": asset(&a), "b": asset(&b)},
+        "assets": {"a": asset(&a), "b": asset(&b), "b2": asset(&b)},
     });
     let item_path = tmp.join("item.json");
     std::fs::write(&item_path, item.to_string()).unwrap();
@@ -6686,6 +6686,8 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a&assets=b&expression=b_b1-a_b1").await, [8.0]);
     // ... and `bN` beside it is still the Nth band of the stack.
     assert_eq!(pixel("&assets=a&assets=b&expression=b_b1%2Bb2").await, [16.0]);
+    // An asset named as a band would be is read as the asset, as before stacking.
+    assert_eq!(pixel("&assets=a&assets=b2&expression=b2").await, [11.0]);
     // An asset asked for twice keeps what each time asked.
     assert_eq!(pixel("&assets=a&assets=a%7Cexpression%3Db1*2").await, [3.0, 5.0, 6.0]);
     assert_eq!(pixel("&assets=a%7Cexpression%3Db1*2&assets=a").await, [6.0, 3.0, 5.0]);
@@ -6697,6 +6699,7 @@ async fn stac_stacks_every_band_of_several_assets() {
     let too_many = client.get(format!("{base}/stac/preview.npy?url={url}{sixteen}")).send().await.unwrap();
     assert_eq!(too_many.status().as_u16(), 400, "sixteen bands with no band math");
     assert_eq!(pixel(&format!("{sixteen}&expression=b1%2Bb16")).await, [8.0]);
+    assert_eq!(pixel(&format!("{sixteen}&bidx=16")).await, [5.0]);
     // Under `asset_as_band` each asset gives one band, however it is chosen.
     assert_eq!(pixel("&assets=a%7Cbidx%3D1&assets=b%7Cexpression%3Db2&asset_as_band=true").await, [3.0, 13.0]);
     for q in ["&assets=a&assets=b", "&assets=a%7Cexpression%3Db1;b2&assets=b%7Cbidx%3D1", "&assets=a%7Cbidx%3D1,2&assets=b%7Cbidx%3D1", "&assets=a"] {

@@ -125,6 +125,15 @@ pub(super) struct ParsedQuery {
 }
 
 impl ParsedQuery {
+    /// Drop the entry-by-entry record of the assets, for a caller that has replaced the
+    /// assets' options by name: their readers then read those (`stac_entry_options`).
+    pub(super) fn forget_asset_entries(&mut self) {
+        self.asset_entries.clear();
+        self.asset_bidx_by_name.clear();
+    }
+}
+
+impl ParsedQuery {
     pub(super) fn parse_color_formula(&self) -> Result<Option<ColorFormula>, EngineError> {
         self.color_formula
             .as_deref()
