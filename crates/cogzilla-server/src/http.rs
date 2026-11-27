@@ -837,8 +837,7 @@ fn fold_asset_math_for_typing(pq: &ParsedQuery) -> Option<ParsedQuery> {
         return None;
     }
     let names: Vec<String> = pq.assets.iter().map(|a| a.split('|').next().unwrap_or(a).to_string()).collect();
-    let own: Vec<Option<String>> =
-        names.iter().zip(occurrences(&names)).map(|(name, nth)| stac_asset_expr_nth(pq, name, nth).map(str::to_string)).collect();
+    let own: Vec<Option<String>> = stac_entry_options(pq, &names).into_iter().map(|(own, _)| own).collect();
     let mut folded = pq.clone();
     // The array is typed as numpy types it: each asset's band math over its own raster, the
     // results stacked, then the request expression, if any, over them.
@@ -3045,13 +3044,38 @@ fn compose_over_results(request: &str, results: &[String]) -> Result<String, Eng
     }
 }
 
+/// Each of `names`' own band math and own bands: by entry when the query's entries are
+/// `names` (an asset asked for twice keeps what each time asked), else by name. An entry's
+/// own `|bidx=` wins over what `asset_bidx` gives its asset.
+fn stac_entry_options(pq: &ParsedQuery, names: &[String]) -> Vec<(Option<String>, Option<Vec<u16>>)> {
+    let by_entry = pq.asset_entries.len() == names.len() && pq.asset_entries.iter().zip(names).all(|(e, n)| &e.name == n);
+    if by_entry {
+        return pq
+            .asset_entries
+            .iter()
+            .map(|e| {
+                let named = || pq.asset_bidx_by_name.iter().find(|(n, _)| n == &e.name).map(|(_, b)| b.clone());
+                (e.expression.clone(), e.bands.clone().or_else(named))
+            })
+            .collect();
+    }
+    let nth = occurrences(names);
+    names
+        .iter()
+        .zip(nth)
+        .map(|(name, nth)| {
+            (stac_asset_expr_nth(pq, name, nth).map(str::to_string), stac_asset_selected_bands(pq, name).map(<[u16]>::to_vec))
+        })
+        .collect()
+}
+
 /// The bands of a `/stac` request's assets as the renderer reads them, and its expression over
 /// them, as rio-tiler stacks a STAC item: of several assets, every band of each (or those its
-/// `|bidx=` picks, or its first under `asset_as_band`), one after another, so that `bN` is the
-/// Nth band of the stack; an asset's own band math (`|expression=`) is over all of its own
-/// bands, at its place in the stack, and a request `expression` is then over the results.
-/// Asset names in the request expression (`rewritten`, where `resolve_stac_assets` made them
-/// `b{asset}`) stay the first band of that asset.
+/// `|bidx=` picks), one after another, so that `bN` is the Nth band of the stack; an asset's
+/// own band math (`|expression=`) is over all of its own bands, at its place in the stack, and
+/// a request `expression` is then over the results. Asset names in the request expression
+/// stand for the asset's first band in the stack (`{asset}_b{k}` for its band `k`), and `bN`
+/// for the Nth band of the stack. Under `asset_as_band` each asset must give one band.
 ///
 /// Returns the rasters to read, one per band read when that is not one band per asset,
 /// with the band each is read for.
@@ -3062,49 +3086,47 @@ fn expand_stac_asset_bidx(
     rewritten: Option<String>,
 ) -> Result<(Vec<Arc<cogzilla_io::OpenedCog>>, Option<Vec<u16>>), EngineError> {
     let named = rewritten != pq.expr_raw;
-    pq.expr_raw = rewritten;
+    let original = std::mem::replace(&mut pq.expr_raw, rewritten);
+    let options = stac_entry_options(pq, names);
+    let mut picked: Vec<Vec<u16>> = Vec::with_capacity(names.len());
+    for ((name, cog), (own, sel)) in names.iter().zip(&cogs).zip(&options) {
+        let nb = data_band_count(cog.index.full_res());
+        // An asset's band math is over all of its bands, and wins over its `bidx`.
+        let bands: Vec<u16> = match (own, sel) {
+            (Some(_), _) | (None, None) => (1..=nb).collect(),
+            (None, Some(sel)) => {
+                if let Some(&b) = sel.iter().find(|&&b| b == 0 || b > nb) {
+                    return Err(EngineError::BadRequest(format!(
+                        "band {b} out of range for asset '{name}' (dataset has {nb} bands)"
+                    )));
+                }
+                sel.clone()
+            }
+        };
+        let gives = own.as_deref().map_or(bands.len(), |own| expression_parts(own).count());
+        if pq.asset_as_band && gives != 1 {
+            return Err(EngineError::BadRequest(format!(
+                "Can't use `asset_as_band` for multibands asset ('{name}' gives {gives} bands)"
+            )));
+        }
+        picked.push(bands);
+    }
     if names.len() == 1 {
-        if let Some(own) = stac_asset_expr(pq, &names[0]).map(str::to_string) {
-            // An asset's band math is over all of its bands, and wins over its `bidx`.
-            let results: Vec<String> = expression_parts(&own).map(str::to_string).collect();
-            pq.expr_raw = Some(match pq.expr_raw.take() {
-                None => own,
-                Some(request) => compose_over_results(&request, &results)?,
-            });
-            pq.asset_exprs.clear();
-            pq.asset_bidx.clear();
-            pq.bidx.clear();
-        } else if pq.bidx.is_empty()
-            && let Some((_, bands)) = pq.asset_bidx.iter().find(|(n, _)| n == &names[0])
-        {
-            pq.bidx = bands.clone();
+        match &options[0] {
+            (Some(own), _) => {
+                let results: Vec<String> = expression_parts(own).map(str::to_string).collect();
+                pq.expr_raw = Some(match pq.expr_raw.take() {
+                    None => own.clone(),
+                    Some(request) => compose_over_results(&request, &results)?,
+                });
+                pq.asset_exprs.clear();
+                pq.asset_bidx.clear();
+                pq.bidx.clear();
+            }
+            (None, Some(sel)) if pq.bidx.is_empty() => pq.bidx = sel.clone(),
+            _ => {}
         }
         return Ok((cogs, None));
-    }
-    let nth = occurrences(names);
-    let mut picked: Vec<Vec<u16>> = Vec::with_capacity(names.len());
-    for (name, cog) in names.iter().zip(&cogs) {
-        let nb = data_band_count(cog.index.full_res());
-        let bands: Vec<u16> = if stac_asset_expr(pq, name).is_some() {
-            (1..=nb).collect()
-        } else if let Some(sel) = stac_asset_selected_bands(pq, name) {
-            if let Some(&b) = sel.iter().find(|&&b| b == 0 || b > nb) {
-                return Err(EngineError::BadRequest(format!(
-                    "band {b} out of range for asset '{name}' (dataset has {nb} bands)"
-                )));
-            }
-            sel.to_vec()
-        } else if pq.asset_as_band {
-            if nb > 1 {
-                return Err(EngineError::BadRequest(format!(
-                    "Can't use `asset_as_band` for multibands asset ('{name}' has {nb} bands)"
-                )));
-            }
-            vec![1]
-        } else {
-            (1..=nb).collect()
-        };
-        picked.push(bands);
     }
     let offsets: Vec<usize> = picked
         .iter()
@@ -3114,7 +3136,7 @@ fn expand_stac_asset_bidx(
             Some(first)
         })
         .collect();
-    if names.iter().any(|n| stac_asset_expr(pq, n).is_some()) {
+    if options.iter().any(|(own, _)| own.is_some()) {
         if named {
             return Err(EngineError::BadRequest(
                 "an expression over the results of the assets' own band math takes b1..bn, not asset names".into(),
@@ -3123,7 +3145,7 @@ fn expand_stac_asset_bidx(
         let mut results: Vec<String> = Vec::new();
         for (i, name) in names.iter().enumerate() {
             let count = picked[i].len();
-            match stac_asset_expr_nth(pq, name, nth[i]) {
+            match &options[i].0 {
                 Some(own) => {
                     for part in expression_parts(own) {
                         let mut beyond = None;
@@ -3152,9 +3174,19 @@ fn expand_stac_asset_bidx(
         });
         pq.asset_exprs.clear();
         pq.bidx.clear();
-    } else if named && let Some(expr) = pq.expr_raw.take() {
-        // An asset's name is its first band.
-        pq.expr_raw = Some(substitute_band_tokens(&expr, |p| offsets.get(p.wrapping_sub(1)).map(|o| format!("b{}", o + 1))));
+    } else if named && let Some(expr) = original {
+        // An asset's name is its first band in the stack, `{asset}_b{k}` its band `k`; `bN`
+        // stays the Nth band of the stack.
+        pq.expr_raw = Some(crate::stac::rewrite_stac_expr_to(&expr, names, |asset, name, band| {
+            let at = asset - 1;
+            let place = match band {
+                None => Some(0),
+                Some(k) => picked[at].iter().position(|&b| usize::from(b) == k),
+            };
+            place.map(|p| offsets[at] + p + 1).ok_or_else(|| {
+                EngineError::BadRequest(format!("band {} of asset '{name}' is not read", band.unwrap_or(0)))
+            })
+        })?);
     }
     if picked.iter().all(|bands| bands.as_slice() == [1]) {
         return Ok((cogs, None));
@@ -5115,13 +5147,12 @@ where
                     }
                     // Each asset's band math on a point is applied by `pgstac::item_fixup` to
                     // every band of the asset, named as such; `asset_as_band` names them there.
-                    // A preview's stack of assets with band math of their own is planned over
-                    // the `assets=` entries, not where `asset_bidx` puts its assets.
-                    if pgstac::item_preview_route(rest)
-                        && !pq.asset_exprs.is_empty()
-                        && let Some(names) = pgstac::asset_entry_names(&raw_query)
-                    {
-                        pq.assets = names;
+                    // A preview's stack is planned over the `assets=` entries, each with its own
+                    // band math and bands (`expand_stac_asset_bidx`).
+                    // titiler-pgstac reads the listed assets only, not one `asset_bidx` adds.
+                    if pgstac::item_preview_route(rest) && pq.asset_entries.iter().any(|e| e.listed) {
+                        pq.asset_entries.retain(|e| e.listed);
+                        pq.assets = pq.asset_entries.iter().map(|e| e.name.clone()).collect();
                     }
                     if matches!(rest, ["point", _]) && has_asset_math {
                         pgstac::point_asset_math_reads(&mut pq, &raw_query);

@@ -1904,8 +1904,8 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// the wrong bands for several; here each asset keeps its own. Band math on one asset is
 /// not something those handlers do. A tile or a box with it never gets here: the search
 /// routes draw those (`item_picture_by_asset`). A point reads every band of such an asset
-/// and works it out afterwards (`item_fixup`); a preview is stacked with it as rio-tiler
-/// stacks an item (`expand_stac_asset_bidx`); the statistics read it as one
+/// and works it out afterwards (`item_fixup`); a preview is not planned here, but stacked
+/// entry by entry as rio-tiler stacks an item (`expand_stac_asset_bidx`); the statistics read it as one
 /// expression over the stacked bands (`item_asset_math`). On what is left, an image over a
 /// posted shape or the info, it is refused, not left out.
 ///
@@ -1913,6 +1913,10 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 /// options. Only the info, statistics and point handlers read bands asset by asset; on
 /// the others several assets with bands of their own are refused too.
 pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
+    // A preview reads each entry's own options as the shared parser records them.
+    if item_preview_route(rest) {
+        return Ok(None);
+    }
     let pairs = query_pairs(raw_query);
     let mut specs = parse_assets(&pairs)?;
     // Bands chosen on an asset with band math, which the shared parser has kept: dropped
@@ -1922,7 +1926,7 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
         if item_asset_math_route(rest) {
             return Ok(None);
         }
-        if !matches!(rest, ["point", _]) && !item_preview_route(rest) {
+        if !matches!(rest, ["point", _]) {
             return Err(detail(
                 StatusCode::BAD_REQUEST,
                 format!("assets={}|expression= is not supported on this item route yet; use `expression`", spec.name),
@@ -1936,7 +1940,7 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
     if !dropped && specs.iter().all(|s| s.indexes.is_none()) {
         return Ok(None);
     }
-    let by_asset = matches!(rest, ["info" | "info.geojson" | "statistics" | "asset_statistics"] | ["point", _]) || item_preview_route(rest);
+    let by_asset = matches!(rest, ["info" | "info.geojson" | "statistics" | "asset_statistics"] | ["point", _]);
     if specs.len() > 1 && !by_asset {
         return Err(detail(
             StatusCode::BAD_REQUEST,

@@ -409,6 +409,25 @@ pub async fn resolve_stac_assets(
 /// `b1`, `b2`, ... (handles TiTiler's default `{asset}_b{i}` syntax, bare `{asset}` when
 /// `asset_as_band=true`, unspaced subtraction `nir-red`, and hyphenated names `SR-B5-SR-B4`).
 pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, EngineError> {
+    let single_asset = names.len() == 1;
+    rewrite_stac_expr_to(expr, names, |asset_1based, name, band_k| match band_k {
+        None => Ok(asset_1based),
+        Some(k) if single_asset => Ok(k),
+        Some(1) => Ok(asset_1based),
+        Some(k) => Err(EngineError::BadRequest(format!(
+            "multi-asset STAC expression '{name}_b{k}' with band != 1 is not supported; use band 1 ({name}_b1) or a single multi-band asset"
+        ))),
+    })
+}
+
+/// [`rewrite_stac_expr`] with the band each name stands for given by `target`: from the
+/// asset's place among `names` (from one), its name, and the `k` of `{asset}_b{k}` (`None`
+/// for the bare name). Every other token, `bN` among them, is left as it is.
+pub(crate) fn rewrite_stac_expr_to(
+    expr: &str,
+    names: &[String],
+    target: impl Fn(usize, &str, Option<usize>) -> Result<usize, EngineError>,
+) -> Result<String, EngineError> {
     let mut ordered: Vec<(usize, &str)> = names
         .iter()
         .enumerate()
@@ -416,7 +435,6 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
         .collect();
     ordered.sort_by_key(|&(_, s)| std::cmp::Reverse(s.len()));
 
-    let single_asset = names.len() == 1;
     let bytes = expr.as_bytes();
     let mut out = String::with_capacity(expr.len());
     let mut i = 0;
@@ -434,7 +452,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
                         .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
             }) {
                 out.push('b');
-                out.push_str(&band_1based.to_string());
+                out.push_str(&target(band_1based, matched, None)?.to_string());
                 i += matched.len();
                 continue;
             }
@@ -456,12 +474,7 @@ pub(crate) fn rewrite_stac_expr(expr: &str, names: &[String]) -> Result<String, 
                             .get(j)
                             .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
                         && let Ok(band_k) = expr[after + 2..j].parse::<usize>() {
-                            if !single_asset && band_k != 1 {
-                                return Err(EngineError::BadRequest(format!(
-                                    "multi-asset STAC expression '{name}_b{band_k}' with band != 1 is not supported; use band 1 ({name}_b1) or a single multi-band asset"
-                                )));
-                            }
-                            let target_band = if single_asset { band_k } else { asset_1based };
+                            let target_band = target(asset_1based, name, Some(band_k))?;
                             matched_band_suffix = Some((target_band, j - i));
                             break;
                         }

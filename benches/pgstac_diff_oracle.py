@@ -1492,6 +1492,10 @@ def main() -> int:
         o.check("item preview, bands chosen on one of two assets", "image", f"{it}/preview.npy?assets=visual%7Cbidx=3,1&assets=red&max_size=64")
         o.check("item preview, an asset asked for twice", "image",
                 f"{it}/preview.npy?assets=red%7Cexpression=b1*2&assets=red%7Cexpression=b1*3&max_size=64")
+        o.check("item preview, an asset asked for twice, with band math once", "image",
+                f"{it}/preview.npy?assets=red&assets=red%7Cexpression=b1*2&max_size=64")
+        o.check("item preview, an asset asked for twice, a band each time", "image",
+                f"{it}/preview.npy?assets=visual%7Cbidx=1&assets=visual%7Cbidx=2&max_size=64")
         o.check("item point, band math on each of two assets", "json",
                 f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual%7Cexpression=b1%2Bb2;b3&assets=red%7Cexpression=b1*2&expression=b1/b3")
         o.check("item statistics, band math on one asset's own bands", "stats", f"{it}/statistics?assets=visual%7Cexpression=b1%2Bb2;b3&max_size=64")

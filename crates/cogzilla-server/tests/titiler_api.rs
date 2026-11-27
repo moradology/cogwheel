@@ -6683,7 +6683,19 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await, [104.0]);
     // An asset's name in the request expression is its first band.
     assert_eq!(pixel("&assets=a&assets=b&expression=b_b1-a_b1").await, [8.0]);
-    let refused = client.get(format!("{base}/stac/preview.npy?url={url}&assets=a&assets=b&asset_as_band=true")).send().await.unwrap();
-    assert_eq!(refused.status().as_u16(), 400, "asset_as_band over assets of two bands");
+    // ... and `bN` beside it is still the Nth band of the stack.
+    assert_eq!(pixel("&assets=a&assets=b&expression=b_b1%2Bb2").await, [16.0]);
+    // An asset asked for twice keeps what each time asked.
+    assert_eq!(pixel("&assets=a&assets=a%7Cexpression%3Db1*2").await, [3.0, 5.0, 6.0]);
+    assert_eq!(pixel("&assets=a%7Cexpression%3Db1*2&assets=a").await, [6.0, 3.0, 5.0]);
+    assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=a%7Cbidx%3D1").await, [5.0, 3.0]);
+    // `asset_bidx` for one asset beside another's own `|bidx=`.
+    assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b&asset_bidx=b%7C2").await, [5.0, 13.0]);
+    // Under `asset_as_band` each asset gives one band, however it is chosen.
+    assert_eq!(pixel("&assets=a%7Cbidx%3D1&assets=b%7Cexpression%3Db2&asset_as_band=true").await, [3.0, 13.0]);
+    for q in ["&assets=a&assets=b", "&assets=a%7Cexpression%3Db1;b2&assets=b%7Cbidx%3D1", "&assets=a%7Cbidx%3D1,2&assets=b%7Cbidx%3D1", "&assets=a"] {
+        let refused = client.get(format!("{base}/stac/preview.npy?url={url}{q}&asset_as_band=true")).send().await.unwrap();
+        assert_eq!(refused.status().as_u16(), 400, "asset_as_band over an asset of two bands: {q}");
+    }
     let _ = std::fs::remove_dir_all(&tmp);
 }
