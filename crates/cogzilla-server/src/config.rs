@@ -189,13 +189,41 @@ impl Config {
             DEFAULT_CACHE_CONTROL_MAX_AGE_SECS,
             &mut warnings,
         );
-        // Optional per-family override for `/zarr/*`, falling back to `COGZILLA_CACHE_CONTROL_MAX_AGE`.
-        let zarr_cache_control_max_age_secs = parse_u64(
-            get,
-            ZARR_CACHE_CONTROL_MAX_AGE_ENV,
-            cache_control_max_age_secs,
-            &mut warnings,
-        );
+        // Optional per-family override for `/zarr/*`, falling back to deprecated
+        // `COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE` (with a warning) and then `COGZILLA_CACHE_CONTROL_MAX_AGE`.
+        const LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV: &str = "COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE";
+        let has_new_zarr = get(ZARR_CACHE_CONTROL_MAX_AGE_ENV).is_some_and(|v| !v.trim().is_empty());
+        let has_legacy_zarr = get(LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV).is_some_and(|v| !v.trim().is_empty());
+        let zarr_cache_control_max_age_secs = if has_new_zarr {
+            if has_legacy_zarr {
+                warnings.push(ConfigWarning {
+                    var: LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV,
+                    raw: get(LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV).unwrap_or_default(),
+                    reason: "deprecated; ignored because COGZILLA_CACHE_CONTROL_MAX_AGE_ZARR is set".to_string(),
+                });
+            }
+            parse_u64(
+                get,
+                ZARR_CACHE_CONTROL_MAX_AGE_ENV,
+                cache_control_max_age_secs,
+                &mut warnings,
+            )
+        } else if has_legacy_zarr {
+            let val = parse_u64(
+                get,
+                LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV,
+                cache_control_max_age_secs,
+                &mut warnings,
+            );
+            warnings.push(ConfigWarning {
+                var: LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV,
+                raw: get(LEGACY_ZARR_CACHE_CONTROL_MAX_AGE_ENV).unwrap_or_default(),
+                reason: format!("deprecated; migrate to COGZILLA_CACHE_CONTROL_MAX_AGE_ZARR (using {val})"),
+            });
+            val
+        } else {
+            cache_control_max_age_secs
+        };
         let max_statistics_features = parse_usize(
             get,
             MAX_STATISTICS_FEATURES_ENV,
@@ -229,7 +257,8 @@ impl Config {
             AIMD_MAX_LIMIT_ENV,
             DEFAULT_AIMD_MAX_LIMIT,
             &mut warnings,
-        );
+        )
+        .max(aimd_min_limit.unwrap_or(1));
 
         let cfg = Self {
             cache_control_max_age_secs,
@@ -421,6 +450,18 @@ mod tests {
         assert!(!files.is_empty());
 
         let mut readers: HashMap<String, Vec<String>> = HashMap::new();
+        // Seed every variable owned by `Config::from_lookup` (declared via `pub const *_ENV`
+        // rather than inline `env::var("COGZILLA_...")`) so duplicates elsewhere are caught.
+        for (var, _) in Config::from_lookup(&|_| None).0.effective_entries() {
+            readers
+                .entry(var.to_string())
+                .or_default()
+                .push("cogzilla-server/src/config.rs".to_string());
+        }
+        readers
+            .entry("COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE".to_string())
+            .or_default()
+            .push("cogzilla-server/src/config.rs".to_string());
         for file in files {
             let content = std::fs::read_to_string(&file).unwrap();
             // Stop before `#[cfg(test)]` modules so test fixtures don't count as production readers.
@@ -466,5 +507,20 @@ mod tests {
             "duplicate COGZILLA_* env var readers found:\n{}",
             duplicates.join("\n")
         );
+    }
+
+    #[test]
+    fn legacy_zarr_cache_control_var_falls_back_with_warning_and_aimd_max_clamps() {
+        let (cfg, warnings) = Config::from_lookup(&|k| match k {
+            "COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE" => Some("60".to_string()),
+            "COGZILLA_AIMD_MIN_LIMIT" => Some("100".to_string()),
+            "COGZILLA_AIMD_MAX_LIMIT" => Some("50".to_string()),
+            _ => None,
+        });
+        assert_eq!(cfg.zarr_cache_control_max_age_secs, 60);
+        assert_eq!(cfg.zarr_cache_control.to_str().unwrap(), "public, max-age=60");
+        assert!(warnings.iter().any(|w| w.var == "COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE"));
+        assert_eq!(cfg.aimd_min_limit, Some(100));
+        assert_eq!(cfg.aimd_max_limit, 100);
     }
 }
