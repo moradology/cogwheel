@@ -6242,6 +6242,9 @@ where
                         Err(message) => return Ok(pgstac::bad_request(message)),
                         Ok(Some((expression, _))) => {
                             item_asset_math = true;
+                            if let Some(names) = pgstac::asset_entry_names(&raw_query) {
+                                pq.assets = names;
+                            }
                             pq.expr_raw = Some(expression);
                             pq.asset_exprs.clear();
                             pq.asset_bidx.clear();

@@ -1971,6 +1971,13 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
     Ok(Some((specs.into_iter().filter_map(|s| s.indexes.map(|i| (s.name, i))).collect(), own)))
 }
 
+/// The assets of an item request's `assets=` entries, in order and as often as each is asked
+/// for: what is read when the assets carry band math of their own, which is planned over
+/// those entries, and not over what `asset_bidx` adds or where it puts it.
+pub(super) fn asset_entry_names(raw_query: &str) -> Option<Vec<String>> {
+    parse_assets(&query_pairs(raw_query)).ok().map(|specs| specs.into_iter().map(|s| s.name).collect())
+}
+
 /// Whether an `assets` option may be band math (`red|expression=b1*2`): a look at the
 /// decoded values that spares the requests without it a parse of their assets.
 fn asset_math_asked(pairs: &[(String, String)]) -> bool {
@@ -5228,7 +5235,7 @@ pub(super) fn point_asset_math_reads(pq: &mut ParsedQuery, raw_query: &str) {
     // Every asset is read whole; each entry's choice of bands is applied afterwards, so that
     // an asset asked for twice is read for each time as asked.
     pq.asset_bidx.clear();
-    pq.assets.retain(|a| specs.iter().any(|s| s.name == a.split('|').next().unwrap_or(a)));
+    pq.assets = specs.into_iter().map(|s| s.name).collect();
     pq.bidx.clear();
     pq.asset_exprs.clear();
     pq.asset_as_band = false;
