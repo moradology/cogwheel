@@ -161,8 +161,75 @@ pub struct TileEngine {
     pub tile_cache: Arc<TileCache>,
     tile_cache_epoch: AtomicU64,
     pub stats: Arc<EngineStats>,
+    pub aimd: crate::aimd::AimdLimiter,
     #[cfg(feature = "gpu")]
     pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
+}
+
+/// Run CPU RGB tile rendering, offloading heavy non-Nearest renders (`N >= 256`) onto Tokio's
+/// blocking pool so Tokio's async I/O worker threads stay free to serve `/healthz`, `/metrics`,
+/// and AIMD `429 Too Many Requests` load shedding under CPU-only overload.
+async fn render_rgb_cpu_maybe_blocking<const N: usize>(
+    tiles: Vec<Option<Arc<cogzilla_codec::DecodedTile>>>,
+    is_planar: bool,
+    b0: [u16; 3],
+    ifd_dims: (u32, u32, u32, u32),
+    grid: (u32, u32, u32, u32, usize),
+    scale_offsets: [(f32, f32); 3],
+    plan: CoordPlan<N>,
+    style: RgbStyle,
+) -> Bytes {
+    let run = move || {
+        let (w, h, tw, th) = ifd_dims;
+        let (tx0, ty0, grid_w, grid_h, grid_len) = grid;
+        let (r_refs, g_refs, b_refs): (Vec<_>, Vec<_>, Vec<_>) = if is_planar {
+            (
+                tiles[0..grid_len]
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                    .collect(),
+                tiles[grid_len..2 * grid_len]
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                    .collect(),
+                tiles[2 * grid_len..3 * grid_len]
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.first()))
+                    .collect(),
+            )
+        } else {
+            (
+                tiles
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[0] as usize)))
+                    .collect(),
+                tiles
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[1] as usize)))
+                    .collect(),
+                tiles
+                    .iter()
+                    .map(|o| o.as_ref().and_then(|t| t.bands.get(b0[2] as usize)))
+                    .collect(),
+            )
+        };
+        let srcs = [
+            BandSource::new(w, h, tw, th, tx0, ty0, grid_w, grid_h, &r_refs)
+                .with_scale_offset(scale_offsets[0].0, scale_offsets[0].1),
+            BandSource::new(w, h, tw, th, tx0, ty0, grid_w, grid_h, &g_refs)
+                .with_scale_offset(scale_offsets[1].0, scale_offsets[1].1),
+            BandSource::new(w, h, tw, th, tx0, ty0, grid_w, grid_h, &b_refs)
+                .with_scale_offset(scale_offsets[2].0, scale_offsets[2].1),
+        ];
+        render_rgb_bands::<N>(&plan, &srcs, &style)
+    };
+    if N >= 256 && !matches!(style.resample, ResampleMode::Nearest) {
+        tokio::task::spawn_blocking(run)
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+    } else {
+        run()
+    }
 }
 
 fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
@@ -297,6 +364,13 @@ impl TileEngine {
     }
 
     pub fn with_store_and_tile_cache(store: Arc<CogStore>, tile_cache_max_bytes: usize) -> Self {
+        #[cfg(feature = "gpu")]
+        let gpu = crate::gpu_backend::GpuBackend::try_init(256 * 1024 * 1024);
+        #[cfg(feature = "gpu")]
+        let has_gpu = gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let has_gpu = false;
+
         Self {
             store,
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
@@ -307,9 +381,16 @@ impl TileEngine {
             tile_cache: Arc::new(TileCache::new(tile_cache_max_bytes)),
             tile_cache_epoch: AtomicU64::new(0),
             stats: Arc::new(EngineStats::default()),
+            aimd: crate::aimd::AimdLimiter::from_env(has_gpu),
             #[cfg(feature = "gpu")]
-            gpu: crate::gpu_backend::GpuBackend::try_init(256 * 1024 * 1024),
+            gpu,
         }
+    }
+
+    /// Replace the engine's AIMD concurrency limiter (useful for tests and custom deployments).
+    pub fn with_aimd(mut self, aimd: crate::aimd::AimdLimiter) -> Self {
+        self.aimd = aimd;
+        self
     }
 
     /// Flush the rendered tile cache if any underlying source was invalidated or replaced.
@@ -1288,7 +1369,19 @@ impl TileEngine {
                                 return Ok(bytes);
                             }
                         }
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                        drop(srcs);
+                        drop((r_refs, g_refs, b_refs));
+                        Ok(render_rgb_cpu_maybe_blocking::<N>(
+                            tiles,
+                            false,
+                            b0,
+                            (ifd.width, ifd.height, ifd.tile_width, ifd.tile_height),
+                            (tx0, ty0, grid_w, grid_h, grid_len),
+                            [(s0, o0), (s1, o1), (s2, o2)],
+                            plan,
+                            style,
+                        )
+                        .await)
                     }
                     PlanarConfig::Planar => {
                         // Fetch all 3 planes in one coalesced call
@@ -1359,7 +1452,19 @@ impl TileEngine {
                                 return Ok(bytes);
                             }
                         }
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                        drop(srcs);
+                        drop((r_refs, g_refs, b_refs));
+                        Ok(render_rgb_cpu_maybe_blocking::<N>(
+                            tiles,
+                            true,
+                            b0,
+                            (ifd.width, ifd.height, ifd.tile_width, ifd.tile_height),
+                            (tx0, ty0, grid_w, grid_h, grid_len),
+                            [(s0, o0), (s1, o1), (s2, o2)],
+                            plan,
+                            style,
+                        )
+                        .await)
                     }
                 }
             }

@@ -118,8 +118,29 @@ Adversarial stress testing via [gpu_torture_test.rs](../crates/cogzilla-server/e
 
 ### Known Hard Limits
 - **Single-buffer `512 MiB` adapter limit**: Default `wgpu` Metal/Vulkan `max_buffer_size` and `max_storage_buffer_binding_size` are `512 MiB`. Single jobs requiring `> 256 MiB` staging or `> 512 MiB` storage cleanly fall back to CPU.
-- **Extreme concurrency (`> 4,096` concurrent uncached jobs)**: Beyond `max_in_flight = 128 × 32 = 4,096` (or `COGZILLA_GPU_MAX_QUEUED`), overflow sheds to CPU; apply HTTP-level concurrency limits in front of the server for `> 4,096` simultaneous uncached clients.
+- **Extreme concurrency (`> 4,096` concurrent uncached jobs)**: Built-in HTTP **AIMD concurrency limiting** (`AimdLimiter`, enabled by default) automatically adapts the concurrency cap to the Little's Law knee (`limit* ≈ throughput × target_rtt`) and sheds excess traffic with HTTP `429 Too Many Requests` (`Retry-After: 1`) in `< 1 ms`, preventing Tokio worker starvation on both CPU-only and GPU servers.
 - **`+Inf` expression overflow**: Expressions overflowing to `±Inf` (e.g. `1e38 * 1e38`) are masked as transparent (`!is_finite_f32`) on GPU, whereas CPU `render_expr` only masks `is_nan()` (clamping `+Inf` to opaque `255`).
+
+---
+
+## Adaptive AIMD Concurrency Limiting (`429 Too Many Requests`)
+
+Live HTTP overload benchmarks via [e2e_aimd_overload_bench.rs](../crates/cogzilla-server/examples/e2e_aimd_overload_bench.rs) (`serve_listener` on `127.0.0.1:0`, `512×512` RGB Lanczos3 JPEG across `10,291` unique tiles, zero tile cache, target RTT `100 ms`, concurrent `/healthz` probes every `100 ms`). Heavy non-Nearest CPU RGB renders (`≥ 256²`) run on `tokio::task::spawn_blocking` so Tokio's async I/O workers remain free to answer `/healthz` and shed `429`s even when all CPU cores are saturated.
+
+| Host & Backend | Clients | AIMD | `200 OK` Goodput | `200 OK` p50 | `200 OK` p99 | `429` Shed (p50) | `/healthz` p99 | Converged `limit` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Apple M5 CPU-only (10 cores)** | 128 | OFF | 63.7 req/s | 1,949.1 ms | 2,362.2 ms | 0 | 0.5 ms | — |
+| **Apple M5 CPU-only (10 cores)** | 128 | **ON** | 56.4 req/s | **180.1 ms (10.8×)** | **728.6 ms (3.2×)** | 37,863 (**0.6 ms**) | **6.9 ms** | `10` |
+| **Apple M5 GPU (Metal)** | 256 | OFF | 824.5 req/s | 307.4 ms | 356.2 ms | 0 | 5.9 ms | — |
+| **Apple M5 GPU (Metal)** | 256 | **ON** | **794.0 req/s** | **117.5 ms (2.6×)** | **222.1 ms (1.6×)** | 50,924 (**0.7 ms**) | **4.6 ms** | `91` |
+| **`thales` CPU-only (48T)** | 128 | OFF | 116.4 req/s | 935.0 ms | 2,601.8 ms | 0 | 2.2 ms | — |
+| **`thales` CPU-only (48T)** | 128 | **ON** | 105.1 req/s | **316.9 ms (3.0×)** | **987.2 ms (2.6×)** | 31,539 (**0.3 ms**) | **0.6 ms** | `32` |
+| **`thales` RTX 3090 Ti (Vulkan)** | 256 | OFF | 3,495.7 req/s | 73.1 ms | 257.5 ms | 0 | 0.6 ms | — |
+| **`thales` RTX 3090 Ti (Vulkan)** | 256 | **ON** | **3,807.2 req/s (+8.9%)** | **63.4 ms** | **97.2 ms (2.6×)** | 2,580 (**0.2 ms**) | **0.5 ms** | `538` |
+
+> **Configuration & Telemetry**: Enabled by default (`COGZILLA_AIMD=off` disables; `COGZILLA_AIMD_TARGET_MS=150`, `COGZILLA_AIMD_MIN_LIMIT`, `COGZILLA_AIMD_MAX_LIMIT=4096`). `/healthz`, `/metrics`, and `OPTIONS` bypass admission control; `4xx` responses call `permit.ignore_rtt()`. Exported in `/metrics` as `cogzilla_aimd_limit`, `cogzilla_aimd_in_flight`, and `cogzilla_aimd_rejected_429_total`.
+
+> **Why AIMD instead of hybrid GPU+CPU work-stealing**: Empirical hill-climbing (`K = 0, 1, 2, 4, 8` CPU helpers stealing from the GPU queue) showed `K = 0` is the global optimum on both hosts — on Apple M5 unified memory, `K = 8` lost **12.8%** throughput to memory-bandwidth contention; on RTX 3090 Ti, `K = 8` blew `p99` up **4.3×** (`42.1 → 180.5 ms`) via CPU stragglers. Pure GPU for heavy work + pure CPU for sub-crossover work + AIMD `429` admission control achieves optimal throughput and tail latency on both CPU-only and GPU deployments.
 
 ---
 
