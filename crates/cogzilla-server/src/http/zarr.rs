@@ -253,34 +253,57 @@ fn json_ok(val: &Value, content_type: &'static str) -> Response<Full<Bytes>> {
     resp
 }
 
-/// Store adapter bridging local filesystem paths (`file://` or bare path) and HTTP/HTTPS prefixes
-/// into [`ZarrStore`].
+/// Store adapter bridging local filesystem paths (`file://` or bare path) and any remote URI
+/// supported by `cogzilla-io` (`http://`, `https://`, `s3://`, `gs://`, `az://`, `abfs://`,
+/// `abfss://`, `/vsi*`) into [`ZarrStore`] using the shared [`cogzilla_io::CogStore`] client pool,
+/// cloud credential chain, allowlist, AIMD concurrency limiter, and `IoMetrics`.
 pub enum ServerZarrStore {
     Local(FsStore),
-    Http {
-        base_url: String,
-        client: reqwest::Client,
+    Remote {
+        base_uri: String,
+        io: Arc<cogzilla_io::CogStore>,
     },
 }
 
-fn zarr_http_client() -> Result<&'static reqwest::Client, ZarrError> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(|e| ZarrError::UpstreamError {
-            key: "http-client".into(),
-            detail: e.clone(),
-        })
+fn is_remote_zarr_uri(uri: &str) -> bool {
+    uri.starts_with("http://")
+        || uri.starts_with("https://")
+        || uri.starts_with("s3://")
+        || uri.starts_with("gs://")
+        || uri.starts_with("az://")
+        || uri.starts_with("abfs://")
+        || uri.starts_with("abfss://")
+        || uri.starts_with("/vsicurl/")
+        || uri.starts_with("/vsis3/")
+        || uri.starts_with("/vsigs/")
+        || uri.starts_with("/vsiaz/")
+}
+
+fn map_io_err<T>(key: String, err: cogzilla_io::IoError) -> Result<Option<T>, ZarrError> {
+    match err.root() {
+        cogzilla_io::IoError::HttpStatus { status: 404, .. } => Ok(None),
+        cogzilla_io::IoError::HttpStatus {
+            status: status @ (401 | 403),
+            ..
+        } => Err(ZarrError::UpstreamRefused {
+            key,
+            status: *status,
+        }),
+        cogzilla_io::IoError::Forbidden(_) => Err(ZarrError::UpstreamRefused { key, status: 403 }),
+        cogzilla_io::IoError::Http(e) if e.is_timeout() => Err(ZarrError::UpstreamTimeout {
+            key,
+            detail: e.to_string(),
+        }),
+        cogzilla_io::IoError::Fs(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        other => Err(ZarrError::UpstreamError {
+            key,
+            detail: other.to_string(),
+        }),
+    }
 }
 
 impl ServerZarrStore {
-    pub fn from_url(raw_url: &str) -> Result<Self, ZarrError> {
+    pub fn from_url(raw_url: &str, io: Arc<cogzilla_io::CogStore>) -> Result<Self, ZarrError> {
         let trimmed = raw_url.trim();
         if trimmed.is_empty() {
             return Err(ZarrError::InvalidSelection {
@@ -294,11 +317,10 @@ impl ServerZarrStore {
                 status: 403,
             });
         }
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            let client = zarr_http_client()?.clone();
-            return Ok(Self::Http {
-                base_url: trimmed.trim_end_matches('/').to_string(),
-                client,
+        if is_remote_zarr_uri(trimmed) {
+            return Ok(Self::Remote {
+                base_uri: trimmed.trim_end_matches('/').to_string(),
+                io,
             });
         }
         if let Some(scheme_pos) = trimmed.find("://") {
@@ -332,56 +354,31 @@ impl ZarrStore for ServerZarrStore {
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, ZarrError>> {
         match self {
             Self::Local(fs) => fs.get(key),
-            Self::Http { base_url, client } => {
-                let url = format!("{base_url}/{}", key.trim_start_matches('/'));
-                let client = client.clone();
+            Self::Remote { base_uri, io } => {
+                let uri = format!("{base_uri}/{}", key.trim_start_matches('/'));
+                let io = Arc::clone(io);
                 let key_owned = key.to_string();
                 Box::pin(async move {
-                    if let Some(cached) = zarr_http_chunk_cache().get(&url) {
+                    if let Some(cached) = zarr_http_chunk_cache().get(&uri) {
                         return Ok(Some(cached.value().clone()));
                     }
-                    let resp = client.get(&url).send().await.map_err(|e| {
-                        if e.is_timeout() {
-                            ZarrError::UpstreamTimeout {
-                                key: key_owned.clone(),
-                                detail: e.to_string(),
+                    match io
+                        .fetch_uri_bytes(&uri, cogzilla_zarr::MAX_DECODED_CHUNK_BYTES)
+                        .await
+                    {
+                        Ok(bytes) => {
+                            let vec = bytes.to_vec();
+                            if vec.len() <= 16 * 1024 * 1024 {
+                                let cache = zarr_http_chunk_cache();
+                                if cache.len() >= 64 {
+                                    cache.clear();
+                                }
+                                cache.insert(uri, vec.clone());
                             }
-                        } else {
-                            ZarrError::UpstreamError {
-                                key: key_owned.clone(),
-                                detail: e.to_string(),
-                            }
+                            Ok(Some(vec))
                         }
-                    })?;
-                    let status = resp.status().as_u16();
-                    if status == 404 {
-                        return Ok(None);
+                        Err(err) => map_io_err(key_owned, err),
                     }
-                    if status == 401 || status == 403 {
-                        return Err(ZarrError::UpstreamRefused {
-                            key: key_owned,
-                            status,
-                        });
-                    }
-                    if !resp.status().is_success() {
-                        return Err(ZarrError::UpstreamError {
-                            key: key_owned,
-                            detail: format!("HTTP {status}"),
-                        });
-                    }
-                    let bytes = resp.bytes().await.map_err(|e| ZarrError::UpstreamError {
-                        key: key_owned,
-                        detail: e.to_string(),
-                    })?;
-                    let vec = bytes.to_vec();
-                    if vec.len() <= 16 * 1024 * 1024 {
-                        let cache = zarr_http_chunk_cache();
-                        if cache.len() >= 64 {
-                            cache.clear();
-                        }
-                        cache.insert(url, vec.clone());
-                    }
-                    Ok(Some(vec))
                 })
             }
         }
@@ -395,65 +392,18 @@ impl ZarrStore for ServerZarrStore {
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ZarrError>> {
         match self {
             Self::Local(fs) => fs.get_range(key, start, end),
-            Self::Http { base_url, client } => {
-                let url = format!("{base_url}/{}", key.trim_start_matches('/'));
-                let client = client.clone();
+            Self::Remote { base_uri, io } => {
+                let uri = format!("{base_uri}/{}", key.trim_start_matches('/'));
+                let io = Arc::clone(io);
                 let key_owned = key.to_string();
                 Box::pin(async move {
                     if start >= end {
                         return Ok(Some(Vec::new()));
                     }
-                    let range_hdr = format!("bytes={start}-{}", end - 1);
-                    let resp = client
-                        .get(&url)
-                        .header(reqwest::header::RANGE, range_hdr)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            if e.is_timeout() {
-                                ZarrError::UpstreamTimeout {
-                                    key: key_owned.clone(),
-                                    detail: e.to_string(),
-                                }
-                            } else {
-                                ZarrError::UpstreamError {
-                                    key: key_owned.clone(),
-                                    detail: e.to_string(),
-                                }
-                            }
-                        })?;
-                    let status = resp.status().as_u16();
-                    if status == 404 {
-                        return Ok(None);
+                    match io.fetch_uri_range(&uri, start, end).await {
+                        Ok(bytes) => Ok(Some(bytes.to_vec())),
+                        Err(err) => map_io_err(key_owned, err),
                     }
-                    if status == 401 || status == 403 {
-                        return Err(ZarrError::UpstreamRefused {
-                            key: key_owned,
-                            status,
-                        });
-                    }
-                    if status != 206 && status != 200 {
-                        return Err(ZarrError::UpstreamError {
-                            key: key_owned,
-                            detail: format!("HTTP {status} on ranged read"),
-                        });
-                    }
-                    let bytes = resp.bytes().await.map_err(|e| ZarrError::UpstreamError {
-                        key: key_owned.clone(),
-                        detail: e.to_string(),
-                    })?;
-                    if status == 200 {
-                        let s = start as usize;
-                        let e = end as usize;
-                        if e > bytes.len() {
-                            return Err(ZarrError::UpstreamError {
-                                key: key_owned,
-                                detail: "origin returned truncated body".into(),
-                            });
-                        }
-                        return Ok(Some(bytes[s..e].to_vec()));
-                    }
-                    Ok(Some(bytes.to_vec()))
                 })
             }
         }
@@ -462,44 +412,15 @@ impl ZarrStore for ServerZarrStore {
     fn size<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<u64>, ZarrError>> {
         match self {
             Self::Local(fs) => fs.size(key),
-            Self::Http { base_url, client } => {
-                let url = format!("{base_url}/{}", key.trim_start_matches('/'));
-                let client = client.clone();
+            Self::Remote { base_uri, io } => {
+                let uri = format!("{base_uri}/{}", key.trim_start_matches('/'));
+                let io = Arc::clone(io);
                 let key_owned = key.to_string();
                 Box::pin(async move {
-                    let resp = client.head(&url).send().await.map_err(|e| {
-                        if e.is_timeout() {
-                            ZarrError::UpstreamTimeout {
-                                key: key_owned.clone(),
-                                detail: e.to_string(),
-                            }
-                        } else {
-                            ZarrError::UpstreamError {
-                                key: key_owned.clone(),
-                                detail: e.to_string(),
-                            }
-                        }
-                    })?;
-                    let status = resp.status().as_u16();
-                    if status == 404 {
-                        return Ok(None);
+                    match io.fetch_uri_size(&uri).await {
+                        Ok(size) => Ok(size),
+                        Err(err) => map_io_err(key_owned, err),
                     }
-                    if status == 401 || status == 403 {
-                        return Err(ZarrError::UpstreamRefused {
-                            key: key_owned,
-                            status,
-                        });
-                    }
-                    let len = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .ok_or_else(|| ZarrError::UpstreamError {
-                            key: key_owned,
-                            detail: "missing Content-Length on HEAD".into(),
-                        })?;
-                    Ok(Some(len))
                 })
             }
         }
@@ -511,7 +432,7 @@ impl ZarrStore for ServerZarrStore {
     ) -> BoxFuture<'a, Result<Option<Vec<String>>, ZarrError>> {
         match self {
             Self::Local(fs) => fs.list_dir(prefix),
-            Self::Http { .. } => Box::pin(async { Ok(None) }),
+            Self::Remote { .. } => Box::pin(async { Ok(None) }),
         }
     }
 }
@@ -705,7 +626,7 @@ fn binary_ok_with_etag(
 
 /// Main dispatcher for all `/zarr/*` routes.
 pub(crate) async fn handle_zarr_request(
-    _engine: &Arc<TileEngine>,
+    engine: &Arc<TileEngine>,
     method: Method,
     sub: &[&str],
     raw_query: &str,
@@ -713,41 +634,42 @@ pub(crate) async fn handle_zarr_request(
     if_none_match: Option<&str>,
     post_body: Option<Bytes>,
 ) -> Response<Full<Bytes>> {
+    let io = &engine.store;
     let q = ZarrQuery::parse(raw_query);
     let result = match (method, sub) {
         // Metadata & introspection family (#372)
-        (Method::GET, ["info"]) => handle_info(&q, false).await,
-        (Method::GET, ["info.geojson"]) => handle_info(&q, true).await,
-        (Method::GET, ["bounds"]) => handle_bounds(&q).await,
-        (Method::GET, ["validate"]) => handle_validate(&q).await,
+        (Method::GET, ["info"]) => handle_info(io, &q, false).await,
+        (Method::GET, ["info.geojson"]) => handle_info(io, &q, true).await,
+        (Method::GET, ["bounds"]) => handle_bounds(io, &q).await,
+        (Method::GET, ["validate"]) => handle_validate(io, &q).await,
         (Method::GET, ["dataset"]) | (Method::GET, ["dataset", "keys"]) => {
-            handle_dataset_keys(&q).await
+            handle_dataset_keys(io, &q).await
         }
-        (Method::GET, ["dataset", "dict"]) => handle_dataset_dict(&q).await,
-        (Method::GET, ["dataset", "dimensions"]) => handle_dataset_dimensions(&q).await,
+        (Method::GET, ["dataset", "dict"]) => handle_dataset_dict(io, &q).await,
+        (Method::GET, ["dataset", "dimensions"]) => handle_dataset_dimensions(io, &q).await,
         (Method::GET, ["dataset", "coordinates", name]) => {
-            handle_dataset_coordinate(&q, &percent_decode(name)).await
+            handle_dataset_coordinate(io, &q, &percent_decode(name)).await
         }
 
         // Raster family (#373): OGC Tilesets, TileJSON, Map HTML, WMTS, Tiles, Point, Preview, BBox, GET Statistics
-        (Method::GET, ["tiles"]) => handle_tileset_list(&q, host, raw_query).await,
-        (Method::GET, ["tiles", tms]) => handle_tileset(&q, tms, host, raw_query).await,
+        (Method::GET, ["tiles"]) => handle_tileset_list(io, &q, host, raw_query).await,
+        (Method::GET, ["tiles", tms]) => handle_tileset(io, &q, tms, host, raw_query).await,
         (Method::GET, ["tilejson.json"]) => {
-            handle_tilejson(&q, "WebMercatorQuad", host, raw_query).await
+            handle_tilejson(io, &q, "WebMercatorQuad", host, raw_query).await
         }
-        (Method::GET, [tms, "tilejson.json"]) => handle_tilejson(&q, tms, host, raw_query).await,
+        (Method::GET, [tms, "tilejson.json"]) => handle_tilejson(io, &q, tms, host, raw_query).await,
         (Method::GET, ["map.html"]) => handle_map_html("WebMercatorQuad", host, raw_query),
         (Method::GET, [tms, "map.html"]) => handle_map_html(tms, host, raw_query),
         (Method::GET, ["WMTSCapabilities.xml"]) => {
-            handle_wmts(&q, "WebMercatorQuad", host, raw_query).await
+            handle_wmts(io, &q, "WebMercatorQuad", host, raw_query).await
         }
-        (Method::GET, [tms, "WMTSCapabilities.xml"]) => handle_wmts(&q, tms, host, raw_query).await,
+        (Method::GET, [tms, "WMTSCapabilities.xml"]) => handle_wmts(io, &q, tms, host, raw_query).await,
         (Method::GET, ["tiles", tms, zs, xs, ys]) => {
-            handle_tile(_engine, &q, tms, zs, xs, ys, raw_query, if_none_match).await
+            handle_tile(engine, &q, tms, zs, xs, ys, raw_query, if_none_match).await
         }
         (Method::GET, ["tiles", zs, xs, ys]) => {
             handle_tile(
-                _engine,
+                engine,
                 &q,
                 "WebMercatorQuad",
                 zs,
@@ -758,23 +680,24 @@ pub(crate) async fn handle_zarr_request(
             )
             .await
         }
-        (Method::GET, ["point", coords]) => handle_point(&q, &percent_decode(coords)).await,
-        (Method::GET, ["preview"]) => handle_preview(&q, None, None, raw_query, if_none_match).await,
+        (Method::GET, ["point", coords]) => handle_point(io, &q, &percent_decode(coords)).await,
+        (Method::GET, ["preview"]) => handle_preview(io, &q, None, None, raw_query, if_none_match).await,
         (Method::GET, [seg]) if seg.starts_with("preview.") => {
             let ext = seg.strip_prefix("preview.");
-            handle_preview(&q, None, ext, raw_query, if_none_match).await
+            handle_preview(io, &q, None, ext, raw_query, if_none_match).await
         }
         (Method::GET, ["preview", dims_seg]) => match parse_dims_ext(dims_seg) {
-            Ok((dims, ext)) => handle_preview(&q, Some(dims), ext, raw_query, if_none_match).await,
+            Ok((dims, ext)) => handle_preview(io, &q, Some(dims), ext, raw_query, if_none_match).await,
             Err(e) => Err(e),
         },
         (Method::GET, ["bbox", bbox_seg]) => {
             let (bbox_str, ext) = split_bbox_ext(&percent_decode(bbox_seg));
-            handle_bbox(&q, &bbox_str, None, ext.as_deref(), raw_query, if_none_match).await
+            handle_bbox(io, &q, &bbox_str, None, ext.as_deref(), raw_query, if_none_match).await
         }
         (Method::GET, ["bbox", bbox_seg, dims_seg]) => match parse_dims_ext(dims_seg) {
             Ok((dims, ext)) => {
                 handle_bbox(
+                    io,
                     &q,
                     &percent_decode(bbox_seg),
                     Some(dims),
@@ -786,22 +709,22 @@ pub(crate) async fn handle_zarr_request(
             }
             Err(e) => Err(e),
         },
-        (Method::GET, ["statistics"]) => handle_get_statistics(&q).await,
+        (Method::GET, ["statistics"]) => handle_get_statistics(io, &q).await,
 
         // POST zonal statistics & feature routes (#374)
         (Method::POST, ["statistics"]) => {
-            handle_post_statistics(&q, post_body.unwrap_or_default()).await
+            handle_post_statistics(io, &q, post_body.unwrap_or_default()).await
         }
         (Method::POST, ["feature"]) => {
-            handle_post_feature(&q, None, None, post_body.unwrap_or_default()).await
+            handle_post_feature(io, &q, None, None, post_body.unwrap_or_default()).await
         }
         (Method::POST, [seg]) if seg.starts_with("feature.") => {
             let ext = seg.strip_prefix("feature.");
-            handle_post_feature(&q, None, ext, post_body.unwrap_or_default()).await
+            handle_post_feature(io, &q, None, ext, post_body.unwrap_or_default()).await
         }
         (Method::POST, ["feature", dims_seg]) => match parse_dims_ext(dims_seg) {
             Ok((dims, ext)) => {
-                handle_post_feature(&q, Some(dims), ext, post_body.unwrap_or_default()).await
+                handle_post_feature(io, &q, Some(dims), ext, post_body.unwrap_or_default()).await
             }
             Err(e) => Err(e),
         },
@@ -858,10 +781,11 @@ fn split_bbox_ext(seg: &str) -> (String, Option<String>) {
 }
 
 async fn open_store_and_hierarchy(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
 ) -> Result<(ServerZarrStore, Arc<ZarrHierarchy>, String), ZarrError> {
     let url = q.url.as_deref().unwrap_or("");
-    let store = ServerZarrStore::from_url(url)?;
+    let store = ServerZarrStore::from_url(url, Arc::clone(io))?;
     let cache = zarr_hierarchy_cache();
 
     match &store {
@@ -887,7 +811,7 @@ async fn open_store_and_hierarchy(
             );
             Ok((store, hierarchy, validator))
         }
-        ServerZarrStore::Http { base_url, client } => {
+        ServerZarrStore::Remote { base_uri, io } => {
             let ttl = zarr_cache_ttl();
             if ttl > Duration::ZERO
                 && let Some(entry) = cache.get(url)
@@ -896,28 +820,11 @@ async fn open_store_and_hierarchy(
                 return Ok((store, Arc::clone(&entry.hierarchy), entry.validator.clone()));
             }
 
-            // Probe root metadata validator cheaply via HEAD (ETag / Last-Modified)
+            // Probe root metadata validator cheaply via shared CogStore HEAD (ETag / Last-Modified)
             let mut remote_validator = String::new();
             for meta_name in ["zarr.json", ".zmetadata"] {
-                if let Ok(resp) = client.head(format!("{base_url}/{meta_name}")).send().await
-                    && resp.status().is_success()
-                {
-                    let et = resp
-                        .headers()
-                        .get(reqwest::header::ETAG)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let lm = resp
-                        .headers()
-                        .get(reqwest::header::LAST_MODIFIED)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let cl = resp
-                        .headers()
-                        .get(reqwest::header::CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    remote_validator = format!("http:{meta_name}:{et}:{lm}:{cl}");
+                if let Some(v) = io.head_uri_validator(&format!("{base_uri}/{meta_name}")).await {
+                    remote_validator = format!("{meta_name}:{v}");
                     break;
                 }
             }
@@ -974,8 +881,8 @@ fn wgs84_bounds_for_geo(geo: &cogzilla_zarr::ZarrGeo, width: u32, height: u32) -
     geo.crs.model.wgs84_bounds(&geo.affine, width, height)
 }
 
-async fn handle_info(q: &ZarrQuery, as_geojson: bool) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_info(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery, as_geojson: bool) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1088,8 +995,8 @@ async fn handle_info(q: &ZarrQuery, as_geojson: bool) -> Result<Response<Full<By
     }
 }
 
-async fn handle_bounds(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_bounds(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1103,8 +1010,8 @@ async fn handle_bounds(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError
     Ok(json_ok(&body, "application/json"))
 }
 
-async fn handle_validate(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_validate(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
 
@@ -1155,21 +1062,21 @@ async fn handle_validate(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrErr
     Ok(json_ok(&body, "application/json"))
 }
 
-async fn handle_dataset_keys(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (_store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_dataset_keys(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (_store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     let keys = group.data_variables();
     Ok(json_ok(&json!(keys), "application/json"))
 }
 
-async fn handle_dataset_dimensions(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (_store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_dataset_dimensions(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (_store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     Ok(json_ok(&json!(group.dimensions()), "application/json"))
 }
 
-async fn handle_dataset_dict(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (_store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_dataset_dict(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (_store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     let dims = group.dimensions();
     let data_vars_set: std::collections::BTreeSet<String> =
@@ -1207,10 +1114,11 @@ fn array_summary_json(meta: &ArrayMeta) -> Value {
 }
 
 async fn handle_dataset_coordinate(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     coord_name: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     let meta = group
         .array(coord_name)
@@ -1281,11 +1189,12 @@ fn zoom_range_for_zarr(tms: &TmsDef, geo: &ZarrGeo, width: u32, height: u32) -> 
 }
 
 async fn handle_tileset_list(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     host: &str,
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1329,13 +1238,14 @@ async fn handle_tileset_list(
 }
 
 async fn handle_tileset(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     tms_id: &str,
     host: &str,
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let tms = require_tms(tms_id)?;
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1389,13 +1299,14 @@ async fn handle_tileset(
 }
 
 async fn handle_tilejson(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     tms_id: &str,
     host: &str,
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let tms = require_tms(tms_id)?;
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1441,13 +1352,14 @@ fn handle_map_html(tms_id: &str, host: &str, raw_query: &str) -> Result<Response
 }
 
 async fn handle_wmts(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     tms_id: &str,
     host: &str,
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let tms = require_tms(tms_id)?;
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1615,7 +1527,7 @@ async fn handle_tile(
         });
     };
 
-    let (store, hierarchy, validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, validator) = open_store_and_hierarchy(&engine.store, q).await?;
     // Honour GeoZarr / OME-Zarr `multiscales` when `?group=` is not explicitly pinned (#375).
     let mut effective_group = q.group.clone();
     if effective_group.is_none()
@@ -1930,7 +1842,7 @@ fn encode_zarr_plane(
     }
 }
 
-async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes>>, ZarrError> {
+async fn handle_point(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes>>, ZarrError> {
     let Some((xs, ys)) = coords.split_once(',') else {
         return Err(ZarrError::InvalidSelection {
             detail: format!("expected /zarr/point/{{lon}},{{lat}}, got {coords:?}"),
@@ -1941,7 +1853,7 @@ async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes
             detail: format!("invalid coordinates {coords:?}"),
         });
     };
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -2023,13 +1935,14 @@ async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes
 }
 
 async fn handle_preview(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     dims: Option<(u32, u32)>,
     ext: Option<&str>,
     raw_query: &str,
     if_none_match: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -2075,6 +1988,7 @@ async fn handle_preview(
 }
 
 async fn handle_bbox(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     bbox_str: &str,
     dims: Option<(u32, u32)>,
@@ -2107,7 +2021,7 @@ async fn handle_bbox(
     }
     let _ = &mut minx;
 
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -2135,8 +2049,8 @@ async fn handle_bbox(
     .await
 }
 
-async fn handle_get_statistics(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+async fn handle_get_statistics(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
@@ -2183,11 +2097,12 @@ async fn handle_get_statistics(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, Z
 // ============================================================================
 
 async fn handle_post_statistics(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     body: Bytes,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let geojson: Value = serde_json::from_slice(&body)?;
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -2371,6 +2286,7 @@ async fn compute_zarr_feature_stats(
 }
 
 async fn handle_post_feature(
+    io: &Arc<cogzilla_io::CogStore>,
     q: &ZarrQuery,
     dims: Option<(u32, u32)>,
     ext: Option<&str>,
@@ -2391,7 +2307,7 @@ async fn handle_post_feature(
             }
         })?;
 
-    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(io, q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
