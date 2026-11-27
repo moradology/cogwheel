@@ -954,6 +954,17 @@ def main() -> int:
                             ("std", rgb), ("var", "assets=visual"), ("min", rgb), ("max", "assets=visual"), ("sum", rgb),
                             ("cast", "assets=red"), ("floor", "assets=visual"), ("terrarium", "assets=red"), ("terrainrgb", "assets=red")):
             o.check(f"statistics of {alg}", "zonal", f"/searches/{sid}/statistics?{assets}&max_size=64&algorithm={alg}", "POST", in_degrees)
+        # hillshade and slope look at a pixel's neighbours; titiler-pgstac answers them only
+        # without a buffer (with one, its coverage is the size of the uncropped image).
+        no_buffer = "&algorithm_params=%7B%22buffer%22%3A0%7D"
+        o.check("statistics of hillshade", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=hillshade{no_buffer}", "POST", in_degrees)
+        o.check("statistics of slope, in metres", "zonal",
+                f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=slope{no_buffer}&dst_crs=epsg:3857", "POST", in_degrees)
+        o.check("statistics of contours", "zonal", f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=contours", "POST", in_degrees)
+        o.check("statistics of contours of three bands", "json", f"/searches/{sid}/statistics?assets=visual&max_size=64&algorithm=contours", "POST", in_degrees)
+        # pydantic's words, but for the link to its documentation of the version it is.
+        o.check("statistics, an algorithm parameter out of range", "status",
+                f"/searches/{sid}/statistics?assets=red&max_size=64&algorithm=hillshade&algorithm_params=%7B%22azimuth%22%3A400%7D", "POST", in_degrees)
         o.check("statistics of grayscale after band math", "zonal",
                 f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&expression=b1*2;b2;b1&max_size=64&algorithm=grayscale", "POST", in_degrees)
         o.check("statistics of a mean after a pixel selection", "zonal",

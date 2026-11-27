@@ -4167,13 +4167,64 @@ enum BandAlgorithm {
     Terrarium,
     /// Mapbox's Terrain-RGB encoding of the first band.
     TerrainRgb { interval: f64, baseval: f64 },
+    /// titiler's hillshade of the first band: numpy's gradient in the grid's own pixels, as
+    /// bytes. It looks at a pixel's neighbours, so the grid is read `buffer` pixels larger
+    /// on every side and that border taken off after.
+    Hillshade { azimuth: f64, altitude: f64, buffer: usize, z: f64 },
+    /// Degrees of slope of the first band, the gradient over the grid's pixel size, as float32.
+    Slope { buffer: usize, z: f64 },
+    /// The first band rescaled from `minz..maxz` to 1..255 and coloured with `terrain`, black
+    /// where `height % increment < thickness`.
+    Contours { increment: f64, thickness: f64, minz: f64, maxz: f64 },
 }
 
 impl BandAlgorithm {
-    fn parse(name: &str, params: Option<&str>) -> Option<Self> {
+    /// The algorithm of that name with its `algorithm_params`, `Ok(None)` for one statistics do
+    /// not take, and a parameter out of titiler's range an error, as pydantic refuses it.
+    fn parse(name: &str, params: Option<&str>) -> Result<Option<Self>, String> {
         let params: Value = params.and_then(|p| serde_json::from_str(p).ok()).unwrap_or(Value::Null);
         let number = |key: &str, default: f64| params.get(key).and_then(Value::as_f64).unwrap_or(default);
-        Some(match name {
+        // pydantic's words for a parameter out of the algorithm's model, as titiler-pgstac
+        // passes them on.
+        let model = match name {
+            "hillshade" => "HillShade",
+            "slope" => "Slope",
+            "contours" => "Contours",
+            _ => "TerrainRGB",
+        };
+        let refused = |key: &str, v: &Value, what: String, kind: &str| {
+            let input_type = if v.is_i64() || v.is_u64() { "int" } else if v.is_f64() { "float" } else { "str" };
+            format!("1 validation error for {model}\n{key}\n  {what} [type={kind}, input_value={v}, input_type={input_type}]")
+        };
+        let bounded = |key: &str, v: &Value, n: f64, lo: f64, hi: f64| -> Result<(), String> {
+            let shown = |x: f64| if x.fract() == 0.0 && x.abs() < 1e15 { format!("{}", x as i64) } else { format!("{x}") };
+            if n < lo {
+                Err(refused(key, v, format!("Input should be greater than or equal to {}", shown(lo)), "greater_than_equal"))
+            } else if n > hi {
+                Err(refused(key, v, format!("Input should be less than or equal to {}", shown(hi)), "less_than_equal"))
+            } else {
+                Ok(())
+            }
+        };
+        // A parameter titiler types as `int` and bounds.
+        let whole = |key: &str, default: i64, lo: i64, hi: i64| -> Result<i64, String> {
+            let Some(v) = params.get(key) else { return Ok(default) };
+            let n = match (v.as_i64(), v.as_f64()) {
+                (Some(n), _) => n,
+                (None, Some(f)) if f.fract() == 0.0 => f as i64,
+                (None, Some(_)) => {
+                    return Err(refused(key, v, "Input should be a valid integer, got a number with a fractional part".into(), "int_from_float"));
+                }
+                _ => return Err(refused(key, v, "Input should be a valid integer".into(), "int_type")),
+            };
+            bounded(key, v, n as f64, lo as f64, hi as f64).map(|()| n)
+        };
+        let within = |key: &str, default: f64, lo: f64, hi: f64| -> Result<f64, String> {
+            let Some(v) = params.get(key) else { return Ok(default) };
+            let n = v.as_f64().ok_or_else(|| refused(key, v, "Input should be a valid number".into(), "float_type"))?;
+            bounded(key, v, n, lo, hi).map(|()| n)
+        };
+        Ok(Some(match name {
             "min" => Self::Min,
             "max" => Self::Max,
             "sum" => Self::Sum,
@@ -4188,15 +4239,48 @@ impl BandAlgorithm {
             "floor" => Self::Floor,
             "terrarium" => Self::Terrarium,
             "terrainrgb" => Self::TerrainRgb { interval: number("interval", 0.1), baseval: number("baseval", -10000.0) },
-            _ => return None,
-        })
+            "hillshade" => Self::Hillshade {
+                azimuth: whole("azimuth", 45, 0, 360)? as f64,
+                altitude: within("angle_altitude", 45.0, -90.0, 90.0)?,
+                buffer: whole("buffer", 3, 0, 99)? as usize,
+                z: within("z_exaggeration", 1.0, 1e-6, 1e6)?,
+            },
+            "slope" => Self::Slope { buffer: whole("buffer", 3, 0, 99)? as usize, z: within("z_exaggeration", 1.0, 1e-6, 1e6)? },
+            "contours" => Self::Contours {
+                increment: whole("increment", 35, 0, 999)? as f64,
+                thickness: whole("thickness", 1, 0, 10)? as f64,
+                minz: whole("minz", -12000, -99999, 99999)? as f64,
+                maxz: whole("maxz", 8000, -99999, 99999)? as f64,
+            },
+            _ => return Ok(None),
+        }))
+    }
+
+    /// The pixels read around the grid on every side, and taken off after.
+    fn buffer(&self) -> usize {
+        match self {
+            Self::Hillshade { buffer, .. } | Self::Slope { buffer, .. } => *buffer,
+            _ => 0,
+        }
+    }
+
+    /// Whether a pixel's value comes from its neighbours too (`hillshade`, `slope`).
+    fn looks_around(&self) -> bool {
+        matches!(self, Self::Hillshade { .. } | Self::Slope { .. })
+    }
+
+    /// Whether the values are float32, as rio-tiler's statistics then count them.
+    fn float32(&self) -> bool {
+        matches!(self, Self::Slope { .. })
     }
 
     /// The bands after the algorithm, and their descriptions. `whole` says the bands hold
     /// their rasters' whole numbers, which `grayscale` brings its result back to.
-    fn apply(&self, bands: Vec<Vec<f64>>, whole: bool) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
+    /// `width` is the grid's, and `pixel` the size of its pixels across and down.
+    fn apply(&self, bands: Vec<Vec<f64>>, whole: bool, width: usize, pixel: (f64, f64)) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
         let n = bands.len();
         let len = bands.first().map_or(0, Vec::len);
+        let height = if width == 0 { 0 } else { len / width };
         let across = |f: &dyn Fn(&mut Vec<f64>) -> f64| -> Vec<f64> {
             let mut values = Vec::with_capacity(n);
             (0..len)
@@ -4277,8 +4361,97 @@ impl BandAlgorithm {
                 let part = |shift: u32| data.iter().map(|d| if d.is_nan() { *d } else { f64::from(((*d as i32) >> shift) & 0xFF) }).collect();
                 Ok((vec![part(16), part(8), part(0)], ["terrain_r", "terrain_g", "terrain_b"].map(String::from).to_vec()))
             }
+            Self::Hillshade { azimuth, altitude, buffer, z } => {
+                let (down, across) = gradient(&bands[0], width, height)?;
+                let (azimuth, altitude) = ((360.0 - azimuth).to_radians(), altitude.to_radians());
+                let shaded: Vec<f64> = down
+                    .iter()
+                    .zip(&across)
+                    .map(|(x, y)| {
+                        let (x, y) = (x * z, y * z);
+                        let slope = std::f64::consts::FRAC_PI_2 - (x * x + y * y).sqrt().atan();
+                        let aspect = (-x).atan2(y);
+                        let shade = altitude.sin() * slope.sin() + altitude.cos() * slope.cos() * (azimuth - aspect).cos();
+                        let v = 255.0 * (shade + 1.0) / 2.0;
+                        if v < 0.0 { 0.0 } else { v.trunc() }
+                    })
+                    .collect();
+                one(crop(shaded, width, height, *buffer), "hillshade")
+            }
+            Self::Slope { buffer, z } => {
+                let (down, across) = gradient(&bands[0], width, height)?;
+                let slope: Vec<f64> = down
+                    .iter()
+                    .zip(&across)
+                    .map(|(x, y)| {
+                        let (dx, dy) = (x * z / pixel.0, y * z / pixel.1);
+                        f64::from((dx * dx + dy * dy).sqrt().atan().to_degrees() as f32)
+                    })
+                    .collect();
+                one(crop(slope, width, height, *buffer), "slope")
+            }
+            Self::Contours { increment, thickness, minz, maxz } => {
+                if n != 1 {
+                    // rio-tiler's `apply_cmap`.
+                    return Err("Source data must be 1 band".into());
+                }
+                let lut = &ColormapName::from_str_opt("terrain").ok_or("no terrain colour map")?.lut().rgb;
+                let mut out = vec![Vec::with_capacity(len); 3];
+                for v in &bands[0] {
+                    let rgb = if v.is_nan() {
+                        [f64::NAN; 3]
+                    } else if v.rem_euclid(*increment) < *thickness {
+                        [0.0; 3]
+                    } else {
+                        // rio-tiler's linear_rescale, then `astype("uint8")`.
+                        let at = ((v.clamp(*minz, *maxz) - minz) / (maxz - minz) * 254.0 + 1.0).trunc();
+                        let c = lut[(at as i64).rem_euclid(256) as usize];
+                        c.map(f64::from)
+                    };
+                    for (band, value) in out.iter_mut().zip(rgb) {
+                        band.push(value);
+                    }
+                }
+                Ok((out, ["contours_r", "contours_g", "contours_b"].map(String::from).to_vec()))
+            }
         }
     }
+}
+
+/// numpy's `gradient` of a `width` x `height` plane, down the rows and then across the
+/// columns: half the difference of the two neighbours inside, the difference with the one
+/// neighbour on an edge. A neighbour without a value leaves none, as numpy's masked arrays do.
+fn gradient(plane: &[f64], width: usize, height: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+    if width < 2 || height < 2 {
+        return Err("Shape of array too small to calculate a numerical gradient, at least (edge_order + 1) elements are required.".into());
+    }
+    let at = |r: usize, c: usize| plane[r * width + c];
+    let mut down = vec![0.0; width * height];
+    let mut across = vec![0.0; width * height];
+    for r in 0..height {
+        for c in 0..width {
+            down[r * width + c] = match r {
+                0 => at(1, c) - at(0, c),
+                _ if r == height - 1 => at(r, c) - at(r - 1, c),
+                _ => (at(r + 1, c) - at(r - 1, c)) / 2.0,
+            };
+            across[r * width + c] = match c {
+                0 => at(r, 1) - at(r, 0),
+                _ if c == width - 1 => at(r, c) - at(r, c - 1),
+                _ => (at(r, c + 1) - at(r, c - 1)) / 2.0,
+            };
+        }
+    }
+    Ok((down, across))
+}
+
+/// A plane with `buffer` pixels taken off every side.
+fn crop(plane: Vec<f64>, width: usize, height: usize, buffer: usize) -> Vec<f64> {
+    if buffer == 0 {
+        return plane;
+    }
+    let (w, h) = (width.saturating_sub(2 * buffer), height.saturating_sub(2 * buffer));
+    (0..h).flat_map(|r| plane[(r + buffer) * width + buffer..][..w].to_vec()).collect()
 }
 
 struct StatsRequest<'a> {
@@ -4355,6 +4528,7 @@ async fn feature_statistics(
         // and nothing stops the reading early.
         let mut fold: Option<Fold<f64>> = None;
         let scene_count = scenes.len();
+        let pad = req.algorithm.as_ref().map_or(0, BandAlgorithm::buffer);
         for (name, hrefs) in scenes {
             let mut cogs = Vec::with_capacity(hrefs.len());
             for href in &hrefs {
@@ -4375,6 +4549,17 @@ async fn feature_statistics(
                 let own = PartSize::Query { max_size: None, width: None, height: None };
                 let native = part_dims(own, own_bounds, grid.res);
                 let (w, h) = part_dims(req.size, own_bounds, grid.res);
+                // An algorithm that looks at a pixel's neighbours is given `pad` pixels more on
+                // every side, and takes them off after.
+                let (own_bounds, native, w, h) = if pad > 0 {
+                    let (span_x, span_y) = (own_bounds[2] - own_bounds[0], own_bounds[3] - own_bounds[1]);
+                    let (grow_x, grow_y) = (pad as f64 * span_x / w as f64, pad as f64 * span_y / h as f64);
+                    let grown = [own_bounds[0] - grow_x, own_bounds[1] - grow_y, own_bounds[2] + grow_x, own_bounds[3] + grow_y];
+                    let more = |n: u64, grow: f64, span: f64| n + 2 * (grow / (span / n as f64)).round() as u64;
+                    (grown, (more(native.0, grow_x, span_x), more(native.1, grow_y, span_y)), w + 2 * pad as u64, h + 2 * pad as u64)
+                } else {
+                    (own_bounds, native, w, h)
+                };
                 if w * h > MAX_STATS_PIXELS || w.max(h) * req.cover_scale as u64 > MAX_COVER_SIDE {
                     return Err(EngineError::BadRequest(format!(
                         "the feature would be read at {w}x{h} pixels with cover_scale {}; pass max_size, or width and height",
@@ -4532,8 +4717,29 @@ async fn feature_statistics(
             // Band math over whole numbers that leaves whole numbers (numexpr's integer
             // arithmetic) keeps the raster's type, which `grayscale` comes back to.
             let whole = whole && (program.is_none() || canvas.iter().flatten().all(|v| v.is_nan() || v.fract() == 0.0));
-            let (bands, described) = algorithm.apply(canvas, whole).map_err(EngineError::BadRequest)?;
+            let pixel = ((bounds[2] - bounds[0]) / width as f64, (bounds[3] - bounds[1]) / height as f64);
+            // rio-tiler's feature image is masked outside the shape, and a gradient beside the
+            // mask is masked too: the shape is burned on the grid before them. A `buffer` is
+            // there to give the pixels on the edge real neighbours (titiler-pgstac fails with
+            // one, its coverage the size of the uncropped image), so with one the gradient is
+            // taken over everything read and only the statistics keep to the shape.
+            if algorithm.looks_around() && pad == 0 {
+                let shape = rings_on_grid(&mask, bounds, (width, height), mercator);
+                let inside = zonal::shape_cover_counts(&shape, width, height, 1).map_err(EngineError::BadRequest)?;
+                for band in &mut canvas {
+                    for (v, hit) in band.iter_mut().zip(&inside) {
+                        if *hit == 0 {
+                            *v = f64::NAN;
+                        }
+                    }
+                }
+            }
+            let (bands, described) = algorithm.apply(canvas, whole, width, pixel).map_err(EngineError::BadRequest)?;
             canvas = bands;
+            if pad > 0 {
+                (width, height) = (width - 2 * pad, height - 2 * pad);
+                bounds = [bounds[0] + pad as f64 * pixel.0, bounds[1] + pad as f64 * pixel.1, bounds[2] - pad as f64 * pixel.0, bounds[3] - pad as f64 * pixel.1];
+            }
             // `cast`, `ceil` and `floor` keep the bands' own descriptions.
             if !described.is_empty() {
                 descriptions = described;
@@ -4646,16 +4852,17 @@ async fn mosaic_statistics(
         None => None,
         Some("normalizedindex") if query_value(pairs, "expression").is_none() => Some("(b2 - b1) / (b2 + b1)"),
         Some(name) => match BandAlgorithm::parse(name, query_value(pairs, "algorithm_params")) {
-            Some(a) => {
+            Ok(Some(a)) => {
                 algorithm = Some(a);
                 None
             }
-            None => {
+            Ok(None) => {
                 return detail(
                     StatusCode::BAD_REQUEST,
-                    format!("algorithm '{name}' is not supported on statistics routes yet (hillshade, slope, contours and normalizedIndex with `expression` are not)"),
+                    format!("algorithm '{name}' is not supported on statistics routes (normalizedIndex is not with `expression`)"),
                 );
             }
+            Err(msg) => return detail(StatusCode::BAD_REQUEST, msg),
         },
     };
     let size = match part_size_from_query(pairs) {
@@ -4685,7 +4892,7 @@ async fn mosaic_statistics(
         opts,
         cover_scale,
         expression: index_math.or_else(|| query_value(pairs, "expression")),
-        single: index_math.is_some(),
+        single: index_math.is_some() || algorithm.as_ref().is_some_and(BandAlgorithm::float32),
         algorithm,
         unscale: pq.unscale,
         nodata: pq.nodata,
@@ -8194,7 +8401,7 @@ mod tests {
     fn algorithms_on_a_mosaic_s_bands() {
         let nan = f64::NAN;
         let bands = vec![vec![1.0, 10.0, nan], vec![2.0, nan, nan], vec![4.0, 20.0, nan]];
-        let run = |a: BandAlgorithm, whole| a.apply(bands.clone(), whole).unwrap();
+        let run = |a: BandAlgorithm, whole| a.apply(bands.clone(), whole, 3, (1.0, 1.0)).unwrap();
         let first = |a: BandAlgorithm| run(a, true).0.remove(0);
         assert_eq!(first(BandAlgorithm::Min)[..2], [1.0, 10.0]);
         assert_eq!(first(BandAlgorithm::Sum)[..2], [7.0, 30.0]);
@@ -8208,20 +8415,27 @@ mod tests {
         // Luma, in the bands' own type: 0.299 + 1.174 + 0.456.
         assert_eq!(first(BandAlgorithm::Grayscale)[0], 1.0);
         assert!((run(BandAlgorithm::Grayscale, false).0[0][0] - 1.929).abs() < 1e-12);
-        assert!(BandAlgorithm::Grayscale.apply(vec![vec![1.0]], true).is_err());
-        assert_eq!(BandAlgorithm::Bitonal.apply(vec![vec![127.0, 128.0, nan]], true).unwrap().0[0][..2], [0.0, 255.0]);
+        assert!(BandAlgorithm::Grayscale.apply(vec![vec![1.0]], true, 1, (1.0, 1.0)).is_err());
+        assert_eq!(BandAlgorithm::Bitonal.apply(vec![vec![127.0, 128.0, nan]], true, 1, (1.0, 1.0)).unwrap().0[0][..2], [0.0, 255.0]);
         // To bytes as `astype("uint8")` wraps, keeping the bands' descriptions.
-        let (cast, described) = BandAlgorithm::Cast.apply(vec![vec![300.0, -1.0, 255.9]], true).unwrap();
+        let (cast, described) = BandAlgorithm::Cast.apply(vec![vec![300.0, -1.0, 255.9]], true, 1, (1.0, 1.0)).unwrap();
         assert_eq!((cast[0].as_slice(), described.len()), (&[44.0, 255.0, 255.0][..], 0));
-        assert_eq!(BandAlgorithm::Ceil.apply(vec![vec![255.5]], false).unwrap().0[0], [0.0]);
+        assert_eq!(BandAlgorithm::Ceil.apply(vec![vec![255.5]], false, 1, (1.0, 1.0)).unwrap().0[0], [0.0]);
         // Terrain-RGB of 100 m: (100 + 10000) / 0.1 = 101000 = 0x018A88.
-        let (rgb, names) = BandAlgorithm::TerrainRgb { interval: 0.1, baseval: -10000.0 }.apply(vec![vec![100.0]], true).unwrap();
+        let (rgb, names) = BandAlgorithm::TerrainRgb { interval: 0.1, baseval: -10000.0 }.apply(vec![vec![100.0]], true, 1, (1.0, 1.0)).unwrap();
         assert_eq!(rgb, [vec![1.0], vec![138.0], vec![136.0]]);
         assert_eq!(names, ["terrain_r", "terrain_g", "terrain_b"]);
         // Terrarium of 100 m: 32868 = 128 * 256 + 100.
-        assert_eq!(BandAlgorithm::Terrarium.apply(vec![vec![100.0]], true).unwrap().0, [vec![128.0], vec![100.0], vec![0.0]]);
-        assert_eq!(BandAlgorithm::parse("hillshade", None), None);
-        assert_eq!(BandAlgorithm::parse("terrainrgb", Some(r#"{"interval":1}"#)), Some(BandAlgorithm::TerrainRgb { interval: 1.0, baseval: -10000.0 }));
+        assert_eq!(BandAlgorithm::Terrarium.apply(vec![vec![100.0]], true, 1, (1.0, 1.0)).unwrap().0, [vec![128.0], vec![100.0], vec![0.0]]);
+        assert_eq!(BandAlgorithm::parse("aspect", None), Ok(None));
+        assert!(BandAlgorithm::parse("hillshade", Some(r#"{"azimuth":400}"#)).is_err());
+        assert!(BandAlgorithm::parse("contours", Some(r#"{"increment":2.5}"#)).is_err());
+        assert_eq!(BandAlgorithm::parse("terrainrgb", Some(r#"{"interval":1}"#)), Ok(Some(BandAlgorithm::TerrainRgb { interval: 1.0, baseval: -10000.0 })));
+        // numpy's gradient: one-sided on the edges, centred inside.
+        let (down, across) = gradient(&[0.0, 1.0, 4.0, 2.0, 4.0, 8.0], 3, 2).unwrap();
+        assert_eq!(down, [2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
+        assert_eq!(across, [1.0, 2.0, 3.0, 2.0, 3.0, 4.0]);
+        assert_eq!(crop((0..16).map(f64::from).collect(), 4, 4, 1), [5.0, 6.0, 9.0, 10.0]);
     }
 
     #[test]
