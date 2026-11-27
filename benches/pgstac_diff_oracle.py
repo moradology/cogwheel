@@ -1498,6 +1498,16 @@ def main() -> int:
         o.check("item statistics, band math on one asset", "stats", f"{it}/statistics?assets=visual&max_size=64&expression=b1-b3;where(b1%3Eb2,1,0)")
         o.check("item statistics, band math by an asset's name", "status",
                 f"{it}/statistics?assets=nir&assets=red&asset_as_band=true&max_size=64&expression=(nir-red)/(nir%2Bred)")
+        # An item's statistics of a posted feature are worked out as a mosaic of the item's:
+        # its pixels covered by fractions, in `dst_crs`, finer with `cover_scale`.
+        iwedge = {"type": "Feature", "id": "w", "properties": {"name": "wedge"}, "geometry": {"type": "Polygon", "coordinates": [[
+            [ilon - 0.05, ilat - 0.03], [ilon + 0.05, ilat - 0.03], [ilon, ilat + 0.04], [ilon - 0.05, ilat - 0.03]]]}}
+        for label, q in (("", "assets=red&max_size=64"), (", in metres", "assets=red&max_size=64&dst_crs=epsg:3857"),
+                         (", cover_scale", "assets=red&max_size=64&cover_scale=4"), (", a width and height", "assets=red&width=50&height=30"),
+                         (", hillshade", "assets=red&max_size=64&algorithm=hillshade&algorithm_params=%7B%22buffer%22%3A0%7D"),
+                         (", band math", "assets=nir&assets=red&asset_as_band=true&max_size=64&expression=(b1-b2)/(b1%2Bb2)"),
+                         (", a pixel_selection passed over", "assets=red&max_size=64&pixel_selection=stdev")):
+            o.check(f"item statistics of a feature{label}", "zonal", f"{it}/statistics?{q}", "POST", iwedge)
         o.check("item wmts", "wmts", f"{it}/WMTSCapabilities.xml?assets=visual")
         o.check("item wmts, jpg and EPSG codes", "wmts",
                 f"{it}/WMTSCapabilities.xml?assets=visual&tile_format=jpg&use_epsg=true&minzoom=9&maxzoom=10")
