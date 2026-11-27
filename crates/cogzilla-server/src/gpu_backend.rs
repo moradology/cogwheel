@@ -76,6 +76,22 @@ impl<'a> BboxCoordSource<'a> {
         }
     }
 
+    /// Source pixels per output pixel, as `cogzilla_kernel::coord_plan_scale` estimates it.
+    fn scale(&self) -> (f32, f32) {
+        match *self {
+            Self::Separable { u, v } | Self::SeparableMasked { u, v, .. } => {
+                cogzilla_kernel::separable_coord_scale(u, v)
+            }
+            Self::Grid2D { dst_w, dst_h, grid_u, grid_v }
+            | Self::Grid2DMasked { dst_w, dst_h, grid_u, grid_v, .. } => {
+                cogzilla_kernel::grid_coord_scale(grid_u, grid_v, dst_w, dst_h)
+            }
+            Self::Exact2D { dst_w, dst_h, u_map, v_map } => {
+                cogzilla_kernel::exact_coord_scale(u_map, v_map, dst_w, dst_h)
+            }
+        }
+    }
+
     fn dims_and_upload_bytes(&self) -> Option<(usize, usize, usize)> {
         match *self {
             Self::Separable { u, v } => Some((u.len(), v.len(), 0)),
@@ -154,6 +170,20 @@ fn map_resample(mode: ResampleMode) -> Option<GpuColormapMode> {
         ResampleMode::Lanczos => Some(GpuColormapMode::Lanczos3),
         _ => None,
     }
+}
+
+/// [`map_resample`] for a render over `coords`, `None` (render on the CPU) when the request
+/// shrinks the source: the CPU widens convolution kernels there like GDAL, the shaders keep the
+/// fixed taps.
+fn map_resample_on(mode: ResampleMode, coords: &BboxCoordSource<'_>) -> Option<GpuColormapMode> {
+    let gpu_mode = map_resample(mode)?;
+    if mode != ResampleMode::Nearest {
+        let (sx, sy) = coords.scale();
+        if cogzilla_kernel::kernel_widens(mode, sx, sy) {
+            return None;
+        }
+    }
+    Some(gpu_mode)
 }
 
 fn map_dem_algorithm(alg: DemAlgorithm) -> Option<GpuDemAlgorithm> {
@@ -782,7 +812,7 @@ impl GpuBackend {
         return_mask: bool,
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
-        let gpu_mode = map_resample(style.resample)?;
+        let gpu_mode = map_resample_on(style.resample, &coords)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
@@ -1208,7 +1238,7 @@ impl GpuBackend {
         return_mask: bool,
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
-        let gpu_mode = map_resample(style.resample)?;
+        let gpu_mode = map_resample_on(style.resample, &coords)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
@@ -1334,7 +1364,7 @@ impl GpuBackend {
         format: OutputFormat,
         active: usize,
     ) -> Option<(CoalescedJob, usize, usize)> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let gpu_alg = match encoding {
             TerrainEncoding::Terrarium => GpuDemAlgorithm::Terrarium,
             TerrainEncoding::TerrainRgb => GpuDemAlgorithm::TerrainRgb,
@@ -1671,7 +1701,7 @@ impl GpuBackend {
         return_mask: bool,
         active: usize,
     ) -> Option<(CoalescedJob, GpuPixelOutput, usize, usize)> {
-        let gpu_mode = map_resample(style.resample)?;
+        let gpu_mode = map_resample_on(style.resample, &coords)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
@@ -1903,7 +1933,7 @@ impl GpuBackend {
         color_formula: Option<&ColorFormula>,
         active: usize,
     ) -> Option<(CoalescedJob, usize, usize)> {
-        let gpu_mode = map_resample(style.resample)?;
+        let gpu_mode = map_resample_on(style.resample, &coords)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || !is_rgba_format(style.format) {
@@ -2273,7 +2303,7 @@ impl GpuBackend {
         src: &BandSource<'_>,
         resample: ResampleMode,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
@@ -2321,7 +2351,7 @@ impl GpuBackend {
         hist_range: Option<(f64, f64)>,
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels() {
             return None;
@@ -2414,7 +2444,7 @@ impl GpuBackend {
         hist_range: Option<(f64, f64)>,
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
         if dst_w == 0
             || dst_h == 0
@@ -2464,7 +2494,7 @@ impl GpuBackend {
         hist_range: Option<(f64, f64)>,
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let gpu_alg = map_dem_algorithm(alg)?;
         let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels() {
@@ -2510,7 +2540,7 @@ impl GpuBackend {
         pixel_size_y_m: f32,
         resample: ResampleMode,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let gpu_alg = map_dem_algorithm(alg)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
@@ -2575,7 +2605,7 @@ impl GpuBackend {
         instrs: &[GpuInstr],
         resample: ResampleMode,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
@@ -2625,7 +2655,9 @@ impl GpuBackend {
         if batch_size < 2 || tile_size == 0 || !tile_size.is_multiple_of(4) {
             return None;
         }
-        let gpu_mode = map_resample(style.resample)?;
+        // The batch shares one zoom: the first tile's axes give its scale.
+        let (u0, v0) = tile_uvs[0];
+        let gpu_mode = map_resample_on(style.resample, &BboxCoordSource::Separable { u: u0, v: v0 })?;
         let out_kind = match style.format {
             OutputFormat::Png => GpuPixelOutput::IndexedU8,
             OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => {
@@ -2733,7 +2765,7 @@ impl GpuBackend {
         color_formula: Option<&ColorFormula>,
         active: usize,
     ) -> Option<(CoalescedJob, usize, usize)> {
-        let gpu_mode = map_resample(style.resample)?;
+        let gpu_mode = map_resample_on(style.resample, &coords)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || !is_rgba_format(style.format) {
@@ -2849,7 +2881,7 @@ impl GpuBackend {
         color_formula: Option<&ColorFormula>,
         return_mask: bool,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(style.resample)?;
+        let gpu_mode = map_resample_on(style.resample, &coords)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
@@ -2890,7 +2922,7 @@ impl GpuBackend {
         srcs: &[BandSource<'_>],
         resample: ResampleMode,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         let nb = srcs.len();
         if dst_w == 0 || dst_h == 0 || nb == 0 || nb > 8 {
@@ -2930,7 +2962,7 @@ impl GpuBackend {
         progs: &[ExprProgram; 3],
         resample: ResampleMode,
     ) -> Option<Bytes> {
-        let gpu_mode = map_resample(resample)?;
+        let gpu_mode = map_resample_on(resample, &coords)?;
         let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {

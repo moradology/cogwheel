@@ -911,6 +911,1020 @@ fn lanczos3_weight(x: f32) -> f32 {
     (px.sin() / px) * (px3.sin() / px3)
 }
 
+// ============================================================================
+// Widened (antialiased) convolution kernels for downsampling
+// ============================================================================
+//
+// GDAL resamples with bilinear, cubic, cubicspline and lanczos as convolution kernels. When the
+// output is coarser than the source (both in the warper, `GWKResample`, and in RasterIO's
+// `GDALResampleChunk_Convolution`), it stretches the kernel by the shrink factor: with `s` source
+// pixels per output pixel, the support grows from `r` to `r * s` source pixels and each tap at
+// distance `d` from the sample point weighs `K(d / s)`, normalised by the sum of the weights. The
+// fixed 2x2 / 4x4 / 6x6 samplers above only see the pixels next to the sample point, which aliases
+// when zoomed out. Upsampling (`s <= 1`) keeps the fixed kernels.
+
+/// Most taps per axis the widened sampler evaluates. Beyond this (only reachable when a COG
+/// without overviews is shrunk more than ~20x) the kernel stops widening.
+const WIDE_MAX_TAPS: usize = 128;
+
+#[inline(always)]
+fn conv_kernel_radius(mode: ResampleMode) -> f32 {
+    match mode {
+        ResampleMode::Bilinear => 1.0,
+        ResampleMode::Cubic | ResampleMode::CubicSpline => 2.0,
+        ResampleMode::Lanczos => 3.0,
+        _ => 0.0,
+    }
+}
+
+/// GDAL's kernel scale for one axis, in source pixels per output pixel (`>= 1`). Like the GDAL
+/// warper, a factor within 0.05 of a whole number snaps to it, so a near-1:1 request keeps the
+/// fixed kernel (and its fast paths).
+#[inline]
+pub fn gdal_kernel_scale(s: f32) -> f32 {
+    if !s.is_finite() || s <= 1.0 {
+        return 1.0;
+    }
+    let r = s.round();
+    if (s - r).abs() < 0.05 { r } else { s }
+}
+
+/// Kernel scale actually used by the widened sampler (GDAL's scale, capped at `WIDE_MAX_TAPS`).
+#[inline(always)]
+fn widened_scale(mode: ResampleMode, s: f32) -> f32 {
+    let r = conv_kernel_radius(mode).max(1.0);
+    gdal_kernel_scale(s).min((WIDE_MAX_TAPS as f32 - 2.0) / (2.0 * r))
+}
+
+/// True when `mode` is one of GDAL's convolution kernels and the source-pixel footprint
+/// `(scale_x, scale_y)` shrinks the image on either axis, so the kernel must widen.
+#[inline]
+pub fn kernel_widens(mode: ResampleMode, scale_x: f32, scale_y: f32) -> bool {
+    matches!(
+        mode,
+        ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos
+    ) && (gdal_kernel_scale(scale_x) > 1.0 || gdal_kernel_scale(scale_y) > 1.0)
+}
+
+/// Support radius, in source pixels, of `mode` at the source-pixel footprint `scale` (for fetch
+/// margins). `0` for modes that are not convolution kernels.
+#[inline]
+pub fn widened_kernel_radius(mode: ResampleMode, scale: f32) -> f32 {
+    conv_kernel_radius(mode) * widened_scale(mode, scale)
+}
+
+/// GDAL's kernel functions: `GWKBilinear` (tent), `GWKCubic` (Keys, `a = -0.5`), `GWKBSpline`
+/// (cubic B-spline) and `GWKLanczosSinc` (radius 3).
+#[inline(always)]
+fn conv_kernel_weight(mode: ResampleMode, x: f32) -> f32 {
+    let ax = x.abs();
+    match mode {
+        ResampleMode::Bilinear => (1.0 - ax).max(0.0),
+        ResampleMode::Cubic => {
+            if ax < 1.0 {
+                (1.5 * ax - 2.5) * ax * ax + 1.0
+            } else if ax < 2.0 {
+                ((-0.5 * ax + 2.5) * ax - 4.0) * ax + 2.0
+            } else {
+                0.0
+            }
+        }
+        ResampleMode::CubicSpline => {
+            if ax < 1.0 {
+                (0.5 * ax - 1.0) * ax * ax + (2.0 / 3.0)
+            } else if ax < 2.0 {
+                let t = 2.0 - ax;
+                t * t * t * (1.0 / 6.0)
+            } else {
+                0.0
+            }
+        }
+        ResampleMode::Lanczos => {
+            if ax < 1e-6 {
+                1.0
+            } else if ax >= 3.0 {
+                0.0
+            } else {
+                // sinc(x) * sinc(x / 3) with one sine: sin(3t) = 3 sin(t) - 4 sin(t)^3, t = pi x / 3.
+                let t = std::f32::consts::FRAC_PI_3 * ax;
+                let s = t.sin();
+                (3.0 - 4.0 * s * s) * s * s / (3.0 * t * t)
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+/// Taps of the widened kernel along one axis for sample position `c` (source pixel-centre
+/// coordinates) at kernel scale `s`: every source pixel `j` with `|j - c| < radius * s`, weighed
+/// `K((j - c) / s)`. Writes the weights into `w` and returns `(first_pixel, tap_count)`.
+#[inline(always)]
+fn widened_axis_taps(mode: ResampleMode, c: f32, s: f32, w: &mut [f32]) -> (i32, usize) {
+    let r = conv_kernel_radius(mode) * s;
+    let inv = 1.0 / s;
+    let start = (c - r).floor() as i32 + 1;
+    let stop = (c + r).ceil() as i32 - 1;
+    let n = ((stop - start + 1).max(0) as usize).min(w.len());
+    let mut d = (start as f32 - c) * inv;
+    for wk in w.iter_mut().take(n) {
+        *wk = conv_kernel_weight(mode, d);
+        d += inv;
+    }
+    (start, n)
+}
+
+/// `sum_j wy[j] * sum_i wx[i] * sl[base + j * stride + i]` over `K` columns (`wx` zero-padded).
+#[inline(always)]
+fn widened_accumulate_fixed<const K: usize>(sl: &[f32], base: usize, stride: usize, wx: &[f32], wy: &[f32]) -> f32 {
+    let mut wk = [0.0f32; K];
+    wk[..wx.len()].copy_from_slice(wx);
+    let mut col = [0.0f32; K];
+    for (j, &wyj) in wy.iter().enumerate() {
+        let off = base + j * stride;
+        let row: &[f32; K] = sl[off..off + K].try_into().unwrap();
+        for k in 0..K {
+            col[k] += row[k] * wyj;
+        }
+    }
+    let mut acc = 0.0f32;
+    for k in 0..K {
+        acc += col[k] * wk[k];
+    }
+    acc
+}
+
+/// [`widened_accumulate_fixed`] skipping `NaN` (nodata) values: `(sum, valid_weight)`.
+#[inline(always)]
+fn widened_accumulate_fixed_nan<const K: usize>(
+    sl: &[f32],
+    base: usize,
+    stride: usize,
+    wx: &[f32],
+    wy: &[f32],
+) -> (f32, f32) {
+    let mut col = [0.0f32; K];
+    let mut colw = [0.0f32; K];
+    for (j, &wyj) in wy.iter().enumerate() {
+        let off = base + j * stride;
+        let row: &[f32; K] = sl[off..off + K].try_into().unwrap();
+        for k in 0..K {
+            let ok = !row[k].is_nan();
+            col[k] += if ok { row[k] * wyj } else { 0.0 };
+            colw[k] += if ok { wyj } else { 0.0 };
+        }
+    }
+    let mut sum = 0.0f32;
+    let mut wsum = 0.0f32;
+    for k in 0..K {
+        sum += col[k] * wx[k];
+        wsum += colw[k] * wx[k];
+    }
+    (sum, wsum)
+}
+
+/// Sum of `w[i] * value` over the valid taps of the `wx.len() x wy.len()` footprint at `(x0, y0)`,
+/// with the valid and total weights: `(sum, valid_weight, total_weight)`.
+#[inline(always)]
+fn widened_accumulate(src: &BandSource<'_>, x0: i32, wx: &[f32], y0: i32, wy: &[f32]) -> (f32, f32, f32) {
+    let nx = wx.len();
+    let ny = wy.len();
+    let wxs: f32 = wx.iter().sum();
+    let wys: f32 = wy.iter().sum();
+    let wtot = wxs * wys;
+    // Clean f32 block, kernel up to 4 or 8 columns wide: pad the columns with zero weights to a
+    // fixed width so each source row is one vector multiply-add.
+    if src.no_nodata && nx <= 8 {
+        let k = if nx <= 4 { 4 } else { 8 };
+        if let Some((band, base, stride)) = src.rect_in_block(x0, y0, k as u32, ny as u32)
+            && let Some(sl) = band.data.as_f32_slice()
+        {
+            let acc = if k == 4 {
+                widened_accumulate_fixed::<4>(sl, base, stride, wx, wy)
+            } else {
+                widened_accumulate_fixed::<8>(sl, base, stride, wx, wy)
+            };
+            return (acc, wtot, wtot);
+        }
+    }
+    let block = src.rect_in_block(x0, y0, nx as u32, ny as u32);
+    if let Some((band, base, stride)) = block
+        && !src.no_nodata
+        && src.nodata_override.is_none()
+        && src.scale_offset.is_none()
+    {
+        // One block that may hold nodata (`NaN` once read as f32): skip those taps.
+        let mut sum = 0.0f32;
+        let mut wsum = 0.0f32;
+        for (j, &wyj) in wy.iter().enumerate() {
+            let off = base + j * stride;
+            let mut rs = 0.0f32;
+            let mut rw = 0.0f32;
+            for (i, &wxi) in wx.iter().enumerate() {
+                let s = unsafe { band.data.get_f32_unchecked(off + i) };
+                if !s.is_nan() {
+                    rs += s * wxi;
+                    rw += wxi;
+                }
+            }
+            sum += rs * wyj;
+            wsum += rw * wyj;
+        }
+        return (sum, wsum, wtot);
+    }
+    if let Some((band, base, stride)) = block
+        && src.no_nodata
+    {
+        let mut acc = 0.0f32;
+        if let Some(sl) = band.data.as_f32_slice() {
+            for (j, &wyj) in wy.iter().enumerate() {
+                let row = &sl[base + j * stride..base + j * stride + nx];
+                let mut r = 0.0f32;
+                for (a, b) in row.iter().zip(wx) {
+                    r += a * b;
+                }
+                acc += r * wyj;
+            }
+        } else {
+            for (j, &wyj) in wy.iter().enumerate() {
+                let off = base + j * stride;
+                let mut r = 0.0f32;
+                for (i, &wxi) in wx.iter().enumerate() {
+                    r += unsafe { band.data.get_f32_unchecked(off + i) } * wxi;
+                }
+                acc += r * wyj;
+            }
+        }
+        return (acc, wtot, wtot);
+    }
+    let mut sum = 0.0f32;
+    let mut wsum = 0.0f32;
+    for (j, &wyj) in wy.iter().enumerate() {
+        let ry = y0 + j as i32;
+        let mut rs = 0.0f32;
+        let mut rw = 0.0f32;
+        for (i, &wxi) in wx.iter().enumerate() {
+            let s = src.sample_checked(x0 + i as i32, ry);
+            if !s.is_nan() {
+                rs += s * wxi;
+                rw += wxi;
+            }
+        }
+        sum += rs * wyj;
+        wsum += rw * wyj;
+    }
+    (sum, wsum, wtot)
+}
+
+/// Normalise a widened-kernel accumulation. Kernels with negative lobes (cubic, lanczos) fall back
+/// to the widened tent when less than half the kernel weight lands on valid pixels (raster edges,
+/// nodata), mirroring the fixed samplers' bilinear fallback; GDAL renormalises over the valid taps.
+#[inline(always)]
+fn widened_finish(mode: ResampleMode, sum: f32, wsum: f32, wtot: f32) -> Option<f32> {
+    let positive = matches!(mode, ResampleMode::Bilinear | ResampleMode::CubicSpline);
+    if positive {
+        if wsum > 1e-6 * wtot.max(1e-6) { Some(sum / wsum) } else { Some(f32::NAN) }
+    } else if wsum >= 0.5 * wtot && wsum > 1e-6 {
+        Some(sum / wsum)
+    } else {
+        None
+    }
+}
+
+/// GDAL-style widened convolution sample at `(u, v)` for `Bilinear` / `Cubic` / `CubicSpline` /
+/// `Lanczos` with source-pixel footprint `(scale_x, scale_y)` (see the section comment). An axis
+/// whose scale is `<= 1` keeps the fixed kernel on that axis.
+pub fn sample_kernel_widened(
+    src: &BandSource<'_>,
+    u: f32,
+    v: f32,
+    scale_x: f32,
+    scale_y: f32,
+    mode: ResampleMode,
+) -> f32 {
+    if !u.is_finite()
+        || !v.is_finite()
+        || u < -0.5
+        || v < -0.5
+        || u > src.ifd_w as f32 - 0.5
+        || v > src.ifd_h as f32 - 0.5
+    {
+        return f32::NAN;
+    }
+    let sx = widened_scale(mode, scale_x);
+    let sy = widened_scale(mode, scale_y);
+    // Size the tap buffers to the kernel so the common small kernels don't clear 1 KiB per sample.
+    let need = (2.0 * conv_kernel_radius(mode) * sx.max(sy)).ceil() as usize + 1;
+    let val = if need <= 8 {
+        sample_kernel_widened_taps::<8>(src, u, v, sx, sy, mode)
+    } else if need <= 24 {
+        sample_kernel_widened_taps::<24>(src, u, v, sx, sy, mode)
+    } else {
+        sample_kernel_widened_taps::<WIDE_MAX_TAPS>(src, u, v, sx, sy, mode)
+    };
+    match val {
+        Some(val) => val,
+        None => sample_kernel_widened(src, u, v, scale_x, scale_y, ResampleMode::Bilinear),
+    }
+}
+
+#[inline(always)]
+fn sample_kernel_widened_taps<const M: usize>(
+    src: &BandSource<'_>,
+    u: f32,
+    v: f32,
+    sx: f32,
+    sy: f32,
+    mode: ResampleMode,
+) -> Option<f32> {
+    let mut wx = [0.0f32; M];
+    let mut wy = [0.0f32; M];
+    let (x0, nx) = widened_axis_taps(mode, u, sx, &mut wx);
+    let (y0, ny) = widened_axis_taps(mode, v, sy, &mut wy);
+    let (sum, wsum, wtot) = widened_accumulate(src, x0, &wx[..nx], y0, &wy[..ny]);
+    widened_finish(mode, sum, wsum, wtot)
+}
+
+/// Most taps per axis [`WidenedSampler`] caches; wider kernels go straight to
+/// [`sample_kernel_widened`].
+const WIDE_CACHE_TAPS: usize = 16;
+/// Entries in [`WidenedSampler`]'s direct-mapped column-weight cache.
+const WIDE_CACHE_COLS: usize = 4096;
+
+/// Cached taps of one axis position: key (`f32` bits of the coordinate), first pixel, tap count
+/// and the weights normalised to sum to 1, zero-padded to `WIDE_CACHE_TAPS`.
+#[derive(Clone, Copy)]
+struct CachedTaps {
+    key: u32,
+    first: i32,
+    count: u32,
+    w: [f32; WIDE_CACHE_TAPS],
+}
+
+impl CachedTaps {
+    const EMPTY: Self = Self {
+        // A NaN key never matches a finite coordinate.
+        key: 0x7fc0_0000,
+        first: 0,
+        count: 0,
+        w: [0.0; WIDE_CACHE_TAPS],
+    };
+
+    #[inline(always)]
+    fn fill(&mut self, mode: ResampleMode, c: f32, s: f32) {
+        let (first, n) = widened_axis_taps(mode, c, s, &mut self.w);
+        let sum: f32 = self.w[..n].iter().sum();
+        let inv = if sum.abs() > 1e-12 { 1.0 / sum } else { 0.0 };
+        for w in &mut self.w[..n] {
+            *w *= inv;
+        }
+        self.w[n..].fill(0.0);
+        self.key = c.to_bits();
+        self.first = first;
+        self.count = n as u32;
+    }
+}
+
+/// [`sample_kernel_widened`] for one request (fixed mode and footprint) sampled pixel by pixel from
+/// coordinate maps. It remembers the row weights of the last `v` and the column weights of recent
+/// `u` values, so maps whose rows share `v` and whose columns repeat `u` (every same-CRS bbox and
+/// preview) compute each kernel weight once instead of once per pixel, and it reads clean blocks
+/// with fixed-width (4, 8 or 16 column) multiply-adds. Not `Sync`: one per thread.
+pub struct WidenedSampler {
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+    sx: f32,
+    sy: f32,
+    /// Padded column width (4, 8 or 16), or 0 when the kernel is too wide to cache.
+    width: usize,
+    row: std::cell::UnsafeCell<CachedTaps>,
+    cols: std::cell::UnsafeCell<Vec<CachedTaps>>,
+    grid: Option<std::cell::UnsafeCell<GridPlanes>>,
+}
+
+/// Most output pixels for which [`WidenedSampler::with_grid`] keeps whole planes (16 MiB each).
+const WIDE_GRID_MAX_PIXELS: usize = 4 << 20;
+/// Most source bands whose planes one [`WidenedSampler`] keeps.
+const WIDE_GRID_MAX_PLANES: usize = 16;
+
+/// Identity of a [`BandSource`]'s data: its first decoded block, the block grid and how values
+/// are read (nodata override, scale/offset). The blocks outlive the sampler's render.
+type PlaneKey = (usize, usize, u32, u32, u64, u64);
+
+/// Separable source grid of a [`WidenedSampler`] with the planes computed on it so far.
+struct GridPlanes {
+    us: Vec<f32>,
+    vs: Vec<f32>,
+    planes: Vec<GridPlane>,
+}
+
+struct GridPlane {
+    key: PlaneKey,
+    data: std::rc::Rc<[f32]>,
+}
+
+#[inline(always)]
+fn plane_key(src: &BandSource<'_>) -> Option<PlaneKey> {
+    let first: &cogzilla_codec::DecodedBand = match src.blocks.first() {
+        Some(Some(b)) => b,
+        _ => src.blocks.iter().flatten().next()?,
+    };
+    let nodata = src.nodata_override.map_or(u64::MAX, |nd| nd.to_bits() as u64);
+    let so = src
+        .scale_offset
+        .map_or(u64::MAX, |(sc, off)| ((sc.to_bits() as u64) << 32) | off.to_bits() as u64);
+    Some((
+        first as *const cogzilla_codec::DecodedBand as usize,
+        src.blocks.len(),
+        src.tx0,
+        src.ty0,
+        nodata,
+        so,
+    ))
+}
+
+/// The column coordinates of row 0 and the row coordinates of column 0 when the `w x h`
+/// row-major maps are separable (every row of `u_map` equal, `v_map` constant along each row)
+/// and finite; `None` otherwise.
+pub fn separable_axes(u_map: &[f32], v_map: &[f32], w: usize, h: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+    if w == 0 || h == 0 || u_map.len() < w * h || v_map.len() < w * h {
+        return None;
+    }
+    let us = &u_map[..w];
+    if !us.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let mut vs = Vec::with_capacity(h);
+    for y in 0..h {
+        let row_u = &u_map[y * w..(y + 1) * w];
+        let row_v = &v_map[y * w..(y + 1) * w];
+        let v0 = row_v[0];
+        if !v0.is_finite()
+            || row_u.iter().zip(us).any(|(a, b)| a.to_bits() != b.to_bits())
+            || row_v.iter().any(|a| a.to_bits() != v0.to_bits())
+        {
+            return None;
+        }
+        vs.push(v0);
+    }
+    Some((us.to_vec(), vs))
+}
+
+impl WidenedSampler {
+    /// A sampler that also knows the maps are the separable source grid `us` x `vs` (see
+    /// [`separable_axes`]): [`Self::grid_plane`] then gives a band's whole plane, computed once
+    /// with [`widened_plane_separable`]. `None` when the grid exceeds `WIDE_GRID_MAX_PIXELS`.
+    pub fn with_grid(mode: ResampleMode, scale_x: f32, scale_y: f32, us: Vec<f32>, vs: Vec<f32>) -> Option<Self> {
+        if us.is_empty() || vs.is_empty() || us.len().saturating_mul(vs.len()) > WIDE_GRID_MAX_PIXELS {
+            return None;
+        }
+        let mut s = Self::new(mode, scale_x, scale_y);
+        s.grid = Some(std::cell::UnsafeCell::new(GridPlanes { us, vs, planes: Vec::new() }));
+        Some(s)
+    }
+
+    /// A sampler without the column-tap cache, for maps whose columns do not repeat `u`
+    /// (reprojections), where every lookup would miss.
+    pub fn new_uncached(mode: ResampleMode, scale_x: f32, scale_y: f32) -> Self {
+        let mut s = Self::new(mode, scale_x, scale_y);
+        s.cols = std::cell::UnsafeCell::new(Vec::new());
+        s
+    }
+
+    /// `src`'s widened plane on the grid (row-major, `us.len()` wide): at each output pixel the
+    /// value [`Self::sample`] gives at that pixel's grid coordinates. Computed on first use per
+    /// band; `None` without a grid or when the band cannot be keyed or cached.
+    pub fn grid_plane(&self, src: &BandSource<'_>) -> Option<std::rc::Rc<[f32]>> {
+        // SAFETY: as in `sample`, the sampler is `!Sync` and never re-entered.
+        let g = unsafe { &mut *self.grid.as_ref()?.get() };
+        let key = plane_key(src)?;
+        if let Some(p) = g.planes.iter().find(|p| p.key == key) {
+            return Some(p.data.clone());
+        }
+        if g.planes.len() >= WIDE_GRID_MAX_PLANES {
+            return None;
+        }
+        let data: std::rc::Rc<[f32]> =
+            widened_plane_separable(&g.us, &g.vs, src, self.mode, self.scale_x, self.scale_y).into();
+        g.planes.push(GridPlane { key, data: data.clone() });
+        Some(data)
+    }
+
+    pub fn new(mode: ResampleMode, scale_x: f32, scale_y: f32) -> Self {
+        let sx = widened_scale(mode, scale_x);
+        let sy = widened_scale(mode, scale_y);
+        let need = (2.0 * conv_kernel_radius(mode) * sx.max(sy)).ceil() as usize + 1;
+        let width = match need {
+            0..=4 => 4,
+            5..=8 => 8,
+            9..=WIDE_CACHE_TAPS => WIDE_CACHE_TAPS,
+            _ => 0,
+        };
+        let slots = if width > 0 { WIDE_CACHE_COLS } else { 0 };
+        Self {
+            mode,
+            scale_x,
+            scale_y,
+            sx,
+            sy,
+            width,
+            row: std::cell::UnsafeCell::new(CachedTaps::EMPTY),
+            cols: std::cell::UnsafeCell::new(vec![CachedTaps::EMPTY; slots]),
+            grid: None,
+        }
+    }
+
+    /// Same value as `sample_kernel_widened(src, u, v, scale_x, scale_y, mode)`.
+    #[inline]
+    pub fn sample(&self, src: &BandSource<'_>, u: f32, v: f32) -> f32 {
+        if self.width == 0 {
+            return sample_kernel_widened(src, u, v, self.scale_x, self.scale_y, self.mode);
+        }
+        if !u.is_finite()
+            || !v.is_finite()
+            || u < -0.5
+            || v < -0.5
+            || u > src.ifd_w as f32 - 0.5
+            || v > src.ifd_h as f32 - 0.5
+        {
+            return f32::NAN;
+        }
+        // SAFETY: `WidenedSampler` is `!Sync` (it holds `UnsafeCell`s) and `sample` never re-enters
+        // itself, so these are the only live references to the caches.
+        let row = unsafe { &mut *self.row.get() };
+        let cols = unsafe { &mut *self.cols.get() };
+        if row.key != v.to_bits() {
+            row.fill(self.mode, v, self.sy);
+        }
+        let mut fresh = CachedTaps::EMPTY;
+        let col: &CachedTaps = if cols.is_empty() {
+            fresh.fill(self.mode, u, self.sx);
+            &fresh
+        } else {
+            let ub = u.to_bits();
+            let col = &mut cols[((ub ^ (ub >> 13)) as usize) & (WIDE_CACHE_COLS - 1)];
+            if col.key != ub {
+                col.fill(self.mode, u, self.sx);
+            }
+            col
+        };
+        let (x0, y0, ny) = (col.first, row.first, row.count as usize);
+        let wy = &row.w[..ny];
+        let block = if src.nodata_override.is_none() && src.scale_offset.is_none() {
+            src.rect_in_block(x0, y0, self.width as u32, ny as u32)
+                .and_then(|(band, base, stride)| Some((band.data.as_f32_slice()?, base, stride)))
+        } else {
+            None
+        };
+        let (sum, wsum, wtot) = match block {
+            // Weights are normalised and zero-padded: on clean data the sum is the value.
+            Some((sl, base, stride)) if src.no_nodata => {
+                return match self.width {
+                    4 => widened_accumulate_fixed::<4>(sl, base, stride, &col.w[..4], wy),
+                    8 => widened_accumulate_fixed::<8>(sl, base, stride, &col.w[..8], wy),
+                    _ => widened_accumulate_fixed::<WIDE_CACHE_TAPS>(sl, base, stride, &col.w, wy),
+                };
+            }
+            Some((sl, base, stride)) => {
+                let (sum, wsum) = match self.width {
+                    4 => widened_accumulate_fixed_nan::<4>(sl, base, stride, &col.w[..4], wy),
+                    8 => widened_accumulate_fixed_nan::<8>(sl, base, stride, &col.w[..8], wy),
+                    _ => widened_accumulate_fixed_nan::<WIDE_CACHE_TAPS>(sl, base, stride, &col.w, wy),
+                };
+                (sum, wsum, 1.0)
+            }
+            None => widened_accumulate(src, x0, &col.w[..col.count as usize], y0, wy),
+        };
+        match widened_finish(self.mode, sum, wsum, wtot) {
+            Some(val) => val,
+            None => sample_kernel_widened(src, u, v, self.scale_x, self.scale_y, ResampleMode::Bilinear),
+        }
+    }
+}
+
+/// `f64` twin of [`sample_kernel_widened`] for wide dtypes (`Uint32`, `Int32`, `Float64`, ...).
+pub fn sample_f64_kernel_widened(
+    src: &BandSource<'_>,
+    u: f64,
+    v: f64,
+    scale_x: f32,
+    scale_y: f32,
+    mode: ResampleMode,
+) -> f64 {
+    if !u.is_finite()
+        || !v.is_finite()
+        || u < -0.5
+        || v < -0.5
+        || u > src.ifd_w as f64 - 0.5
+        || v > src.ifd_h as f64 - 0.5
+    {
+        return f64::NAN;
+    }
+    let axis = |c: f64, s: f32| -> (i32, Vec<f64>) {
+        let s = widened_scale(mode, s) as f64;
+        let r = conv_kernel_radius(mode) as f64 * s;
+        let start = (c - r).floor() as i32 + 1;
+        let stop = (c + r).ceil() as i32 - 1;
+        let w = (start..=stop)
+            .map(|j| conv_kernel_weight(mode, ((j as f64 - c) / s) as f32) as f64)
+            .collect();
+        (start, w)
+    };
+    let (x0, wx) = axis(u, scale_x);
+    let (y0, wy) = axis(v, scale_y);
+    let wtot = wx.iter().sum::<f64>() * wy.iter().sum::<f64>();
+    let mut sum = 0.0f64;
+    let mut wsum = 0.0f64;
+    for (j, &wyj) in wy.iter().enumerate() {
+        for (i, &wxi) in wx.iter().enumerate() {
+            let s = src.sample_f64_checked(x0 + i as i32, y0 + j as i32);
+            if !s.is_nan() {
+                sum += s * wxi * wyj;
+                wsum += wxi * wyj;
+            }
+        }
+    }
+    match widened_finish(mode, sum as f32, wsum as f32, wtot as f32) {
+        Some(val) if val.is_nan() => f64::NAN,
+        Some(_) => sum / wsum,
+        None => sample_f64_kernel_widened(src, u, v, scale_x, scale_y, ResampleMode::Bilinear),
+    }
+}
+
+/// Scratch for [`widened_plane_separable`]: source row segment, ring of horizontal-pass rows
+/// (sums and, on data with nodata, valid weights), the source row held by each ring slot, and a
+/// row of vertical-pass valid weights.
+struct WideScratch {
+    seg: Vec<f32>,
+    hs: Vec<f32>,
+    hw: Vec<f32>,
+    tags: Vec<i32>,
+    wrow: Vec<f32>,
+}
+
+thread_local! {
+    static WIDE_SCRATCH: RefCell<WideScratch> = const {
+        RefCell::new(WideScratch { seg: Vec::new(), hs: Vec::new(), hw: Vec::new(), tags: Vec::new(), wrow: Vec::new() })
+    };
+}
+
+/// Precomputed widened-kernel taps for every output column (or row) of a separable plan.
+struct AxisTapTable {
+    start: Vec<i32>,
+    count: Vec<u32>,
+    stride: usize,
+    /// `len * stride` weights, normalised to sum to 1 per entry.
+    weights: Vec<f32>,
+}
+
+impl AxisTapTable {
+    fn build(mode: ResampleMode, coords: &[f32], scale: f32, lim: i32) -> Self {
+        let s = widened_scale(mode, scale);
+        let bound = ((2.0 * conv_kernel_radius(mode) * s).ceil() as usize + 1).min(WIDE_MAX_TAPS);
+        let mut start = Vec::with_capacity(coords.len());
+        let mut count = Vec::with_capacity(coords.len());
+        let mut packed = vec![0.0f32; coords.len() * bound];
+        let mut tmp = [0.0f32; WIDE_MAX_TAPS];
+        let mut most = 0usize;
+        let max_c = lim as f32 - 0.5;
+        for (k, &c) in coords.iter().enumerate() {
+            let (st, n) = if c.is_finite() && c >= -0.5 && c <= max_c {
+                widened_axis_taps(mode, c, s, &mut tmp[..bound])
+            } else {
+                (0, 0)
+            };
+            let sum: f32 = tmp[..n].iter().sum();
+            let inv = if sum.abs() > 1e-12 { 1.0 / sum } else { 0.0 };
+            for i in 0..n {
+                packed[k * bound + i] = tmp[i] * inv;
+            }
+            start.push(st);
+            count.push(n as u32);
+            most = most.max(n);
+        }
+        // The widest entry rounded up to a multiple of 4, so short kernels run as fixed-width,
+        // zero-padded dots.
+        let stride = (most.max(1).div_ceil(4) * 4).min(bound.div_ceil(4) * 4);
+        let mut weights = vec![0.0f32; coords.len() * stride];
+        for (k, &n) in count.iter().enumerate() {
+            let n = n as usize;
+            weights[k * stride..k * stride + n].copy_from_slice(&packed[k * bound..k * bound + n]);
+        }
+        Self { start, count, stride, weights }
+    }
+
+    /// All `stride` weights of entry `k`, zero past its taps.
+    #[inline(always)]
+    fn taps_padded(&self, k: usize) -> &[f32] {
+        &self.weights[k * self.stride..(k + 1) * self.stride]
+    }
+
+    #[inline(always)]
+    fn taps(&self, k: usize) -> (i32, &[f32]) {
+        let n = self.count[k] as usize;
+        (self.start[k], &self.weights[k * self.stride..k * self.stride + n])
+    }
+
+    /// Inclusive range of source pixels touched by any entry, or `None` when no entry has taps.
+    fn span(&self) -> Option<(i32, i32)> {
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        for (k, &st) in self.start.iter().enumerate() {
+            let n = self.count[k] as i32;
+            if n > 0 {
+                lo = lo.min(st);
+                hi = hi.max(st + n - 1);
+            }
+        }
+        (lo <= hi).then_some((lo, hi))
+    }
+}
+
+/// Render the `N x N` widened-kernel plane of `src` for a plan, as row-major `f32` (`NaN` = no
+/// data): [`widened_plane_separable`] for separable plans, [`sample_kernel_widened`] per pixel
+/// otherwise.
+pub fn widened_plane<const N: usize>(
+    plan: &CoordPlan<N>,
+    src: &BandSource<'_>,
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+) -> Vec<f32> {
+    if let CoordPlan::Separable1D { u, v, .. } = plan {
+        return widened_plane_separable(&u[..], &v[..], src, mode, scale_x, scale_y);
+    }
+    let mut out = vec![f32::NAN; N * N];
+    let sampler = WidenedSampler::new_uncached(mode, scale_x, scale_y);
+    for py in 0..N {
+        for_each_pixel_in_row(plan, py, |px, uu, vv| {
+            out[py * N + px] = sampler.sample(src, uu, vv);
+        });
+    }
+    out
+}
+
+/// Clean horizontal pass with `K`-wide zero-padded taps: `hs_row[px] = sum_i w_i * seg[off + i]`.
+#[inline(always)]
+fn h_pass_fixed<const K: usize>(seg: &[f32], gc0: i32, cols: &AxisTapTable, col_ok: &[bool], hs_row: &mut [f32]) {
+    for (px, out) in hs_row.iter_mut().enumerate() {
+        if col_ok[px] {
+            let off = (cols.start[px] - gc0) as usize;
+            let a: &[f32; K] = seg[off..off + K].try_into().unwrap();
+            let b: &[f32; K] = cols.taps_padded(px).try_into().unwrap();
+            let mut acc = 0.0f32;
+            for k in 0..K {
+                acc += a[k] * b[k];
+            }
+            *out = acc;
+        }
+    }
+}
+
+/// [`h_pass_fixed`] skipping `NaN` (nodata) values, with the valid weight in `hw_row`.
+#[inline(always)]
+fn h_pass_fixed_nan<const K: usize>(
+    seg: &[f32],
+    gc0: i32,
+    cols: &AxisTapTable,
+    col_ok: &[bool],
+    hs_row: &mut [f32],
+    hw_row: &mut [f32],
+) {
+    for (px, (out, wout)) in hs_row.iter_mut().zip(hw_row.iter_mut()).enumerate() {
+        if col_ok[px] {
+            let off = (cols.start[px] - gc0) as usize;
+            let a: &[f32; K] = seg[off..off + K].try_into().unwrap();
+            let b: &[f32; K] = cols.taps_padded(px).try_into().unwrap();
+            let (mut acc, mut wacc) = (0.0f32, 0.0f32);
+            for k in 0..K {
+                let ok = !a[k].is_nan();
+                acc += if ok { a[k] * b[k] } else { 0.0 };
+                wacc += if ok { b[k] } else { 0.0 };
+            }
+            *out = acc;
+            *wout = wacc;
+        }
+    }
+}
+
+/// Widened-kernel plane of `src` on the separable grid `us` (column coordinates) x `vs` (row
+/// coordinates), row-major `vs.len() x us.len()` (`NaN` = no data); every value equals
+/// [`sample_kernel_widened`] at `(us[px], vs[py])`. Runs as two passes over precomputed
+/// per-column / per-row taps: each source row is filtered horizontally once (into a small ring,
+/// as consecutive output rows share source rows), then each output row is a vertical blend of
+/// those. On clean data the passes skip validity bookkeeping and the few columns / rows whose
+/// footprint leaves the raster are sampled per pixel; with nodata (or `NaN`) the passes carry the
+/// valid weight and renormalise like the per-pixel sampler.
+pub fn widened_plane_separable(
+    us: &[f32],
+    vs: &[f32],
+    src: &BandSource<'_>,
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+) -> Vec<f32> {
+    let (w, h) = (us.len(), vs.len());
+    let mut out = vec![f32::NAN; w * h];
+    let in_range = |c: f32, lim: i32| c.is_finite() && c >= -0.5 && c <= lim as f32 - 0.5;
+    let cols = AxisTapTable::build(mode, us, scale_x, src.ifd_w);
+    let rows = AxisTapTable::build(mode, vs, scale_y, src.ifd_h);
+    let (Some((c_lo, c_hi)), Some(_)) = (cols.span(), rows.span()) else {
+        return out;
+    };
+    let clean = src.no_nodata;
+    // Columns / rows the passes handle: sample point in range and, on clean data, the whole
+    // footprint inside the raster (taps outside it are skipped like nodata on the other path).
+    let col_ok: Vec<bool> = (0..w)
+        .map(|k| {
+            let (st, t) = cols.taps(k);
+            in_range(us[k], src.ifd_w) && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_w))
+        })
+        .collect();
+    let row_ok: Vec<bool> = (0..h)
+        .map(|k| {
+            let (st, t) = rows.taps(k);
+            in_range(vs[k], src.ifd_h) && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_h))
+        })
+        .collect();
+    let (gc0, gc1) = if clean { (c_lo.max(0), c_hi.min(src.ifd_w - 1)) } else { (c_lo, c_hi) };
+    let positive = matches!(mode, ResampleMode::Bilinear | ResampleMode::CubicSpline);
+    let ring = rows.stride + 1;
+    let mut fallback: Vec<usize> = Vec::new();
+    WIDE_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let sc = &mut *guard;
+        let seg_w = if gc0 <= gc1 { (gc1 - gc0 + 1) as usize } else { 0 };
+        // Zero tail so fixed-width dots may read past the last column (with zero weights).
+        let pad = cols.stride;
+        if sc.seg.len() < seg_w + pad {
+            sc.seg.resize(seg_w + pad, 0.0);
+        }
+        sc.seg[seg_w..seg_w + pad].fill(0.0);
+        for buf in [&mut sc.hs, &mut sc.hw] {
+            if buf.len() < ring * w {
+                buf.resize(ring * w, 0.0);
+            }
+        }
+        if sc.wrow.len() < w {
+            sc.wrow.resize(w, 0.0);
+        }
+        sc.tags.clear();
+        sc.tags.resize(ring, i32::MIN);
+        let WideScratch { seg, hs, hw, tags, wrow } = sc;
+        let seg = &mut seg[..seg_w + pad];
+        let wrow = &mut wrow[..w];
+        for py in 0..h {
+            let row_out = &mut out[py * w..(py + 1) * w];
+            if row_ok[py] && seg_w > 0 {
+                let (st, wy) = rows.taps(py);
+                // Horizontal pass for the source rows this output row needs and the ring lacks.
+                for j in 0..wy.len() {
+                    let r = st + j as i32;
+                    let slot = r.rem_euclid(ring as i32) as usize;
+                    if tags[slot] == r {
+                        continue;
+                    }
+                    tags[slot] = r;
+                    src.read_row_segment(r, gc0, &mut seg[..seg_w]);
+                    let hs_row = &mut hs[slot * w..(slot + 1) * w];
+                    if clean {
+                        match cols.stride {
+                            4 => h_pass_fixed::<4>(seg, gc0, &cols, &col_ok, hs_row),
+                            8 => h_pass_fixed::<8>(seg, gc0, &cols, &col_ok, hs_row),
+                            _ => {
+                                for px in 0..w {
+                                    if col_ok[px] {
+                                        let (cst, wx) = cols.taps(px);
+                                        let off = (cst - gc0) as usize;
+                                        let mut acc = 0.0f32;
+                                        for (a, b) in seg[off..off + wx.len()].iter().zip(wx) {
+                                            acc += a * b;
+                                        }
+                                        hs_row[px] = acc;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let hw_row = &mut hw[slot * w..(slot + 1) * w];
+                        match cols.stride {
+                            4 => h_pass_fixed_nan::<4>(seg, gc0, &cols, &col_ok, hs_row, hw_row),
+                            8 => h_pass_fixed_nan::<8>(seg, gc0, &cols, &col_ok, hs_row, hw_row),
+                            _ => {
+                                for px in 0..w {
+                                    if col_ok[px] {
+                                        let (cst, wx) = cols.taps(px);
+                                        let off = (cst - gc0) as usize;
+                                        let (mut acc, mut wacc) = (0.0f32, 0.0f32);
+                                        for (&a, &b) in seg[off..off + wx.len()].iter().zip(wx) {
+                                            let ok = !a.is_nan();
+                                            acc += if ok { a * b } else { 0.0 };
+                                            wacc += if ok { b } else { 0.0 };
+                                        }
+                                        hs_row[px] = acc;
+                                        hw_row[px] = wacc;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Vertical pass.
+                row_out.fill(0.0);
+                if !clean {
+                    wrow.fill(0.0);
+                }
+                for (j, &wj) in wy.iter().enumerate() {
+                    let slot = (st + j as i32).rem_euclid(ring as i32) as usize;
+                    for (o, &a) in row_out.iter_mut().zip(&hs[slot * w..(slot + 1) * w]) {
+                        *o += a * wj;
+                    }
+                    if !clean {
+                        for (o, &a) in wrow.iter_mut().zip(&hw[slot * w..(slot + 1) * w]) {
+                            *o += a * wj;
+                        }
+                    }
+                }
+            }
+            for px in 0..w {
+                if !row_ok[py] || !col_ok[px] || seg_w == 0 {
+                    row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                } else if clean {
+                    if row_out[px].is_nan() {
+                        row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                    }
+                } else {
+                    // Normalised weights: the valid weight is the share of the kernel on valid pixels.
+                    let ws = wrow[px];
+                    row_out[px] = if positive {
+                        if ws > 1e-6 { row_out[px] / ws } else { f32::NAN }
+                    } else if ws >= 0.5 {
+                        row_out[px] / ws
+                    } else {
+                        fallback.push(py * w + px);
+                        f32::NAN
+                    };
+                }
+            }
+        }
+    });
+    // Cubic / lanczos pixels with under half the kernel on valid data take the widened tent, as in
+    // `sample_kernel_widened`: one tent pass over just the rows that need it (nodata-heavy images
+    // have many such pixels, and sampling each one alone dominated the render).
+    if !fallback.is_empty() {
+        let mut sub_of_row = vec![u32::MAX; h];
+        let mut sub_vs = Vec::new();
+        for &i in &fallback {
+            let py = i / w;
+            if sub_of_row[py] == u32::MAX {
+                sub_of_row[py] = sub_vs.len() as u32;
+                sub_vs.push(vs[py]);
+            }
+        }
+        let tent = widened_plane_separable(us, &sub_vs, src, ResampleMode::Bilinear, scale_x, scale_y);
+        for &i in &fallback {
+            out[i] = tent[sub_of_row[i / w] as usize * w + i % w];
+        }
+    }
+    out
+}
+
+/// `(scale_x, scale_y)` of `plan` when `mode` is a convolution kernel that widens on it.
+#[inline]
+pub fn plan_widened_scale<const N: usize>(plan: &CoordPlan<N>, mode: ResampleMode) -> Option<(f32, f32)> {
+    if !matches!(
+        mode,
+        ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos
+    ) {
+        return None;
+    }
+    let (sx, sy) = coord_plan_scale(plan);
+    kernel_widens(mode, sx, sy).then_some((sx, sy))
+}
+
+/// Separable plan over output pixel indices (`u[px] = px`, `v[py] = py`), used to feed a
+/// precomputed `N x N` plane through the per-pixel encoders.
+fn index_plan<const N: usize>() -> CoordPlan<N> {
+    let mut u = Box::new([0.0f32; N]);
+    for (i, x) in u.iter_mut().enumerate() {
+        *x = i as f32;
+    }
+    CoordPlan::Separable1D {
+        v: u.clone(),
+        u,
+        src_min_col: 0,
+        src_max_col: N as i32 - 1,
+        src_min_row: 0,
+        src_max_row: N as i32 - 1,
+        all_in_bounds: true,
+    }
+}
+
+#[inline(always)]
+fn plane_at<const N: usize>(plane: &[f32], u: f32, v: f32) -> f32 {
+    plane[(v as usize) * N + (u as usize)]
+}
+
 /// General sampler supporting all 15 GDAL/TiTiler resampling methods at 1:1 source scale.
 #[inline]
 pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) -> f32 {
@@ -926,8 +1940,28 @@ pub fn sample_general(src: &BandSource<'_>, u: f32, v: f32, mode: ResampleMode) 
 /// - At 1:1 scale (`scale_x == 1, scale_y == 1`), reads the exact single source pixel (0 blur).
 /// - At exact integer factors (2x, 4x, 8x, ...), computes the exact block mean / mode / stat.
 /// - At non-integer factors, weights each overlapped source pixel by its exact overlap area.
+///
+/// `Bilinear`, `Cubic`, `CubicSpline` and `Lanczos` widen their kernel like GDAL when the footprint
+/// shrinks the image (see [`sample_kernel_widened`]).
 #[inline]
 pub fn sample_general_scaled(
+    src: &BandSource<'_>,
+    u: f32,
+    v: f32,
+    scale_x: f32,
+    scale_y: f32,
+    mode: ResampleMode,
+) -> f32 {
+    if kernel_widens(mode, scale_x, scale_y) {
+        return sample_kernel_widened(src, u, v, scale_x, scale_y, mode);
+    }
+    sample_general_unwidened(src, u, v, scale_x, scale_y, mode)
+}
+
+/// [`sample_general_scaled`] for callers that already sent widened convolution kernels to
+/// [`sample_kernel_widened`]: fixed-size kernels (1:1 and upsampling) and footprint modes.
+#[inline]
+pub fn sample_general_unwidened(
     src: &BandSource<'_>,
     u: f32,
     v: f32,
@@ -1300,66 +2334,78 @@ fn sample_footprint_exact(
 #[inline]
 pub fn coord_plan_scale<const N: usize>(plan: &CoordPlan<N>) -> (f32, f32) {
     match plan {
-        CoordPlan::Separable1D { u, v, .. } => {
-            let denom = (N.saturating_sub(1)).max(1) as f32;
-            let sx = (u[N - 1] - u[0]).abs() / denom;
-            let sy = (v[N - 1] - v[0]).abs() / denom;
-            (
-                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
-                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
-            )
+        CoordPlan::Separable1D { u, v, .. } => separable_coord_scale(&u[..], &v[..]),
+        CoordPlan::Grid2D { grid_u, grid_v, .. } => grid_coord_scale(grid_u, grid_v, N, N),
+        CoordPlan::Exact2D { u, v, .. } => exact_coord_scale(&u[..], &v[..], N, N),
+    }
+}
+
+#[inline(always)]
+fn usable_scale(s: f32) -> f32 {
+    if s.is_finite() && s > 1e-4 { s } else { 1.0 }
+}
+
+/// [`coord_plan_scale`] of separable axes `u` (columns) x `v` (rows).
+#[inline]
+pub fn separable_coord_scale(u: &[f32], v: &[f32]) -> (f32, f32) {
+    let span = |c: &[f32]| match (c.first(), c.last()) {
+        (Some(a), Some(b)) => (b - a).abs() / (c.len().saturating_sub(1)).max(1) as f32,
+        _ => 1.0,
+    };
+    (usable_scale(span(u)), usable_scale(span(v)))
+}
+
+/// [`coord_plan_scale`] of a `GRID_DIM` x `GRID_DIM` warp grid over a `dst_w` x `dst_h` output.
+#[inline]
+pub fn grid_coord_scale(grid_u: &[f32], grid_v: &[f32], dst_w: usize, dst_h: usize) -> (f32, f32) {
+    let mid = (GRID_DIM - 1) / 2;
+    let i00 = mid * GRID_DIM + mid;
+    let i10 = i00 + 1;
+    let i01 = (mid + 1) * GRID_DIM + mid;
+    let cell_x = (dst_w / (GRID_DIM - 1)).max(1) as f32;
+    let cell_y = (dst_h / (GRID_DIM - 1)).max(1) as f32;
+    let sx = (grid_u[i10] - grid_u[i00]).hypot(grid_v[i10] - grid_v[i00]) / cell_x;
+    let sy = (grid_u[i01] - grid_u[i00]).hypot(grid_v[i01] - grid_v[i00]) / cell_y;
+    (usable_scale(sx), usable_scale(sy))
+}
+
+/// [`coord_plan_scale`] of dense row-major `w` x `h` coordinate maps: the first pixel step found
+/// with finite, non-degenerate neighbours (centre first, then a coarse and a full scan).
+pub fn exact_coord_scale(u: &[f32], v: &[f32], w: usize, h: usize) -> (f32, f32) {
+    if w <= 1 || h <= 1 || u.len() < w * h || v.len() < w * h {
+        return (1.0, 1.0);
+    }
+    let probe = |py: usize, px: usize| -> Option<(f32, f32)> {
+        let i00 = py * w + px;
+        let i10 = i00 + 1;
+        let i01 = (py + 1) * w + px;
+        let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
+        let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
+        if sx.is_finite() && sx > 1e-4 && sy.is_finite() && sy > 1e-4 {
+            Some((sx, sy))
+        } else {
+            None
         }
-        CoordPlan::Grid2D { grid_u, grid_v, .. } => {
-            let cell_px = (N / (GRID_DIM - 1)).max(1) as f32;
-            let mid = (GRID_DIM - 1) / 2;
-            let i00 = mid * GRID_DIM + mid;
-            let i10 = i00 + 1;
-            let i01 = (mid + 1) * GRID_DIM + mid;
-            let sx = (grid_u[i10] - grid_u[i00]).hypot(grid_v[i10] - grid_v[i00]) / cell_px;
-            let sy = (grid_u[i01] - grid_u[i00]).hypot(grid_v[i01] - grid_v[i00]) / cell_px;
-            (
-                if sx.is_finite() && sx > 1e-4 { sx } else { 1.0 },
-                if sy.is_finite() && sy > 1e-4 { sy } else { 1.0 },
-            )
-        }
-        CoordPlan::Exact2D { u, v, .. } => {
-            if N <= 1 {
-                return (1.0, 1.0);
-            }
-            let probe = |py: usize, px: usize| -> Option<(f32, f32)> {
-                let i00 = py * N + px;
-                let i10 = i00 + 1;
-                let i01 = (py + 1) * N + px;
-                let sx = (u[i10] - u[i00]).hypot(v[i10] - v[i00]);
-                let sy = (u[i01] - u[i00]).hypot(v[i01] - v[i00]);
-                if sx.is_finite() && sx > 1e-4 && sy.is_finite() && sy > 1e-4 {
-                    Some((sx, sy))
-                } else {
-                    None
-                }
-            };
-            let mid = (N / 2).min(N - 2);
-            if let Some(s) = probe(mid, mid) {
+    };
+    if let Some(s) = probe((h / 2).min(h - 2), (w / 2).min(w - 2)) {
+        return s;
+    }
+    let (step_y, step_x) = ((h / 16).max(1), (w / 16).max(1));
+    for py in (0..h - 1).step_by(step_y) {
+        for px in (0..w - 1).step_by(step_x) {
+            if let Some(s) = probe(py, px) {
                 return s;
             }
-            let step = (N / 16).max(1);
-            for py in (0..N - 1).step_by(step) {
-                for px in (0..N - 1).step_by(step) {
-                    if let Some(s) = probe(py, px) {
-                        return s;
-                    }
-                }
-            }
-            for py in 0..N - 1 {
-                for px in 0..N - 1 {
-                    if let Some(s) = probe(py, px) {
-                        return s;
-                    }
-                }
-            }
-            (1.0, 1.0)
         }
     }
+    for py in 0..h - 1 {
+        for px in 0..w - 1 {
+            if let Some(s) = probe(py, px) {
+                return s;
+            }
+        }
+    }
+    (1.0, 1.0)
 }
 
 #[inline(always)]
@@ -2371,14 +3417,18 @@ pub fn render_single_band<const N: usize>(
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
-        (ResampleMode::Bilinear, true) => render_single_specialized::<N, true, true>(plan, src, style),
-        (ResampleMode::Bilinear, false) => render_single_specialized::<N, true, false>(plan, src, style),
         (ResampleMode::Nearest, true) => render_single_specialized::<N, false, true>(plan, src, style),
         (ResampleMode::Nearest, false) => render_single_specialized::<N, false, false>(plan, src, style),
+        (mode, _) if plan_widened_scale(plan, mode).is_some() => {
+            let (sx, sy) = coord_plan_scale(plan);
+            render_plane_single::<N>(&widened_plane(plan, src, mode, sx, sy), style)
+        }
+        (ResampleMode::Bilinear, true) => render_single_specialized::<N, true, true>(plan, src, style),
+        (ResampleMode::Bilinear, false) => render_single_specialized::<N, true, false>(plan, src, style),
         (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| sample_cubic(src, u, v)),
         (other, _) => {
             let (sx, sy) = coord_plan_scale(plan);
-            render_eval_fn(plan, style, |u, v| sample_general_scaled(src, u, v, sx, sy, other))
+            render_eval_fn(plan, style, |u, v| sample_general_unwidened(src, u, v, sx, sy, other))
         }
     }
 }
@@ -3974,19 +5024,36 @@ pub fn render_rgb_bands<const N: usize>(
         && srcs[2].is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
-        (ResampleMode::Bilinear, true) => render_rgb_specialized::<N, true, true>(plan, srcs, style),
-        (ResampleMode::Bilinear, false) => render_rgb_specialized::<N, true, false>(plan, srcs, style),
         (ResampleMode::Nearest, true) => render_rgb_specialized::<N, false, true>(plan, srcs, style),
         (ResampleMode::Nearest, false) => render_rgb_specialized::<N, false, false>(plan, srcs, style),
-        (ResampleMode::Cubic, _) => render_rgb_cubic::<N>(plan, srcs, style),
-        (_, _) => render_rgb_cubic::<N>(plan, srcs, style),
+        (mode, _) if plan_widened_scale(plan, mode).is_some() => {
+            let (sx, sy) = coord_plan_scale(plan);
+            let planes = [
+                widened_plane(plan, &srcs[0], mode, sx, sy),
+                widened_plane(plan, &srcs[1], mode, sx, sy),
+                widened_plane(plan, &srcs[2], mode, sx, sy),
+            ];
+            render_rgb_cubic::<N>(&index_plan::<N>(), style, |b, u, v| plane_at::<N>(&planes[b], u, v))
+        }
+        (ResampleMode::Bilinear, true) => render_rgb_specialized::<N, true, true>(plan, srcs, style),
+        (ResampleMode::Bilinear, false) => render_rgb_specialized::<N, true, false>(plan, srcs, style),
+        (mode, _) => {
+            let (sx, sy) = coord_plan_scale(plan);
+            render_rgb_cubic::<N>(plan, style, |b, u, v| {
+                if mode == ResampleMode::Cubic {
+                    sample_cubic(&srcs[b], u, v)
+                } else {
+                    sample_general_unwidened(&srcs[b], u, v, sx, sy, mode)
+                }
+            })
+        }
     }
 }
 
 fn render_rgb_cubic<const N: usize>(
     plan: &CoordPlan<N>,
-    srcs: &[BandSource<'_>; 3],
     style: &RgbStyle,
+    sample_band: impl Fn(usize, f32, f32) -> f32,
 ) -> Bytes {
     let inv = [
         255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
@@ -3994,22 +5061,13 @@ fn render_rgb_cubic<const N: usize>(
         255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
-    let mode = style.resample;
-    let (sx, sy) = coord_plan_scale(plan);
-    let sample_px = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
-        if mode == ResampleMode::Cubic {
-            sample_cubic(src, u, v)
-        } else {
-            sample_general_scaled(src, u, v, sx, sy, mode)
-        }
-    };
     match style.format {
         OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
             let mut out = BytesMut::with_capacity(N * N * 12);
             for b in 0..3 {
                 for py in 0..N {
                     for_each_pixel_in_row(plan, py, |_px, u, v| {
-                        out.put_slice(&sample_px(&srcs[b], u, v).to_le_bytes());
+                        out.put_slice(&sample_band(b, u, v).to_le_bytes());
                     });
                 }
             }
@@ -4029,9 +5087,9 @@ fn render_rgb_cubic<const N: usize>(
             for py in 0..N {
                 let row = &mut sc.row_buf[..N * 4];
                 for_each_pixel_in_row(plan, py, |px, u, v| {
-                    let r = sample_px(&srcs[0], u, v);
-                    let g = sample_px(&srcs[1], u, v);
-                    let b = sample_px(&srcs[2], u, v);
+                    let r = sample_band(0, u, v);
+                    let g = sample_band(1, u, v);
+                    let b = sample_band(2, u, v);
                     let off = px * 4;
                     if r.is_nan() || g.is_nan() || b.is_nan() {
                         row[off..off + 4].fill(0);
@@ -4056,9 +5114,9 @@ fn render_rgb_cubic<const N: usize>(
             let buf = &mut sc.img_buf[..total];
             for py in 0..N {
                 for_each_pixel_in_row(plan, py, |px, u, v| {
-                    let r = sample_px(&srcs[0], u, v);
-                    let g = sample_px(&srcs[1], u, v);
-                    let b = sample_px(&srcs[2], u, v);
+                    let r = sample_band(0, u, v);
+                    let g = sample_band(1, u, v);
+                    let b = sample_band(2, u, v);
                     let off = (py * N + px) * 4;
                     if r.is_nan() || g.is_nan() || b.is_nan() {
                         buf[off..off + 4].fill(0);
@@ -4212,6 +5270,43 @@ fn render_eval_fn<const N: usize, F: Fn(f32, f32) -> f32>(
     }
 }
 
+/// Encode a precomputed single-band `N x N` plane (`NaN` = no data, see [`widened_plane`]). A
+/// fully valid PNG is written opaque (grey or indexed without transparency), as the clean
+/// specialised samplers do; everything else goes through [`render_eval_fn`].
+fn render_plane_single<const N: usize>(plane: &[f32], style: &SingleBandStyle) -> Bytes {
+    if matches!(style.format, OutputFormat::Png) && !plane.iter().any(|v| v.is_nan()) {
+        let inv_range = 255.0 / safe_rescale_denom(style.rescale_min, style.rescale_max);
+        let min_val = style.rescale_min;
+        let lut: &ColormapLut = style.colormap.lut();
+        let plte = build_plte_opaque(lut);
+        return SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            let stride = 1 + N;
+            let total = N * stride;
+            if sc.img_buf.len() < total {
+                sc.img_buf.resize(total, 0);
+            }
+            if sc.row_buf.len() < N {
+                sc.row_buf.resize(N, 0);
+            }
+            for py in 0..N {
+                let row_idx = &mut sc.row_buf[..N];
+                for (o, &val) in row_idx.iter_mut().zip(&plane[py * N..(py + 1) * N]) {
+                    *o = rescale_u8(val, inv_range, min_val);
+                }
+                filter_sub_u8_row(row_idx, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+            }
+            if matches!(style.colormap, crate::colormap::ColormapName::Grayscale) {
+                encode_filtered_png(N as u32, N as u32, 0, &sc.img_buf[..total])
+            } else {
+                encode_indexed_png(N as u32, N as u32, plte, None, &sc.img_buf[..total])
+            }
+        });
+    }
+    render_eval_fn(&index_plan::<N>(), style, |u, v| plane_at::<N>(plane, u, v))
+}
+
 /// Fused 1-band spectral transform kernel (e.g. SAR linear power -> dB `10*log10(x)`).
 pub fn render_bandmath1<const N: usize>(
     plan: &CoordPlan<N>,
@@ -4226,6 +5321,14 @@ pub fn render_bandmath1<const N: usize>(
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
+        (
+            mode @ (ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos),
+            _,
+        ) if plan_widened_scale(plan, mode).is_some() => {
+            let (sx, sy) = coord_plan_scale(plan);
+            let plane = widened_plane(plan, src, mode, sx, sy);
+            render_eval_fn(&index_plan::<N>(), style, |u, v| expr.eval1(plane_at::<N>(&plane, u, v)))
+        }
         (ResampleMode::Bilinear, true) => {
             render_eval_fn(plan, style, |u, v| expr.eval1(sample_bilinear::<true>(src, u, v)))
         }
@@ -4244,7 +5347,7 @@ pub fn render_bandmath1<const N: usize>(
         (other, _) => {
             let (scale_x, scale_y) = coord_plan_scale(plan);
             render_eval_fn(plan, style, |u, v| {
-                expr.eval1(sample_general_scaled(src, u, v, scale_x, scale_y, other))
+                expr.eval1(sample_general_unwidened(src, u, v, scale_x, scale_y, other))
             })
         }
     }
@@ -4271,9 +5374,21 @@ pub fn render_sar_rgb<const N: usize>(
     ];
     let mins = style.rescale_min;
     let (scale_x, scale_y) = coord_plan_scale(plan);
+    let widen = style.resample != ResampleMode::Nearest && plan_widened_scale(plan, style.resample).is_some();
+    let wide = widen.then(|| [
+        WidenedSampler::new(style.resample, scale_x, scale_y),
+        WidenedSampler::new(style.resample, scale_x, scale_y),
+    ]);
 
     let sample_pair = |u: f32, v: f32| -> (f32, f32, f32) {
         let (vv, vh) = match (style.resample, clean) {
+            (
+                ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos,
+                _,
+            ) if widen => match &wide {
+                Some(w) => (w[0].sample(&srcs[0], u, v), w[1].sample(&srcs[1], u, v)),
+                None => (f32::NAN, f32::NAN),
+            },
             (ResampleMode::Cubic, _) => (
                 sample_cubic(&srcs[0], u, v),
                 sample_cubic(&srcs[1], u, v),
@@ -4295,8 +5410,8 @@ pub fn render_sar_rgb<const N: usize>(
                 sample_nearest::<false>(&srcs[1], u, v),
             ),
             (other, _) => (
-                sample_general_scaled(&srcs[0], u, v, scale_x, scale_y, other),
-                sample_general_scaled(&srcs[1], u, v, scale_x, scale_y, other),
+                sample_general_unwidened(&srcs[0], u, v, scale_x, scale_y, other),
+                sample_general_unwidened(&srcs[1], u, v, scale_x, scale_y, other),
             ),
         };
         let vv_db = fast_db_from_power(vv);
@@ -4410,6 +5525,23 @@ pub fn render_bandmath2<const N: usize>(
         && srcs[1].is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
+        (
+            mode @ (ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos),
+            _,
+        ) if plan_widened_scale(plan, mode).is_some() => {
+            let (sx, sy) = coord_plan_scale(plan);
+            let pa = widened_plane(plan, &srcs[0], mode, sx, sy);
+            let pb = widened_plane(plan, &srcs[1], mode, sx, sy);
+            render_eval_fn(&index_plan::<N>(), style, |u, v| {
+                let a = plane_at::<N>(&pa, u, v);
+                let b = plane_at::<N>(&pb, u, v);
+                if a.is_nan() || b.is_nan() {
+                    f32::NAN
+                } else {
+                    expr.eval2(a, b)
+                }
+            })
+        }
         (ResampleMode::Bilinear, true) => render_eval_fn(plan, style, |u, v| {
             let a = sample_bilinear::<true>(&srcs[0], u, v);
             let b = sample_bilinear::<true>(&srcs[1], u, v);
@@ -4450,8 +5582,8 @@ pub fn render_bandmath2<const N: usize>(
         (other, _) => {
             let (scale_x, scale_y) = coord_plan_scale(plan);
             render_eval_fn(plan, style, |u, v| {
-                let a = sample_general_scaled(&srcs[0], u, v, scale_x, scale_y, other);
-                let b = sample_general_scaled(&srcs[1], u, v, scale_x, scale_y, other);
+                let a = sample_general_unwidened(&srcs[0], u, v, scale_x, scale_y, other);
+                let b = sample_general_unwidened(&srcs[1], u, v, scale_x, scale_y, other);
                 if a.is_nan() || b.is_nan() {
                     f32::NAN
                 } else {
@@ -4479,6 +5611,25 @@ pub fn render_bandmath3<const N: usize>(
         && srcs[2].is_clean_inbounds(c0, c1, r0, r1);
 
     match (style.resample, clean) {
+        (
+            mode @ (ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos),
+            _,
+        ) if plan_widened_scale(plan, mode).is_some() => {
+            let (sx, sy) = coord_plan_scale(plan);
+            let pa = widened_plane(plan, &srcs[0], mode, sx, sy);
+            let pb = widened_plane(plan, &srcs[1], mode, sx, sy);
+            let pc = widened_plane(plan, &srcs[2], mode, sx, sy);
+            render_eval_fn(&index_plan::<N>(), style, |u, v| {
+                let a = plane_at::<N>(&pa, u, v);
+                let b = plane_at::<N>(&pb, u, v);
+                let c = plane_at::<N>(&pc, u, v);
+                if a.is_nan() || b.is_nan() || c.is_nan() {
+                    f32::NAN
+                } else {
+                    expr.eval3(a, b, c)
+                }
+            })
+        }
         (ResampleMode::Bilinear, true) => render_eval_fn(plan, style, |u, v| {
             let a = sample_bilinear::<true>(&srcs[0], u, v);
             let b = sample_bilinear::<true>(&srcs[1], u, v);
@@ -4524,9 +5675,9 @@ pub fn render_bandmath3<const N: usize>(
         (other, _) => {
             let (scale_x, scale_y) = coord_plan_scale(plan);
             render_eval_fn(plan, style, |u, v| {
-                let a = sample_general_scaled(&srcs[0], u, v, scale_x, scale_y, other);
-                let b = sample_general_scaled(&srcs[1], u, v, scale_x, scale_y, other);
-                let c = sample_general_scaled(&srcs[2], u, v, scale_x, scale_y, other);
+                let a = sample_general_unwidened(&srcs[0], u, v, scale_x, scale_y, other);
+                let b = sample_general_unwidened(&srcs[1], u, v, scale_x, scale_y, other);
+                let c = sample_general_unwidened(&srcs[2], u, v, scale_x, scale_y, other);
                 if a.is_nan() || b.is_nan() || c.is_nan() {
                     f32::NAN
                 } else {
@@ -4584,8 +5735,24 @@ pub fn render_expr_vm<const N: usize>(
         Vec::new()
     };
 
+    let widened_planes: Vec<Vec<f32>> = match plan_widened_scale(plan, style.resample) {
+        Some((sx, sy)) => srcs[..nb]
+            .iter()
+            .map(|s| widened_plane(plan, s, style.resample, sx, sy))
+            .collect(),
+        None => Vec::new(),
+    };
+
     let sample_row = |py: usize, band_rows: &mut [[f32; N]]| {
         match (style.resample, all_clean) {
+            (
+                ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos,
+                _,
+            ) if !widened_planes.is_empty() => {
+                for b in 0..nb {
+                    band_rows[b].copy_from_slice(&widened_planes[b][py * N..(py + 1) * N]);
+                }
+            }
             (ResampleMode::Bilinear, true) => {
                 if let CoordPlan::Separable1D { u, v, .. } = plan
                     && all_single
@@ -4650,7 +5817,7 @@ pub fn render_expr_vm<const N: usize>(
                 for_each_pixel_in_row(plan, py, |px, u, v| {
                     for b in 0..nb {
                         band_rows[b][px] =
-                            sample_general_scaled(&srcs[b], u, v, scale_x, scale_y, other);
+                            sample_general_unwidened(&srcs[b], u, v, scale_x, scale_y, other);
                     }
                 });
             }
@@ -4896,15 +6063,21 @@ pub fn render_terrain_tile<const N: usize>(
 
     let encode_px = |v: f32| -> [u8; 3] { encoding.encode_rgb(v) };
     let (scale_x, scale_y) = coord_plan_scale(plan);
+    let widen = resample != ResampleMode::Nearest && plan_widened_scale(plan, resample).is_some();
+    let wide = widen.then(|| WidenedSampler::new(resample, scale_x, scale_y));
 
     let sample_px = |u: f32, v: f32| -> f32 {
         match (resample, clean) {
+            (
+                ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos,
+                _,
+            ) if widen => wide.as_ref().map_or(f32::NAN, |w| w.sample(src, u, v)),
             (ResampleMode::Bilinear, true) => sample_bilinear::<true>(src, u, v),
             (ResampleMode::Bilinear, false) => sample_bilinear::<false>(src, u, v),
             (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
             (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
-            (other, _) => sample_general_scaled(src, u, v, scale_x, scale_y, other),
+            (other, _) => sample_general_unwidened(src, u, v, scale_x, scale_y, other),
         }
     };
 
@@ -4921,7 +6094,7 @@ pub fn render_terrain_tile<const N: usize>(
                 if sc.row_buf.len() < N * 3 {
                     sc.row_buf.resize(N * 3, 0);
                 }
-                let flat_dem = if resample == ResampleMode::Bilinear {
+                let flat_dem = if resample == ResampleMode::Bilinear && !widen {
                     src.single_block_flat()
                 } else {
                     None
@@ -5454,25 +6627,36 @@ pub fn render_dem_algorithm<const N: usize>(
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
     let (scale_x, scale_y) = coord_plan_scale(plan);
+    let widen = style.resample != ResampleMode::Nearest && plan_widened_scale(plan, style.resample).is_some();
+    let wide = widen.then(|| WidenedSampler::new(style.resample, scale_x, scale_y));
 
     let sample_px = |u: f32, v: f32| -> f32 {
         match (style.resample, clean) {
+            (
+                ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos,
+                _,
+            ) if widen => wide.as_ref().map_or(f32::NAN, |w| w.sample(src, u, v)),
             (ResampleMode::Bilinear, true) => sample_bilinear::<true>(src, u, v),
             (ResampleMode::Bilinear, false) => sample_bilinear::<false>(src, u, v),
             (ResampleMode::Nearest, true) => sample_nearest::<true>(src, u, v),
             (ResampleMode::Nearest, false) => sample_nearest::<false>(src, u, v),
             (ResampleMode::Cubic, _) => sample_cubic(src, u, v),
-            (other, _) => sample_general_scaled(src, u, v, scale_x, scale_y, other),
+            (other, _) => sample_general_unwidened(src, u, v, scale_x, scale_y, other),
         }
     };
     // Sub-pixel bounds-checked sampler for the 1-pixel extrapolated border so tile edges
     // match neighboring tiles' interior pixels with zero staircase seam.
     let sample_border = |u: f32, v: f32| -> f32 {
         match style.resample {
+            ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos
+                if widen =>
+            {
+                sample_kernel_widened(src, u, v, scale_x, scale_y, style.resample)
+            }
             ResampleMode::Bilinear => sample_bilinear::<false>(src, u, v),
             ResampleMode::Nearest => sample_nearest::<false>(src, u, v),
             ResampleMode::Cubic => sample_cubic(src, u, v),
-            other => sample_general_scaled(src, u, v, scale_x, scale_y, other),
+            other => sample_general_unwidened(src, u, v, scale_x, scale_y, other),
         }
     };
 
@@ -5495,7 +6679,7 @@ pub fn render_dem_algorithm<const N: usize>(
         let mut u_row = [0.0f32; N];
         let mut v_row = [0.0f32; N];
 
-        let flat_dem = if style.resample == ResampleMode::Bilinear && clean {
+        let flat_dem = if style.resample == ResampleMode::Bilinear && clean && !widen {
             src.single_block_flat()
         } else {
             None
@@ -7343,3 +8527,261 @@ mod npy_typed_tests {
         assert!(sample_general_scaled(&src, -5.0, 4.0, 4.0, 4.0, ResampleMode::Average).is_nan());
     }
 }
+
+#[cfg(test)]
+mod widened_kernel_tests {
+    use super::*;
+    use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
+
+    fn f32_band(w: u32, h: u32, f: impl Fn(u32, u32) -> f32) -> DecodedBand {
+        let mut slab = AlignedF32Slab::new_uninit((w * h) as usize);
+        let mut no_nodata = true;
+        for (i, d) in slab.as_mut_slice().iter_mut().enumerate() {
+            *d = f(i as u32 % w, i as u32 / w);
+            no_nodata &= !d.is_nan();
+        }
+        DecodedBand {
+            width: w,
+            height: h,
+            data: BandData::F32(slab),
+            stats: BlockStats { all_nodata: false, no_nodata, min: 0.0, max: 1.0 },
+        }
+    }
+
+    fn pattern(x: u32, y: u32) -> f32 {
+        ((x * 7919 + y * 104_729) % 1000) as f32
+    }
+
+    /// Straight `f64` GDAL convolution: every pixel `j` with `|j - c| < r * s`, weight `K((j - c) / s)`.
+    fn reference(src: &BandSource<'_>, u: f32, v: f32, s: f32, mode: ResampleMode) -> f64 {
+        let r = conv_kernel_radius(mode) as f64 * s as f64;
+        let (mut sum, mut wsum) = (0.0f64, 0.0f64);
+        for y in 0..src.ifd_h {
+            let dy = y as f64 - v as f64;
+            if dy.abs() >= r {
+                continue;
+            }
+            for x in 0..src.ifd_w {
+                let dx = x as f64 - u as f64;
+                if dx.abs() >= r {
+                    continue;
+                }
+                let w = conv_kernel_weight(mode, (dx / s as f64) as f32) as f64
+                    * conv_kernel_weight(mode, (dy / s as f64) as f32) as f64;
+                sum += w * src.sample_checked(x, y) as f64;
+                wsum += w;
+            }
+        }
+        sum / wsum
+    }
+
+    #[test]
+    fn kernel_scale_snaps_like_the_gdal_warper() {
+        assert_eq!(gdal_kernel_scale(0.5), 1.0);
+        assert_eq!(gdal_kernel_scale(1.0), 1.0);
+        assert_eq!(gdal_kernel_scale(1.04), 1.0);
+        assert_eq!(gdal_kernel_scale(1.97), 2.0);
+        assert!((gdal_kernel_scale(1.56) - 1.56).abs() < 1e-6);
+        assert!(!kernel_widens(ResampleMode::Bilinear, 1.04, 0.5));
+        assert!(kernel_widens(ResampleMode::Bilinear, 1.0, 1.5));
+        assert!(kernel_widens(ResampleMode::Lanczos, 2.0, 2.0));
+        assert!(!kernel_widens(ResampleMode::Nearest, 4.0, 4.0));
+        assert!(!kernel_widens(ResampleMode::Average, 4.0, 4.0));
+        assert!(!kernel_widens(ResampleMode::Gauss, 4.0, 4.0));
+        assert_eq!(widened_kernel_radius(ResampleMode::Cubic, 1.5), 3.0);
+        assert_eq!(widened_kernel_radius(ResampleMode::Nearest, 3.0), 0.0);
+    }
+
+    #[test]
+    fn halving_bilinear_is_the_gdal_1_3_3_1_filter() {
+        let b = f32_band(16, 16, pattern);
+        let blks = [Some(&b)];
+        let src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blks);
+        // Output pixel centred between source pixels 5 and 6 (and rows 7 and 8) at 2x shrink.
+        let got = sample_kernel_widened(&src, 5.5, 7.5, 2.0, 2.0, ResampleMode::Bilinear);
+        let w = [0.125f64, 0.375, 0.375, 0.125];
+        let mut want = 0.0f64;
+        for (j, wy) in w.iter().enumerate() {
+            for (i, wx) in w.iter().enumerate() {
+                want += wx * wy * pattern(4 + i as u32, 6 + j as u32) as f64;
+            }
+        }
+        assert!((got as f64 - want).abs() < 1e-3, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn widened_sampler_matches_a_direct_gdal_convolution() {
+        let b = f32_band(64, 64, pattern);
+        let blks = [Some(&b)];
+        let src = BandSource::new(64, 64, 64, 64, 0, 0, 1, 1, &blks);
+        for mode in [ResampleMode::Bilinear, ResampleMode::Cubic, ResampleMode::CubicSpline, ResampleMode::Lanczos] {
+            for &s in &[1.3f32, 1.56, 2.0, 3.7] {
+                let sampler = WidenedSampler::new(mode, s, s);
+                for &(u, v) in &[(20.0f32, 30.0f32), (31.25, 17.8), (40.6, 40.1)] {
+                    let want = reference(&src, u, v, gdal_kernel_scale(s), mode);
+                    let got = sample_kernel_widened(&src, u, v, s, s, mode) as f64;
+                    let cached = sampler.sample(&src, u, v) as f64;
+                    assert!((got - want).abs() < 2e-2, "{mode:?} s={s} ({u},{v}): {got} vs {want}");
+                    assert!((cached - want).abs() < 2e-2, "{mode:?} s={s} ({u},{v}) cached: {cached} vs {want}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn widened_kernel_skips_nodata_and_out_of_raster_taps() {
+        // Left half NaN: a sample next to the boundary averages only the valid pixels.
+        let b = f32_band(16, 16, |x, _| if x < 8 { f32::NAN } else { 10.0 });
+        let blks = [Some(&b)];
+        let src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blks);
+        let v = sample_kernel_widened(&src, 7.5, 8.0, 2.0, 2.0, ResampleMode::Bilinear);
+        assert!((v - 10.0).abs() < 1e-5, "{v}");
+        let sampler = WidenedSampler::new(ResampleMode::Lanczos, 2.0, 2.0);
+        let l = sampler.sample(&src, 7.5, 8.0);
+        assert!((l - 10.0).abs() < 1e-4, "{l}");
+        // Fully inside the NaN half: no data.
+        assert!(sample_kernel_widened(&src, 2.0, 8.0, 2.0, 2.0, ResampleMode::Bilinear).is_nan());
+        // Raster corner: renormalised over the in-raster taps.
+        let c = f32_band(16, 16, |_, _| 3.0);
+        let cb = [Some(&c)];
+        let csrc = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &cb);
+        let e = sample_kernel_widened(&csrc, 0.0, 0.0, 3.0, 3.0, ResampleMode::Cubic);
+        assert!((e - 3.0).abs() < 1e-5, "{e}");
+        // Sample point outside the raster stays no data.
+        assert!(sample_kernel_widened(&csrc, -0.7, 4.0, 3.0, 3.0, ResampleMode::Cubic).is_nan());
+    }
+
+    #[test]
+    fn separable_widened_plane_matches_per_pixel_sampling() {
+        // 2x2 grid of 32x32 blocks, one with a nodata patch, so the plane crosses blocks and meets
+        // nodata (wide enough that cubic / lanczos pixels on its rim fall back to the tent).
+        let blocks: Vec<DecodedBand> = (0..4u32)
+            .map(|k| {
+                f32_band(32, 32, move |x, y| {
+                    if k == 3 && x < 12 && y < 12 {
+                        f32::NAN
+                    } else {
+                        pattern(x + 32 * (k % 2), y + 32 * (k / 2))
+                    }
+                })
+            })
+            .collect();
+        let refs: Vec<Option<&DecodedBand>> = blocks.iter().map(Some).collect();
+        let src = BandSource::new(64, 64, 32, 32, 0, 0, 2, 2, &refs);
+        const N: usize = 32;
+        let s = 1.9f32;
+        let mut u = Box::new([0.0f32; N]);
+        let mut v = Box::new([0.0f32; N]);
+        for i in 0..N {
+            u[i] = (i as f32 + 0.5) * s - 0.5 - 1.0;
+            v[i] = (i as f32 + 0.5) * s - 0.5 + 0.3;
+        }
+        let plan = CoordPlan::Separable1D {
+            u: u.clone(),
+            v: v.clone(),
+            src_min_col: -1,
+            src_max_col: 62,
+            src_min_row: 0,
+            src_max_row: 61,
+            all_in_bounds: false,
+        };
+        let (sx, sy) = coord_plan_scale(&plan);
+        for mode in [ResampleMode::Bilinear, ResampleMode::Cubic, ResampleMode::CubicSpline, ResampleMode::Lanczos] {
+            assert!(plan_widened_scale(&plan, mode).is_some());
+            let plane = widened_plane(&plan, &src, mode, sx, sy);
+            for py in 0..N {
+                for px in 0..N {
+                    let want = sample_kernel_widened(&src, u[px], v[py], sx, sy, mode);
+                    let got = plane[py * N + px];
+                    assert!(
+                        (want.is_nan() && got.is_nan()) || (got - want).abs() < 1e-2,
+                        "{mode:?} ({px},{py}): plane {got} vs pixel {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_sampler_and_uncached_sampler_match_per_pixel_sampling() {
+        // Clean data across a 2x2 block grid, non-square output grid that runs past the raster.
+        let blocks: Vec<DecodedBand> = (0..4u32)
+            .map(|k| f32_band(32, 32, move |x, y| pattern(x + 32 * (k % 2), y + 32 * (k / 2))))
+            .collect();
+        let refs: Vec<Option<&DecodedBand>> = blocks.iter().map(Some).collect();
+        let src = BandSource::new(64, 64, 32, 32, 0, 0, 2, 2, &refs);
+        let (w, h) = (40usize, 23usize);
+        let us: Vec<f32> = (0..w).map(|i| (i as f32 + 0.5) * 1.62 - 1.5).collect();
+        let vs: Vec<f32> = (0..h).map(|i| (i as f32 + 0.5) * 2.7 + 0.2).collect();
+        let mut u_map = Vec::new();
+        let mut v_map = Vec::new();
+        for &v in &vs {
+            for &u in &us {
+                u_map.push(u);
+                v_map.push(v);
+            }
+        }
+        let (gu, gv) = separable_axes(&u_map, &v_map, w, h).expect("separable");
+        assert_eq!((gu.len(), gv.len()), (w, h));
+        let mut skewed = v_map.clone();
+        skewed[w + 3] += 0.25;
+        assert!(separable_axes(&u_map, &skewed, w, h).is_none());
+        for mode in [ResampleMode::Bilinear, ResampleMode::Cubic, ResampleMode::CubicSpline, ResampleMode::Lanczos] {
+            let grid = WidenedSampler::with_grid(mode, 1.62, 2.7, gu.clone(), gv.clone()).unwrap();
+            let uncached = WidenedSampler::new_uncached(mode, 1.62, 2.7);
+            for i in 0..w * h {
+                let want = sample_kernel_widened(&src, u_map[i], v_map[i], 1.62, 2.7, mode);
+                let g = grid.grid_plane(&src).unwrap()[i];
+                let c = uncached.sample(&src, u_map[i], v_map[i]);
+                for got in [g, c] {
+                    assert!(
+                        (want.is_nan() && got.is_nan()) || (got - want).abs() < 1e-2,
+                        "{mode:?} pixel {i}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upsampling_keeps_the_fixed_kernels() {
+        let b = f32_band(16, 16, pattern);
+        let blks = [Some(&b)];
+        let src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blks);
+        for &(u, v) in &[(5.3f32, 6.7f32), (8.0, 8.5)] {
+            assert_eq!(
+                sample_general_scaled(&src, u, v, 0.5, 0.5, ResampleMode::Bilinear),
+                sample_bilinear::<false>(&src, u, v)
+            );
+            assert_eq!(sample_general_scaled(&src, u, v, 1.02, 0.7, ResampleMode::Cubic), sample_cubic(&src, u, v));
+        }
+    }
+
+    #[test]
+    fn widened_plane_separable_ignores_far_out_of_range_coords_with_nodata() {
+        // Out-of-range coordinates (e.g. low-zoom tile over a small COG) must not inflate the
+        // separable tap span or overflow i32 when no_nodata is false.
+        let b = f32_band(16, 16, |x, _| if x == 0 { f32::NAN } else { 7.0 });
+        let blks = [Some(&b)];
+        let mut src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blks);
+        src.no_nodata = false;
+        let us = [-1e9f32, -500_000.0, 4.5, 1e9];
+        let vs = [-1e9f32, 4.5, 1e9];
+        for mode in [ResampleMode::Bilinear, ResampleMode::Cubic, ResampleMode::CubicSpline, ResampleMode::Lanczos] {
+            let plane = widened_plane_separable(&us, &vs, &src, mode, 2.0, 2.0);
+            assert_eq!(plane.len(), us.len() * vs.len());
+            for (py, &v) in vs.iter().enumerate() {
+                for (px, &u) in us.iter().enumerate() {
+                    let got = plane[py * us.len() + px];
+                    let want = sample_kernel_widened(&src, u, v, 2.0, 2.0, mode);
+                    if want.is_nan() {
+                        assert!(got.is_nan(), "{mode:?} ({px},{py}): expected NaN, got {got}");
+                    } else {
+                        assert!((got - want).abs() < 1e-4, "{mode:?} ({px},{py}): {got} vs {want}");
+                    }
+                }
+            }
+        }
+    }
+}
+
