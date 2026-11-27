@@ -2116,21 +2116,16 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
     }
 }
 
-/// The two steps an array of [`item_asset_math`] is typed by, as numpy types them: the
-/// assets' results stacked (each over the asset's own bands, which is the same type as over
-/// the stack's), then the request expression over that stack. `None` without a request
-/// expression, when the results are the answer.
-pub(super) fn item_asset_math_stages(rest: &[&str], pairs: &[(String, String)]) -> Option<(String, String)> {
+/// The two steps an array of [`item_asset_math`] is typed by, as numpy types them: each
+/// `assets` entry's band math over its own raster (`None` for a plain asset, which is its
+/// raster's type), the results stacked at the widest of their types, then the request
+/// expression over that stack. `None` without a request expression, when the results are
+/// the answer.
+pub(super) fn item_asset_math_stages(rest: &[&str], pairs: &[(String, String)]) -> Option<(Vec<Option<String>>, String)> {
     let request = request_expression(pairs)?;
     let specs = parse_assets(pairs).ok()?;
-    let results: Vec<String> = specs
-        .iter()
-        .flat_map(|spec| match &spec.expression {
-            Some(own) => own.split(';').map(str::trim).filter(|p| !p.is_empty()).map(str::to_string).collect(),
-            None => vec!["b1".to_string()],
-        })
-        .collect();
-    item_asset_math_route(rest).then(|| (results.join(";"), request.to_string()))
+    let own: Vec<Option<String>> = specs.into_iter().map(|spec| spec.expression).collect();
+    item_asset_math_route(rest).then(|| (own, request.to_string()))
 }
 
 /// [`item_asset_math`] over several assets reads each asset's first band, which is the
@@ -8149,8 +8144,8 @@ mod tests {
     #[test]
     fn asset_math_is_typed_from_its_stacked_results() {
         let stages = |q: &str| item_asset_math_stages(&["preview.npy"], &query_pairs(q));
-        assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some(("b1/2;b1".into(), "b2".into())));
-        assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some(("b1*2;b1".into(), "b1-b2".into())));
+        assert_eq!(stages("assets=red%7Cexpression%3Db1/2;b1&expression=b2"), Some((vec![Some("b1/2;b1".into())], "b2".into())));
+        assert_eq!(stages("assets=red%7Cexpression%3Db1*2&assets=nir&expression=b1-b2"), Some((vec![Some("b1*2".into()), None], "b1-b2".into())));
         assert_eq!(stages("assets=red%7Cexpression%3Db1*2"), None, "the results are the answer");
     }
 
