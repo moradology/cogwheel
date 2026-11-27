@@ -89,6 +89,40 @@ Traffic mix in Scenarios 1–3: **40%** `512×512` RGB Lanczos3 JPEG (`q=85`), *
 
 ---
 
+## Chaos, Torture & Hard-Limit Testing
+
+Adversarial stress testing via [gpu_torture_test.rs](../crates/cogzilla-server/examples/gpu_torture_test.rs), [gpu_breaking_point_test.rs](../crates/cogzilla-server/examples/gpu_breaking_point_test.rs), and [gpu_torture_round3.rs](../crates/cogzilla-server/examples/gpu_torture_round3.rs) surfaced **5 real production failure modes** (fixed in PRs #345 and #348) and established hard operational limits on both Metal (M5) and Vulkan (RTX 3090 Ti):
+
+### Failure Modes Caught & Fixed
+1. **Coalescer staging-buffer crash on concurrent `4096²` bursts** *(fixed in PR #348)*: `16` concurrent `4096²` RawRgba jobs (`1 GiB`) exceeded `wgpu`'s `512 MiB` `max_buffer_size` inside `cogzilla-gpu-coalescer`, panicking the background worker thread permanently. Fixed via `CoalescedJob::estimated_staging_and_slot_bytes()`, per-job rejection to CPU, and 1-slot `deferred` batch splitting capped at `min(max_buffer_size/2, 256 MiB)` (all `16/16` now complete in `1.00–1.19 s` with the coalescer alive).
+2. **Orphaned-job queue storm on client disconnect** *(fixed in PR #345)*: Dropping ~32,000 futures mid-flight at 1–3 ms timeouts previously left dead jobs draining through `GpuCoalescer`'s unbounded channel for 5+ seconds. Fixed with `GpuCoalescer::submit_cancellable` + RAII `CancelOnDrop` (discards cancelled requests before GPU encoding) and bounded `COGZILLA_GPU_MAX_QUEUED=4096`.
+3. **256–2,048 client Tokio async-worker starvation** *(fixed in PRs #345, #348)*: Previously, crossing `max_in_flight × 32` shed tiles to synchronous CPU rendering directly on Tokio's async worker threads, pinning `p95` at `5,000+ ms`. Raising `policy.max_in_flight = 128` (`4,096` coalesced async GPU jobs) eliminated runtime starvation up to 2,048+ concurrent clients.
+4. **Mosaic `in_flight` unit mismatch** *(fixed in PR #345)*: `try_composite_mosaic_*` passed raw `in_flight` instead of `in_flight / 32`, locking Mosaic out of the GPU whenever ≥4 tiles were active.
+5. **Noisy-neighbor startup floor calibration** *(fixed in PR #345)*: Switched `GpuProfile::calibrate` from median-of-5 to p20-of-7 so a transient GPU spike at boot no longer permanently inflates `dispatch_floor_us`.
+
+### Verified Torture Results (Post-Fix)
+
+| Adversarial Test | RTX 3090 Ti (Vulkan) | Apple M5 (Metal) |
+| :--- | :--- | :--- |
+| **Degenerate geometry (`1×1`, `1×4096`, `4096×1`, `333×777`), `[0,0]` rescale, all-NaN, 768 MiB mosaic** | Survived (clean fallback) | Survived (clean fallback) |
+| **Mid-flight cancel storm (64 tasks, 1–3 ms timeouts, 4s)** | Survived (`2,295` ok, `34,830` dropped cleanly) | Survived (`957` ok, `35,339` dropped cleanly) |
+| **Slab-cache thrashing (12–24 distinct COGs, ~1.15 GiB, 5s)** | `6,153–13,199` tiles, `201–436` evictions, 0 OOM | `3,959–4,305` tiles, `505–961` evictions, 0 OOM |
+| **256-client flood (5s)** | **4,655 req/s** (`p50=53.7`, `p95=63.1`, `max=104.9 ms`) | **1,560 req/s** (`p50=177.7`, `p95=197.8`, `max=218.4 ms`) |
+| **512-client flood (5s)** | **4,109 req/s** (`p50=124.6`, `p95=147.3`, `max=168.3 ms`) | **1,606 req/s** (`p50=344.0`, `p95=377.5`, `max=399.7 ms`) |
+| **2,048-client flood (5s)** | **6,144 req/s** (`p50=318.4`, `p95=392.2`, `max=727.9 ms`) | **3,351 req/s** (`p50=609.6`, `p95=659.9`, `max=681.4 ms`) |
+| **16× concurrent `4096²` RawRgba (`1 GiB` burst)** | **16/16 ok, 0 err** (`1,000 ms`, coalescer alive) | **16/16 ok, 0 err** (`1,193 ms`, coalescer alive) |
+| **Cross-subsystem chaos (64 tile + 4× `4096²` + 4× zonal + 4× mosaic RGB JPEG, 8s)** | `1,518` tiles, `78` `4096²`, `131` zonals, `74` GPU mosaics (`0` fallbacks) | `1,098` tiles, `62` `4096²`, `49` zonals, `35` GPU mosaics (`0` fallbacks) |
+| **Adversarial stats (all-NaN, 1-px, const, `-0.0`, `1e-40`, `±1e30`, disjoint hist)** | Survived | Survived |
+| **327-op `CustomExprRgb`, deep nesting, 3× `GpuBackend` init/drop** | Survived (0 diffs) | Survived (0 diffs, `100.5 ms` lifecycle) |
+| **VRAM delta across 83,473 GPU jobs** | `19,116 → 19,125 MiB` (**+9 MiB / 0 leak**) | Unified memory, 0 leak |
+
+### Known Hard Limits
+- **Single-buffer `512 MiB` adapter limit**: Default `wgpu` Metal/Vulkan `max_buffer_size` and `max_storage_buffer_binding_size` are `512 MiB`. Single jobs requiring `> 256 MiB` staging or `> 512 MiB` storage cleanly fall back to CPU.
+- **Extreme concurrency (`> 4,096` concurrent uncached jobs)**: Beyond `max_in_flight = 128 × 32 = 4,096` (or `COGZILLA_GPU_MAX_QUEUED`), overflow sheds to CPU; apply HTTP-level concurrency limits in front of the server for `> 4,096` simultaneous uncached clients.
+- **`+Inf` expression overflow**: Expressions overflowing to `±Inf` (e.g. `1e38 * 1e38`) are masked as transparent (`!is_finite_f32`) on GPU, whereas CPU `render_expr` only masks `is_nan()` (clamping `+Inf` to opaque `255`).
+
+---
+
 ## What These Numbers Do and Don't Say
 
 - **Compute & encode ceiling, not S3 latency**: The soak runs against a local tiled GeoTIFF with warmed decoded blocks in `CogStore`. On cold S3 reads, network I/O and TIFF decompression (DEFLATE/LZW/Zstd) remain on CPU and will dominate single-request latency until blocks enter the cache.
