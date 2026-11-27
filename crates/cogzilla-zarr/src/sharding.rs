@@ -276,6 +276,27 @@ impl ShardIndexCache {
         };
 
         let parsed = Arc::new(ShardIndex::parse(cfg, &raw, shard_key)?);
+        // Bounds-check every inner chunk range against the shard object size before caching (#386).
+        if let Some(total_size) = store.size(shard_key).await? {
+            for (i, entry) in parsed.entries.iter().enumerate() {
+                if let Some((off, len)) = entry {
+                    let end = off.checked_add(*len).ok_or_else(|| ZarrError::Codec {
+                        codec: "sharding_indexed".into(),
+                        chunk_key: shard_key.into(),
+                        detail: format!("shard index entry {i} byte range overflows u64"),
+                    })?;
+                    if end > total_size {
+                        return Err(ZarrError::Codec {
+                            codec: "sharding_indexed".into(),
+                            chunk_key: shard_key.into(),
+                            detail: format!(
+                                "shard index entry {i} range {off}..{end} exceeds shard size {total_size}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         if let Ok(mut guard) = self.indices.write() {
             guard.insert(shard_key.to_string(), Some(Arc::clone(&parsed)));
         }

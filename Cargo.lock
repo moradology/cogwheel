@@ -505,6 +505,7 @@ dependencies = [
  "cogzilla-pgstac",
  "cogzilla-proj",
  "cogzilla-tiff",
+ "cogzilla-zarr",
  "dashmap",
  "futures-util",
  "http-body-util",

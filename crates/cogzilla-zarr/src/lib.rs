@@ -48,7 +48,11 @@ pub use codecs::{MAX_DECODED_CHUNK_BYTES, SUPPORTED_CODECS, decode_chunk_bytes};
 pub use crs::{ZarrCrs, resolve_crs};
 pub use geo::{ZarrGeo, read_coord_1d, resolve_geo};
 pub use hierarchy::{FsStore, GroupMeta, GroupView, MemoryStore, OpenMode, ZarrHierarchy, ZarrNode, ZarrStore};
-pub use reader::{ChunkWindow, ZarrWindowBlocks, read_chunk_window, read_chunk_window_for_band};
+pub use reader::{
+    ChunkWindow, DEFAULT_MAX_CHUNKS_PER_REQUEST, DEFAULT_MAX_DECODED_WINDOW_BYTES, ZarrCaps,
+    ZarrWindowBlocks, read_chunk_window, read_chunk_window_for_band,
+    read_chunk_window_for_band_with_caps,
+};
 pub use sel::{
     CfCalendar, CfTimeUnits, SelDimSpec, SelMethod, parse_sel_params, resolve_sel_indices,
 };
@@ -126,6 +130,20 @@ pub enum ZarrError {
     },
     #[error("unsupported CF calendar {calendar:?}: {detail}")]
     UnsupportedCalendar { calendar: String, detail: String },
+    #[error("store or key {key:?} not found at origin")]
+    NotFound { key: String },
+    #[error("origin refused access to {key:?} (HTTP {status})")]
+    UpstreamRefused { key: String, status: u16 },
+    #[error("origin timed out reading {key:?}: {detail}")]
+    UpstreamTimeout { key: String, detail: String },
+    #[error("origin error or truncated response reading {key:?}: {detail}")]
+    UpstreamError { key: String, detail: String },
+    #[error("request {kind} ({computed}) exceeds configured cap ({cap})")]
+    CapExceeded {
+        kind: &'static str,
+        computed: usize,
+        cap: usize,
+    },
 }
 
 /// Which revision of the Zarr specification a store was written to.
@@ -371,6 +389,7 @@ impl ArrayMeta {
         }
         let shape = u64_vec(v, "shape")?;
         let chunk_shape = u64_vec(v, "chunks")?;
+        validate_shape_and_chunks(&shape, &chunk_shape)?;
         let dtype_str = v
             .get("dtype")
             .and_then(Value::as_str)
@@ -448,6 +467,7 @@ impl ArrayMeta {
             .ok_or(ZarrError::MissingField {
                 field: "chunk_grid.configuration.chunk_shape",
             })?;
+        validate_shape_and_chunks(&shape, &chunk_shape)?;
 
         let mut codecs = Vec::new();
         if let Some(list) = v.get("codecs").and_then(Value::as_array) {
@@ -576,6 +596,12 @@ fn u64_vec(v: &Value, field: &'static str) -> Result<Vec<u64>, ZarrError> {
         .get(field)
         .and_then(Value::as_array)
         .ok_or(ZarrError::MissingField { field })?;
+    if arr.len() > 16 {
+        return Err(ZarrError::BadField {
+            field,
+            detail: format!("dimension count {} exceeds sanity limit 16", arr.len()),
+        });
+    }
     arr.iter()
         .map(|x| {
             x.as_u64().ok_or(ZarrError::BadField {
@@ -584,6 +610,37 @@ fn u64_vec(v: &Value, field: &'static str) -> Result<Vec<u64>, ZarrError> {
             })
         })
         .collect()
+}
+
+fn validate_shape_and_chunks(shape: &[u64], chunk_shape: &[u64]) -> Result<(), ZarrError> {
+    if shape.len() != chunk_shape.len() {
+        return Err(ZarrError::BadField {
+            field: "chunks",
+            detail: format!(
+                "chunk_shape rank {} != array shape rank {}",
+                chunk_shape.len(),
+                shape.len()
+            ),
+        });
+    }
+    let mut total_chunks: u64 = 1;
+    for (ax, (&s, &c)) in shape.iter().zip(chunk_shape).enumerate() {
+        if s > 0 && c == 0 {
+            return Err(ZarrError::BadField {
+                field: "chunks",
+                detail: format!("chunk dimension {ax} is 0 for non-empty axis of size {s}"),
+            });
+        }
+        if c > 0 {
+            let n = s.div_ceil(c);
+            total_chunks = total_chunks.checked_mul(n).ok_or_else(|| ZarrError::BadField {
+                field: "chunks",
+                detail: "total chunk count overflows u64".into(),
+            })?;
+        }
+    }
+    let _ = total_chunks;
+    Ok(())
 }
 
 fn object_map(v: &Value) -> BTreeMap<String, Value> {

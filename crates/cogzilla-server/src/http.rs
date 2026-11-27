@@ -32,6 +32,7 @@ mod html;
 pub(crate) mod pixel_selection;
 mod cql2_text;
 mod point_expr;
+mod zarr;
 mod zonal;
 
 use crate::catalog::{MosaicJsonCatalog, SceneCatalog, load_catalog_json_str};
@@ -9826,6 +9827,15 @@ where
         if let Some((bbox, epsg, is_crs84)) = geo_meta {
             attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
         }
+        return Ok(resp);
+    }
+
+    // ------------------------------------------------------------------------
+    // Zarr API: /zarr/* (metadata, introspection, and raster routes)
+    // ------------------------------------------------------------------------
+    if segs.first() == Some(&"zarr") {
+        let sub = &segs[1..];
+        let resp = zarr::handle_zarr_request(&engine, method, sub, &raw_query).await;
         return Ok(resp);
     }
 

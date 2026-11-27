@@ -17,6 +17,49 @@ use crate::{ArrayMeta, DataType, ZarrError, ZarrStore, decode_chunk_bytes};
 /// Default concurrency limit for chunk fetches inside a single window read.
 pub const DEFAULT_CHUNK_CONCURRENCY: usize = 16;
 
+/// Default maximum number of chunks a single Zarr request may fan out to (#386).
+pub const DEFAULT_MAX_CHUNKS_PER_REQUEST: usize = 256;
+
+/// Default maximum total decoded bytes across all covering chunks in one Zarr request (256 MiB, #386).
+pub const DEFAULT_MAX_DECODED_WINDOW_BYTES: usize = 256 * 1024 * 1024;
+
+/// Pre-fetch fan-out and decoded-byte safety caps (#386).
+#[derive(Debug, Clone, Copy)]
+pub struct ZarrCaps {
+    pub max_chunks_per_request: usize,
+    pub max_decoded_window_bytes: usize,
+}
+
+impl Default for ZarrCaps {
+    fn default() -> Self {
+        Self {
+            max_chunks_per_request: DEFAULT_MAX_CHUNKS_PER_REQUEST,
+            max_decoded_window_bytes: DEFAULT_MAX_DECODED_WINDOW_BYTES,
+        }
+    }
+}
+
+impl ZarrCaps {
+    /// Load caps from `COGZILLA_ZARR_MAX_CHUNKS_PER_REQUEST` and
+    /// `COGZILLA_ZARR_MAX_DECODED_WINDOW_BYTES`, falling back to defaults.
+    pub fn from_env() -> Self {
+        let max_chunks = std::env::var("COGZILLA_ZARR_MAX_CHUNKS_PER_REQUEST")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_CHUNKS_PER_REQUEST);
+        let max_bytes = std::env::var("COGZILLA_ZARR_MAX_DECODED_WINDOW_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MAX_DECODED_WINDOW_BYTES);
+        Self {
+            max_chunks_per_request: max_chunks,
+            max_decoded_window_bytes: max_bytes,
+        }
+    }
+}
+
 /// Rectangular chunk-grid window covering a requested pixel-space rectangle `[x0..x1, y0..y1]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkWindow {
@@ -102,6 +145,37 @@ impl ChunkWindow {
     /// Total number of chunks in this window (`grid_w * grid_h`).
     pub fn chunk_count(&self) -> usize {
         (self.grid_w as usize) * (self.grid_h as usize)
+    }
+
+    /// Enforce fan-out and total decoded-byte caps from metadata BEFORE issuing any upstream GET (#386).
+    pub fn check_caps(&self, meta: &ArrayMeta, caps: &ZarrCaps) -> Result<(), ZarrError> {
+        let count = self.chunk_count();
+        if count > caps.max_chunks_per_request {
+            return Err(ZarrError::CapExceeded {
+                kind: "covering chunk count",
+                computed: count,
+                cap: caps.max_chunks_per_request,
+            });
+        }
+        let sharding = ShardingConfig::from_meta(meta)?;
+        let chunk_shape = sharding
+            .as_ref()
+            .map(|s| s.inner_chunk_shape.as_slice())
+            .unwrap_or(&meta.chunk_shape);
+        let chunk_elems = chunk_shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(usize::try_from(d).ok()?))
+            .unwrap_or(usize::MAX);
+        let chunk_bytes = chunk_elems.saturating_mul(meta.dtype.size());
+        let window_bytes = count.saturating_mul(chunk_bytes);
+        if window_bytes > caps.max_decoded_window_bytes {
+            return Err(ZarrError::CapExceeded {
+                kind: "decoded window bytes",
+                computed: window_bytes,
+                cap: caps.max_decoded_window_bytes,
+            });
+        }
+        Ok(())
     }
 
     /// Valid (edge-truncated) `(width, height)` for chunk `(tx, ty)`.
@@ -191,7 +265,38 @@ pub async fn read_chunk_window_for_band(
     y1: u32,
     max_concurrency: usize,
 ) -> Result<ZarrWindowBlocks, ZarrError> {
+    read_chunk_window_for_band_with_caps(
+        store,
+        array_prefix,
+        meta,
+        band_idx,
+        x0,
+        y0,
+        x1,
+        y1,
+        max_concurrency,
+        &ZarrCaps::default(),
+    )
+    .await
+}
+
+/// Read all covering chunks for pixel window `[x0..x1, y0..y1]` of a 2-D or 3-D array, enforcing
+/// `caps` on metadata before issuing any upstream GET (#386).
+#[allow(clippy::too_many_arguments)]
+pub async fn read_chunk_window_for_band_with_caps(
+    store: &dyn ZarrStore,
+    array_prefix: &str,
+    meta: &ArrayMeta,
+    band_idx: Option<u64>,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    max_concurrency: usize,
+    caps: &ZarrCaps,
+) -> Result<ZarrWindowBlocks, ZarrError> {
     let window = ChunkWindow::from_pixel_window(meta, x0, y0, x1, y1)?;
+    window.check_caps(meta, caps)?;
     let scale_offset = meta.scale_offset();
     if window.chunk_count() == 0 {
         return Ok(ZarrWindowBlocks {
@@ -748,5 +853,31 @@ mod tests {
         let src = wb.as_band_source(&refs);
         assert!(src.sample_f64_checked(0, 0).is_nan());
         assert_eq!(src.sample_f64_checked(1, 0), exact_val as f64);
+    }
+
+    #[tokio::test]
+    async fn caps_refuse_oversized_fanout_before_first_fetch() {
+        // 1024x1024 array with 16x16 chunks = 64x64 = 4096 chunks
+        let meta = make_2d_meta(1024, 1024, 16, 16, DataType::Float32, Some(f64::NAN));
+        let store = MemoryStore::new();
+        let caps = ZarrCaps {
+            max_chunks_per_request: 16,
+            max_decoded_window_bytes: 1024 * 1024,
+        };
+        let err = read_chunk_window_for_band_with_caps(
+            &store, "arr", &meta, None, 0, 0, 1024, 1024, 4, &caps,
+        )
+        .await
+        .err()
+        .expect("expected CapExceeded");
+        assert!(
+            matches!(err, ZarrError::CapExceeded { computed: 4096, cap: 16, .. }),
+            "{err}"
+        );
+        assert_eq!(
+            store.get_count(),
+            0,
+            "cap refusal must happen before any upstream GET"
+        );
     }
 }
