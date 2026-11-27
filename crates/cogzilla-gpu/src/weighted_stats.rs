@@ -992,7 +992,7 @@ fn decode_weighted_readback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expr::opcodes;
+    use cogzilla_kernel::expr_vm::Op;
 
     #[test]
     fn gpu_weighted_expr_stats_matches_two_pass() {
@@ -1041,45 +1041,46 @@ mod tests {
             }
         }
 
+        let op = |o: Op| GpuInstr::op(o.wire_opcode().unwrap());
         // Expr 0: NDVI = (b3 - b2) / (b3 + b2), uses bands {2, 3} -> mask 0b1100
         let ndvi_ins = vec![
             GpuInstr::load_band(3),
             GpuInstr::load_band(2),
-            GpuInstr::op(opcodes::SUB),
+            op(Op::Sub),
             GpuInstr::load_band(3),
             GpuInstr::load_band(2),
-            GpuInstr::op(opcodes::ADD),
-            GpuInstr::op(opcodes::DIV),
+            op(Op::Add),
+            op(Op::Div),
         ];
         // Expr 1: NDWI = (b1 - b3) / (b1 + b3), uses bands {1, 3} -> mask 0b1010
         let ndwi_ins = vec![
             GpuInstr::load_band(1),
             GpuInstr::load_band(3),
-            GpuInstr::op(opcodes::SUB),
+            op(Op::Sub),
             GpuInstr::load_band(1),
             GpuInstr::load_band(3),
-            GpuInstr::op(opcodes::ADD),
-            GpuInstr::op(opcodes::DIV),
+            op(Op::Add),
+            op(Op::Div),
         ];
         // Expr 2: EVI-like = 2.5 * (b3 - b2) / (b3 + 6.0 * b2 - 7.5 * b0 + 10000.0), uses {0, 2, 3} -> mask 0b1101
         let evi_ins = vec![
             GpuInstr::push_const(2.5),
             GpuInstr::load_band(3),
             GpuInstr::load_band(2),
-            GpuInstr::op(opcodes::SUB),
-            GpuInstr::op(opcodes::MUL),
+            op(Op::Sub),
+            op(Op::Mul),
             GpuInstr::load_band(3),
             GpuInstr::push_const(6.0),
             GpuInstr::load_band(2),
-            GpuInstr::op(opcodes::MUL),
-            GpuInstr::op(opcodes::ADD),
+            op(Op::Mul),
+            op(Op::Add),
             GpuInstr::push_const(7.5),
             GpuInstr::load_band(0),
-            GpuInstr::op(opcodes::MUL),
-            GpuInstr::op(opcodes::SUB),
+            op(Op::Mul),
+            op(Op::Sub),
             GpuInstr::push_const(10000.0),
-            GpuInstr::op(opcodes::ADD),
-            GpuInstr::op(opcodes::DIV),
+            op(Op::Add),
+            op(Op::Div),
         ];
 
         // CPU reference evaluated bands
