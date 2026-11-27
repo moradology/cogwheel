@@ -342,14 +342,14 @@ pub(super) fn bbox_to_wgs84(
     // Polar-centered projected bboxes (e.g. EPSG:3413 / EPSG:3031) contain a pole in their interior:
     // if either pole projects inside [x0..=x1, y0..=y1], span full [-180, 180] and extend to ±90°.
     // Exclude cylindrical / pseudocylindrical projections where poles are horizontal lines (not points).
-    let is_line_pole = matches!(
-        crs,
-        cogzilla_proj::CrsModel::Geographic
-            | cogzilla_proj::CrsModel::Epsg3857
-            | cogzilla_proj::CrsModel::WorldMercator
-            | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
-            | cogzilla_proj::CrsModel::EqualEarth(_)
-    );
+    let is_line_pole = crs.is_geographic()
+        || crs.is_web_mercator()
+        || matches!(
+            crs,
+            cogzilla_proj::CrsModel::WorldMercator
+                | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+                | cogzilla_proj::CrsModel::EqualEarth(_)
+        );
     if !is_line_pole {
         let (bx0, bx1) = (x0.min(x1), x0.max(x1));
         let (by0, by1) = (y0.min(y1), y0.max(y1));
@@ -699,7 +699,45 @@ mod tests {
             let (lon, lat) = coord_to_lonlat(-100.0, 40.0, Some(&crs))
                 .unwrap_or_else(|e| panic!("EPSG:{epsg} coord_to_lonlat failed: {e}"));
             assert!((lon - (-100.0)).abs() < 0.05 && (lat - 40.0).abs() < 0.05, "EPSG:{epsg}: ({lon}, {lat})");
+            if epsg != 4326 {
+                assert!(
+                    (lon - (-100.0)).abs() > 1e-5 || (lat - 40.0).abs() > 1e-5,
+                    "EPSG:{epsg} must preserve non-zero datum shift, got ({lon}, {lat})"
+                );
+            }
         }
+
+        // Zonal densify_ring_lonlat_to_pixel must preserve Helmert datum shift on datum-shifted geographic CRSes.
+        let nad27 = CrsModel::from_epsg(4267).unwrap();
+        let identity = cogzilla_tiff::Affine2D {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+            e: 1.0,
+            f: 0.0,
+        };
+        let ring = vec![(-100.0, 40.0), (-99.0, 40.0), (-99.0, 41.0), (-100.0, 40.0)];
+        let shifted = crate::zonal::densify_ring_lonlat_to_pixel(
+            &ring,
+            &nad27,
+            &identity,
+            None,
+            nad27.is_geographic(),
+            false,
+            0.0,
+            ring.len(),
+        );
+        let (sx, sy) = shifted[0];
+        let (exp_x, exp_y) = nad27.from_lonlat_deg(-100.0, 40.0);
+        assert!(
+            (sx - exp_x).abs() < 1e-9 && (sy - exp_y).abs() < 1e-9,
+            "NAD27 zonal ring must apply Helmert shift: got ({sx}, {sy}), expected ({exp_x}, {exp_y})"
+        );
+        assert!(
+            (sx - (-100.0)).abs() > 1e-5 || (sy - 40.0).abs() > 1e-5,
+            "NAD27 zonal ring shift must be non-zero"
+        );
 
         // Projected CRSes (e.g. EPSG:3857) must still reject minx >= maxx.
         let merc = CrsModel::from_epsg(3857).unwrap();

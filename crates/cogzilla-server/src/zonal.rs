@@ -468,12 +468,17 @@ pub fn densify_ring_lonlat_to_pixel(
     if ring.len() < 2 {
         return Vec::new();
     }
+    let is_wgs84_geo = matches!(crs, CrsModel::Geographic);
     let map_pt = |lon: f64, lat: f64| -> (f64, f64) {
-        let adj_lon = lon + lon_shift_deg;
-        let (sx, sy) = if is_geo_dataset {
-            (adj_lon, lat)
+        let (sx, sy) = if is_wgs84_geo {
+            (lon + lon_shift_deg, lat)
+        } else if is_geo_dataset {
+            // Datum-shifted geographic CRS (e.g. NAD27/OSGB36/Amersfoort/CH1903): apply the
+            // Helmert shift first, then lon_shift_deg so atan2 does not wrap it back to [-180, 180].
+            let (gx, gy) = crs.from_lonlat_deg(lon, lat);
+            (gx + lon_shift_deg, gy)
         } else {
-            crs.from_lonlat_deg(adj_lon, lat)
+            crs.from_lonlat_deg(lon + lon_shift_deg, lat)
         };
         let (col, row) = if let Some(poly) = gcp_poly {
             poly.crs_to_pixel(sx, sy)
@@ -2104,11 +2109,15 @@ fn project_mask_to_ifd(
         }
     }
 
+    let is_wgs84_geo = matches!(crs, CrsModel::Geographic);
     let mut pts_px = Vec::with_capacity(pm.points.len());
     for &(lon, lat) in &pm.points {
         let adj_lon = geo_point_lon_shift(lon, ifd, is_geo);
-        let (sx, sy) = if is_geo {
+        let (sx, sy) = if is_wgs84_geo {
             (adj_lon, lat)
+        } else if is_geo {
+            let (gx, gy) = crs.from_lonlat_deg(lon, lat);
+            (gx + (adj_lon - lon), gy)
         } else {
             crs.from_lonlat_deg(adj_lon, lat)
         };
