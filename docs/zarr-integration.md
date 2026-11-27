@@ -42,6 +42,14 @@ ranged reads into one object — which is a tuning question for Phase 4, not a n
 
 ## Phases
 
+### Phase 0 — fixtures, before any of it
+
+CI generates fixtures with `benches/generate_fixtures.py` and caches them on that script's hash,
+and the integration tests skip themselves when `benches/fixtures` is absent. There is no Zarr
+equivalent, so until `benches/generate_zarr_fixtures.py` exists every other phase has nowhere to
+put an integration test. It is first for that reason, and it includes a GeoTIFF twin written from
+the same samples on the same grid, for the assertion in Phase 2 that the whole plan rests on.
+
 ### Phase 1 — metadata and chunk addressing (this commit)
 
 `crates/cogzilla-zarr`: v2 `.zarray`/`.zattrs` and v3 `zarr.json` parsed into one `ArrayMeta`;
@@ -95,10 +103,49 @@ exactly what `cogzilla-io` is built for.
 - A `cogmark` scenario against `titiler.xarray` on the same store, in the same shape as the COG
   comparison, so the claim is measured rather than asserted.
 
+## Cross-cutting, and not optional
+
+These three are not a phase. They cut across the reader and the routes, and the branch does not
+merge to `main` without them.
+
+### Bound the fan-out before anything is fetched
+
+Serving COGs, one tile is a handful of ranged reads into one object. Serving Zarr, **one tile can
+be thousands of GETs against someone else's bucket**, and at low zoom over a finely chunked array
+the fan-out is bounded only by the chunk count, which the client picks by choosing a URL. No
+existing cap covers it: `COGZILLA_MAX_UPSTREAM_FETCHES` limits concurrency rather than the total,
+and the `{w}x{h}` cap bounds the output image rather than the input. So the covering chunk count
+and the decoded byte count are checked from metadata, before the first fetch, and a request over
+the cap is refused with the computed number in the message.
+
+The decode side needs the same care: `MAX_DECODED_TILE_BYTES` guards TIFF tiles today, and a blosc
+header or a zstd frame can claim any size it likes. A chunk that decodes to more than its own
+declared shape is a corrupt or hostile store whatever its header says.
+
+### Freshness, because Zarr stores change
+
+Every caching assumption in this codebase comes from COGs, which are effectively immutable. Zarr
+stores are routinely appended to — a new time step an hour is ordinary — and rewritten in place.
+Cache the consolidated metadata under `COGZILLA_CACHE_TTL_SECS` and prefer cheap revalidation to
+blind expiry; fold the metadata validator into the ETag, or a client revalidating after an append
+gets a 304 for data that has moved on. One store is one open URI, however many chunks it holds.
+
+### One table of failure to HTTP status
+
+cogzilla's statuses are better than TiTiler's because they were decided rather than inherited.
+Zarr brings a dozen new failure modes at once — unknown codec, irregular grid, missing variable,
+`sel` out of range, unmodellable CRS, missing chunk with no fill value, corrupt shard index — and
+they are settled in one table, used by every route. Client fault is 4xx, origin fault is 5xx, and
+the message names the thing that failed.
+
 ## Deliberately out of scope
 
 NetCDF and HDF5 (a hard binary format, and the real weight behind `titiler.xarray`), kerchunk and
 virtual Zarr, icechunk, writes, complex and variable-length dtypes, curvilinear grids.
+
+Zarr assets reached through `/stac` and `/mosaicjson` are a separate decision, not an oversight:
+the asset layer resolves to COGs today, a Zarr asset needs a `variable` that STAC has no settled
+way to express, and TiTiler keeps the two apart as well. Deferred, and recorded as deferred.
 
 ## Risks
 
@@ -110,6 +157,14 @@ virtual Zarr, icechunk, writes, complex and variable-length dtypes, curvilinear 
   made on a measurement in Phase 2, not up front.
 - **No pyramid.** Without multiscales, a global array at z=0 is an expensive tile however fast the
   decoder is. Phase 4 should state plainly what the cost is rather than hide it.
+
+## The one test that decides whether this plan is right
+
+A tile rendered from a Zarr array must come out **byte-identical** to the same tile rendered from a
+GeoTIFF written from the same samples on the same grid. That is the whole thesis of the branch — if
+the kernel really is format-agnostic, the two paths cannot disagree — and it is reachable early,
+right after the chunk reader. If it cannot be made to pass, the premise is wrong and the plan needs
+rethinking before the route work, not after it.
 
 ## Done means
 
