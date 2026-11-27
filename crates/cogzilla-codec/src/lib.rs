@@ -618,7 +618,10 @@ pub fn decode_tile_rows_exact(
                     Compression::Lerc => None,
                     Compression::LercDeflate => {
                         let max_cap = expected_bytes.saturating_mul(2).clamp(65_536, MAX_DECODED_TILE_BYTES);
-                        let mut cap = expected_bytes.clamp(4096, max_cap);
+                        let mut cap = compressed
+                            .len()
+                            .saturating_mul(16)
+                            .clamp(4096usize.min(max_cap), max_cap);
                         let buf = loop {
                             let mut out = vec![0u8; cap];
                             match st.deflate.zlib_decompress(compressed, &mut out) {
@@ -677,7 +680,11 @@ pub fn decode_tile_rows_exact(
                                     "LERC_ZSTD payload exceeds tile size cap".into(),
                                 ));
                             }
-                            sz.max(1)
+                            let ratio_cap = compressed
+                                .len()
+                                .saturating_mul(16)
+                                .clamp(4096usize.min(max_cap), max_cap);
+                            sz.min(ratio_cap).max(1)
                         } else {
                             compressed
                                 .len()

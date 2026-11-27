@@ -398,13 +398,20 @@ fn render_query_error(pairs: &[(String, String)]) -> Option<Resp> {
 /// `scan_limit`, `items_limit`, `time_limit`, `exitwhenfull` and `skipcovered`.
 fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
     let mut limits = SearchLimits::default();
-    let int = |name: &str, slot: &mut i32| -> Result<(), Resp> {
+    let int = |name: &str, max_allowed: i32, slot: &mut i32| -> Result<(), Resp> {
         if let Some(v) = query_value(pairs, name) {
             let given = v
                 .parse::<i32>()
                 .ok()
                 .filter(|n| *n >= 0)
                 .ok_or_else(|| invalid_param("query", name, "Input should be a valid integer"))?;
+            if given > max_allowed {
+                return Err(invalid_param(
+                    "query",
+                    name,
+                    &format!("Input should be less than or equal to {max_allowed}"),
+                ));
+            }
             // Zero is no limit given, as in titiler-pgstac: the default stands.
             if given > 0 {
                 *slot = given;
@@ -412,9 +419,9 @@ fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
         }
         Ok(())
     };
-    int("scan_limit", &mut limits.scan_limit)?;
-    int("items_limit", &mut limits.items_limit)?;
-    int("time_limit", &mut limits.time_limit_secs)?;
+    int("scan_limit", 100_000, &mut limits.scan_limit)?;
+    int("items_limit", 10_000, &mut limits.items_limit)?;
+    int("time_limit", 60, &mut limits.time_limit_secs)?;
     let boolean = |name: &str, slot: &mut bool| -> Result<(), Resp> {
         if let Some(v) = query_value(pairs, name) {
             *slot = parse_bool(v)

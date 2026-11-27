@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 cogzilla-io = { path = "../cogzilla-io" }
-cogzilla-server = { path = "../cogzilla-server" }
+cogzilla-server = { path = "../cogzilla-server", default-features = false }
 bytes.workspace = true
 lambda_http.workspace = true
 tokio.workspace = true

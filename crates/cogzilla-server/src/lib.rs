@@ -1,5 +1,8 @@
+pub mod aimd;
 pub mod catalog;
 pub mod engine;
+#[cfg(feature = "gpu")]
+pub mod gpu_backend;
 mod geotiff;
 pub mod http;
 pub mod openapi;
@@ -8,6 +11,8 @@ pub mod tile_cache;
 pub mod titiler;
 pub mod tms;
 pub mod zonal;
+
+pub use aimd::{AimdLimiter, AimdPermit, AimdSnapshot};
 
 pub use catalog::{
     InMemoryCatalog, MosaicJsonCatalog, SceneCatalog, SceneEntry, load_catalog_json_file,

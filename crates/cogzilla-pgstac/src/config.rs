@@ -164,9 +164,17 @@ fn percent_decode(s: &str) -> Result<String, PgStacError> {
 /// only parameter names are compared, so a value or a password that happens to contain
 /// `sslmode=` changes nothing.
 fn split_url(conn: &str) -> Result<ConnParts, PgStacError> {
-    // tokio-postgres ends the credentials at the first `@`, and the query starts at the
-    // first `?` after that; the same reading is used here so both agree on what is what.
-    let after_credentials = conn.find('@').map_or(0, |i| i + 1);
+    // Only search for `@` before the path `/` (not in the query string) so both
+    // passwords containing `?` (`postgresql://u:p?x@h/d`) and passwordless URLs with
+    // `@` in a query value (`postgresql://h/d?application_name=svc@prod&sslmode=verify-full`)
+    // split off TLS parameters cleanly.
+    let after_scheme = conn.find("://").map_or(0, |i| i + 3);
+    let path_start = conn[after_scheme..]
+        .find('/')
+        .map_or(conn.len(), |i| after_scheme + i);
+    let after_credentials = conn[after_scheme..path_start]
+        .find('@')
+        .map_or(after_scheme, |i| after_scheme + i + 1);
     let Some(question) = conn[after_credentials..].find('?').map(|i| after_credentials + i) else {
         return Ok(ConnParts {
             conn: conn.to_string(),

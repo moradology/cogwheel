@@ -377,15 +377,15 @@ impl PixelAreaModel {
                 win_w,
                 win_h,
             } => {
-                let fx = if *nx <= 1 {
+                let fx = if *nx <= 1 || *win_w <= 1 {
                     0.0
                 } else {
-                    ((dx as f64 + 0.5) / (*win_w as f64)).clamp(0.0, 1.0) * ((*nx - 1) as f64)
+                    (dx as f64 / ((*win_w - 1) as f64)).clamp(0.0, 1.0) * ((*nx - 1) as f64)
                 };
-                let fy = if *ny <= 1 {
+                let fy = if *ny <= 1 || *win_h <= 1 {
                     0.0
                 } else {
-                    ((dy as f64 + 0.5) / (*win_h as f64)).clamp(0.0, 1.0) * ((*ny - 1) as f64)
+                    (dy as f64 / ((*win_h - 1) as f64)).clamp(0.0, 1.0) * ((*ny - 1) as f64)
                 };
                 let x0 = (fx.floor() as usize).min(nx.saturating_sub(1));
                 let x1 = (x0 + 1).min(nx.saturating_sub(1));
@@ -742,15 +742,47 @@ pub fn rasterize_exact_coverage(
             }
 
             // Single linear scanline pass per row: combine prefix run with boundary cell area.
-            for row in 0..win_h {
-                let d_off = row * stride_delta;
-                let a_off = row * win_w;
-                let mut prefix = 0.0_f64;
-                for col in 0..win_w {
-                    prefix += st.run_delta[d_off + col];
-                    let v = (prefix + st.area[a_off + col]).clamp(0.0, 1.0);
-                    if v > 1e-12 {
-                        cov[a_off + col] = (cov[a_off + col] + v).min(1.0);
+            let area_slice = &st.area[..n_px];
+            let delta_slice = &st.run_delta[..win_h * stride_delta];
+            if n_px >= 65_536 && win_h >= 16 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get().clamp(2, 8))
+                    .unwrap_or(4);
+                let rows_per = win_h.div_ceil(threads);
+                std::thread::scope(|s| {
+                    for (ci, cov_chunk) in cov.chunks_mut(rows_per * win_w).enumerate() {
+                        let r_start = ci * rows_per;
+                        let n_rows = cov_chunk.len() / win_w;
+                        s.spawn(move || {
+                            for r in 0..n_rows {
+                                let row = r_start + r;
+                                let d_off = row * stride_delta;
+                                let a_off = row * win_w;
+                                let c_off = r * win_w;
+                                let mut prefix = 0.0_f64;
+                                for col in 0..win_w {
+                                    prefix += delta_slice[d_off + col];
+                                    let v = (prefix + area_slice[a_off + col]).clamp(0.0, 1.0);
+                                    if v > 1e-12 {
+                                        cov_chunk[c_off + col] =
+                                            (cov_chunk[c_off + col] + v).min(1.0);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            } else {
+                for row in 0..win_h {
+                    let d_off = row * stride_delta;
+                    let a_off = row * win_w;
+                    let mut prefix = 0.0_f64;
+                    for col in 0..win_w {
+                        prefix += delta_slice[d_off + col];
+                        let v = (prefix + area_slice[a_off + col]).clamp(0.0, 1.0);
+                        if v > 1e-12 {
+                            cov[a_off + col] = (cov[a_off + col] + v).min(1.0);
+                        }
                     }
                 }
             }
@@ -1705,6 +1737,263 @@ pub fn compute_weighted_band_stats_with_geom(
 
 /// Compute exact analytical coverage-weighted & ellipsoidal area-weighted zonal statistics
 /// directly on the COG's native pixel grid (zero resampling).
+#[cfg(feature = "gpu")]
+fn weighted_gpu_stats_to_json(
+    gs: &cogzilla_gpu::GpuWeightedBandStats,
+    area_scale: f64,
+    total_poly_area_px: Option<f64>,
+    description: &str,
+    opts: &StatsOptions,
+) -> serde_json::Value {
+    let count_out = snap_near_int(gs.count_cov);
+    let poly_area = total_poly_area_px.unwrap_or(0.0).max(gs.count_cov);
+    let (valid_percent, masked_pixels) = if poly_area > 0.0 {
+        (
+            ((gs.count_cov / poly_area) * 100.0).clamp(0.0, 100.0),
+            (poly_area - gs.count_cov).max(0.0),
+        )
+    } else {
+        let total_touched = gs.valid_pixels + gs.masked_pixels;
+        let vp = if total_touched > 0 {
+            ((gs.valid_pixels as f64 / total_touched as f64) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        (vp, gs.masked_pixels as f64)
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("min".into(), serde_json::json!(gs.min));
+    obj.insert("max".into(), serde_json::json!(gs.max));
+    obj.insert("mean".into(), serde_json::json!(gs.mean));
+    obj.insert("count".into(), serde_json::json!(count_out));
+    obj.insert("sum".into(), serde_json::json!(gs.sum_cov));
+    obj.insert("std".into(), serde_json::json!(gs.std));
+    obj.insert("median".into(), serde_json::json!(gs.median));
+    obj.insert("majority".into(), serde_json::json!(gs.majority));
+    obj.insert("minority".into(), serde_json::json!(gs.minority));
+    obj.insert("unique".into(), serde_json::json!(gs.unique_bins as f64));
+    obj.insert(
+        "histogram".into(),
+        serde_json::json!([gs.hist_counts, gs.hist_edges]),
+    );
+    obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
+    obj.insert("masked_pixels".into(), serde_json::json!(masked_pixels));
+    obj.insert("valid_pixels".into(), serde_json::json!(gs.valid_pixels as f64));
+    obj.insert("area".into(), serde_json::json!(gs.area_valid_m2 * area_scale));
+    for &(p, val) in &gs.percentiles {
+        let key = if p.fract() == 0.0 {
+            format!("percentile_{}", p as i64)
+        } else {
+            format!("percentile_{p}")
+        };
+        obj.insert(key, serde_json::json!(val));
+    }
+    let _ = opts;
+    if !description.is_empty() {
+        obj.insert("description".into(), serde_json::json!(description));
+    }
+    serde_json::Value::Object(obj)
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_weighted_polygon_bands(
+    gpu: &crate::gpu_backend::GpuBackend,
+    bands: &[(&str, &[f32])],
+    cov: &[f64],
+    win_w: usize,
+    win_h: usize,
+    area_model: &PixelAreaModel,
+    total_poly_area_px: Option<f64>,
+    opts: &StatsOptions,
+) -> Option<Vec<serde_json::Value>> {
+    if opts.categorical || opts.histogram_edges.is_some() || bands.is_empty() {
+        return None;
+    }
+    let (row_areas, area_scale): (Vec<f32>, f64) = match area_model {
+        PixelAreaModel::Constant(a) => {
+            let scale = if *a > 0.0 { *a } else { 1.0 };
+            (vec![(*a / scale) as f32; win_h], scale)
+        }
+        PixelAreaModel::PerRow(rows) => {
+            if rows.len() != win_h {
+                return None;
+            }
+            let max_a = rows.iter().copied().fold(0.0_f64, f64::max);
+            let scale = if max_a > 0.0 { max_a } else { 1.0 };
+            (rows.iter().map(|&a| (a / scale) as f32).collect(), scale)
+        }
+        PixelAreaModel::Lattice { .. } => return None,
+    };
+    let cov_f32: Vec<f32> = if cov.len() >= 256 * 256 {
+        let mut out = vec![0.0f32; cov.len()];
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get().clamp(2, 8))
+            .unwrap_or(4);
+        let chunk = cov.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            for (dst, src) in out.chunks_mut(chunk).zip(cov.chunks(chunk)) {
+                s.spawn(move || {
+                    for (d, &c) in dst.iter_mut().zip(src.iter()) {
+                        *d = c as f32;
+                    }
+                });
+            }
+        });
+        out
+    } else {
+        cov.iter().map(|&c| c as f32).collect()
+    };
+    let slices: Vec<&[f32]> = bands.iter().map(|&(_, s)| s).collect();
+    let pcts: Vec<f64> = if opts.percentiles.is_empty() {
+        vec![2.0, 98.0]
+    } else {
+        opts.percentiles.clone()
+    };
+    let gs_list = gpu.try_reduce_weighted_zonal_stats(
+        &slices,
+        &cov_f32,
+        win_w,
+        &row_areas,
+        opts.area_weighted,
+        COV_EPS as f32,
+        PIXEL_SET_EPS as f32,
+        opts.histogram_bins.clamp(1, 1000),
+        opts.histogram_range,
+        &pcts,
+    )?;
+    // If any band hit 0 valid_pixels (e.g. microscopic sub-pixel polygon), fall back to CPU.
+    if gs_list.iter().any(|gs| gs.valid_pixels == 0) {
+        return None;
+    }
+    Some(
+        gs_list
+            .iter()
+            .zip(bands.iter())
+            .map(|(gs, &(desc, _))| {
+                weighted_gpu_stats_to_json(gs, area_scale, total_poly_area_px, desc, opts)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_weighted_polygon_exprs(
+    gpu: &crate::gpu_backend::GpuBackend,
+    band_bufs: &[(u16, Vec<f32>)],
+    exprs: &[(String, cogzilla_kernel::ExprProgram)],
+    cov: &[f64],
+    win_w: usize,
+    win_h: usize,
+    area_model: &PixelAreaModel,
+    total_poly_area_px: Option<f64>,
+    opts: &StatsOptions,
+) -> Option<Vec<serde_json::Value>> {
+    if opts.categorical
+        || opts.histogram_edges.is_some()
+        || exprs.is_empty()
+        || band_bufs.is_empty()
+        || band_bufs.len() > 8
+        || exprs
+            .iter()
+            .any(|(_, prog)| prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where))
+    {
+        return None;
+    }
+    let (row_areas, area_scale): (Vec<f32>, f64) = match area_model {
+        PixelAreaModel::Constant(a) => {
+            let scale = if *a > 0.0 { *a } else { 1.0 };
+            (vec![(*a / scale) as f32; win_h], scale)
+        }
+        PixelAreaModel::PerRow(rows) => {
+            if rows.len() != win_h {
+                return None;
+            }
+            let max_a = rows.iter().copied().fold(0.0_f64, f64::max);
+            let scale = if max_a > 0.0 { max_a } else { 1.0 };
+            (rows.iter().map(|&a| (a / scale) as f32).collect(), scale)
+        }
+        PixelAreaModel::Lattice { .. } => return None,
+    };
+
+    // Compile each expression to GPU bytecode and remap LoadBand(local_slot) -> shared raw_bands index.
+    let mut compiled: Vec<(Vec<cogzilla_gpu::GpuInstr>, u32)> = Vec::with_capacity(exprs.len());
+    for (_, prog) in exprs {
+        let mut instrs = crate::gpu_backend::GpuBackend::compile_expr_to_gpu(prog)?;
+        let mut band_mask = 0u32;
+        let mut slot_remap: Vec<u32> = Vec::with_capacity(prog.used_bands.len());
+        for &b1 in &prog.used_bands {
+            let shared_idx = band_bufs.iter().position(|(k, _)| *k == b1)?;
+            slot_remap.push(shared_idx as u32);
+            band_mask |= 1u32 << (shared_idx as u32);
+        }
+        for ins in &mut instrs {
+            if ins.opcode == 1 {
+                let local = ins.imm_u32 as usize;
+                ins.imm_u32 = *slot_remap.get(local)?;
+            }
+        }
+        compiled.push((instrs, band_mask));
+    }
+
+    let cov_f32: Vec<f32> = if cov.len() >= 256 * 256 {
+        let mut out = vec![0.0f32; cov.len()];
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get().clamp(2, 8))
+            .unwrap_or(4);
+        let chunk = cov.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            for (dst, src) in out.chunks_mut(chunk).zip(cov.chunks(chunk)) {
+                s.spawn(move || {
+                    for (d, &c) in dst.iter_mut().zip(src.iter()) {
+                        *d = c as f32;
+                    }
+                });
+            }
+        });
+        out
+    } else {
+        cov.iter().map(|&c| c as f32).collect()
+    };
+
+    let raw_slices: Vec<&[f32]> = band_bufs.iter().map(|(_, b)| b.as_slice()).collect();
+    let expr_refs: Vec<(&[cogzilla_gpu::GpuInstr], u32)> = compiled
+        .iter()
+        .map(|(ins, mask)| (ins.as_slice(), *mask))
+        .collect();
+    let pcts: Vec<f64> = if opts.percentiles.is_empty() {
+        vec![2.0, 98.0]
+    } else {
+        opts.percentiles.clone()
+    };
+    let gs_list = gpu.try_reduce_weighted_zonal_expr_stats(
+        &raw_slices,
+        &expr_refs,
+        &cov_f32,
+        win_w,
+        &row_areas,
+        opts.area_weighted,
+        COV_EPS as f32,
+        PIXEL_SET_EPS as f32,
+        opts.histogram_bins.clamp(1, 1000),
+        opts.histogram_range,
+        &pcts,
+    )?;
+    if gs_list.iter().any(|gs| gs.valid_pixels == 0) {
+        return None;
+    }
+    Some(
+        gs_list
+            .iter()
+            .zip(exprs.iter())
+            .map(|(gs, (desc, _))| {
+                weighted_gpu_stats_to_json(gs, area_scale, total_poly_area_px, desc, opts)
+            })
+            .collect(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn compute_native_exact_polygon_stats(
     engine: &TileEngine,
@@ -2007,118 +2296,109 @@ pub async fn compute_native_exact_polygon_stats(
     // Fetch intersecting data blocks in parallel (get_blocks already applies internal mask IFDs).
     let eff_nodata = nodata_override.or(cog.index.nodata);
 
-    let mut band_bufs: Vec<(u16, Vec<f32>)> = if stream_chunky {
-        Vec::new()
-    } else {
-        Vec::with_capacity(sel_bands.len())
-    };
-    let mut streamed_chunky_tiles = None;
-    match ifd.planar_config {
-        PlanarConfig::Chunky => {
-            let mut indices = Vec::with_capacity(blocks_x * blocks_y);
-            for ty in ty0..=ty1 {
-                for tx in tx0..=tx1 {
-                    indices.push(Some(ifd.tile_index(tx as u32, ty as u32, 0) as u32));
+    let stitch_band = |tiles: &[Option<Arc<cogzilla_codec::DecodedTile>>],
+                       band_in_tile: usize,
+                       sc: f32,
+                       off: f32|
+     -> Vec<f32> {
+        let mut pixels = vec![f32::NAN; n_px];
+        let nd_finite = eff_nodata.filter(|nd| nd.is_finite());
+        for (bi, tile_opt) in tiles.iter().enumerate() {
+            let Some(tile) = tile_opt else { continue };
+            let Some(band) = tile.bands.get(band_in_tile) else { continue };
+            let ty = ty0 + bi / blocks_x;
+            let tx = tx0 + bi % blocks_x;
+            let tile_x0 = tx * tw;
+            let tile_y0 = ty * th;
+            let rx0 = c0.max(tile_x0);
+            let rx1 = c1.min(tile_x0 + tw);
+            let ry0 = r0.max(tile_y0);
+            let ry1 = r1.min(tile_y0 + th);
+            let span = rx1 - rx0;
+            let lx0 = rx0 - tile_x0;
+            let dst_x0 = rx0 - c0;
+            match &band.data {
+                cogzilla_codec::BandData::F32(slab)
+                    if !unscale && nd_finite.is_none() =>
+                {
+                    let src_slice = slab.as_slice();
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        pixels[d0..d0 + span].copy_from_slice(&src_slice[s0..s0 + span]);
+                    }
                 }
-            }
-            let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
-            if stream_chunky {
-                streamed_chunky_tiles = Some(tiles);
-            } else {
-                for &b1 in &sel_bands {
-                    let b0 = (b1 - 1) as usize;
-                    let sc = if unscale {
-                        cog.index.scales.get(b0).copied().unwrap_or(1.0)
-                    } else {
-                        1.0
-                    };
-                    let off = if unscale {
-                        cog.index.offsets.get(b0).copied().unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-                    let mut pixels = vec![f32::NAN; n_px];
-                    for (bi, tile_opt) in tiles.iter().enumerate() {
-                        let Some(tile) = tile_opt else { continue };
-                        let Some(band) = tile.bands.get(b0) else { continue };
-                        let ty = ty0 + bi / blocks_x;
-                        let tx = tx0 + bi % blocks_x;
-                        let tile_x0 = tx * tw;
-                        let tile_y0 = ty * th;
-                        let rx0 = c0.max(tile_x0);
-                        let rx1 = c1.min(tile_x0 + tw);
-                        let ry0 = r0.max(tile_y0);
-                        let ry1 = r1.min(tile_y0 + th);
-                        for row in ry0..ry1 {
-                            let ly = row - tile_y0;
-                            let dst_row = (row - r0) * win_w;
-                            for col in rx0..rx1 {
-                                let lx = col - tile_x0;
-                                let src_i = ly * tw + lx;
-                                let mut v = band.data.get_f32(src_i);
-                                if !v.is_finite() {
-                                    continue;
-                                }
-                                if let Some(nd) = eff_nodata
-                                    && (nd.is_nan() && v.is_nan() || v == nd)
-                                {
-                                    continue;
-                                }
-                                if unscale {
-                                    v = v * sc + off;
-                                }
-                                pixels[dst_row + (col - c0)] = v;
+                cogzilla_codec::BandData::F32(slab) => {
+                    let src_slice = slab.as_slice();
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&src_slice[s0..s0 + span]) {
+                            if !raw.is_finite() {
+                                continue;
                             }
+                            if let Some(nd) = nd_finite
+                                && raw == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { raw * sc + off } else { raw };
                         }
                     }
-                    band_bufs.push((b1, pixels));
                 }
-            }
-        }
-        PlanarConfig::Planar => {
-            for &b1 in &sel_bands {
-                let b0 = (b1 - 1) as usize;
-                let mut indices = Vec::with_capacity(blocks_x * blocks_y);
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
-                        indices.push(Some(ifd.tile_index(tx as u32, ty as u32, b0 as u16) as u32));
+                cogzilla_codec::BandData::U16 { data, nodata } => {
+                    let nd_internal = *nodata;
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
+                            let v = raw as f32;
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
                     }
                 }
-                let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
-                let sc = if unscale {
-                    cog.index.scales.get(b0).copied().unwrap_or(1.0)
-                } else {
-                    1.0
-                };
-                let off = if unscale {
-                    cog.index.offsets.get(b0).copied().unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                let mut pixels = vec![f32::NAN; n_px];
-                for (bi, tile_opt) in tiles.iter().enumerate() {
-                    let Some(tile) = tile_opt else { continue };
-                    let Some(band) = tile.bands.first() else { continue };
-                    let ty = ty0 + bi / blocks_x;
-                    let tx = tx0 + bi % blocks_x;
-                    let tile_x0 = tx * tw;
-                    let tile_y0 = ty * th;
-                    let rx0 = c0.max(tile_x0);
-                    let rx1 = c1.min(tile_x0 + tw);
-                    let ry0 = r0.max(tile_y0);
-                    let ry1 = r1.min(tile_y0 + th);
+                cogzilla_codec::BandData::U8 { data, nodata } => {
+                    let nd_internal = *nodata;
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
+                            let v = raw as f32;
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
+                    }
+                }
+                _ => {
                     for row in ry0..ry1 {
                         let ly = row - tile_y0;
                         let dst_row = (row - r0) * win_w;
                         for col in rx0..rx1 {
                             let lx = col - tile_x0;
-                            let src_i = ly * tw + lx;
-                            let mut v = band.data.get_f32(src_i);
+                            let mut v = band.data.get_f32(ly * tw + lx);
                             if !v.is_finite() {
                                 continue;
                             }
-                            if let Some(nd) = eff_nodata
-                                && (nd.is_nan() && v.is_nan() || v == nd)
+                            if let Some(nd) = nd_finite
+                                && v == nd
                             {
                                 continue;
                             }
@@ -2129,10 +2409,127 @@ pub async fn compute_native_exact_polygon_stats(
                         }
                     }
                 }
-                band_bufs.push((b1, pixels));
             }
         }
-    }
+        pixels
+    };
+
+    let mut streamed_chunky_tiles = None;
+    let band_bufs: Vec<(u16, Vec<f32>)> = match ifd.planar_config {
+        PlanarConfig::Chunky => {
+            let mut indices = Vec::with_capacity(blocks_x * blocks_y);
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    indices.push(Some(ifd.tile_index(tx as u32, ty as u32, 0) as u32));
+                }
+            }
+            let tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+            if stream_chunky {
+                streamed_chunky_tiles = Some(tiles);
+                Vec::new()
+            } else if sel_bands.len() > 1 && n_px >= 65_536 {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = sel_bands
+                        .iter()
+                        .map(|&b1| {
+                            let b0 = (b1 - 1) as usize;
+                            let sc = if unscale {
+                                cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                            } else {
+                                1.0
+                            };
+                            let off = if unscale {
+                                cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            let tiles_ref = &tiles;
+                            let stitch_ref = &stitch_band;
+                            s.spawn(move || (b1, stitch_ref(tiles_ref, b0, sc, off)))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            } else {
+                sel_bands
+                    .iter()
+                    .map(|&b1| {
+                        let b0 = (b1 - 1) as usize;
+                        let sc = if unscale {
+                            cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                        } else {
+                            1.0
+                        };
+                        let off = if unscale {
+                            cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        (b1, stitch_band(&tiles, b0, sc, off))
+                    })
+                    .collect()
+            }
+        }
+        PlanarConfig::Planar => {
+            // Fetch ALL requested planar bands in ONE parallel `get_blocks` batch!
+            let per_band = blocks_x * blocks_y;
+            let mut indices = Vec::with_capacity(per_band * sel_bands.len());
+            for &b1 in &sel_bands {
+                let b0 = (b1 - 1) as u16;
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        indices.push(Some(ifd.tile_index(tx as u32, ty as u32, b0) as u32));
+                    }
+                }
+            }
+            let all_tiles = engine.store.get_blocks(cog, ifd_idx, &indices).await?;
+            if sel_bands.len() > 1 && n_px >= 65_536 {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = sel_bands
+                        .iter()
+                        .enumerate()
+                        .map(|(bi, &b1)| {
+                            let b0 = (b1 - 1) as usize;
+                            let sc = if unscale {
+                                cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                            } else {
+                                1.0
+                            };
+                            let off = if unscale {
+                                cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            let slice = &all_tiles[bi * per_band..(bi + 1) * per_band];
+                            let stitch_ref = &stitch_band;
+                            s.spawn(move || (b1, stitch_ref(slice, 0, sc, off)))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            } else {
+                sel_bands
+                    .iter()
+                    .enumerate()
+                    .map(|(bi, &b1)| {
+                        let b0 = (b1 - 1) as usize;
+                        let sc = if unscale {
+                            cog.index.scales.get(b0).copied().unwrap_or(1.0)
+                        } else {
+                            1.0
+                        };
+                        let off = if unscale {
+                            cog.index.offsets.get(b0).copied().unwrap_or(0.0)
+                        } else {
+                            0.0
+                        };
+                        let slice = &all_tiles[bi * per_band..(bi + 1) * per_band];
+                        (b1, stitch_band(slice, 0, sc, off))
+                    })
+                    .collect()
+            }
+        }
+    };
 
     // Compute exact coverage, ellipsoidal area model (or geodesic line lengths), and weighted statistics.
     let crs_owned = crs.clone();
@@ -2156,6 +2553,10 @@ pub async fn compute_native_exact_polygon_stats(
     } else {
         ZonalGeomKind::Point
     };
+    #[cfg(feature = "gpu")]
+    let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
+    #[cfg(feature = "gpu")]
+    let gpu_stats_counter = Arc::clone(&engine.stats);
     let compute_cpu = move || -> serde_json::Value {
         let total_poly_area_px =
             (geom_kind == ZonalGeomKind::Polygon).then_some(total_poly_area_px_val);
@@ -2174,7 +2575,31 @@ pub async fn compute_native_exact_polygon_stats(
         };
         let mut out = serde_json::Map::new();
         if let Some(ref exprs) = opts_owned.expressions {
-            for (ei, (desc, prog)) in exprs.iter().enumerate() {
+            #[cfg(feature = "gpu")]
+            if geom_kind == ZonalGeomKind::Polygon
+                && let Some(ref gpu) = gpu_opt
+                && let Some(vals) = try_gpu_weighted_polygon_exprs(
+                    gpu,
+                    &band_bufs,
+                    exprs,
+                    &cov,
+                    win_w,
+                    win_h,
+                    &area_model,
+                    total_poly_area_px,
+                    &opts_owned,
+                )
+            {
+                gpu_stats_counter
+                    .gpu_dispatches
+                    .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                for (ei, val) in vals.into_iter().enumerate() {
+                    out.insert(format!("b{}", ei + 1), val);
+                }
+                return serde_json::Value::Object(out);
+            }
+            let mut expr_bufs: Vec<(&str, Vec<f32>)> = Vec::with_capacity(exprs.len());
+            for (desc, prog) in exprs {
                 let mut expr_px = vec![f32::NAN; n_px];
                 let slot_bufs: Vec<Option<&[f32]>> = prog
                     .used_bands
@@ -2187,31 +2612,78 @@ pub async fn compute_native_exact_polygon_stats(
                     })
                     .collect();
                 let allow_nan = prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where);
-                let mut b_vals = vec![0.0_f32; slot_bufs.len()];
-                for i in 0..n_px {
-                    if cov[i] <= COV_EPS {
-                        continue;
-                    }
-                    let mut all_valid = true;
-                    for (slot, buf_opt) in slot_bufs.iter().enumerate() {
-                        let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
-                        if !v.is_finite() {
-                            if allow_nan {
-                                b_vals[slot] = f32::NAN;
-                                continue;
+                let eval_chunk = |start: usize, dst: &mut [f32]| {
+                    let mut b_vals = vec![0.0_f32; slot_bufs.len()];
+                    for (j, out_v) in dst.iter_mut().enumerate() {
+                        let i = start + j;
+                        if cov[i] <= COV_EPS {
+                            continue;
+                        }
+                        let mut all_valid = true;
+                        for (slot, buf_opt) in slot_bufs.iter().enumerate() {
+                            let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
+                            if !v.is_finite() {
+                                if allow_nan {
+                                    b_vals[slot] = f32::NAN;
+                                    continue;
+                                }
+                                all_valid = false;
+                                break;
                             }
-                            all_valid = false;
-                            break;
+                            b_vals[slot] = v;
                         }
-                        b_vals[slot] = v;
-                    }
-                    if all_valid {
-                        let r = prog.eval(&b_vals);
-                        if r.is_finite() {
-                            expr_px[i] = r;
+                        if all_valid {
+                            let r = prog.eval(&b_vals);
+                            if r.is_finite() {
+                                *out_v = r;
+                            }
                         }
                     }
+                };
+                if n_px >= 65_536 {
+                    let threads = std::thread::available_parallelism()
+                        .map(|p| p.get().clamp(2, 8))
+                        .unwrap_or(4);
+                    let chunk = n_px.div_ceil(threads);
+                    std::thread::scope(|s| {
+                        for (ci, dst) in expr_px.chunks_mut(chunk).enumerate() {
+                            let off = ci * chunk;
+                            s.spawn(move || eval_chunk(off, dst));
+                        }
+                    });
+                } else {
+                    eval_chunk(0, &mut expr_px);
                 }
+                expr_bufs.push((desc.as_str(), expr_px));
+            }
+            #[cfg(feature = "gpu")]
+            if geom_kind == ZonalGeomKind::Polygon
+                && let Some(ref gpu) = gpu_opt
+            {
+                let pairs: Vec<(&str, &[f32])> = expr_bufs
+                    .iter()
+                    .map(|(d, b)| (*d, b.as_slice()))
+                    .collect();
+                if let Some(vals) = try_gpu_weighted_polygon_bands(
+                    gpu,
+                    &pairs,
+                    &cov,
+                    win_w,
+                    win_h,
+                    &area_model,
+                    total_poly_area_px,
+                    &opts_owned,
+                ) {
+                    gpu_stats_counter
+                        .gpu_dispatches
+                        .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    for (ei, val) in vals.into_iter().enumerate() {
+                        out.insert(format!("b{}", ei + 1), val);
+                    }
+                    return serde_json::Value::Object(out);
+                }
+            }
+            for (ei, (desc, expr_px)) in expr_bufs.into_iter().enumerate() {
                 out.insert(
                     format!("b{}", ei + 1),
                     compute_weighted_band_stats_with_geom(
@@ -2303,13 +2775,46 @@ pub async fn compute_native_exact_polygon_stats(
                 );
             }
         } else {
-            for (b1, pixels) in &band_bufs {
-                let desc = descs_owned
-                    .get((*b1 - 1) as usize)
-                    .map(String::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .unwrap_or_else(|| format!("b{b1}"));
+            let band_descs: Vec<String> = band_bufs
+                .iter()
+                .map(|(b1, _)| {
+                    descs_owned
+                        .get((*b1 - 1) as usize)
+                        .map(String::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .unwrap_or_else(|| format!("b{b1}"))
+                })
+                .collect();
+            #[cfg(feature = "gpu")]
+            if geom_kind == ZonalGeomKind::Polygon
+                && let Some(ref gpu) = gpu_opt
+            {
+                let pairs: Vec<(&str, &[f32])> = band_bufs
+                    .iter()
+                    .zip(band_descs.iter())
+                    .map(|((_, px), d)| (d.as_str(), px.as_slice()))
+                    .collect();
+                if let Some(vals) = try_gpu_weighted_polygon_bands(
+                    gpu,
+                    &pairs,
+                    &cov,
+                    win_w,
+                    win_h,
+                    &area_model,
+                    total_poly_area_px,
+                    &opts_owned,
+                ) {
+                    gpu_stats_counter
+                        .gpu_dispatches
+                        .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    for ((b1, _), val) in band_bufs.iter().zip(vals.into_iter()) {
+                        out.insert(format!("b{b1}"), val);
+                    }
+                    return serde_json::Value::Object(out);
+                }
+            }
+            for ((b1, pixels), desc) in band_bufs.iter().zip(band_descs.iter()) {
                 out.insert(
                     format!("b{b1}"),
                     compute_weighted_band_stats_with_geom(
@@ -2602,7 +3107,6 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         }
     }
 
-    let mut band_bufs: Vec<(u16, Vec<f32>)> = Vec::with_capacity(ref_slots.len());
     for &b1 in &ref_slots {
         if (b1 as usize) == 0 || (b1 as usize) > cogs.len() {
             return Err(EngineError::BadRequest(format!(
@@ -2610,12 +3114,38 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 cogs.len()
             )));
         }
+    }
+
+    // Fetch all referenced asset COGs concurrently via JoinSet, then stitch each band with hoisted block loops.
+    let mut js = tokio::task::JoinSet::new();
+    for (order, &b1) in ref_slots.iter().enumerate() {
         let slot = (b1 - 1) as usize;
+        let store = Arc::clone(&engine.store);
+        let asset_cog = Arc::clone(&cogs[slot]);
+        let idx_clone = indices.clone();
+        js.spawn(async move {
+            let tiles = store.get_blocks(&asset_cog, ifd_idx, &idx_clone).await?;
+            Ok::<_, EngineError>((order, b1, slot, tiles))
+        });
+    }
+    let mut fetched_ord = Vec::with_capacity(ref_slots.len());
+    while let Some(res) = js.join_next().await {
+        let item = res.map_err(|e| EngineError::BadGateway(format!("multi-cog fetch join: {e}")))??;
+        fetched_ord.push(item);
+    }
+    fetched_ord.sort_by_key(|(ord, _, _, _)| *ord);
+    let fetched: Vec<_> = fetched_ord
+        .into_iter()
+        .map(|(_, b1, slot, tiles)| (b1, slot, tiles))
+        .collect();
+
+    let stitch_asset = |slot: usize, tiles: &[Option<std::sync::Arc<cogzilla_codec::DecodedTile>>]| -> Vec<f32> {
         let asset_cog = &cogs[slot];
         let asset_ifd = &asset_cog.index.ifds[ifd_idx];
         let asset_tw = asset_ifd.tile_width as usize;
         let asset_th = asset_ifd.tile_height as usize;
         let eff_nodata = nodata_override.or_else(|| asset_cog.index.nodata.map(|v| v as f32));
+        let nd_finite = eff_nodata.filter(|nd| nd.is_finite());
         let sc = if unscale {
             asset_cog.index.scales.first().copied().unwrap_or(1.0)
         } else {
@@ -2626,7 +3156,6 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         } else {
             0.0
         };
-        let tiles = engine.store.get_blocks(asset_cog, ifd_idx, &indices).await?;
         let mut pixels = vec![f32::NAN; n_px];
         for (bi, tile_opt) in tiles.iter().enumerate() {
             let Some(tile) = tile_opt else { continue };
@@ -2639,34 +3168,137 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             let rx1 = c1.min(tile_x0 + asset_tw);
             let ry0 = r0.max(tile_y0);
             let ry1 = r1.min(tile_y0 + asset_th);
-            for row in ry0..ry1 {
-                let ly = row - tile_y0;
-                let dst_row = (row - r0) * win_w;
-                for col in rx0..rx1 {
-                    let lx = col - tile_x0;
-                    let mut v = band.data.get_f32(ly * asset_tw + lx);
-                    if !v.is_finite() {
-                        continue;
+            let span = rx1.saturating_sub(rx0);
+            if span == 0 || ry1 <= ry0 {
+                continue;
+            }
+            let lx0 = rx0 - tile_x0;
+            let dst_x0 = rx0 - c0;
+            match &band.data {
+                cogzilla_codec::BandData::F32(slab)
+                    if !unscale && nd_finite.is_none() =>
+                {
+                    let src_slice = slab.as_slice();
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * asset_tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        pixels[d0..d0 + span].copy_from_slice(&src_slice[s0..s0 + span]);
                     }
-                    if let Some(nd) = eff_nodata
-                        && (nd.is_nan() && v.is_nan() || v == nd)
-                    {
-                        continue;
+                }
+                cogzilla_codec::BandData::F32(slab) => {
+                    let src_slice = slab.as_slice();
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * asset_tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &v) in dst.iter_mut().zip(&src_slice[s0..s0 + span]) {
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
                     }
-                    if unscale {
-                        v = v * sc + off;
+                }
+                cogzilla_codec::BandData::U16 { data, nodata } => {
+                    let nd_internal = *nodata;
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * asset_tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
+                            let v = raw as f32;
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
                     }
-                    pixels[dst_row + (col - c0)] = v;
+                }
+                cogzilla_codec::BandData::U8 { data, nodata } => {
+                    let nd_internal = *nodata;
+                    for row in ry0..ry1 {
+                        let s0 = (row - tile_y0) * asset_tw + lx0;
+                        let d0 = (row - r0) * win_w + dst_x0;
+                        let dst = &mut pixels[d0..d0 + span];
+                        for (d, &raw) in dst.iter_mut().zip(&data[s0..s0 + span]) {
+                            if nd_internal == Some(raw) {
+                                continue;
+                            }
+                            let v = raw as f32;
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            *d = if unscale { v * sc + off } else { v };
+                        }
+                    }
+                }
+                _ => {
+                    for row in ry0..ry1 {
+                        let ly = row - tile_y0;
+                        let dst_row = (row - r0) * win_w;
+                        for col in rx0..rx1 {
+                            let lx = col - tile_x0;
+                            let mut v = band.data.get_f32(ly * asset_tw + lx);
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if let Some(nd) = nd_finite
+                                && v == nd
+                            {
+                                continue;
+                            }
+                            if unscale {
+                                v = v * sc + off;
+                            }
+                            pixels[dst_row + (col - c0)] = v;
+                        }
+                    }
                 }
             }
         }
-        band_bufs.push((b1, pixels));
-    }
+        pixels
+    };
+
+    let band_bufs: Vec<(u16, Vec<f32>)> = if fetched.len() > 1 && n_px >= 65_536 {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = fetched
+                .iter()
+                .map(|(b1, slot, tiles)| {
+                    let b1 = *b1;
+                    let slot = *slot;
+                    let stitch_ref = &stitch_asset;
+                    s.spawn(move || (b1, stitch_ref(slot, tiles)))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    } else {
+        fetched
+            .iter()
+            .map(|(b1, slot, tiles)| (*b1, stitch_asset(*slot, tiles)))
+            .collect()
+    };
 
     let crs_owned = crs.clone();
     let p2c = ifd.pixel_to_crs;
     let opts_owned = opts.clone();
     let exprs_owned = exprs.to_vec();
+    #[cfg(feature = "gpu")]
+    let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
+    #[cfg(feature = "gpu")]
+    let gpu_stats_counter = Arc::clone(&engine.stats);
     let compute_cpu = move || -> serde_json::Value {
         let total_poly_area_px =
             (geom_kind == ZonalGeomKind::Polygon).then_some(total_poly_area_px_val);
@@ -2684,7 +3316,31 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             PixelAreaModel::Constant(0.0)
         };
         let mut out = serde_json::Map::new();
-        for (ei, (desc, prog)) in exprs_owned.iter().enumerate() {
+        #[cfg(feature = "gpu")]
+        if geom_kind == ZonalGeomKind::Polygon
+            && let Some(ref gpu) = gpu_opt
+            && let Some(vals) = try_gpu_weighted_polygon_exprs(
+                gpu,
+                &band_bufs,
+                &exprs_owned,
+                &cov,
+                win_w,
+                win_h,
+                &area_model,
+                total_poly_area_px,
+                &opts_owned,
+            )
+        {
+            gpu_stats_counter
+                .gpu_dispatches
+                .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            for (ei, val) in vals.into_iter().enumerate() {
+                out.insert(format!("b{}", ei + 1), val);
+            }
+            return serde_json::Value::Object(out);
+        }
+        let mut expr_bufs: Vec<(&str, Vec<f32>)> = Vec::with_capacity(exprs_owned.len());
+        for (desc, prog) in &exprs_owned {
             let mut expr_px = vec![f32::NAN; n_px];
             let slot_bufs: Vec<Option<&[f32]>> = prog
                 .used_bands
@@ -2697,31 +3353,78 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                 })
                 .collect();
             let allow_nan = prog.ops.contains(&cogzilla_kernel::expr_vm::Op::Where);
-            let mut b_vals = vec![0.0_f32; slot_bufs.len()];
-            for i in 0..n_px {
-                if cov[i] <= COV_EPS {
-                    continue;
-                }
-                let mut all_valid = true;
-                for (slot, buf_opt) in slot_bufs.iter().enumerate() {
-                    let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
-                    if !v.is_finite() {
-                        if allow_nan {
-                            b_vals[slot] = f32::NAN;
-                            continue;
+            let eval_chunk = |start: usize, dst: &mut [f32]| {
+                let mut b_vals = vec![0.0_f32; slot_bufs.len()];
+                for (j, out_v) in dst.iter_mut().enumerate() {
+                    let i = start + j;
+                    if cov[i] <= COV_EPS {
+                        continue;
+                    }
+                    let mut all_valid = true;
+                    for (slot, buf_opt) in slot_bufs.iter().enumerate() {
+                        let v = buf_opt.map_or(f32::NAN, |buf| buf[i]);
+                        if !v.is_finite() {
+                            if allow_nan {
+                                b_vals[slot] = f32::NAN;
+                                continue;
+                            }
+                            all_valid = false;
+                            break;
                         }
-                        all_valid = false;
-                        break;
+                        b_vals[slot] = v;
                     }
-                    b_vals[slot] = v;
-                }
-                if all_valid {
-                    let r = prog.eval(&b_vals);
-                    if r.is_finite() {
-                        expr_px[i] = r;
+                    if all_valid {
+                        let r = prog.eval(&b_vals);
+                        if r.is_finite() {
+                            *out_v = r;
+                        }
                     }
                 }
+            };
+            if n_px >= 65_536 {
+                let threads = std::thread::available_parallelism()
+                    .map(|p| p.get().clamp(2, 8))
+                    .unwrap_or(4);
+                let chunk = n_px.div_ceil(threads);
+                std::thread::scope(|s| {
+                    for (ci, dst) in expr_px.chunks_mut(chunk).enumerate() {
+                        let off = ci * chunk;
+                        s.spawn(move || eval_chunk(off, dst));
+                    }
+                });
+            } else {
+                eval_chunk(0, &mut expr_px);
             }
+            expr_bufs.push((desc.as_str(), expr_px));
+        }
+        #[cfg(feature = "gpu")]
+        if geom_kind == ZonalGeomKind::Polygon
+            && let Some(ref gpu) = gpu_opt
+        {
+            let pairs: Vec<(&str, &[f32])> = expr_bufs
+                .iter()
+                .map(|(d, b)| (*d, b.as_slice()))
+                .collect();
+            if let Some(vals) = try_gpu_weighted_polygon_bands(
+                gpu,
+                &pairs,
+                &cov,
+                win_w,
+                win_h,
+                &area_model,
+                total_poly_area_px,
+                &opts_owned,
+            ) {
+                gpu_stats_counter
+                    .gpu_dispatches
+                    .fetch_add(vals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                for (ei, val) in vals.into_iter().enumerate() {
+                    out.insert(format!("b{}", ei + 1), val);
+                }
+                return serde_json::Value::Object(out);
+            }
+        }
+        for (ei, (desc, expr_px)) in expr_bufs.into_iter().enumerate() {
             out.insert(
                 format!("b{}", ei + 1),
                 compute_weighted_band_stats_with_geom(

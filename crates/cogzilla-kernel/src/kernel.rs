@@ -1286,7 +1286,11 @@ fn sample_footprint_exact(
             let lo = pos.floor() as usize;
             let hi = (lo + 1).min(slice.len() - 1);
             let frac = pos - lo as f32;
-            slice[lo] + (slice[hi] - slice[lo]) * frac
+            if frac == 0.0 || lo == hi || slice[lo] == slice[hi] {
+                slice[lo]
+            } else {
+                slice[lo] * (1.0 - frac) + slice[hi] * frac
+            }
         }
         _ => unreachable!(),
     }

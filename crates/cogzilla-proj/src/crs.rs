@@ -1263,7 +1263,10 @@ impl<const N: usize> CoordPlan<N> {
         if crs_to_pixel.is_axis_aligned()
             && matches!(
                 crs,
-                CrsModel::Epsg3857 | CrsModel::Geographic | CrsModel::CylindricalEqualArea(_)
+                CrsModel::Epsg3857
+                    | CrsModel::WorldMercator
+                    | CrsModel::Geographic
+                    | CrsModel::CylindricalEqualArea(_)
             )
         {
             let mut u = Box::new([0.0f32; N]);
@@ -1286,6 +1289,23 @@ impl<const N: usize> CoordPlan<N> {
                     for py in 0..N {
                         let my = max_y - (py as f64 + 0.5) * step_y;
                         let vv = (crs_to_pixel.e * my + crs_to_pixel.f - 0.5) as f32;
+                        v[py] = vv;
+                        min_v = min_v.min(vv);
+                        max_v = max_v.max(vv);
+                    }
+                }
+                CrsModel::WorldMercator => {
+                    for px in 0..N {
+                        let mx = min_x + (px as f64 + 0.5) * step_x;
+                        let uu = (crs_to_pixel.a * mx + crs_to_pixel.c - 0.5) as f32;
+                        u[px] = uu;
+                        min_u = min_u.min(uu);
+                        max_u = max_u.max(uu);
+                    }
+                    for py in 0..N {
+                        let my = max_y - (py as f64 + 0.5) * step_y;
+                        let (_, sy) = crs.from_3857(0.0, my);
+                        let vv = (crs_to_pixel.e * sy + crs_to_pixel.f - 0.5) as f32;
                         v[py] = vv;
                         min_v = min_v.min(vv);
                         max_v = max_v.max(vv);

@@ -275,6 +275,18 @@ impl<T: Sample> Fold<T> {
         }
     }
 
+    /// Borrow held scenes for GPU-accelerated Median compositing when `method == Selection::Median`,
+    /// `scenes >= 3`, and `!integer`. Returns `Some((bands, scenes))` if eligible.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn median_scenes(&self) -> Option<(usize, &[Vec<T>])> {
+        if self.method == Selection::Median && !self.integer && self.scenes >= 3
+            && let State::All(ref scenes) = self.state
+        {
+            return Some((self.bands, scenes.as_slice()));
+        }
+        None
+    }
+
     /// The values the method leaves. `None` when no scene was taken.
     pub(crate) fn finish(self) -> Option<Selected<T>> {
         if self.scenes == 0 {
