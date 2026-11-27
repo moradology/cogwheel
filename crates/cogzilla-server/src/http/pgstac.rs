@@ -6533,8 +6533,12 @@ fn respelled(resp: Resp) -> Resp {
     };
     let epsg = if crs.contains("OGC/0/CRS84") || crs.contains("EPSG/0/4326") {
         4326
-    } else if crs.contains("EPSG/0/3857") {
-        3857
+    } else if let Some(rest) = crs.split("EPSG/0/").nth(1) {
+        let digits = rest.trim_end_matches(['>', ' ']);
+        match digits.parse::<u16>() {
+            Ok(code) => code,
+            Err(_) => return resp,
+        }
     } else {
         return resp;
     };
@@ -6546,9 +6550,8 @@ fn respelled(resp: Resp) -> Resp {
 }
 
 /// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
-/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in.
-/// Only degrees and Web Mercator are worked out here; a picture in any other system goes
-/// without the headers, and a preview or a posted shape is placed by [`item_drawn_placed`].
+/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in
+/// (for any supported CRS). A preview or a posted shape is placed by [`item_drawn_placed`].
 pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
@@ -6584,32 +6587,40 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             let Some((bbox, _)) = super::parse_bbox4(seg) else {
                 return resp;
             };
-            // 4326 or 3857, or nothing for a system not placed here.
-            let system = |key: &str, default: u16| match asked(key).as_deref().map(super::parse_coord_crs_with_epsg) {
+            let parse_sys = |key: &str, default: (CrsModel, u16)| match asked(key)
+                .as_deref()
+                .map(super::parse_coord_crs_with_epsg)
+            {
                 None => Some(default),
-                Some(Ok((_, epsg @ (4326 | 3857)))) => Some(epsg),
-                Some(_) => None,
+                Some(Ok(pair)) => Some(pair),
+                Some(Err(_)) => None,
             };
-            let Some(given) = system("coord_crs", 4326) else {
+            let Some((given_crs, given_epsg)) = parse_sys("coord_crs", (CrsModel::Geographic, 4326)) else {
                 return resp;
             };
-            let Some(drawn) = system("dst_crs", given) else {
+            let Some((drawn_crs, drawn_epsg)) = parse_sys("dst_crs", (given_crs.clone(), given_epsg)) else {
                 return resp;
             };
-            let corners = |to: fn(f64, f64) -> (f64, f64)| {
-                let ((w, s), (e, n)) = (to(bbox[0], bbox[1]), to(bbox[2], bbox[3]));
-                [w, s, e, n]
+            let bounds = if given_epsg == drawn_epsg {
+                bbox
+            } else {
+                let Ok(wgs_bbox) = super::bbox_to_wgs84(bbox, Some(&given_crs)) else {
+                    return resp;
+                };
+                if drawn_epsg == 4326 {
+                    wgs_bbox
+                } else {
+                    let Ok(reproj) = super::reproject_wgs84_bounds(wgs_bbox, &drawn_crs) else {
+                        return resp;
+                    };
+                    reproj
+                }
             };
-            let bounds = match (given, drawn) {
-                (4326, 3857) => corners(cogzilla_proj::mercator::lonlat_deg_to_mercator),
-                (3857, 4326) => corners(mercator_to_lonlat_deg),
-                _ => bbox,
-            };
-            if bounds.iter().any(|c| !c.is_finite()) {
+            if bounds.iter().any(|c| !c.is_finite()) || bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
                 return resp;
             }
             let spelled = asked("dst_crs").or_else(|| asked("coord_crs"));
-            placed_as(resp, bounds, drawn, spelled.as_deref())
+            placed_as(resp, bounds, drawn_epsg, spelled.as_deref())
         }
         _ => resp,
     }
@@ -8908,10 +8919,11 @@ mod tests {
         );
         assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=EPSG%3A3857").unwrap().1, crs(3857));
         assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
-        // Systems not placed here, tiles that are not tiles, and other routes go without.
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:32631").unwrap().1, crs(32631));
+        assert_eq!(said(&["bbox", "765000,4832000,782000,4855000.png"], "coord_crs=epsg:32631").unwrap().1, crs(32631));
+        // Unsupported systems, tiles that are not tiles, and other routes go without.
         for (sub, query) in [
-            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:32631"),
-            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "coord_crs=epsg:32631"),
+            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:4275"),
             (&["tiles", "WebMercatorQuad", "1", "2", "0.png"][..], ""),
             (&["tiles", "WGS1984Quad", "0", "0", "0.png"][..], ""),
             (&["preview.png"][..], ""),
@@ -8930,6 +8942,22 @@ mod tests {
         assert!(said(&["tiles", "WebMercatorQuad", "0", "0", "0.png"], "buffer=0").is_some());
         let missing = Response::builder().status(StatusCode::NOT_FOUND).body(Full::new(Bytes::new())).unwrap();
         assert!(item_placed(missing, &["bbox", "6.3,43.6,6.5,43.8.png"], "").headers().get("content-bbox").is_none());
+        // `respelled` preserves arbitrary EPSG codes from upstream Content-Crs headers.
+        let utm_tile = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-bbox", "500000,4800000,510000,4810000")
+            .header("content-crs", "<http://www.opengis.net/def/crs/EPSG/0/32631>")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let respelled_utm = item_placed(utm_tile, &["tiles", "UTM31N", "0", "0", "0.png"], "");
+        assert_eq!(
+            respelled_utm.headers().get("content-crs").unwrap().to_str().unwrap(),
+            crs(32631)
+        );
+        assert_eq!(
+            respelled_utm.headers().get("content-bbox").unwrap().to_str().unwrap(),
+            "500000.0,4800000.0,510000.0,4810000.0"
+        );
     }
 
     #[test]

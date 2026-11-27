@@ -6059,9 +6059,17 @@ where
         .headers()
         .get(hyper::header::ACCEPT)
         .and_then(|v| v.to_str().ok());
+    let raw_q = req.uri().query().unwrap_or("");
+    let colormap_prefers_image = {
+        let mut parts = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty());
+        matches!((parts.next(), parts.next(), parts.next()), (Some("colorMaps"), Some(_), None))
+            && html::explicit_format(raw_q).is_none()
+            && accept_hdr.and_then(html::negotiate_colormap_accept).is_some()
+    };
     let as_page = (offers_page
-        && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
-    .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
+        && !colormap_prefers_image
+        && html::wants_html(raw_q, accept_hdr))
+    .then(|| (req.uri().path().to_string(), raw_q.to_string()));
     // Prevent a cached JSON ETag in `If-None-Match` from short-circuiting an HTML page request to 304.
     if as_page.is_some() {
         req.headers_mut().remove(IF_NONE_MATCH);
@@ -8127,46 +8135,54 @@ where
                 Bytes::from(list_colormaps_json(&host).to_string()),
                 "application/json",
             )),
-            ["colorMaps", id] => match pq.format_param.as_deref() {
-                None | Some("json") | Some("html") => {
-                    get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+            ["colorMaps", id] => {
+                let negotiated_fmt: Option<&str> = pq.format_param.as_deref().or_else(|| {
+                    req.headers()
+                        .get(hyper::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(html::negotiate_colormap_accept)
+                });
+                match negotiated_fmt {
+                    None | Some("json") | Some("html") => {
+                        get_colormap_json(id).map(|v| (Bytes::from(v.to_string()), "application/json"))
+                    }
+                    Some("npy") => get_colormap_image(
+                        id,
+                        OutputFormat::Npy,
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "application/x-binary")),
+                    Some("png") => get_colormap_image(
+                        id,
+                        OutputFormat::Png,
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/png")),
+                    Some("jpg" | "jpeg") => get_colormap_image(
+                        id,
+                        OutputFormat::Jpeg { quality: pq.jpeg_quality },
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/jpeg")),
+                    Some("webp") => get_colormap_image(
+                        id,
+                        OutputFormat::Webp { quality: pq.webp_quality },
+                        pq.orientation_vertical,
+                        pq.width,
+                        pq.height,
+                    )
+                    .map(|b| (b, "image/webp")),
+                    Some(other) => Err(EngineError::BadRequest(format!(
+                        "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
+                    ))),
                 }
-                Some("npy") => get_colormap_image(
-                    id,
-                    OutputFormat::Npy,
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "application/x-binary")),
-                Some("png") => get_colormap_image(
-                    id,
-                    OutputFormat::Png,
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/png")),
-                Some("jpg" | "jpeg") => get_colormap_image(
-                    id,
-                    OutputFormat::Jpeg { quality: pq.jpeg_quality },
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/jpeg")),
-                Some("webp") => get_colormap_image(
-                    id,
-                    OutputFormat::Webp { quality: pq.webp_quality },
-                    pq.orientation_vertical,
-                    pq.width,
-                    pq.height,
-                )
-                .map(|b| (b, "image/webp")),
-                Some(other) => Err(EngineError::BadRequest(format!(
-                    "unsupported colormap format '{other}' (use json, html, npy, png, jpg, or webp)"
-                ))),
-            },
+            }
             _ => Err(EngineError::NotFound(path.clone())),
         };
         return Ok(to_http_response(&engine, res, if_none_match.as_deref()));
@@ -11923,7 +11939,7 @@ fn attach_tile_geo_headers_opts(
             .map(|sc| sc.saturating_mul(base_ts))
             .unwrap_or(if opts.has_explicit_ts { opts.tile_size } else { base_ts });
         if let Some(bbox) = tms_def.tile_bounds(z, x, y, opts.buffer, ts) {
-            let is_crs84 = matches!(tms, "WorldCRS84Quad" | "GNOSISGlobalGrid" | "WGS1984Quad");
+            let is_crs84 = tms == "WorldCRS84Quad";
             attach_geo_headers(resp, bbox, Some(tms_def.epsg), is_crs84);
         }
     }
