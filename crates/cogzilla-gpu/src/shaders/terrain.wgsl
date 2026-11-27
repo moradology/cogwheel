@@ -200,7 +200,10 @@ fn sample_elev(u: f32, v: f32) -> f32 {
     } else if (params.resample_mode == 1u) {
         return sample_cubic(u, v);
     } else if (params.resample_mode == 3u) {
-        if (!is_finite_f32(u) || !is_finite_f32(v)) {
+        if (!is_finite_f32(u) || !is_finite_f32(v)
+            || u < -0.5 || v < -0.5
+            || u > f32(params.src_w) - 0.5
+            || v > f32(params.src_h) - 0.5) {
             return nan_f32();
         }
         return sample_checked(i32(floor(u + 0.5)), i32(floor(v + 0.5)));
@@ -287,7 +290,7 @@ fn eval_horn_from_shared(lx: u32, ly: u32) -> f32 {
     let cx = lx + 1u;
     let cy = ly + 1u;
     let z_c = shared_elev[cy * 18u + cx];
-    if (is_nan_f32(z_c)) {
+    if (!is_finite_f32(z_c)) {
         return nan_f32();
     }
 
@@ -304,14 +307,14 @@ fn eval_horn_from_shared(lx: u32, ly: u32) -> f32 {
     let z_s  = shared_elev[r2 + cx];
     let z_se = shared_elev[r2 + cx + 1u];
 
-    let nw = select(z_nw, z_c, is_nan_f32(z_nw));
-    let n  = select(z_n,  z_c, is_nan_f32(z_n));
-    let ne = select(z_ne, z_c, is_nan_f32(z_ne));
-    let w  = select(z_w,  z_c, is_nan_f32(z_w));
-    let e  = select(z_e,  z_c, is_nan_f32(z_e));
-    let sw = select(z_sw, z_c, is_nan_f32(z_sw));
-    let s  = select(z_s,  z_c, is_nan_f32(z_s));
-    let se = select(z_se, z_c, is_nan_f32(z_se));
+    let nw = select(z_c, z_nw, is_finite_f32(z_nw));
+    let n  = select(z_c, z_n,  is_finite_f32(z_n));
+    let ne = select(z_c, z_ne, is_finite_f32(z_ne));
+    let w  = select(z_c, z_w,  is_finite_f32(z_w));
+    let e  = select(z_c, z_e,  is_finite_f32(z_e));
+    let sw = select(z_c, z_sw, is_finite_f32(z_sw));
+    let s  = select(z_c, z_s,  is_finite_f32(z_s));
+    let se = select(z_c, z_se, is_finite_f32(z_se));
 
     let dz_dx = ((ne + 2.0 * e + se) - (nw + 2.0 * w + sw)) * params.inv_8dx;
     let dz_dy = ((sw + 2.0 * s + se) - (nw + 2.0 * n + ne)) * params.inv_8dy;

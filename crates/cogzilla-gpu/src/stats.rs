@@ -468,17 +468,37 @@ pub fn decode_stats_readback(
 ) -> GpuBandStats {
     let rb = std::mem::size_of::<ResolvedStats>();
     let hb = 2 * CDF_BINS * std::mem::size_of::<u32>();
-    if bytes.len() < rb + hb {
+    if bytes.len() < rb + hb || (bytes.len() - rb - hb) % 4 != 0 {
         return empty_stats(total_pixels, percentiles);
     }
     let n_bins = num_bins.clamp(1, CDF_BINS);
-    let res: ResolvedStats = *bytemuck::from_bytes(&bytes[..rb]);
+    let res: ResolvedStats = bytemuck::pod_read_unaligned(&bytes[..rb]);
     let valid_px = res.valid_count as usize;
     if valid_px == 0 {
         return empty_stats(total_pixels, percentiles);
     }
-    let h_all: &[u32] = bytemuck::cast_slice(&bytes[rb..rb + hb]);
-    let v_all: &[f32] = bytemuck::cast_slice(&bytes[rb + hb..]);
+    let h_owned: Vec<u32>;
+    let h_all: &[u32] = match bytemuck::try_cast_slice(&bytes[rb..rb + hb]) {
+        Ok(s) => s,
+        Err(_) => {
+            h_owned = bytes[rb..rb + hb]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            &h_owned
+        }
+    };
+    let v_owned: Vec<f32>;
+    let v_all: &[f32] = match bytemuck::try_cast_slice(&bytes[rb + hb..]) {
+        Ok(s) => s,
+        Err(_) => {
+            v_owned = bytes[rb + hb..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            &v_owned
+        }
+    };
     let hist_counts: Vec<u64> = h_all[..n_bins].iter().map(|&c| c as u64).collect();
     let cdf_counts: Vec<u64> = h_all[CDF_BINS..2 * CDF_BINS]
         .iter()

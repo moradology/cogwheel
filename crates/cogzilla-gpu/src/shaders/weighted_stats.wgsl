@@ -398,14 +398,17 @@ fn wstats_hist_pass2(
                 }
                 atomicAdd(&sh_cdf[cb], wq);
 
-                // User N-bin weighted histogram
+                // User N-bin coverage-weighted histogram (always in coverage units, matching zonal.rs)
                 if (v >= h_min && v <= h_max) {
                     var hb: u32 = 0u;
                     if (h_inv > 0.0) {
                         let hf = (v - h_min) * h_inv;
                         hb = min(u32(hf * n_bins_f), last_bin);
                     }
-                    atomicAdd(&sh_hist[hb], wq);
+                    let cq = u32(round(clamp(c, 0.0, 1.0) * 64.0));
+                    if (cq > 0u) {
+                        atomicAdd(&sh_hist[hb], cq);
+                    }
                 }
             }
         }

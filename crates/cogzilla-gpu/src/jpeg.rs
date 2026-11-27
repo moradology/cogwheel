@@ -246,7 +246,7 @@ fn encode_block(
             bw.write_bits(ac_tbl.code[0xf0] as u32, ac_tbl.len[0xf0] as u32);
             run -= 16;
         }
-        let (nbits, code) = bit_size_and_code(c as i32);
+        let (nbits, code) = bit_size_and_code((c as i32).clamp(-2047, 2047));
         let rs = (run << 4) | (nbits as usize);
         let ac_len = ac_tbl.len[rs] as u32;
         let ac_code = ac_tbl.code[rs] as u32;
@@ -292,10 +292,34 @@ fn std_huff_tables() -> &'static StdHuffTables {
 /// Lock-free and uses SWAR 32-bit `BitWriter` + 128-bit zero-tail scan + multi-threaded
 /// `DRI`/`RST0..RST7` encoding for large images (`>= 8192` MCUs).
 pub fn huffman_encode_coeffs(coeffs_bytes: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
+    if width == 0 || height == 0 || width > 65535 || height > 65535 {
+        return Vec::new();
+    }
     let mcu_w = width.div_ceil(16) as usize;
     let mcu_h = height.div_ceil(16) as usize;
-    let total_mcus = mcu_w * mcu_h;
-    let coeffs: &[i16] = bytemuck::cast_slice(coeffs_bytes);
+    let Some(total_mcus) = mcu_w.checked_mul(mcu_h) else {
+        return Vec::new();
+    };
+    let Some(need_coeffs) = total_mcus.checked_mul(384) else {
+        return Vec::new();
+    };
+    let Some(need_bytes) = need_coeffs.checked_mul(2) else {
+        return Vec::new();
+    };
+    if coeffs_bytes.len() < need_bytes {
+        return Vec::new();
+    }
+    let owned_coeffs: Vec<i16>;
+    let coeffs: &[i16] = match bytemuck::try_cast_slice(&coeffs_bytes[..need_bytes]) {
+        Ok(s) => s,
+        Err(_) => {
+            owned_coeffs = coeffs_bytes[..need_bytes]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            &owned_coeffs
+        }
+    };
     let q_y = scale_qtable(&STD_LUMA_Q, quality);
     let q_c = scale_qtable(&STD_CHROMA_Q, quality);
     let tbls = std_huff_tables();

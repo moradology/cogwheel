@@ -203,7 +203,10 @@ fn sample_band(band: u32, u: f32, v: f32) -> f32 {
     } else if (params.resample_mode == 1u) {
         return sample_cubic(band, u, v);
     } else if (params.resample_mode == 3u) {
-        if (!is_finite_f32(u) || !is_finite_f32(v)) {
+        if (!is_finite_f32(u) || !is_finite_f32(v)
+            || u < -0.5 || v < -0.5
+            || u > f32(params.src_w) - 0.5
+            || v > f32(params.src_h) - 0.5) {
             return nan_f32();
         }
         return sample_checked(band, i32(floor(u + 0.5)), i32(floor(v + 0.5)));

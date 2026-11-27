@@ -511,9 +511,15 @@ impl GpuWeightedStatsReducer {
         percentiles: &[f64],
     ) -> Result<Vec<GpuWeightedBandStats>, GpuError> {
         let len = covs.len();
-        if len == 0 || win_w == 0 || row_areas.len() < len.div_ceil(win_w) || bands.is_empty() {
+        const MAX_HIST_PIXELS: usize = (u32::MAX / 64) as usize;
+        if len == 0
+            || len > MAX_HIST_PIXELS
+            || win_w == 0
+            || row_areas.len() < len.div_ceil(win_w)
+            || bands.is_empty()
+        {
             return Err(GpuError::InvalidDimensions(
-                "weighted stats requires non-empty bands, covs, win_w, and valid row_areas".into(),
+                "weighted stats requires 1..=67108863 pixels, non-empty bands, win_w, and valid row_areas".into(),
             ));
         }
         let needed_bytes = (len as u64).saturating_mul(4);
@@ -745,7 +751,9 @@ impl GpuWeightedStatsReducer {
         percentiles: &[f64],
     ) -> Result<Vec<GpuWeightedBandStats>, GpuError> {
         let len = covs.len();
+        const MAX_HIST_PIXELS: usize = (u32::MAX / 64) as usize;
         if len == 0
+            || len > MAX_HIST_PIXELS
             || win_w == 0
             || row_areas.len() < len.div_ceil(win_w)
             || raw_bands.is_empty()
@@ -1172,18 +1180,15 @@ fn decode_weighted_readback(
     let hist_edges: Vec<f64> = (0..=n_bins)
         .map(|i| h_lo + h_span * (i as f64) / (n_bins as f64))
         .collect();
-    // Convert quantized weighted histogram counts back to exact coverage units summing to count_cov
-    // (matching zonal.rs's weighted histogram counts).
+    // Convert quantized coverage histogram counts (scaled by 64.0 in shader) back to coverage units
+    // matching zonal.rs's coverage-weighted histogram counts.
     let raw_hist_sum: f64 = hist_u32[..n_bins].iter().map(|&c| c as f64).sum();
     let hist_scale = if raw_hist_sum > 0.0 {
-        let target_sum = if hist_range.is_none() {
-            resolved.c_total as f64
-        } else if resolved.inv_max_w > 0.0 {
-            raw_hist_sum / (resolved.inv_max_w as f64)
+        if hist_range.is_none() {
+            (resolved.c_total as f64) / raw_hist_sum
         } else {
-            0.0
-        };
-        target_sum / raw_hist_sum
+            1.0 / 64.0
+        }
     } else {
         0.0
     };
