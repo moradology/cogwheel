@@ -1723,11 +1723,24 @@ pub fn widened_plane_separable(
     scale_x: f32,
     scale_y: f32,
 ) -> Vec<f32> {
+    let cols = AxisTapTable::build(mode, us, scale_x, src.ifd_w);
+    let rows = AxisTapTable::build(mode, vs, scale_y, src.ifd_h);
+    widened_plane_separable_with_tables(us, vs, src, mode, scale_x, scale_y, &cols, &rows)
+}
+
+fn widened_plane_separable_with_tables(
+    us: &[f32],
+    vs: &[f32],
+    src: &BandSource<'_>,
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+    cols: &AxisTapTable,
+    rows: &AxisTapTable,
+) -> Vec<f32> {
     let (w, h) = (us.len(), vs.len());
     let mut out = vec![f32::NAN; w * h];
     let in_range = |c: f32, lim: i32| c.is_finite() && c >= -0.5 && c <= lim as f32 - 0.5;
-    let cols = AxisTapTable::build(mode, us, scale_x, src.ifd_w);
-    let rows = AxisTapTable::build(mode, vs, scale_y, src.ifd_h);
     let (Some((c_lo, c_hi)), Some(_)) = (cols.span(), rows.span()) else {
         return out;
     };
@@ -5046,18 +5059,32 @@ pub fn render_rgb_bands<const N: usize>(
         (ResampleMode::Nearest, false) => render_rgb_specialized::<N, false, false>(plan, srcs, style),
         (mode, _) if plan_widened_scale(plan, mode).is_some() => {
             let (sx, sy) = coord_plan_scale(plan);
-            let planes = [
-                widened_plane(plan, &srcs[0], mode, sx, sy),
-                widened_plane(plan, &srcs[1], mode, sx, sy),
-                widened_plane(plan, &srcs[2], mode, sx, sy),
-            ];
-            render_rgb_cubic::<N>(&index_plan::<N>(), style, |b, u, v| plane_at::<N>(&planes[b], u, v))
+            let same_dims = srcs[1].ifd_w == srcs[0].ifd_w
+                && srcs[1].ifd_h == srcs[0].ifd_h
+                && srcs[2].ifd_w == srcs[0].ifd_w
+                && srcs[2].ifd_h == srcs[0].ifd_h;
+            let planes = if let (true, CoordPlan::Separable1D { u, v, .. }) = (same_dims, plan) {
+                let cols = AxisTapTable::build(mode, &u[..], sx, srcs[0].ifd_w);
+                let rows = AxisTapTable::build(mode, &v[..], sy, srcs[0].ifd_h);
+                [
+                    widened_plane_separable_with_tables(&u[..], &v[..], &srcs[0], mode, sx, sy, &cols, &rows),
+                    widened_plane_separable_with_tables(&u[..], &v[..], &srcs[1], mode, sx, sy, &cols, &rows),
+                    widened_plane_separable_with_tables(&u[..], &v[..], &srcs[2], mode, sx, sy, &cols, &rows),
+                ]
+            } else {
+                [
+                    widened_plane(plan, &srcs[0], mode, sx, sy),
+                    widened_plane(plan, &srcs[1], mode, sx, sy),
+                    widened_plane(plan, &srcs[2], mode, sx, sy),
+                ]
+            };
+            render_rgb_cubic::<N>(&index_plan::<N>(), style, clean, |b, u, v| plane_at::<N>(&planes[b], u, v))
         }
         (ResampleMode::Bilinear, true) => render_rgb_specialized::<N, true, true>(plan, srcs, style),
         (ResampleMode::Bilinear, false) => render_rgb_specialized::<N, true, false>(plan, srcs, style),
         (mode, _) => {
             let (sx, sy) = coord_plan_scale(plan);
-            render_rgb_cubic::<N>(plan, style, |b, u, v| {
+            render_rgb_cubic::<N>(plan, style, clean, |b, u, v| {
                 if mode == ResampleMode::Cubic {
                     sample_cubic(&srcs[b], u, v)
                 } else {
@@ -5071,6 +5098,7 @@ pub fn render_rgb_bands<const N: usize>(
 fn render_rgb_cubic<const N: usize>(
     plan: &CoordPlan<N>,
     style: &RgbStyle,
+    clean: bool,
     sample_band: impl Fn(usize, f32, f32) -> f32,
 ) -> Bytes {
     let inv = [
@@ -5094,6 +5122,30 @@ fn render_rgb_cubic<const N: usize>(
         OutputFormat::Png => SCRATCH.with(|cell| {
             let mut guard = cell.borrow_mut();
             let sc = &mut *guard;
+            if clean {
+                let stride = 1 + N * 3;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N * 3 {
+                    sc.row_buf.resize(N * 3, 0);
+                }
+                for py in 0..N {
+                    let row = &mut sc.row_buf[..N * 3];
+                    for_each_pixel_in_row(plan, py, |px, u, v| {
+                        let r = sample_band(0, u, v);
+                        let g = sample_band(1, u, v);
+                        let b = sample_band(2, u, v);
+                        let off = px * 3;
+                        row[off] = rescale_u8(r, inv[0], mins[0]);
+                        row[off + 1] = rescale_u8(g, inv[1], mins[1]);
+                        row[off + 2] = rescale_u8(b, inv[2], mins[2]);
+                    });
+                    filter_sub_rgb_row(row, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                }
+                return encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total]);
+            }
             let stride = 1 + N * 4;
             let total = N * stride;
             if sc.img_buf.len() < total {
