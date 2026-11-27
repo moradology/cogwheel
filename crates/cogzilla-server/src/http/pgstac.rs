@@ -1900,6 +1900,9 @@ pub(super) type AssetBidx = Vec<(String, Vec<u16>)>;
 pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Option<(AssetBidx, Vec<u16>)>, Resp> {
     let pairs = query_pairs(raw_query);
     let mut specs = parse_assets(&pairs)?;
+    // Bands chosen on an asset with band math, which the shared parser has kept: dropped
+    // here, so the options are given back even when no other asset chooses any.
+    let mut dropped = false;
     if let Some(spec) = specs.iter().find(|s| s.expression.is_some()) {
         if item_asset_math_route(rest) {
             return Ok(None);
@@ -1912,10 +1915,10 @@ pub(super) fn item_asset_options(rest: &[&str], raw_query: &str) -> Result<Optio
         }
         // An asset's band math is over all of its bands, and wins over its `bidx`.
         for spec in specs.iter_mut().filter(|s| s.expression.is_some()) {
-            spec.indexes = None;
+            dropped |= spec.indexes.take().is_some();
         }
     }
-    if specs.iter().all(|s| s.indexes.is_none()) {
+    if !dropped && specs.iter().all(|s| s.indexes.is_none()) {
         return Ok(None);
     }
     let by_asset = matches!(rest, ["info" | "info.geojson" | "statistics" | "asset_statistics"] | ["point", _]);
@@ -7455,6 +7458,19 @@ mod tests {
         assert!(math("assets=visual%7Cexpression%3Db1%3Bb2&asset_as_band=true").is_err());
         assert_eq!(math("assets=red&expression=b1*2"), Ok(None), "no asset's own band math");
         assert_eq!(item_asset_math(&["point", "1,2"], &query_pairs("assets=red%7Cexpression%3Db1*2")), Ok(None));
+    }
+
+    /// An asset's band math is over all of its bands: the bands it chooses are dropped, and the
+    /// options given back so that the shared parser's choice of them is not read either.
+    #[test]
+    fn asset_math_drops_the_assets_own_band_choice() {
+        let options = |q: &str| item_asset_options(&["point", "1,2"], q).ok().flatten();
+        assert_eq!(options("assets=visual%7Cexpression%3Db3%7Cbidx%3D1"), Some((vec![], vec![])));
+        assert_eq!(
+            options("assets=visual%7Cexpression%3Db3%7Cbidx%3D1&assets=red%7Cbidx%3D1"),
+            Some((vec![("red".to_string(), vec![1])], vec![]))
+        );
+        assert_eq!(options("assets=visual%7Cexpression%3Db3"), None);
     }
 
     /// An item's point is read band by band and each asset's band math applied afterwards.
