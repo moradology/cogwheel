@@ -2800,11 +2800,11 @@ mod tests {
         let ndvi_instrs = vec![
             GpuInstr::load_band(0),
             GpuInstr::load_band(1),
-            GpuInstr::op(crate::expr::opcodes::SUB),
+            GpuInstr::op(cogzilla_kernel::expr_vm::Op::Sub.wire_opcode().unwrap()),
             GpuInstr::load_band(0),
             GpuInstr::load_band(1),
-            GpuInstr::op(crate::expr::opcodes::ADD),
-            GpuInstr::op(crate::expr::opcodes::DIV),
+            GpuInstr::op(cogzilla_kernel::expr_vm::Op::Add.wire_opcode().unwrap()),
+            GpuInstr::op(cogzilla_kernel::expr_vm::Op::Div.wire_opcode().unwrap()),
         ];
         let formula = GpuColorFormula::from_gamma_sigmoidal_sat(Some(1.2), Some((6.0, 0.5)), Some(1.3));
 

@@ -188,6 +188,128 @@ fn eval_expr_vm_range(
             case 30u: { // Round
                 stack[sp - 1u] = round(stack[sp - 1u]);
             }
+            case 31u: { // Mod (floored remainder matching Python/NumPy & CPU)
+                sp -= 1u;
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                if (is_nan_f32(a) || is_nan_f32(b) || abs(b) < 1e-12) {
+                    stack[sp - 1u] = nan_f32();
+                } else {
+                    let r = a - b * trunc(a / b);
+                    stack[sp - 1u] = select(r, r + b, r != 0.0 && (r < 0.0) != (b < 0.0));
+                }
+            }
+            case 32u: { // ModPow2 (floored remainder by constant power of two in imm_f32)
+                let a = stack[sp - 1u];
+                let c = ins.imm_f32;
+                stack[sp - 1u] = a - c * floor(a / c);
+            }
+            case 33u: { // BitAnd
+                sp -= 1u;
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                if (is_nan_f32(a) || is_nan_f32(b)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (a >= 0.0 && b >= 0.0 && a <= 4294967295.0 && b <= 4294967295.0) {
+                    stack[sp - 1u] = f32(u32(a) & u32(b));
+                } else {
+                    let ai = i32(clamp(a, -2147483648.0, 2147483520.0));
+                    let bi = i32(clamp(b, -2147483648.0, 2147483520.0));
+                    stack[sp - 1u] = f32(ai & bi);
+                }
+            }
+            case 34u: { // BitOr
+                sp -= 1u;
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                if (is_nan_f32(a) || is_nan_f32(b)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (a >= 0.0 && b >= 0.0 && a <= 4294967295.0 && b <= 4294967295.0) {
+                    stack[sp - 1u] = f32(u32(a) | u32(b));
+                } else {
+                    let ai = i32(clamp(a, -2147483648.0, 2147483520.0));
+                    let bi = i32(clamp(b, -2147483648.0, 2147483520.0));
+                    stack[sp - 1u] = f32(ai | bi);
+                }
+            }
+            case 35u: { // BitNot
+                let x = stack[sp - 1u];
+                stack[sp - 1u] = select(select(0.0, 1.0, x == 0.0), nan_f32(), is_nan_f32(x));
+            }
+            case 36u: { // Log1p
+                let x = stack[sp - 1u];
+                if (is_nan_f32(x) || x <= -1.0) {
+                    stack[sp - 1u] = nan_f32();
+                } else {
+                    let u = 1.0 + x;
+                    stack[sp - 1u] = select(log(u) * (x / (u - 1.0)), x, u == 1.0);
+                }
+            }
+            case 37u: { // Expm1
+                let x = stack[sp - 1u];
+                if (is_nan_f32(x)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (abs(x) < 1e-4) {
+                    stack[sp - 1u] = x + 0.5 * x * x;
+                } else {
+                    stack[sp - 1u] = exp(x) - 1.0;
+                }
+            }
+            case 38u: { // Sign
+                let x = stack[sp - 1u];
+                if (is_nan_f32(x)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (x > 0.0) {
+                    stack[sp - 1u] = 1.0;
+                } else if (x < 0.0) {
+                    stack[sp - 1u] = -1.0;
+                } else {
+                    stack[sp - 1u] = 0.0;
+                }
+            }
+            case 39u: { // Arcsin
+                let x = stack[sp - 1u];
+                if (is_nan_f32(x) || x < -1.0 || x > 1.0) {
+                    stack[sp - 1u] = nan_f32();
+                } else {
+                    stack[sp - 1u] = asin(x);
+                }
+            }
+            case 40u: { // Arccos
+                let x = stack[sp - 1u];
+                if (is_nan_f32(x) || x < -1.0 || x > 1.0) {
+                    stack[sp - 1u] = nan_f32();
+                } else {
+                    stack[sp - 1u] = acos(x);
+                }
+            }
+            case 41u: { // Arctan
+                stack[sp - 1u] = atan(stack[sp - 1u]);
+            }
+            case 42u: { // Arctan2
+                sp -= 1u;
+                let a = stack[sp - 1u];
+                let b = stack[sp];
+                if (is_nan_f32(a) || is_nan_f32(b)) {
+                    stack[sp - 1u] = nan_f32();
+                } else if (a == 0.0 && b == 0.0) {
+                    stack[sp - 1u] = 0.0;
+                } else {
+                    stack[sp - 1u] = atan2(a, b);
+                }
+            }
+            case 43u: { // Sinh
+                stack[sp - 1u] = sinh(stack[sp - 1u]);
+            }
+            case 44u: { // Cosh
+                stack[sp - 1u] = cosh(stack[sp - 1u]);
+            }
+            case 45u: { // Tanh
+                stack[sp - 1u] = tanh(stack[sp - 1u]);
+            }
+            case 46u: { // Trunc
+                stack[sp - 1u] = trunc(stack[sp - 1u]);
+            }
             default: {}
         }
     }

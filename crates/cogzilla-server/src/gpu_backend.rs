@@ -7,8 +7,7 @@ use cogzilla_gpu::{
     GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuInstr, GpuJpegEncoder,
     GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuSlab,
     GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
-    MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
-    pack_rgb_lut,
+    MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, pack_rgb_lut,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{
@@ -1443,39 +1442,56 @@ impl GpuBackend {
         }
         let mut out = Vec::with_capacity(ops.len());
         for &op in ops {
+            let opcode = op.wire_opcode()?;
             let ins = match op {
                 Op::PushConst(v) => GpuInstr::push_const(v),
                 Op::LoadBand(slot) => GpuInstr::load_band(slot as u32),
-                Op::Add => GpuInstr::op(opcodes::ADD),
-                Op::Sub => GpuInstr::op(opcodes::SUB),
-                Op::Mul => GpuInstr::op(opcodes::MUL),
-                Op::Div => GpuInstr::op(opcodes::DIV),
-                Op::Pow => GpuInstr::op(opcodes::POW),
-                Op::Neg => GpuInstr::op(opcodes::NEG),
-                Op::Log10 => GpuInstr::op(opcodes::LOG10),
-                Op::Ln => GpuInstr::op(opcodes::LN),
-                Op::Log2 => GpuInstr::op(opcodes::LOG2),
-                Op::Db => GpuInstr::op(opcodes::DB),
-                Op::Exp => GpuInstr::op(opcodes::EXP),
-                Op::Sqrt => GpuInstr::op(opcodes::SQRT),
-                Op::Abs => GpuInstr::op(opcodes::ABS),
-                Op::Sin => GpuInstr::op(opcodes::SIN),
-                Op::Cos => GpuInstr::op(opcodes::COS),
-                Op::Tan => GpuInstr::op(opcodes::TAN),
-                Op::Min => GpuInstr::op(opcodes::MIN),
-                Op::Max => GpuInstr::op(opcodes::MAX),
-                Op::Clip => GpuInstr::op(opcodes::CLIP),
-                Op::Lt => GpuInstr::op(opcodes::LT),
-                Op::Le => GpuInstr::op(opcodes::LE),
-                Op::Gt => GpuInstr::op(opcodes::GT),
-                Op::Ge => GpuInstr::op(opcodes::GE),
-                Op::Eq => GpuInstr::op(opcodes::EQ),
-                Op::Ne => GpuInstr::op(opcodes::NE),
-                Op::Where => GpuInstr::op(opcodes::WHERE),
-                Op::Ceil => GpuInstr::op(opcodes::CEIL),
-                Op::Floor => GpuInstr::op(opcodes::FLOOR),
-                Op::Round => GpuInstr::op(opcodes::ROUND),
-                _ => return None,
+                Op::ModPow2(c) => GpuInstr::op_f32(opcode, c),
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Pow
+                | Op::Neg
+                | Op::Log10
+                | Op::Ln
+                | Op::Log2
+                | Op::Db
+                | Op::Exp
+                | Op::Sqrt
+                | Op::Abs
+                | Op::Sin
+                | Op::Cos
+                | Op::Tan
+                | Op::Min
+                | Op::Max
+                | Op::Clip
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::Eq
+                | Op::Ne
+                | Op::Where
+                | Op::Ceil
+                | Op::Floor
+                | Op::Round
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitNot
+                | Op::Log1p
+                | Op::Expm1
+                | Op::Sign
+                | Op::Arcsin
+                | Op::Arccos
+                | Op::Arctan
+                | Op::Arctan2
+                | Op::Sinh
+                | Op::Cosh
+                | Op::Tanh
+                | Op::Trunc => GpuInstr::op(opcode),
+                Op::Median(_) | Op::Std(_) | Op::Var(_) => return None,
             };
             out.push(ins);
         }
@@ -2963,9 +2979,134 @@ mod tests {
         let instrs = GpuBackend::compile_expr_to_gpu(&prog).expect("should translate to GPU VM");
         assert_eq!(instrs.len(), prog.ops.len());
 
-        // Unsupported op (median) must cleanly return None for CPU fallback
-        let med = ExprProgram::compile("median(b1, b2, b3)").unwrap();
-        assert!(GpuBackend::compile_expr_to_gpu(&med).is_none());
+        // All 16 scalar opcodes unlocked in #435 must translate to GPU VM bytecode
+        for expr in [
+            "b1 % b2",
+            "b1 % 4",
+            "(b1 & b2) | (~b1)",
+            "log1p(b1) + expm1(b2) + sign(b1 - b2)",
+            "arcsin(b1) + arccos(b2) + arctan(b1) + arctan2(b1, b2)",
+            "sinh(b1) + cosh(b2) + tanh(b1) + trunc(b2)",
+        ] {
+            let p = ExprProgram::compile(expr).unwrap_or_else(|e| panic!("compile {expr}: {e}"));
+            assert!(
+                GpuBackend::compile_expr_to_gpu(&p).is_some(),
+                "expected {expr} to compile to GPU VM"
+            );
+        }
+
+        // Unsupported multi-band reductions must cleanly return None for CPU fallback
+        for expr in ["median(b1, b2, b3)", "std(b1, b2, b3)", "var(b1, b2, b3)"] {
+            let p = ExprProgram::compile(expr).unwrap();
+            assert!(GpuBackend::compile_expr_to_gpu(&p).is_none());
+        }
+    }
+
+    #[test]
+    fn gpu_expr_vm_scalar_opcodes_match_cpu_numerically() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            eprintln!("skipping GPU expr parity test (no adapter)");
+            return;
+        };
+        let w = 256u32;
+        let h = 256u32;
+        let n = (w * h) as usize;
+        let mut b1_vals = vec![0.0f32; n];
+        let mut b2_vals = vec![0.0f32; n];
+        for i in 0..n {
+            // Mix positive, negative, fractional, and [-1, 1] values
+            b1_vals[i] = -0.8 + (i as f32 / n as f32) * 1.6;
+            b2_vals[i] = 0.25 + (i as f32 / n as f32) * 3.5;
+        }
+        // Inject edge-case pixels: NaN, 0.0, -1.0, out-of-domain ±1.5, small ±1e-5.
+        let edge_b1 = [f32::NAN, 0.0, -1.0, 1.5, -1.5, 1e-5, -1e-5, 0.0];
+        let edge_b2 = [1.0, 0.0, 2.0, f32::NAN, -2.5, 1e-5, -1e-5, -1.0];
+        for (idx, (&x, &y)) in edge_b1.iter().zip(edge_b2.iter()).enumerate() {
+            b1_vals[idx] = x;
+            b2_vals[idx] = y;
+        }
+        let slab = Arc::new(
+            cogzilla_gpu::GpuMultiBandSlab::upload_bands(
+                &gpu.ctx.device,
+                &[b1_vals.as_slice(), b2_vals.as_slice()],
+                w,
+                h,
+                w,
+            )
+            .unwrap(),
+        );
+
+        let u: Vec<f32> = (0..w).map(|x| x as f32).collect();
+        let v: Vec<f32> = (0..h).map(|y| y as f32).collect();
+
+        for expr in [
+            "b2 % 3.0",
+            "b1 % 3.0",
+            "b2 % 4",
+            "(floor(b2 * 10) & 7) | 1",
+            "~where(b1 > 0, 1, 0)",
+            "log1p(b2)",
+            "log1p(b1)",
+            "expm1(b1)",
+            "sign(b1)",
+            "arcsin(b1)",
+            "arccos(b1)",
+            "arctan(b1)",
+            "arctan2(b1, b2)",
+            "arctan2(b1, b1)",
+            "sinh(b1)",
+            "cosh(b1)",
+            "tanh(b1)",
+            "trunc(b2 * 3.0 - 5.0)",
+        ] {
+            let prog = ExprProgram::compile(expr).unwrap();
+            let mut instrs = GpuBackend::compile_expr_to_gpu(&prog).unwrap();
+            // Map prog.used_bands slots directly into our 2-band slab (b1 -> 0, b2 -> 1)
+            for ins in &mut instrs {
+                if ins.opcode == Op::LoadBand(0).wire_opcode().unwrap() {
+                    ins.imm_u32 = (prog.used_bands[ins.imm_u32 as usize] - 1) as u32;
+                }
+            }
+            let gpu_bytes = gpu
+                .coalescer
+                .submit(CoalescedJob::Expr {
+                    slab: Arc::clone(&slab),
+                    plan: OwnedCoordPlan::Separable1D {
+                        u: u.clone(),
+                        v: v.clone(),
+                    },
+                    mode: map_resample(ResampleMode::Nearest).unwrap(),
+                    instrs,
+                    rescale_min: 0.0,
+                    rescale_max: 1.0,
+                    lut_u32: [0u32; 256],
+                    output: CoalescedOutput::RawF32,
+                })
+                .unwrap_or_else(|e| panic!("GPU failed to render {expr}: {e}"));
+            let gpu_f32: Vec<f32> = gpu_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let mut max_err = 0.0f32;
+            for i in 0..n {
+                let slot_vals: Vec<f32> = prog
+                    .used_bands
+                    .iter()
+                    .map(|&bidx| if bidx == 1 { b1_vals[i] } else { b2_vals[i] })
+                    .collect();
+                let cpu_v = prog.eval(&slot_vals);
+                let gpu_v = gpu_f32[i];
+                if cpu_v.is_nan() {
+                    assert!(gpu_v.is_nan(), "{expr} px {i}: cpu=NaN gpu={gpu_v}");
+                } else {
+                    max_err = max_err.max((cpu_v - gpu_v).abs());
+                }
+            }
+            assert!(
+                max_err < 1e-4,
+                "{expr}: CPU vs GPU max_err={max_err} exceeded 1e-4"
+            );
+        }
     }
 
     #[test]

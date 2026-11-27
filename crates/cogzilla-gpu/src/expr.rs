@@ -101,39 +101,9 @@ impl GpuInstr {
     pub const fn op(opcode: u32) -> Self {
         Self { opcode, imm_u32: 0, imm_f32: 0.0, _pad: 0 }
     }
-}
-
-/// Opcode constants matching `shaders/expr.wgsl`.
-pub mod opcodes {
-    pub const ADD: u32 = 2;
-    pub const SUB: u32 = 3;
-    pub const MUL: u32 = 4;
-    pub const DIV: u32 = 5;
-    pub const POW: u32 = 6;
-    pub const NEG: u32 = 7;
-    pub const LOG10: u32 = 8;
-    pub const LN: u32 = 9;
-    pub const LOG2: u32 = 10;
-    pub const DB: u32 = 11;
-    pub const EXP: u32 = 12;
-    pub const SQRT: u32 = 13;
-    pub const ABS: u32 = 14;
-    pub const SIN: u32 = 15;
-    pub const COS: u32 = 16;
-    pub const TAN: u32 = 17;
-    pub const MIN: u32 = 18;
-    pub const MAX: u32 = 19;
-    pub const CLIP: u32 = 20;
-    pub const LT: u32 = 21;
-    pub const LE: u32 = 22;
-    pub const GT: u32 = 23;
-    pub const GE: u32 = 24;
-    pub const EQ: u32 = 25;
-    pub const NE: u32 = 26;
-    pub const WHERE: u32 = 27;
-    pub const CEIL: u32 = 28;
-    pub const FLOOR: u32 = 29;
-    pub const ROUND: u32 = 30;
+    pub const fn op_f32(opcode: u32, imm_f32: f32) -> Self {
+        Self { opcode, imm_u32: 0, imm_f32, _pad: 0 }
+    }
 }
 
 /// Pre-fused RGB LUT + optional CIE LCH (D65) saturation for GPU `color_formula` execution.
@@ -181,6 +151,53 @@ impl GpuColorFormula {
         Self {
             rgb_lut,
             saturation,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cogzilla_kernel::expr_vm::Op;
+
+    /// Pin that every `case <N>u:` in `common_expr_vm.wgsl` is in exact 1-to-1 bijection
+    /// with `Op::GPU_WIRE_OPCODES` (the single source of truth in `cogzilla-kernel`).
+    #[test]
+    fn wgsl_switch_matches_kernel_wire_opcodes() {
+        assert_eq!(super::GpuInstr::push_const(0.0).opcode, Op::PushConst(0.0).wire_opcode().unwrap());
+        assert_eq!(super::GpuInstr::load_band(0).opcode, Op::LoadBand(0).wire_opcode().unwrap());
+
+        let wgsl = include_str!("shaders/common_expr_vm.wgsl");
+        let mut wgsl_cases: Vec<(String, u32)> = Vec::new();
+        for line in wgsl.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("case ")
+                && let Some((num_str, after)) = rest.split_once("u:")
+                && let Ok(n) = num_str.parse::<u32>()
+            {
+                let comment = after
+                    .split_once("//")
+                    .map(|(_, c)| c.split_whitespace().next().unwrap_or(""))
+                    .unwrap_or("")
+                    .to_string();
+                wgsl_cases.push((comment, n));
+            }
+        }
+        let expected: Vec<(String, u32)> = Op::GPU_WIRE_OPCODES
+            .iter()
+            .map(|&(name, id)| (name.to_string(), id))
+            .collect();
+        assert_eq!(
+            wgsl_cases.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            expected.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            "common_expr_vm.wgsl switch case IDs drifted from Op::GPU_WIRE_OPCODES"
+        );
+        // Verify each case's ID and that its comment names the matching opcode (for ops >= 28
+        // where comments match Op variant names verbatim).
+        for ((wname, wid), (ename, eid)) in wgsl_cases.iter().zip(expected.iter()) {
+            assert_eq!(wid, eid);
+            if *wid >= 28 {
+                assert_eq!(wname, ename, "WGSL case {wid}u comment '{wname}' != expected '{ename}'");
+            }
         }
     }
 }

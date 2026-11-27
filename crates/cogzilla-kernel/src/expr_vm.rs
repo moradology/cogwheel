@@ -58,6 +58,123 @@ pub enum Op {
     Var(u8),
 }
 
+impl Op {
+    /// Single authoritative wire opcode number shared with the GPU WGSL VM
+    /// (`cogzilla-gpu/src/shaders/common_expr_vm.wgsl`).
+    ///
+    /// Returns `None` only for multi-band reductions (`Median`, `Std`, `Var`) that remain
+    /// CPU-only. Every other [`Op`] has a dense, stable wire opcode in `0..=46`.
+    pub const fn wire_opcode(self) -> Option<u32> {
+        Some(match self {
+            Self::PushConst(_) => 0,
+            Self::LoadBand(_) => 1,
+            Self::Add => 2,
+            Self::Sub => 3,
+            Self::Mul => 4,
+            Self::Div => 5,
+            Self::Pow => 6,
+            Self::Neg => 7,
+            Self::Log10 => 8,
+            Self::Ln => 9,
+            Self::Log2 => 10,
+            Self::Db => 11,
+            Self::Exp => 12,
+            Self::Sqrt => 13,
+            Self::Abs => 14,
+            Self::Sin => 15,
+            Self::Cos => 16,
+            Self::Tan => 17,
+            Self::Min => 18,
+            Self::Max => 19,
+            Self::Clip => 20,
+            Self::Lt => 21,
+            Self::Le => 22,
+            Self::Gt => 23,
+            Self::Ge => 24,
+            Self::Eq => 25,
+            Self::Ne => 26,
+            Self::Where => 27,
+            Self::Ceil => 28,
+            Self::Floor => 29,
+            Self::Round => 30,
+            Self::Mod => 31,
+            Self::ModPow2(_) => 32,
+            Self::BitAnd => 33,
+            Self::BitOr => 34,
+            Self::BitNot => 35,
+            Self::Log1p => 36,
+            Self::Expm1 => 37,
+            Self::Sign => 38,
+            Self::Arcsin => 39,
+            Self::Arccos => 40,
+            Self::Arctan => 41,
+            Self::Arctan2 => 42,
+            Self::Sinh => 43,
+            Self::Cosh => 44,
+            Self::Tanh => 45,
+            Self::Trunc => 46,
+            Self::Median(_) | Self::Std(_) | Self::Var(_) => return None,
+        })
+    }
+
+    /// True when this opcode is supported by the GPU WGSL expression evaluator.
+    pub const fn gpu_supported(self) -> bool {
+        self.wire_opcode().is_some()
+    }
+
+    /// Exhaustive list of `(name, wire_opcode)` pairs for every GPU-supported opcode,
+    /// verified against `common_expr_vm.wgsl` by unit tests.
+    pub const GPU_WIRE_OPCODES: &[(&str, u32)] = &[
+        ("PushConst", 0),
+        ("LoadBand", 1),
+        ("Add", 2),
+        ("Sub", 3),
+        ("Mul", 4),
+        ("Div", 5),
+        ("Pow", 6),
+        ("Neg", 7),
+        ("Log10", 8),
+        ("Ln", 9),
+        ("Log2", 10),
+        ("Db", 11),
+        ("Exp", 12),
+        ("Sqrt", 13),
+        ("Abs", 14),
+        ("Sin", 15),
+        ("Cos", 16),
+        ("Tan", 17),
+        ("Min", 18),
+        ("Max", 19),
+        ("Clip", 20),
+        ("Lt", 21),
+        ("Le", 22),
+        ("Gt", 23),
+        ("Ge", 24),
+        ("Eq", 25),
+        ("Ne", 26),
+        ("Where", 27),
+        ("Ceil", 28),
+        ("Floor", 29),
+        ("Round", 30),
+        ("Mod", 31),
+        ("ModPow2", 32),
+        ("BitAnd", 33),
+        ("BitOr", 34),
+        ("BitNot", 35),
+        ("Log1p", 36),
+        ("Expm1", 37),
+        ("Sign", 38),
+        ("Arcsin", 39),
+        ("Arccos", 40),
+        ("Arctan", 41),
+        ("Arctan2", 42),
+        ("Sinh", 43),
+        ("Cosh", 44),
+        ("Tanh", 45),
+        ("Trunc", 46),
+    ];
+}
+
 /// Compiled flat bytecode for any TiTiler-style band-math expression (e.g. `(b1-b2)/(b1+b2)`).
 #[derive(Debug, Clone)]
 pub struct ExprProgram {
@@ -1577,6 +1694,69 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn wire_opcode_table_matches_every_op_variant() {
+        let all_gpu_ops: [(&str, Op); 47] = [
+            ("PushConst", Op::PushConst(0.0)),
+            ("LoadBand", Op::LoadBand(0)),
+            ("Add", Op::Add),
+            ("Sub", Op::Sub),
+            ("Mul", Op::Mul),
+            ("Div", Op::Div),
+            ("Pow", Op::Pow),
+            ("Neg", Op::Neg),
+            ("Log10", Op::Log10),
+            ("Ln", Op::Ln),
+            ("Log2", Op::Log2),
+            ("Db", Op::Db),
+            ("Exp", Op::Exp),
+            ("Sqrt", Op::Sqrt),
+            ("Abs", Op::Abs),
+            ("Sin", Op::Sin),
+            ("Cos", Op::Cos),
+            ("Tan", Op::Tan),
+            ("Min", Op::Min),
+            ("Max", Op::Max),
+            ("Clip", Op::Clip),
+            ("Lt", Op::Lt),
+            ("Le", Op::Le),
+            ("Gt", Op::Gt),
+            ("Ge", Op::Ge),
+            ("Eq", Op::Eq),
+            ("Ne", Op::Ne),
+            ("Where", Op::Where),
+            ("Ceil", Op::Ceil),
+            ("Floor", Op::Floor),
+            ("Round", Op::Round),
+            ("Mod", Op::Mod),
+            ("ModPow2", Op::ModPow2(4.0)),
+            ("BitAnd", Op::BitAnd),
+            ("BitOr", Op::BitOr),
+            ("BitNot", Op::BitNot),
+            ("Log1p", Op::Log1p),
+            ("Expm1", Op::Expm1),
+            ("Sign", Op::Sign),
+            ("Arcsin", Op::Arcsin),
+            ("Arccos", Op::Arccos),
+            ("Arctan", Op::Arctan),
+            ("Arctan2", Op::Arctan2),
+            ("Sinh", Op::Sinh),
+            ("Cosh", Op::Cosh),
+            ("Tanh", Op::Tanh),
+            ("Trunc", Op::Trunc),
+        ];
+        assert_eq!(all_gpu_ops.len(), Op::GPU_WIRE_OPCODES.len());
+        for ((name, op), &(table_name, table_id)) in all_gpu_ops.iter().zip(Op::GPU_WIRE_OPCODES.iter()) {
+            assert_eq!(*name, table_name);
+            assert_eq!(op.wire_opcode(), Some(table_id), "mismatch for {name}");
+            assert!(op.gpu_supported(), "{name} should be gpu_supported");
+        }
+        for cpu_only in [Op::Median(3), Op::Std(3), Op::Var(3)] {
+            assert_eq!(cpu_only.wire_opcode(), None);
+            assert!(!cpu_only.gpu_supported());
         }
     }
 }
