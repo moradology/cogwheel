@@ -1749,6 +1749,22 @@ fn resample_method(parameter: &str, method: &str) -> Option<ResampleMode> {
     }
 }
 
+/// A tileset list or tileset asked for in a format other than `html` and `json`, as FastAPI
+/// refuses it.
+fn tileset_format_error(pairs: &[(String, String)]) -> Option<Resp> {
+    let f = query_value(pairs, "f").filter(|f| !matches!(*f, "html" | "json"))?;
+    Some(json_resp(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        &json!({ "detail": [{
+            "type": "literal_error",
+            "loc": ["query", "f"],
+            "msg": "Input should be 'html' or 'json'",
+            "input": f,
+            "ctx": { "expected": "'html' or 'json'" },
+        }] }),
+    ))
+}
+
 /// A `colormap_name` nobody has, or one not in lower case, as FastAPI refuses it.
 fn colormap_name_error(pairs: &[(String, String)]) -> Option<Resp> {
     let name = query_value(pairs, "colormap_name")?;
@@ -2885,10 +2901,12 @@ fn unknown_asset(asset: &str, item: &MosaicItem) -> Resp {
 const MAX_PART_SIDE: u32 = 4096;
 
 /// The `{lon},{lat}` of a path. Without a comma it is no such path; with one, what is
-/// not two numbers is a 422, as in TiTiler.
+/// not two numbers (spaces around them allowed) is a 422, as in TiTiler.
 fn point_coords(seg: &str) -> Result<(f64, f64), Resp> {
+    let seg = super::percent_decode(seg);
     let (x, y) = seg.split_once(',').ok_or_else(|| detail(StatusCode::NOT_FOUND, "Not Found"))?;
-    match (x.parse::<f64>(), y.parse::<f64>()) {
+    // Python's `float` reads a number with spaces around it.
+    match (x.trim().parse::<f64>(), y.trim().parse::<f64>()) {
         (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() => Ok((x, y)),
         _ => Err(invalid_param("path", "lon,lat", "Input should be two numbers, as lon,lat")),
     }
@@ -6207,6 +6225,9 @@ pub(super) async fn item_route(
             {
                 return Done(r);
             }
+            if let Some(r) = tileset_format_error(&pairs) {
+                return Done(r);
+            }
             let extent = match item_extent(ctx, &doc, &item, &readable, pq).await {
                 Ok(e) => e,
                 Err(r) => return Done(r),
@@ -6634,6 +6655,7 @@ async fn mosaic_route(
             };
             wmts(ctx, base, source, pairs)
         }
+        ["tiles"] | ["tiles", _] if tileset_format_error(pairs).is_some() => tileset_format_error(pairs).unwrap_or_else(not_found),
         ["tiles"] => tilesets(ctx, base, &rec.metadata, pairs),
         ["tiles", tms] => tileset(ctx, base, &rec.metadata, tms, pairs),
         ["tiles", _, zs, xs, ys, "assets"] => {
@@ -7996,6 +8018,20 @@ mod tests {
         ] {
             let (algorithm, _, _) = asked(query, ext);
             assert!(algorithm.is_some(), "{query}");
+        }
+    }
+
+    #[test]
+    fn a_point_s_numbers_and_a_tileset_s_format() {
+        assert_eq!(point_coords("6.73%20,%2043.402").ok(), Some((6.73, 43.402)));
+        assert_eq!(point_coords(" 1 , 2 ").ok(), Some((1.0, 2.0)));
+        assert!(point_coords("1,abc").is_err());
+        let pairs = |f: &str| vec![("f".to_string(), f.to_string())];
+        assert!(tileset_format_error(&pairs("html")).is_none());
+        assert!(tileset_format_error(&pairs("json")).is_none());
+        assert!(tileset_format_error(&[]).is_none());
+        for f in ["png", "HTML", ""] {
+            assert_eq!(tileset_format_error(&pairs(f)).map(|r| r.status()), Some(StatusCode::UNPROCESSABLE_ENTITY), "{f:?}");
         }
     }
 
