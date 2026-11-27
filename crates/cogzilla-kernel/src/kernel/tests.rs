@@ -2,7 +2,9 @@
 
 use cogzilla_raster::SampleType;
 
+use crate::colormap::nodata_index;
 use super::dem::eval_hillshade_row_clean;
+use super::single_band::render_single_specialized;
 use super::rgb::{
     CleanRgbNearestPlan, bilinear_rgb_single_block_row, sample_rgb_bilinear_row_clean,
     sample_rgb_nearest_row_clean,
