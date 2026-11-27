@@ -7680,8 +7680,17 @@ async fn render_bbox_core(
         let _ = fused_stats;
         let ifd_w_i = ifd_width as i32;
         let ifd_h_i = ifd_height as i32;
-        let wide = widen_kernel
-            .then(|| cogzilla_kernel::WidenedSampler::new(resample, footprint_sx, footprint_sy));
+        // Same-CRS boxes and previews have separable maps: the widened sampler then filters each
+        // band's whole plane in two passes (`plane_of`), read directly by the common outputs.
+        let wide = widen_kernel.then(|| {
+            cogzilla_kernel::separable_axes(&u_map, &v_map, w, h)
+                .and_then(|(us, vs)| {
+                    cogzilla_kernel::WidenedSampler::with_grid(resample, footprint_sx, footprint_sy, us, vs)
+                })
+                .unwrap_or_else(|| {
+                    cogzilla_kernel::WidenedSampler::new_uncached(resample, footprint_sx, footprint_sy)
+                })
+        });
         let sample = |src: &BandSource<'_>, u: f32, v: f32| -> f32 {
             if !u.is_finite() || !v.is_finite() {
                 return f32::NAN;
@@ -7764,6 +7773,8 @@ async fn render_bbox_core(
                 ),
             }
         };
+        // The widened plane of a band on separable maps (`None` otherwise: sample per pixel).
+        let plane_of = |src: &BandSource<'_>| wide.as_ref().and_then(|wd| wd.grid_plane(src));
 
         let apply_source_unscale = unscale
             && (crate::engine::needs_source_unscale(bands, format)
@@ -8262,9 +8273,15 @@ async fn render_bbox_core(
                 BandRequest::Single { band_1based, .. } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    coord_map.for_each_uv(w, h, |_, u, v| {
-                        out.put_slice(&sample(&src, u, v).to_le_bytes());
-                    });
+                    if let Some(p) = plane_of(&src) {
+                        for v in &p[..w * h] {
+                            out.put_slice(&v.to_le_bytes());
+                        }
+                    } else {
+                        coord_map.for_each_uv(w, h, |_, u, v| {
+                            out.put_slice(&sample(&src, u, v).to_le_bytes());
+                        });
+                    }
                 }
                 BandRequest::Terrain {
                     band_1based,
@@ -8387,6 +8404,12 @@ async fn render_bbox_core(
                     let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
                     out.reserve(w * h * 8);
                     for s in &srcs {
+                        if let Some(p) = plane_of(s) {
+                            for v in &p[..w * h] {
+                                out.put_slice(&v.to_le_bytes());
+                            }
+                            continue;
+                        }
                         coord_map.for_each_uv(w, h, |_, u, v| {
                             out.put_slice(&sample(s, u, v).to_le_bytes());
                         });
@@ -8810,16 +8833,28 @@ async fn render_bbox_core(
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
-                coord_map.for_each_uv(w, h, |i, u, v| {
-                    let val = sample(&src, u, v);
-                    if !val.is_nan() {
-                        let [r, g, b, a] = map_color(val, rescale.0, inv, *colormap);
-                        rgba[i * 4] = r;
-                        rgba[i * 4 + 1] = g;
-                        rgba[i * 4 + 2] = b;
-                        rgba[i * 4 + 3] = a;
+                if let Some(p) = plane_of(&src) {
+                    for (i, &v) in p[..w * h].iter().enumerate() {
+                        if !v.is_nan() {
+                            let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);
+                            rgba[i * 4] = r;
+                            rgba[i * 4 + 1] = g;
+                            rgba[i * 4 + 2] = b;
+                            rgba[i * 4 + 3] = a;
+                        }
                     }
-                });
+                } else {
+                    coord_map.for_each_uv(w, h, |i, u, v| {
+                        let val = sample(&src, u, v);
+                        if !val.is_nan() {
+                            let [r, g, b, a] = map_color(val, rescale.0, inv, *colormap);
+                            rgba[i * 4] = r;
+                            rgba[i * 4 + 1] = g;
+                            rgba[i * 4 + 2] = b;
+                            rgba[i * 4 + 3] = a;
+                        }
+                    });
+                }
             }
             BandRequest::Terrain {
                 band_1based,
@@ -8896,17 +8931,30 @@ async fn render_bbox_core(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
-                coord_map.for_each_uv(w, h, |i, u, v| {
-                    let r = sample(&s0, u, v);
-                    let g = sample(&s1, u, v);
-                    let b = sample(&s2, u, v);
-                    if !r.is_nan() && !g.is_nan() && !b.is_nan() {
-                        rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 3] = 255;
+                if let (Some(p0), Some(p1), Some(p2)) = (plane_of(&s0), plane_of(&s1), plane_of(&s2)) {
+                    let n = w * h;
+                    let px = rgba[..n * 4].chunks_exact_mut(4);
+                    for (((o, &r), &g), &b) in px.zip(&p0[..n]).zip(&p1[..n]).zip(&p2[..n]) {
+                        if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                            o[0] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                            o[1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                            o[2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                            o[3] = 255;
+                        }
                     }
-                });
+                } else {
+                    coord_map.for_each_uv(w, h, |i, u, v| {
+                        let r = sample(&s0, u, v);
+                        let g = sample(&s1, u, v);
+                        let b = sample(&s2, u, v);
+                        if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                            rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
+                            rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
+                            rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
+                            rgba[i * 4 + 3] = 255;
+                        }
+                    });
+                }
             }
             BandRequest::SarRgb {
                 bands_1based,

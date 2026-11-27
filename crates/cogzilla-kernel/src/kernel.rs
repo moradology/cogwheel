@@ -1299,9 +1299,117 @@ pub struct WidenedSampler {
     width: usize,
     row: std::cell::UnsafeCell<CachedTaps>,
     cols: std::cell::UnsafeCell<Vec<CachedTaps>>,
+    grid: Option<std::cell::UnsafeCell<GridPlanes>>,
+}
+
+/// Most output pixels for which [`WidenedSampler::with_grid`] keeps whole planes (16 MiB each).
+const WIDE_GRID_MAX_PIXELS: usize = 4 << 20;
+/// Most source bands whose planes one [`WidenedSampler`] keeps.
+const WIDE_GRID_MAX_PLANES: usize = 16;
+
+/// Identity of a [`BandSource`]'s data: its first decoded block, the block grid and how values
+/// are read (nodata override, scale/offset). The blocks outlive the sampler's render.
+type PlaneKey = (usize, usize, u32, u32, u64, u64);
+
+/// Separable source grid of a [`WidenedSampler`] with the planes computed on it so far.
+struct GridPlanes {
+    us: Vec<f32>,
+    vs: Vec<f32>,
+    planes: Vec<GridPlane>,
+}
+
+struct GridPlane {
+    key: PlaneKey,
+    data: std::rc::Rc<[f32]>,
+}
+
+#[inline(always)]
+fn plane_key(src: &BandSource<'_>) -> Option<PlaneKey> {
+    let first: &cogzilla_codec::DecodedBand = match src.blocks.first() {
+        Some(Some(b)) => b,
+        _ => src.blocks.iter().flatten().next()?,
+    };
+    let nodata = src.nodata_override.map_or(u64::MAX, |nd| nd.to_bits() as u64);
+    let so = src
+        .scale_offset
+        .map_or(u64::MAX, |(sc, off)| ((sc.to_bits() as u64) << 32) | off.to_bits() as u64);
+    Some((
+        first as *const cogzilla_codec::DecodedBand as usize,
+        src.blocks.len(),
+        src.tx0,
+        src.ty0,
+        nodata,
+        so,
+    ))
+}
+
+/// The column coordinates of row 0 and the row coordinates of column 0 when the `w x h`
+/// row-major maps are separable (every row of `u_map` equal, `v_map` constant along each row)
+/// and finite; `None` otherwise.
+pub fn separable_axes(u_map: &[f32], v_map: &[f32], w: usize, h: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+    if w == 0 || h == 0 || u_map.len() < w * h || v_map.len() < w * h {
+        return None;
+    }
+    let us = &u_map[..w];
+    if !us.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let mut vs = Vec::with_capacity(h);
+    for y in 0..h {
+        let row_u = &u_map[y * w..(y + 1) * w];
+        let row_v = &v_map[y * w..(y + 1) * w];
+        let v0 = row_v[0];
+        if !v0.is_finite()
+            || row_u.iter().zip(us).any(|(a, b)| a.to_bits() != b.to_bits())
+            || row_v.iter().any(|a| a.to_bits() != v0.to_bits())
+        {
+            return None;
+        }
+        vs.push(v0);
+    }
+    Some((us.to_vec(), vs))
 }
 
 impl WidenedSampler {
+    /// A sampler that also knows the maps are the separable source grid `us` x `vs` (see
+    /// [`separable_axes`]): [`Self::grid_plane`] then gives a band's whole plane, computed once
+    /// with [`widened_plane_separable`]. `None` when the grid exceeds `WIDE_GRID_MAX_PIXELS`.
+    pub fn with_grid(mode: ResampleMode, scale_x: f32, scale_y: f32, us: Vec<f32>, vs: Vec<f32>) -> Option<Self> {
+        if us.is_empty() || vs.is_empty() || us.len().saturating_mul(vs.len()) > WIDE_GRID_MAX_PIXELS {
+            return None;
+        }
+        let mut s = Self::new(mode, scale_x, scale_y);
+        s.grid = Some(std::cell::UnsafeCell::new(GridPlanes { us, vs, planes: Vec::new() }));
+        Some(s)
+    }
+
+    /// A sampler without the column-tap cache, for maps whose columns do not repeat `u`
+    /// (reprojections), where every lookup would miss.
+    pub fn new_uncached(mode: ResampleMode, scale_x: f32, scale_y: f32) -> Self {
+        let mut s = Self::new(mode, scale_x, scale_y);
+        s.cols = std::cell::UnsafeCell::new(Vec::new());
+        s
+    }
+
+    /// `src`'s widened plane on the grid (row-major, `us.len()` wide): at each output pixel the
+    /// value [`Self::sample`] gives at that pixel's grid coordinates. Computed on first use per
+    /// band; `None` without a grid or when the band cannot be keyed or cached.
+    pub fn grid_plane(&self, src: &BandSource<'_>) -> Option<std::rc::Rc<[f32]>> {
+        // SAFETY: as in `sample`, the sampler is `!Sync` and never re-entered.
+        let g = unsafe { &mut *self.grid.as_ref()?.get() };
+        let key = plane_key(src)?;
+        if let Some(p) = g.planes.iter().find(|p| p.key == key) {
+            return Some(p.data.clone());
+        }
+        if g.planes.len() >= WIDE_GRID_MAX_PLANES {
+            return None;
+        }
+        let data: std::rc::Rc<[f32]> =
+            widened_plane_separable(&g.us, &g.vs, src, self.mode, self.scale_x, self.scale_y).into();
+        g.planes.push(GridPlane { key, data: data.clone() });
+        Some(data)
+    }
+
     pub fn new(mode: ResampleMode, scale_x: f32, scale_y: f32) -> Self {
         let sx = widened_scale(mode, scale_x);
         let sy = widened_scale(mode, scale_y);
@@ -1322,6 +1430,7 @@ impl WidenedSampler {
             width,
             row: std::cell::UnsafeCell::new(CachedTaps::EMPTY),
             cols: std::cell::UnsafeCell::new(vec![CachedTaps::EMPTY; slots]),
+            grid: None,
         }
     }
 
@@ -1347,11 +1456,18 @@ impl WidenedSampler {
         if row.key != v.to_bits() {
             row.fill(self.mode, v, self.sy);
         }
-        let ub = u.to_bits();
-        let col = &mut cols[((ub ^ (ub >> 13)) as usize) & (WIDE_CACHE_COLS - 1)];
-        if col.key != ub {
-            col.fill(self.mode, u, self.sx);
-        }
+        let mut fresh = CachedTaps::EMPTY;
+        let col: &CachedTaps = if cols.is_empty() {
+            fresh.fill(self.mode, u, self.sx);
+            &fresh
+        } else {
+            let ub = u.to_bits();
+            let col = &mut cols[((ub ^ (ub >> 13)) as usize) & (WIDE_CACHE_COLS - 1)];
+            if col.key != ub {
+                col.fill(self.mode, u, self.sx);
+            }
+            col
+        };
         let (x0, y0, ny) = (col.first, row.first, row.count as usize);
         let wy = &row.w[..ny];
         let block = if src.nodata_override.is_none() && src.scale_offset.is_none() {
@@ -1435,9 +1551,21 @@ pub fn sample_f64_kernel_widened(
     }
 }
 
+/// Scratch for [`widened_plane_separable`]: source row segment, ring of horizontal-pass rows
+/// (sums and, on data with nodata, valid weights), the source row held by each ring slot, and a
+/// row of vertical-pass valid weights.
+struct WideScratch {
+    seg: Vec<f32>,
+    hs: Vec<f32>,
+    hw: Vec<f32>,
+    tags: Vec<i32>,
+    wrow: Vec<f32>,
+}
+
 thread_local! {
-    /// `(source row segment, horizontal-pass rows)` scratch for [`widened_plane`].
-    static WIDE_SCRATCH: RefCell<(Vec<f32>, Vec<f32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    static WIDE_SCRATCH: RefCell<WideScratch> = const {
+        RefCell::new(WideScratch { seg: Vec::new(), hs: Vec::new(), hw: Vec::new(), tags: Vec::new(), wrow: Vec::new() })
+    };
 }
 
 /// Precomputed widened-kernel taps for every output column (or row) of a separable plan.
@@ -1452,22 +1580,38 @@ struct AxisTapTable {
 impl AxisTapTable {
     fn build(mode: ResampleMode, coords: &[f32], scale: f32) -> Self {
         let s = widened_scale(mode, scale);
-        let stride = ((2.0 * conv_kernel_radius(mode) * s).ceil() as usize + 1).min(WIDE_MAX_TAPS);
+        let bound = ((2.0 * conv_kernel_radius(mode) * s).ceil() as usize + 1).min(WIDE_MAX_TAPS);
         let mut start = Vec::with_capacity(coords.len());
         let mut count = Vec::with_capacity(coords.len());
-        let mut weights = vec![0.0f32; coords.len() * stride];
+        let mut packed = vec![0.0f32; coords.len() * bound];
         let mut tmp = [0.0f32; WIDE_MAX_TAPS];
+        let mut most = 0usize;
         for (k, &c) in coords.iter().enumerate() {
-            let (st, n) = widened_axis_taps(mode, c, s, &mut tmp[..stride]);
+            let (st, n) = if c.is_finite() { widened_axis_taps(mode, c, s, &mut tmp[..bound]) } else { (0, 0) };
             let sum: f32 = tmp[..n].iter().sum();
             let inv = if sum.abs() > 1e-12 { 1.0 / sum } else { 0.0 };
             for i in 0..n {
-                weights[k * stride + i] = tmp[i] * inv;
+                packed[k * bound + i] = tmp[i] * inv;
             }
             start.push(st);
             count.push(n as u32);
+            most = most.max(n);
+        }
+        // The widest entry rounded up to a multiple of 4, so short kernels run as fixed-width,
+        // zero-padded dots.
+        let stride = (most.max(1).div_ceil(4) * 4).min(bound.div_ceil(4) * 4);
+        let mut weights = vec![0.0f32; coords.len() * stride];
+        for (k, &n) in count.iter().enumerate() {
+            let n = n as usize;
+            weights[k * stride..k * stride + n].copy_from_slice(&packed[k * bound..k * bound + n]);
         }
         Self { start, count, stride, weights }
+    }
+
+    /// All `stride` weights of entry `k`, zero past its taps.
+    #[inline(always)]
+    fn taps_padded(&self, k: usize) -> &[f32] {
+        &self.weights[k * self.stride..(k + 1) * self.stride]
     }
 
     #[inline(always)]
@@ -1492,9 +1636,8 @@ impl AxisTapTable {
 }
 
 /// Render the `N x N` widened-kernel plane of `src` for a plan, as row-major `f32` (`NaN` = no
-/// data). Separable plans run as two passes over precomputed per-column / per-row taps (a
-/// horizontal pass over each needed source row, then a vertical pass); pixels whose footprint
-/// leaves the raster or meets nodata, and non-separable plans, use [`sample_kernel_widened`].
+/// data): [`widened_plane_separable`] for separable plans, [`sample_kernel_widened`] per pixel
+/// otherwise.
 pub fn widened_plane<const N: usize>(
     plan: &CoordPlan<N>,
     src: &BandSource<'_>,
@@ -1502,93 +1645,242 @@ pub fn widened_plane<const N: usize>(
     scale_x: f32,
     scale_y: f32,
 ) -> Vec<f32> {
-    let mut out = vec![f32::NAN; N * N];
-    let CoordPlan::Separable1D { u, v, .. } = plan else {
-        for py in 0..N {
-            for_each_pixel_in_row(plan, py, |px, uu, vv| {
-                out[py * N + px] = sample_kernel_widened(src, uu, vv, scale_x, scale_y, mode);
-            });
-        }
-        return out;
-    };
-    let in_range = |c: f32, lim: i32| c.is_finite() && c >= -0.5 && c <= lim as f32 - 0.5;
-    let cols = AxisTapTable::build(mode, &u[..], scale_x);
-    let rows = AxisTapTable::build(mode, &v[..], scale_y);
-    let (Some((c_lo, c_hi)), Some((r_lo, r_hi))) = (cols.span(), rows.span()) else {
-        return out;
-    };
-    // Columns / rows whose whole footprint is inside the raster, with the sample point in range.
-    let col_ok: Vec<bool> = (0..N)
-        .map(|k| {
-            let (st, w) = cols.taps(k);
-            in_range(u[k], src.ifd_w) && st >= 0 && st + w.len() as i32 <= src.ifd_w
-        })
-        .collect();
-    let row_ok: Vec<bool> = (0..N)
-        .map(|k| {
-            let (st, w) = rows.taps(k);
-            in_range(v[k], src.ifd_h) && st >= 0 && st + w.len() as i32 <= src.ifd_h
-        })
-        .collect();
-    let gc0 = c_lo.max(0);
-    let gc1 = c_hi.min(src.ifd_w - 1);
-    let gr0 = r_lo.max(0);
-    let gr1 = r_hi.min(src.ifd_h - 1);
-    if gc0 > gc1 || gr0 > gr1 {
-        return out;
+    if let CoordPlan::Separable1D { u, v, .. } = plan {
+        return widened_plane_separable(&u[..], &v[..], src, mode, scale_x, scale_y);
     }
-    let seg_w = (gc1 - gc0 + 1) as usize;
-    let n_rows = (gr1 - gr0 + 1) as usize;
+    let mut out = vec![f32::NAN; N * N];
+    let sampler = WidenedSampler::new_uncached(mode, scale_x, scale_y);
+    for py in 0..N {
+        for_each_pixel_in_row(plan, py, |px, uu, vv| {
+            out[py * N + px] = sampler.sample(src, uu, vv);
+        });
+    }
+    out
+}
+
+/// Clean horizontal pass with `K`-wide zero-padded taps: `hs_row[px] = sum_i w_i * seg[off + i]`.
+#[inline(always)]
+fn h_pass_fixed<const K: usize>(seg: &[f32], gc0: i32, cols: &AxisTapTable, col_ok: &[bool], hs_row: &mut [f32]) {
+    for (px, out) in hs_row.iter_mut().enumerate() {
+        if col_ok[px] {
+            let off = (cols.start[px] - gc0) as usize;
+            let a: &[f32; K] = seg[off..off + K].try_into().unwrap();
+            let b: &[f32; K] = cols.taps_padded(px).try_into().unwrap();
+            let mut acc = 0.0f32;
+            for k in 0..K {
+                acc += a[k] * b[k];
+            }
+            *out = acc;
+        }
+    }
+}
+
+/// [`h_pass_fixed`] skipping `NaN` (nodata) values, with the valid weight in `hw_row`.
+#[inline(always)]
+fn h_pass_fixed_nan<const K: usize>(
+    seg: &[f32],
+    gc0: i32,
+    cols: &AxisTapTable,
+    col_ok: &[bool],
+    hs_row: &mut [f32],
+    hw_row: &mut [f32],
+) {
+    for (px, (out, wout)) in hs_row.iter_mut().zip(hw_row.iter_mut()).enumerate() {
+        if col_ok[px] {
+            let off = (cols.start[px] - gc0) as usize;
+            let a: &[f32; K] = seg[off..off + K].try_into().unwrap();
+            let b: &[f32; K] = cols.taps_padded(px).try_into().unwrap();
+            let (mut acc, mut wacc) = (0.0f32, 0.0f32);
+            for k in 0..K {
+                let ok = !a[k].is_nan();
+                acc += if ok { a[k] * b[k] } else { 0.0 };
+                wacc += if ok { b[k] } else { 0.0 };
+            }
+            *out = acc;
+            *wout = wacc;
+        }
+    }
+}
+
+/// Widened-kernel plane of `src` on the separable grid `us` (column coordinates) x `vs` (row
+/// coordinates), row-major `vs.len() x us.len()` (`NaN` = no data); every value equals
+/// [`sample_kernel_widened`] at `(us[px], vs[py])`. Runs as two passes over precomputed
+/// per-column / per-row taps: each source row is filtered horizontally once (into a small ring,
+/// as consecutive output rows share source rows), then each output row is a vertical blend of
+/// those. On clean data the passes skip validity bookkeeping and the few columns / rows whose
+/// footprint leaves the raster are sampled per pixel; with nodata (or `NaN`) the passes carry the
+/// valid weight and renormalise like the per-pixel sampler.
+pub fn widened_plane_separable(
+    us: &[f32],
+    vs: &[f32],
+    src: &BandSource<'_>,
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+) -> Vec<f32> {
+    let (w, h) = (us.len(), vs.len());
+    let mut out = vec![f32::NAN; w * h];
+    let in_range = |c: f32, lim: i32| c.is_finite() && c >= -0.5 && c <= lim as f32 - 0.5;
+    let cols = AxisTapTable::build(mode, us, scale_x);
+    let rows = AxisTapTable::build(mode, vs, scale_y);
+    let (Some((c_lo, c_hi)), Some(_)) = (cols.span(), rows.span()) else {
+        return out;
+    };
+    let clean = src.no_nodata;
+    // Columns / rows the passes handle: sample point in range and, on clean data, the whole
+    // footprint inside the raster (taps outside it are skipped like nodata on the other path).
+    let col_ok: Vec<bool> = (0..w)
+        .map(|k| {
+            let (st, t) = cols.taps(k);
+            in_range(us[k], src.ifd_w) && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_w))
+        })
+        .collect();
+    let row_ok: Vec<bool> = (0..h)
+        .map(|k| {
+            let (st, t) = rows.taps(k);
+            in_range(vs[k], src.ifd_h) && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_h))
+        })
+        .collect();
+    let (gc0, gc1) = if clean { (c_lo.max(0), c_hi.min(src.ifd_w - 1)) } else { (c_lo, c_hi) };
+    let positive = matches!(mode, ResampleMode::Bilinear | ResampleMode::CubicSpline);
+    let ring = rows.stride + 1;
+    let mut fallback: Vec<usize> = Vec::new();
     WIDE_SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
-        let (seg, hbuf) = &mut *guard;
-        if seg.len() < seg_w {
-            seg.resize(seg_w, 0.0);
+        let sc = &mut *guard;
+        let seg_w = if gc0 <= gc1 { (gc1 - gc0 + 1) as usize } else { 0 };
+        // Zero tail so fixed-width dots may read past the last column (with zero weights).
+        let pad = cols.stride;
+        if sc.seg.len() < seg_w + pad {
+            sc.seg.resize(seg_w + pad, 0.0);
         }
-        if hbuf.len() < n_rows * N {
-            hbuf.resize(n_rows * N, 0.0);
-        }
-        let seg = &mut seg[..seg_w];
-        let hbuf = &mut hbuf[..n_rows * N];
-        // Horizontal pass: hrow[r][px] = sum_i wx_i * src(x0 + i, r), NaN when any tap is nodata.
-        // Columns that are not `col_ok` are left stale: their output pixels take the per-pixel path.
-        for (ri, hrow) in hbuf.chunks_exact_mut(N).enumerate() {
-            src.read_row_segment(gr0 + ri as i32, gc0, seg);
-            for px in 0..N {
-                if !col_ok[px] {
-                    continue;
-                }
-                let (st, w) = cols.taps(px);
-                let off = (st - gc0) as usize;
-                let mut acc = 0.0f32;
-                for (a, b) in seg[off..off + w.len()].iter().zip(w) {
-                    acc += a * b;
-                }
-                hrow[px] = acc;
+        sc.seg[seg_w..seg_w + pad].fill(0.0);
+        for buf in [&mut sc.hs, &mut sc.hw] {
+            if buf.len() < ring * w {
+                buf.resize(ring * w, 0.0);
             }
         }
-        // Vertical pass.
-        for py in 0..N {
-            let row_out = &mut out[py * N..(py + 1) * N];
-            if row_ok[py] {
-                let (st, w) = rows.taps(py);
-                let base = (st - gr0) as usize;
+        if sc.wrow.len() < w {
+            sc.wrow.resize(w, 0.0);
+        }
+        sc.tags.clear();
+        sc.tags.resize(ring, i32::MIN);
+        let WideScratch { seg, hs, hw, tags, wrow } = sc;
+        let seg = &mut seg[..seg_w + pad];
+        let wrow = &mut wrow[..w];
+        for py in 0..h {
+            let row_out = &mut out[py * w..(py + 1) * w];
+            if row_ok[py] && seg_w > 0 {
+                let (st, wy) = rows.taps(py);
+                // Horizontal pass for the source rows this output row needs and the ring lacks.
+                for j in 0..wy.len() {
+                    let r = st + j as i32;
+                    let slot = r.rem_euclid(ring as i32) as usize;
+                    if tags[slot] == r {
+                        continue;
+                    }
+                    tags[slot] = r;
+                    src.read_row_segment(r, gc0, &mut seg[..seg_w]);
+                    let hs_row = &mut hs[slot * w..(slot + 1) * w];
+                    if clean {
+                        match cols.stride {
+                            4 => h_pass_fixed::<4>(seg, gc0, &cols, &col_ok, hs_row),
+                            8 => h_pass_fixed::<8>(seg, gc0, &cols, &col_ok, hs_row),
+                            _ => {
+                                for px in 0..w {
+                                    if col_ok[px] {
+                                        let (cst, wx) = cols.taps(px);
+                                        let off = (cst - gc0) as usize;
+                                        let mut acc = 0.0f32;
+                                        for (a, b) in seg[off..off + wx.len()].iter().zip(wx) {
+                                            acc += a * b;
+                                        }
+                                        hs_row[px] = acc;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let hw_row = &mut hw[slot * w..(slot + 1) * w];
+                        match cols.stride {
+                            4 => h_pass_fixed_nan::<4>(seg, gc0, &cols, &col_ok, hs_row, hw_row),
+                            8 => h_pass_fixed_nan::<8>(seg, gc0, &cols, &col_ok, hs_row, hw_row),
+                            _ => {
+                                for px in 0..w {
+                                    if col_ok[px] {
+                                        let (cst, wx) = cols.taps(px);
+                                        let off = (cst - gc0) as usize;
+                                        let (mut acc, mut wacc) = (0.0f32, 0.0f32);
+                                        for (&a, &b) in seg[off..off + wx.len()].iter().zip(wx) {
+                                            let ok = !a.is_nan();
+                                            acc += if ok { a * b } else { 0.0 };
+                                            wacc += if ok { b } else { 0.0 };
+                                        }
+                                        hs_row[px] = acc;
+                                        hw_row[px] = wacc;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Vertical pass.
                 row_out.fill(0.0);
-                for (j, &wj) in w.iter().enumerate() {
-                    let hrow = &hbuf[(base + j) * N..(base + j + 1) * N];
-                    for (o, &h) in row_out.iter_mut().zip(hrow) {
-                        *o += h * wj;
+                if !clean {
+                    wrow.fill(0.0);
+                }
+                for (j, &wj) in wy.iter().enumerate() {
+                    let slot = (st + j as i32).rem_euclid(ring as i32) as usize;
+                    for (o, &a) in row_out.iter_mut().zip(&hs[slot * w..(slot + 1) * w]) {
+                        *o += a * wj;
+                    }
+                    if !clean {
+                        for (o, &a) in wrow.iter_mut().zip(&hw[slot * w..(slot + 1) * w]) {
+                            *o += a * wj;
+                        }
                     }
                 }
             }
-            for px in 0..N {
-                // NaN (a nodata tap), an edge column/row, or an out-of-range sample: per-pixel path.
-                if !row_ok[py] || !col_ok[px] || row_out[px].is_nan() {
-                    row_out[px] = sample_kernel_widened(src, u[px], v[py], scale_x, scale_y, mode);
+            for px in 0..w {
+                if !row_ok[py] || !col_ok[px] || seg_w == 0 {
+                    row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                } else if clean {
+                    if row_out[px].is_nan() {
+                        row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                    }
+                } else {
+                    // Normalised weights: the valid weight is the share of the kernel on valid pixels.
+                    let ws = wrow[px];
+                    row_out[px] = if positive {
+                        if ws > 1e-6 { row_out[px] / ws } else { f32::NAN }
+                    } else if ws >= 0.5 {
+                        row_out[px] / ws
+                    } else {
+                        fallback.push(py * w + px);
+                        f32::NAN
+                    };
                 }
             }
         }
     });
+    // Cubic / lanczos pixels with under half the kernel on valid data take the widened tent, as in
+    // `sample_kernel_widened`: one tent pass over just the rows that need it (nodata-heavy images
+    // have many such pixels, and sampling each one alone dominated the render).
+    if !fallback.is_empty() {
+        let mut sub_of_row = vec![u32::MAX; h];
+        let mut sub_vs = Vec::new();
+        for &i in &fallback {
+            let py = i / w;
+            if sub_of_row[py] == u32::MAX {
+                sub_of_row[py] = sub_vs.len() as u32;
+                sub_vs.push(vs[py]);
+            }
+        }
+        let tent = widened_plane_separable(us, &sub_vs, src, ResampleMode::Bilinear, scale_x, scale_y);
+        for &i in &fallback {
+            out[i] = tent[sub_of_row[i / w] as usize * w + i % w];
+        }
+    }
     out
 }
 
@@ -8344,11 +8636,12 @@ mod widened_kernel_tests {
 
     #[test]
     fn separable_widened_plane_matches_per_pixel_sampling() {
-        // 2x2 grid of 32x32 blocks, one with nodata, so the plane crosses blocks and meets nodata.
+        // 2x2 grid of 32x32 blocks, one with a nodata patch, so the plane crosses blocks and meets
+        // nodata (wide enough that cubic / lanczos pixels on its rim fall back to the tent).
         let blocks: Vec<DecodedBand> = (0..4u32)
             .map(|k| {
                 f32_band(32, 32, move |x, y| {
-                    if k == 3 && x < 4 && y < 4 {
+                    if k == 3 && x < 12 && y < 12 {
                         f32::NAN
                     } else {
                         pattern(x + 32 * (k % 2), y + 32 * (k / 2))
@@ -8393,6 +8686,47 @@ mod widened_kernel_tests {
     }
 
     #[test]
+    fn grid_sampler_and_uncached_sampler_match_per_pixel_sampling() {
+        // Clean data across a 2x2 block grid, non-square output grid that runs past the raster.
+        let blocks: Vec<DecodedBand> = (0..4u32)
+            .map(|k| f32_band(32, 32, move |x, y| pattern(x + 32 * (k % 2), y + 32 * (k / 2))))
+            .collect();
+        let refs: Vec<Option<&DecodedBand>> = blocks.iter().map(Some).collect();
+        let src = BandSource::new(64, 64, 32, 32, 0, 0, 2, 2, &refs);
+        let (w, h) = (40usize, 23usize);
+        let us: Vec<f32> = (0..w).map(|i| (i as f32 + 0.5) * 1.62 - 1.5).collect();
+        let vs: Vec<f32> = (0..h).map(|i| (i as f32 + 0.5) * 2.7 + 0.2).collect();
+        let mut u_map = Vec::new();
+        let mut v_map = Vec::new();
+        for &v in &vs {
+            for &u in &us {
+                u_map.push(u);
+                v_map.push(v);
+            }
+        }
+        let (gu, gv) = separable_axes(&u_map, &v_map, w, h).expect("separable");
+        assert_eq!((gu.len(), gv.len()), (w, h));
+        let mut skewed = v_map.clone();
+        skewed[w + 3] += 0.25;
+        assert!(separable_axes(&u_map, &skewed, w, h).is_none());
+        for mode in [ResampleMode::Bilinear, ResampleMode::Cubic, ResampleMode::CubicSpline, ResampleMode::Lanczos] {
+            let grid = WidenedSampler::with_grid(mode, 1.62, 2.7, gu.clone(), gv.clone()).unwrap();
+            let uncached = WidenedSampler::new_uncached(mode, 1.62, 2.7);
+            for i in 0..w * h {
+                let want = sample_kernel_widened(&src, u_map[i], v_map[i], 1.62, 2.7, mode);
+                let g = grid.grid_plane(&src).unwrap()[i];
+                let c = uncached.sample(&src, u_map[i], v_map[i]);
+                for got in [g, c] {
+                    assert!(
+                        (want.is_nan() && got.is_nan()) || (got - want).abs() < 1e-2,
+                        "{mode:?} pixel {i}: {got} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn upsampling_keeps_the_fixed_kernels() {
         let b = f32_band(16, 16, pattern);
         let blks = [Some(&b)];
@@ -8406,3 +8740,4 @@ mod widened_kernel_tests {
         }
     }
 }
+
