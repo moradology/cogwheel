@@ -1,24 +1,14 @@
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use cogzilla_io::{ByteBudget, EvictTarget};
 use dashmap::DashMap;
 use hyper::header::HeaderValue;
 use tokio::sync::Notify;
 
 use crate::engine::EngineError;
-
-fn atomic_saturating_sub(atom: &AtomicUsize, delta: usize) -> usize {
-    let mut cur = atom.load(Ordering::Acquire);
-    loop {
-        let next = cur.saturating_sub(delta);
-        match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return next,
-            Err(actual) => cur = actual,
-        }
-    }
-}
 
 fn etag_hasher() -> ahash::RandomState {
     ahash::RandomState::with_seeds(
@@ -101,12 +91,9 @@ impl Drop for InFlightGuard<'_> {
 /// - **Opt-in (`max_bytes > 0`):** Also retains recently encoded tiles in a bounded LRU map so
 ///   repeated identical tile requests return in ~1 µs without resampling or re-encoding.
 pub struct TileCache {
-    max_bytes: usize,
     ready: DashMap<String, ReadyEntry, ahash::RandomState>,
     inflight: DashMap<String, Arc<InFlightSlot>, ahash::RandomState>,
-    current_bytes: AtomicUsize,
-    clock: AtomicU64,
-    evicting: AtomicBool,
+    budget: ByteBudget,
     clear_epoch: AtomicU64,
     pub hits: AtomicU64,
     pub misses: AtomicU64,
@@ -116,12 +103,9 @@ pub struct TileCache {
 impl TileCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
-            max_bytes,
             ready: DashMap::with_hasher(ahash::RandomState::new()),
             inflight: DashMap::with_hasher(ahash::RandomState::new()),
-            current_bytes: AtomicUsize::new(0),
-            clock: AtomicU64::new(1),
-            evicting: AtomicBool::new(false),
+            budget: ByteBudget::new(max_bytes as u64),
             clear_epoch: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -130,41 +114,41 @@ impl TileCache {
     }
 
     pub fn current_bytes(&self) -> usize {
-        self.current_bytes.load(Ordering::Relaxed)
+        self.budget.current_bytes() as usize
     }
 
     pub fn max_bytes(&self) -> usize {
-        self.max_bytes
+        self.budget.max_bytes() as usize
     }
 
     pub fn clear(&self) {
         self.clear_epoch.fetch_add(1, Ordering::AcqRel);
-        let mut removed = 0usize;
+        let mut removed = 0u64;
         self.ready.retain(|_, entry| {
-            removed += entry.byte_len;
+            removed = removed.saturating_add(entry.byte_len as u64);
             false
         });
         if removed > 0 {
-            atomic_saturating_sub(&self.current_bytes, removed);
+            self.budget.sub(removed);
         }
     }
 
     #[inline]
     fn tick(&self) -> u64 {
-        self.clock.fetch_add(1, Ordering::Relaxed)
+        self.budget.touch()
     }
 
     fn insert_ready(&self, key: String, tile: CachedTile) {
-        if self.max_bytes == 0 {
+        if self.budget.max_bytes() == 0 {
             return;
         }
         let byte_len = tile.bytes.len() + key.len() + 64;
-        if byte_len > self.max_bytes {
+        if (byte_len as u64) > self.budget.max_bytes() {
             return;
         }
         let stamp = self.tick();
         // Reserve `byte_len` before inserting so concurrent eviction/clear cannot subtract first.
-        let mut now = self.current_bytes.fetch_add(byte_len, Ordering::AcqRel) + byte_len;
+        let mut now = self.budget.add(byte_len as u64);
         let old_len = self
             .ready
             .insert(
@@ -175,78 +159,20 @@ impl TileCache {
                     last_used: AtomicU64::new(stamp),
                 },
             )
-            .map(|old| old.byte_len)
+            .map(|old| old.byte_len as u64)
             .unwrap_or(0);
 
         if old_len > 0 {
-            now = atomic_saturating_sub(&self.current_bytes, old_len);
+            now = self.budget.sub(old_len);
         }
-        if now > self.max_bytes {
-            self.evict_some();
-        }
-    }
-
-    fn evict_some(&self) {
-        loop {
-            if self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
-                return;
-            }
-            if self
-                .evicting
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
-
-            let mut dropped_any = false;
-            {
-                struct Reset<'a>(&'a AtomicBool);
-                impl Drop for Reset<'_> {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
-                    }
-                }
-                let _reset = Reset(&self.evicting);
-
-                let cur = self.current_bytes.load(Ordering::Acquire);
-                if cur > self.max_bytes {
-                    let excess = cur - self.max_bytes;
-                    let target_drop = excess.max(self.max_bytes / 4);
-                    let mut candidates: Vec<(u64, String, usize)> = self
-                        .ready
-                        .iter()
-                        .map(|r| {
-                            (
-                                r.last_used.load(Ordering::Relaxed),
-                                r.key().clone(),
-                                r.byte_len,
-                            )
-                        })
-                        .collect();
-                    candidates.sort_unstable_by_key(|(ts, _, _)| *ts);
-                    let mut dropped = 0usize;
-                    for (_, k, _) in candidates {
-                        if let Some((_, entry)) = self.ready.remove(&k) {
-                            atomic_saturating_sub(&self.current_bytes, entry.byte_len);
-                            dropped += entry.byte_len;
-                            dropped_any = true;
-                            if dropped >= target_drop {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if !dropped_any {
-                return;
-            }
+        if now > self.budget.max_bytes() {
+            self.budget.evict_to_budget(self);
         }
     }
 
     /// Look up an encoded tile directly in the ready micro-cache.
     pub fn get(&self, key: &str) -> Option<CachedTile> {
-        if self.max_bytes == 0 {
+        if self.budget.max_bytes() == 0 {
             return None;
         }
         let entry = self.ready.get(key)?;
@@ -257,7 +183,7 @@ impl TileCache {
 
     /// Insert a rendered encoded tile into the ready micro-cache, respecting `max_bytes` and LRU eviction.
     pub fn insert(&self, key: String, bytes: Bytes, content_type: &'static str) {
-        if self.max_bytes == 0 {
+        if self.budget.max_bytes() == 0 {
             return;
         }
         let tile = CachedTile {
@@ -279,7 +205,7 @@ impl TileCache {
         Fut: Future<Output = Result<(Bytes, &'static str), EngineError>>,
     {
         // 1. Fast path: encoded tile micro-cache hit
-        if self.max_bytes > 0
+        if self.max_bytes() > 0
             && let Some(entry) = self.ready.get(&key) {
                 entry.last_used.store(self.tick(), Ordering::Relaxed);
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +216,7 @@ impl TileCache {
         let mut render_opt = Some(render_fn);
         loop {
             // Re-check ready cache in case a previous owner just completed
-            if self.max_bytes > 0
+            if self.max_bytes() > 0
                 && let Some(entry) = self.ready.get(&key) {
                     entry.last_used.store(self.tick(), Ordering::Relaxed);
                     self.hits.fetch_add(1, Ordering::Relaxed);
@@ -376,9 +302,33 @@ impl TileCache {
     }
 }
 
+impl EvictTarget for TileCache {
+    type Key = String;
+
+    fn candidates(&self) -> Vec<(u64, String)> {
+        self.ready
+            .iter()
+            .map(|r| (r.last_used.load(Ordering::Relaxed), r.key().clone()))
+            .collect()
+    }
+
+    fn remove_if_cold(&self, key: &String, expected_stamp: u64) -> Option<u64> {
+        let (_, entry) = self
+            .ready
+            .remove_if(key, |_, e| e.last_used.load(Ordering::Relaxed) == expected_stamp)?;
+        Some(entry.byte_len as u64)
+    }
+
+    fn remove_now(&self, key: &String) -> Option<u64> {
+        let (_, entry) = self.ready.remove(key)?;
+        Some(entry.byte_len as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     #[tokio::test]
@@ -502,5 +452,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v2.bytes.as_ref(), b"FRESH_V2");
+    }
+
+    #[tokio::test]
+    async fn hot_tile_survives_churn_and_concurrent_herd_stays_bounded() {
+        // 1. Hot entry survives repeated churn under two-pass cold-first eviction.
+        let cap = 1024usize;
+        let cache = Arc::new(TileCache::new(cap));
+        cache.insert("hot".into(), Bytes::from(vec![9u8; 160]), "image/png");
+        for round in 0..40 {
+            assert!(cache.get("hot").is_some(), "hot tile evicted at round {round}");
+            cache.insert(
+                format!("cold_{round}"),
+                Bytes::from(vec![1u8; 160]),
+                "image/png",
+            );
+        }
+        assert!(cache.get("hot").is_some());
+        assert!(cache.current_bytes() <= cap);
+
+        // 2. Concurrent thundering herd of readers + writers stays strictly bounded and exact.
+        let herd_cap = 4096usize;
+        let herd = Arc::new(TileCache::new(herd_cap));
+        let mut tasks = Vec::new();
+        for t in 0..16usize {
+            let c = herd.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..64usize {
+                    let key = format!("k_{}_{}", t, i);
+                    c.insert(key.clone(), Bytes::from(vec![(i & 0xff) as u8; 200]), "image/png");
+                    let _ = c.get(&format!("k_{}_{}", t, i.saturating_sub(1)));
+                }
+            }));
+        }
+        for h in tasks {
+            h.await.unwrap();
+        }
+        let exact: usize = herd.ready.iter().map(|e| e.byte_len).sum();
+        assert_eq!(herd.current_bytes(), exact, "byte accounting drifted under concurrent herd");
+        assert!(
+            herd.current_bytes() <= herd_cap,
+            "current_bytes {} exceeded cap {}",
+            herd.current_bytes(),
+            herd_cap
+        );
     }
 }

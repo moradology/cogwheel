@@ -2,27 +2,18 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 
+use crate::budget::{ByteBudget, EvictTarget};
+
 const MAGIC: [u8; 4] = *b"CGZ1";
 const HEADER_LEN: usize = 8;
 const WRITE_QUEUE_CAP: usize = 256;
-
-fn atomic_saturating_sub_u64(atom: &AtomicU64, delta: u64) -> u64 {
-    let mut cur = atom.load(Ordering::Acquire);
-    loop {
-        let next = cur.saturating_sub(delta);
-        match atom.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return next,
-            Err(actual) => cur = actual,
-        }
-    }
-}
 
 struct DiskEntry {
     path: PathBuf,
@@ -57,11 +48,8 @@ pub struct DiskCacheStats {
 /// - LRU eviction enforces `max_bytes`.
 pub struct DiskBlockCache {
     dir: PathBuf,
-    max_bytes: u64,
     entries: DashMap<[u8; 16], DiskEntry, ahash::RandomState>,
-    current_bytes: AtomicU64,
-    clock: AtomicU64,
-    evicting: AtomicBool,
+    budget: ByteBudget,
     tmp_seq: AtomicU64,
     clear_epoch: AtomicU64,
     tx: std::sync::mpsc::SyncSender<WriteJob>,
@@ -82,11 +70,8 @@ impl DiskBlockCache {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WriteJob>(WRITE_QUEUE_CAP);
         let cache = Arc::new(Self {
             dir: dir.clone(),
-            max_bytes: max_bytes.max(1),
             entries: DashMap::with_hasher(ahash::RandomState::new()),
-            current_bytes: AtomicU64::new(0),
-            clock: AtomicU64::new(1),
-            evicting: AtomicBool::new(false),
+            budget: ByteBudget::new(max_bytes.max(1)),
             tmp_seq: AtomicU64::new(0),
             clear_epoch: AtomicU64::new(0),
             tx,
@@ -98,7 +83,7 @@ impl DiskBlockCache {
         });
 
         cache.scan_existing();
-        cache.evict_if_needed();
+        cache.budget.evict_to_budget(&*cache);
 
         // Dedicated background writer thread so disk flushes never block Tokio workers or responses.
         let writer_cache = Arc::downgrade(&cache);
@@ -143,7 +128,7 @@ impl DiskBlockCache {
 
     #[inline(always)]
     fn tick(&self) -> u64 {
-        self.clock.fetch_add(1, Ordering::Relaxed)
+        self.budget.touch()
     }
 
     fn scan_existing(&self) {
@@ -205,7 +190,7 @@ impl DiskBlockCache {
             );
             total = total.saturating_add(sz);
         }
-        self.current_bytes.store(total, Ordering::Release);
+        self.budget.add(total);
     }
 
     /// Fast synchronous in-memory index check. Returns `Some((key, path))` if the block is
@@ -293,7 +278,7 @@ impl DiskBlockCache {
     /// Queue a non-blocking background write of raw compressed block bytes.
     /// Never blocks or fails the caller; drops and increments `write_errors` if queue is full.
     pub fn put_async(&self, uri: &str, ifd_idx: u16, tile_idx: u32, data: Bytes) {
-        if (data.len() + HEADER_LEN) as u64 > self.max_bytes {
+        if (data.len() + HEADER_LEN) as u64 > self.budget.max_bytes() {
             return;
         }
         let key = Self::key_bytes(uri, ifd_idx, tile_idx);
@@ -308,7 +293,7 @@ impl DiskBlockCache {
 
     /// Synchronous atomic write (also used directly in unit tests).
     pub fn put_sync(&self, uri: &str, ifd_idx: u16, tile_idx: u32, data: &[u8]) {
-        if (data.len() + HEADER_LEN) as u64 > self.max_bytes {
+        if (data.len() + HEADER_LEN) as u64 > self.budget.max_bytes() {
             return;
         }
         let key = Self::key_bytes(uri, ifd_idx, tile_idx);
@@ -357,7 +342,7 @@ impl DiskBlockCache {
         let new_sz = (HEADER_LEN + data.len()) as u64;
         // Reserve `new_sz` before inserting into `self.entries` so concurrent eviction cannot
         // subtract `new_sz` before `fetch_add` runs.
-        let mut now = self.current_bytes.fetch_add(new_sz, Ordering::AcqRel) + new_sz;
+        let mut now = self.budget.add(new_sz);
         let old_sz = self
             .entries
             .insert(
@@ -372,7 +357,7 @@ impl DiskBlockCache {
             .unwrap_or(0);
 
         if old_sz > 0 {
-            now = atomic_saturating_sub_u64(&self.current_bytes, old_sz);
+            now = self.budget.sub(old_sz);
         }
 
         // If `clear()` ran concurrently between rename and insert, immediately remove the stale entry.
@@ -381,72 +366,15 @@ impl DiskBlockCache {
             return;
         }
 
-        if now > self.max_bytes {
-            self.evict_if_needed();
+        if now > self.budget.max_bytes() {
+            self.budget.evict_to_budget(self);
         }
     }
 
     fn remove_entry(&self, key: [u8; 16]) {
         if let Some((_, entry)) = self.entries.remove(&key) {
             let _ = fs::remove_file(&entry.path);
-            atomic_saturating_sub_u64(&self.current_bytes, entry.bytes);
-        }
-    }
-
-    fn evict_if_needed(&self) {
-        loop {
-            if self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
-                return;
-            }
-            if self
-                .evicting
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return;
-            }
-
-            let mut removed_any = false;
-            {
-                struct Reset<'a>(&'a AtomicBool);
-                impl Drop for Reset<'_> {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
-                    }
-                }
-                let _reset = Reset(&self.evicting);
-
-                let cur = self.current_bytes.load(Ordering::Acquire);
-                if cur > self.max_bytes {
-                    let excess = cur - self.max_bytes;
-                    let target_drop = excess.max(self.max_bytes / 4);
-
-                    let mut candidates: Vec<(u64, [u8; 16])> = self
-                        .entries
-                        .iter()
-                        .map(|e| (e.value().last_used.load(Ordering::Relaxed), *e.key()))
-                        .collect();
-                    candidates.sort_unstable_by_key(|(stamp, _)| *stamp);
-
-                    let mut dropped = 0u64;
-                    for (_, key) in candidates {
-                        if dropped >= target_drop {
-                            break;
-                        }
-                        if let Some((_, entry)) = self.entries.remove(&key) {
-                            let _ = fs::remove_file(&entry.path);
-                            dropped += entry.bytes;
-                            removed_any = true;
-                            self.evictions.fetch_add(1, Ordering::Relaxed);
-                            atomic_saturating_sub_u64(&self.current_bytes, entry.bytes);
-                        }
-                    }
-                }
-            }
-
-            if !removed_any || self.current_bytes.load(Ordering::Acquire) <= self.max_bytes {
-                return;
-            }
+            self.budget.sub(entry.bytes);
         }
     }
 
@@ -454,12 +382,39 @@ impl DiskBlockCache {
         DiskCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
-            bytes_used: self.current_bytes.load(Ordering::Relaxed),
-            max_bytes: self.max_bytes,
+            bytes_used: self.budget.current_bytes(),
+            max_bytes: self.budget.max_bytes(),
             evictions: self.evictions.load(Ordering::Relaxed),
             write_errors: self.write_errors.load(Ordering::Relaxed),
             read_errors: self.read_errors.load(Ordering::Relaxed),
         }
+    }
+}
+
+impl EvictTarget for DiskBlockCache {
+    type Key = [u8; 16];
+
+    fn candidates(&self) -> Vec<(u64, [u8; 16])> {
+        self.entries
+            .iter()
+            .map(|e| (e.value().last_used.load(Ordering::Relaxed), *e.key()))
+            .collect()
+    }
+
+    fn remove_if_cold(&self, key: &[u8; 16], expected_stamp: u64) -> Option<u64> {
+        let (_, entry) = self
+            .entries
+            .remove_if(key, |_, e| e.last_used.load(Ordering::Relaxed) == expected_stamp)?;
+        let _ = fs::remove_file(&entry.path);
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        Some(entry.bytes)
+    }
+
+    fn remove_now(&self, key: &[u8; 16]) -> Option<u64> {
+        let (_, entry) = self.entries.remove(key)?;
+        let _ = fs::remove_file(&entry.path);
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        Some(entry.bytes)
     }
 }
 
