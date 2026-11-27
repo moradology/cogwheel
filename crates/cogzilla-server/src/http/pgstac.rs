@@ -8521,7 +8521,9 @@ mod tests {
         assert_eq!(BandAlgorithm::Terrarium.apply(vec![vec![100.0]], true, 1, (1.0, 1.0)).unwrap().0, [vec![128.0], vec![100.0], vec![0.0]]);
         assert_eq!(BandAlgorithm::parse("aspect", None), Ok(None));
         assert!(BandAlgorithm::parse("hillshade", Some(r#"{"azimuth":400}"#)).is_err());
-        assert!(BandAlgorithm::parse("contours", Some(r#"{"increment":2.5}"#)).is_err());
+        // A fractional increment is taken, as on the shared routes; one past TiTiler's bound is not.
+        assert!(matches!(BandAlgorithm::parse("contours", Some(r#"{"increment":2.5}"#)), Ok(Some(BandAlgorithm::Contours { increment, .. })) if increment == 2.5));
+        assert!(BandAlgorithm::parse("contours", Some(r#"{"increment":1000}"#)).is_err());
         assert_eq!(BandAlgorithm::parse("terrainrgb", Some(r#"{"interval":1}"#)), Ok(Some(BandAlgorithm::TerrainRgb { interval: 1.0, baseval: -10000.0 })));
         // numpy's gradient: one-sided on the edges, centred inside.
         let (down, across) = gradient(&[0.0, 1.0, 4.0, 2.0, 4.0, 8.0], 3, 2).unwrap();
