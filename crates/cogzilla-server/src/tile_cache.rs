@@ -20,16 +20,27 @@ fn atomic_saturating_sub(atom: &AtomicUsize, delta: usize) -> usize {
     }
 }
 
-/// Fast, deterministic weak ETag (`W/"cgz-<ahash64>-<len>"`) for rendered tile bytes.
-pub fn compute_tile_etag(bytes: &[u8]) -> HeaderValue {
-    let hasher = ahash::RandomState::with_seeds(
+fn etag_hasher() -> ahash::RandomState {
+    ahash::RandomState::with_seeds(
         0x243f_6a88_85a3_08d3,
         0x1319_8a2e_0370_7344,
         0xa409_3822_299f_31d0,
         0x082e_fa98_ec4e_6c89,
-    );
-    let h = hasher.hash_one(bytes);
+    )
+}
+
+/// Fast, deterministic weak ETag (`W/"cgz-<ahash64>-<len>"`) for rendered tile bytes.
+pub fn compute_tile_etag(bytes: &[u8]) -> HeaderValue {
+    let h = etag_hasher().hash_one(bytes);
     let s = format!("W/\"cgz-{h:016x}-{}\"", bytes.len());
+    HeaderValue::from_str(&s).expect("valid ASCII ETag")
+}
+
+/// Fast, deterministic strong ETag (`"cgz-<ahash64>-<len>"`) folding in a freshness key
+/// (such as a mutable Zarr store validator) plus the full response body.
+pub fn compute_keyed_etag(key: &str, bytes: &[u8]) -> HeaderValue {
+    let h = etag_hasher().hash_one((key, bytes));
+    let s = format!("\"cgz-{h:016x}-{}\"", bytes.len());
     HeaderValue::from_str(&s).expect("valid ASCII ETag")
 }
 

@@ -558,18 +558,10 @@ impl ZarrQuery {
     }
 
     fn resample_mode(&self) -> ResampleMode {
-        match self.resampling.as_deref().map(str::to_ascii_lowercase).as_deref() {
-            Some("bilinear") => ResampleMode::Bilinear,
-            Some("cubic") => ResampleMode::Cubic,
-            Some("cubic_spline") => ResampleMode::CubicSpline,
-            Some("lanczos") => ResampleMode::Lanczos,
-            Some("average") => ResampleMode::Average,
-            Some("mode") => ResampleMode::Mode,
-            Some("max") => ResampleMode::Max,
-            Some("min") => ResampleMode::Min,
-            Some("med") => ResampleMode::Med,
-            _ => ResampleMode::Nearest,
-        }
+        self.resampling
+            .as_deref()
+            .and_then(|s| super::parse_resample_mode(&s.to_ascii_lowercase()))
+            .unwrap_or(ResampleMode::Nearest)
     }
 
     fn colormap(&self) -> ColormapName {
@@ -591,23 +583,14 @@ fn parse_output_format(ext: Option<&str>, q_fmt: Option<&str>) -> (OutputFormat,
     }
 }
 
-fn compute_zarr_etag(key: &str, body: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut h);
-    body.len().hash(&mut h);
-    let sample = body.len().min(512);
-    body[..sample].hash(&mut h);
-    format!("\"{:016x}\"", h.finish())
-}
-
 fn binary_ok_with_etag(
     body: Bytes,
     content_type: &'static str,
     etag_key: &str,
     if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
-    let etag = compute_zarr_etag(etag_key, &body);
+    let etag_hdr = crate::tile_cache::compute_keyed_etag(etag_key, &body);
+    let etag = etag_hdr.to_str().unwrap_or("");
     let cc = zarr_cache_control_header();
     if let Some(inm) = if_none_match {
         let matched = inm.trim() == "*"
@@ -617,7 +600,7 @@ fn binary_ok_with_etag(
         if matched {
             return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
-                .header(ETAG, HeaderValue::from_str(&etag).unwrap())
+                .header(ETAG, etag_hdr)
                 .header(CACHE_CONTROL, cc)
                 .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
                 .body(Full::new(Bytes::new()))
@@ -627,7 +610,7 @@ fn binary_ok_with_etag(
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
-        .header(ETAG, HeaderValue::from_str(&etag).unwrap())
+        .header(ETAG, etag_hdr)
         .header(CACHE_CONTROL, cc)
         .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
         .body(Full::new(body))
@@ -1827,6 +1810,14 @@ async fn render_zarr_rect(
     Ok(binary_ok_with_etag(body, content_type, etag_key, if_none_match))
 }
 
+fn f32_plane_to_le_bytes(plane: &[f32]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(plane.len() * 4);
+    for &v in plane {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    raw
+}
+
 fn encode_zarr_plane(
     plane: &[f32],
     out_w: u32,
@@ -1837,18 +1828,15 @@ fn encode_zarr_plane(
     fmt: OutputFormat,
 ) -> Bytes {
     match fmt {
-        OutputFormat::Npy => {
-            let mut raw = Vec::with_capacity(plane.len() * 4);
-            for &v in plane {
-                raw.extend_from_slice(&v.to_le_bytes());
-            }
-            wrap_raw_f32_as_npy_with_mask(Bytes::from(raw), 1, out_h, out_w, q.return_mask)
-        }
+        OutputFormat::Npy => wrap_raw_f32_as_npy_with_mask(
+            Bytes::from(f32_plane_to_le_bytes(plane)),
+            1,
+            out_h,
+            out_w,
+            q.return_mask,
+        ),
         OutputFormat::RawF32 => {
-            let mut raw = Vec::with_capacity(plane.len() * 4);
-            for &v in plane {
-                raw.extend_from_slice(&v.to_le_bytes());
-            }
+            let raw = f32_plane_to_le_bytes(plane);
             encode_geotiff_f32(out_w, out_h, &raw, dst_bounds, dst_epsg, q.return_mask)
         }
         _ => {
