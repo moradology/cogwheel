@@ -6,6 +6,7 @@ license.workspace = true
 description = "Optional wgpu (Metal/Vulkan) GPU compute backend for cogzilla"
 
 [dependencies]
+cogzilla-raster = { path = "../cogzilla-raster" }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 thiserror.workspace = true

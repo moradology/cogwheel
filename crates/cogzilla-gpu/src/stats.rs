@@ -57,26 +57,8 @@ pub(crate) struct ResolvedStats {
     pub(crate) _pad2: u32,
 }
 
-/// Complete TiTiler-compatible band statistics computed on the GPU.
-#[derive(Debug, Clone)]
-pub struct GpuBandStats {
-    pub total_pixels: usize,
-    pub valid_pixels: usize,
-    pub masked_pixels: usize,
-    pub valid_percent: f64,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub mean: Option<f64>,
-    pub sum: f64,
-    pub std: Option<f64>,
-    pub median: Option<f64>,
-    pub majority: Option<f64>,
-    pub minority: Option<f64>,
-    pub unique_bins: usize,
-    pub percentiles: Vec<(f64, Option<f64>)>,
-    pub hist_counts: Vec<u64>,
-    pub hist_edges: Vec<f64>,
-}
+/// Complete TiTiler-compatible band statistics computed on the GPU (defined in `cogzilla-raster`).
+pub use cogzilla_raster::GpuBandStats;
 
 /// Single-submit GPU raster statistics & histogram reducer.
 pub struct GpuStatsReducer {

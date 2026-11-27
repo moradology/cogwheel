@@ -5,30 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::colormap::GpuPixelOutput;
 use crate::context::{GpuContext, GpuError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpuPixelSelection {
-    First,
-    Highest,
-    Lowest,
-    Mean,
-    Median,
-    Stdev,
-    Count,
-}
-
-impl GpuPixelSelection {
-    fn as_u32(self) -> u32 {
-        match self {
-            Self::First => 0,
-            Self::Highest => 1,
-            Self::Lowest => 2,
-            Self::Mean => 3,
-            Self::Median => 4,
-            Self::Stdev => 5,
-            Self::Count => 6,
-        }
-    }
-}
+pub use cogzilla_raster::GpuPixelSelection;
 
 /// GPU-resident stack of `1..=32` aligned scene planes (`width * height` `f32` each).
 pub struct GpuSceneStack {

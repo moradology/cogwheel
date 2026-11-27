@@ -9,6 +9,7 @@ default = ["gpu"]
 gpu = ["dep:cogzilla-gpu"]
 
 [dependencies]
+cogzilla-raster = { path = "../cogzilla-raster" }
 cogzilla-tiff = { path = "../cogzilla-tiff" }
 cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-proj = { path = "../cogzilla-proj" }

@@ -40,19 +40,12 @@ impl StubSlabCache {
     }
 }
 
-/// Stub re-export matching `cogzilla_gpu::GpuPixelSelection`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GpuPixelSelection {
-    First,
-    Highest,
-    Lowest,
-    Mean,
-    Median,
-    Stdev,
-    Count,
-}
+/// Shared plain-data GPU types re-exported directly from `cogzilla-raster`
+/// (identical across GPU and CPU-only builds; cannot drift).
+pub use cogzilla_raster::{GpuBandStats, GpuPixelSelection, GpuWeightedBandStats};
 
-/// Stub re-export matching `cogzilla_gpu::GpuInstr`.
+/// Stub matching `cogzilla_gpu::GpuInstr` (16-byte POD instruction; field layout pinned by
+/// a compile-time assertion in `gpu_backend.rs`).
 #[derive(Clone, Copy, Debug)]
 pub struct GpuInstr {
     pub opcode: u32,
@@ -64,43 +57,6 @@ pub struct GpuInstr {
 /// Stub re-export matching `cogzilla_gpu::MultiBandSlabKey`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MultiBandSlabKey;
-
-/// Stub re-export matching `cogzilla_gpu::GpuBandStats`.
-#[derive(Clone, Debug)]
-pub struct GpuBandStats {
-    pub valid_pixels: usize,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    pub mean: Option<f64>,
-    pub sum: f64,
-    pub std: Option<f64>,
-    pub median: Option<f64>,
-    pub majority: Option<f64>,
-    pub minority: Option<f64>,
-    pub unique_bins: usize,
-    pub hist_counts: Vec<u64>,
-    pub percentiles: Vec<(f64, Option<f64>)>,
-}
-
-/// Stub re-export matching `cogzilla_gpu::GpuWeightedBandStats`.
-#[derive(Clone, Debug)]
-pub struct GpuWeightedBandStats {
-    pub min: f64,
-    pub max: f64,
-    pub mean: f64,
-    pub std: f64,
-    pub median: f64,
-    pub majority: f64,
-    pub minority: f64,
-    pub count_cov: f64,
-    pub sum_cov: f64,
-    pub valid_pixels: usize,
-    pub masked_pixels: usize,
-    pub unique_bins: usize,
-    pub area_valid_m2: f64,
-    pub hist_counts: Vec<f64>,
-    pub percentiles: Vec<(f64, f64)>,
-}
 
 /// Stub matching `gpu_backend::BboxCoordSource`.
 #[derive(Clone, Copy)]
