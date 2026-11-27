@@ -6533,8 +6533,12 @@ fn respelled(resp: Resp) -> Resp {
     };
     let epsg = if crs.contains("OGC/0/CRS84") || crs.contains("EPSG/0/4326") {
         4326
-    } else if crs.contains("EPSG/0/3857") {
-        3857
+    } else if let Some(rest) = crs.split("EPSG/0/").nth(1) {
+        let digits = rest.trim_end_matches(['>', ' ']);
+        match digits.parse::<u16>() {
+            Ok(code) => code,
+            Err(_) => return resp,
+        }
     } else {
         return resp;
     };
@@ -6546,9 +6550,8 @@ fn respelled(resp: Resp) -> Resp {
 }
 
 /// An item's tile or `bbox` picture with where it lies, as titiler-pgstac's item routes
-/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in.
-/// Only degrees and Web Mercator are worked out here; a picture in any other system goes
-/// without the headers, and a preview or a posted shape is placed by [`item_drawn_placed`].
+/// say it: the tile's bounds in Web Mercator, or the box in the system it was drawn in
+/// (for any supported CRS). A preview or a posted shape is placed by [`item_drawn_placed`].
 pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
@@ -6584,32 +6587,47 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             let Some((bbox, _)) = super::parse_bbox4(seg) else {
                 return resp;
             };
-            // 4326 or 3857, or nothing for a system not placed here.
-            let system = |key: &str, default: u16| match asked(key).as_deref().map(super::parse_coord_crs_with_epsg) {
+            let parse_sys = |key: &str, default: (CrsModel, u16)| match asked(key)
+                .as_deref()
+                .map(super::parse_coord_crs_with_epsg)
+            {
                 None => Some(default),
-                Some(Ok((_, epsg @ (4326 | 3857)))) => Some(epsg),
-                Some(_) => None,
+                Some(Ok(pair)) => Some(pair),
+                Some(Err(_)) => None,
             };
-            let Some(given) = system("coord_crs", 4326) else {
+            let Some((given_crs, given_epsg)) = parse_sys("coord_crs", (CrsModel::Geographic, 4326)) else {
                 return resp;
             };
-            let Some(drawn) = system("dst_crs", given) else {
+            let Some((drawn_crs, drawn_epsg)) = parse_sys("dst_crs", (given_crs.clone(), given_epsg)) else {
                 return resp;
             };
-            let corners = |to: fn(f64, f64) -> (f64, f64)| {
-                let ((w, s), (e, n)) = (to(bbox[0], bbox[1]), to(bbox[2], bbox[3]));
-                [w, s, e, n]
-            };
-            let bounds = match (given, drawn) {
-                (4326, 3857) => corners(cogzilla_proj::mercator::lonlat_deg_to_mercator),
-                (3857, 4326) => corners(mercator_to_lonlat_deg),
-                _ => bbox,
+            let bounds = if given_epsg == drawn_epsg {
+                bbox
+            } else {
+                let mut out = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+                const STEPS: usize = 8;
+                for i in 0..=STEPS {
+                    let f = i as f64 / STEPS as f64;
+                    let x = bbox[0] + f * (bbox[2] - bbox[0]);
+                    let y = bbox[1] + f * (bbox[3] - bbox[1]);
+                    for (px, py) in [(x, bbox[1]), (x, bbox[3]), (bbox[0], y), (bbox[2], y)] {
+                        let (lon, lat) = given_crs.to_lonlat_deg(px, py);
+                        let (dx, dy) = drawn_crs.from_lonlat_deg(lon, lat);
+                        if dx.is_finite() && dy.is_finite() {
+                            out[0] = out[0].min(dx);
+                            out[1] = out[1].min(dy);
+                            out[2] = out[2].max(dx);
+                            out[3] = out[3].max(dy);
+                        }
+                    }
+                }
+                out
             };
             if bounds.iter().any(|c| !c.is_finite()) {
                 return resp;
             }
             let spelled = asked("dst_crs").or_else(|| asked("coord_crs"));
-            placed_as(resp, bounds, drawn, spelled.as_deref())
+            placed_as(resp, bounds, drawn_epsg, spelled.as_deref())
         }
         _ => resp,
     }
@@ -8908,10 +8926,11 @@ mod tests {
         );
         assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=EPSG%3A3857").unwrap().1, crs(3857));
         assert_eq!(said(&["bbox", "701000,5404000,720000,5420000.png"], "coord_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
-        // Systems not placed here, tiles that are not tiles, and other routes go without.
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:32631").unwrap().1, crs(32631));
+        assert_eq!(said(&["bbox", "765000,4832000,782000,4855000.png"], "coord_crs=epsg:32631").unwrap().1, crs(32631));
+        // Unsupported systems, tiles that are not tiles, and other routes go without.
         for (sub, query) in [
-            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:32631"),
-            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "coord_crs=epsg:32631"),
+            (&["bbox", "6.3,43.6,6.5,43.8.png"][..], "dst_crs=epsg:4275"),
             (&["tiles", "WebMercatorQuad", "1", "2", "0.png"][..], ""),
             (&["tiles", "WGS1984Quad", "0", "0", "0.png"][..], ""),
             (&["preview.png"][..], ""),
