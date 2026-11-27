@@ -35,6 +35,7 @@ pub mod codecs;
 pub mod crs;
 pub mod geo;
 pub mod hierarchy;
+pub mod multiscales;
 pub mod reader;
 pub mod sel;
 pub mod select;
@@ -48,6 +49,7 @@ pub use codecs::{MAX_DECODED_CHUNK_BYTES, SUPPORTED_CODECS, decode_chunk_bytes};
 pub use crs::{ZarrCrs, resolve_crs};
 pub use geo::{ZarrGeo, read_coord_1d, resolve_geo};
 pub use hierarchy::{FsStore, GroupMeta, GroupView, MemoryStore, OpenMode, ZarrHierarchy, ZarrNode, ZarrStore};
+pub use multiscales::{MultiscaleLevel, MultiscalePyramid};
 pub use reader::{
     ChunkWindow, DEFAULT_MAX_CHUNKS_PER_REQUEST, DEFAULT_MAX_DECODED_WINDOW_BYTES, ZarrCaps,
     ZarrWindowBlocks, read_chunk_window, read_chunk_window_for_band,

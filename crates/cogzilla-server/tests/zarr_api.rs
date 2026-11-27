@@ -330,4 +330,65 @@ async fn zarr_raster_routes_and_geotiff_twin_http_tile_parity() {
     assert!(mtxt.contains("cogzilla_zarr_chunk_holes_total"));
     assert!(mtxt.contains("cogzilla_zarr_bytes_decoded_total"));
     assert!(mtxt.contains("cogzilla_zarr_cap_refusals_total"));
+
+    // 12. GeoZarr / OME-Zarr multiscales fixture serves low-zoom & high-zoom tiles (#375)
+    let ms_url = dir.join("multiscale.zarr").to_string_lossy().to_string();
+    let (st_lo, _, body_lo) = get_bytes(
+        &engine,
+        &format!("/zarr/tiles/WebMercatorQuad/9/81/197.png?url={ms_url}&rescale=100,900"),
+        None,
+    )
+    .await;
+    assert_eq!(st_lo, StatusCode::OK);
+    assert_eq!(&body_lo[0..4], b"\x89PNG");
+
+    let (st_hi, _, body_hi) = get_bytes(
+        &engine,
+        &format!("/zarr/tiles/WebMercatorQuad/11/327/791.png?url={ms_url}&rescale=100,900"),
+        None,
+    )
+    .await;
+    assert_eq!(st_hi, StatusCode::OK);
+    assert_eq!(&body_hi[0..4], b"\x89PNG");
+
+    // 13. Freshness & validator ETag (#387): mutating a local store invalidates ETag (200 not 304)
+    let tmp_dir = std::env::temp_dir().join(format!("cogzilla_zarr_freshness_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    copy_dir_all(&dir.join("v3_consolidated.zarr"), &tmp_dir);
+    let tmp_url = tmp_dir.to_string_lossy().to_string();
+    let tile_uri = format!(
+        "/zarr/tiles/WebMercatorQuad/9/81/197.png?url={tmp_url}&rescale=100,900"
+    );
+    let (st1, etag1, _) = get_bytes(&engine, &tile_uri, None).await;
+    assert_eq!(st1, StatusCode::OK);
+    let etag1 = etag1.expect("expected ETag");
+    // Revalidate before mutation -> 304
+    let (st304, _, _) = get_bytes(&engine, &tile_uri, Some(&etag1)).await;
+    assert_eq!(st304, StatusCode::NOT_MODIFIED);
+
+    // Mutate root zarr.json (simulating a store append / attribute update)
+    let zjson_path = tmp_dir.join("zarr.json");
+    let mut zjson = std::fs::read_to_string(&zjson_path).unwrap();
+    zjson.push('\n'); // changes file length + mtime
+    std::fs::write(&zjson_path, zjson).unwrap();
+
+    // Revalidate with old ETag after mutation -> 200 OK with new ETag (NOT 304!)
+    let (st2, etag2, body2) = get_bytes(&engine, &tile_uri, Some(&etag1)).await;
+    assert_eq!(st2, StatusCode::OK, "mutated store must return 200, not stale 304");
+    assert_ne!(etag2.as_deref(), Some(etag1.as_str()));
+    assert_eq!(&body2[0..4], b"\x89PNG");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let ty = entry.file_type().unwrap();
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()));
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).unwrap();
+        }
+    }
 }

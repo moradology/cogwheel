@@ -6026,6 +6026,7 @@ where
         engine.clear_gpu_caches();
         engine.stac_cache.clear();
         engine.mosaicjson_cache.clear();
+        zarr::clear_zarr_cache();
         if let Some(pg) = engine.pgstac() {
             pg.clear_caches();
         }

@@ -118,6 +118,16 @@ Estimates from the v0.1.2 S3 benchmark, not measurements.
 - **Storing decoded blocks on disk.** They are several times larger than the compressed bytes and
   would have to be written at eviction time, when the server is already under memory pressure.
 - **Sharing the disk tier between processes or hosts.** One process owns its directory.
+
+## Zarr metadata caching & freshness (#387)
+
+Unlike COGs (which are effectively immutable), Zarr stores are routinely appended to or rewritten in place:
+
+- **One open-URI slot per store:** `COGZILLA_MAX_OPEN_URIS` (default `4,096`) bounds cached Zarr hierarchies by store prefix, not by chunk count (a 50,000-chunk store occupies one slot).
+- **Local stores:** Validated on every open via `stat(len, mtime)` of the root metadata file (`zarr.json`, `.zmetadata`, `.zgroup`, or `.zarray`), so overwrites and appends are visible immediately and deleted stores return `404`.
+- **Remote HTTP stores:** Cached under `COGZILLA_CACHE_TTL_SECS` (default `5` s). Within the TTL, warm reads issue zero metadata GETs; once elapsed, the server revalidates via `HEAD` (`ETag` / `Last-Modified` / `Content-Length`) and refreshes the hierarchy only when the validator changes.
+- **Validator-backed ETags & `Cache-Control`:** `/zarr/*` raster ETags fold in the store's current metadata validator, so a client revalidating with `If-None-Match` after an append receives `200 OK` with fresh bytes rather than a stale `304`. `COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE` defaults to `60` s (shorter than COG's `3600` s) to match actively updated stores.
+- **Manual flush:** `POST /admin/clear-cache` synchronously clears the Zarr hierarchy cache alongside the COG, STAC, MosaicJSON, and pgSTAC caches.
 - **Caching rendered tiles.** That is a CDN's job.
 
 ## Related, separate change

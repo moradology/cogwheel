@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use bytes::Bytes;
 use cogzilla_kernel::{
@@ -16,11 +16,12 @@ use cogzilla_kernel::{
 use cogzilla_proj::{CoordPlan, CrsModel, TileCoord, normalize_geographic_lon};
 use cogzilla_zarr::hierarchy::BoxFuture;
 use cogzilla_zarr::{
-    ArrayMeta, CfTimeUnits, DataType, FsStore, OpenMode, ShardingConfig, ZarrCaps, ZarrError,
-    ZarrGeo, ZarrHierarchy, ZarrStore, ZarrVersion, parse_sel_params,
+    ArrayMeta, CfTimeUnits, DataType, FsStore, MultiscalePyramid, OpenMode, ShardingConfig,
+    ZarrCaps, ZarrError, ZarrGeo, ZarrHierarchy, ZarrStore, ZarrVersion, parse_sel_params,
     read_chunk_window_for_band_with_caps, read_coord_1d, resolve_geo, resolve_sel_indices,
     select_variable,
 };
+use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderValue};
 use hyper::{Method, Response, StatusCode};
@@ -93,6 +94,69 @@ pub(crate) fn append_zarr_metrics(out: &mut String) {
         "cogzilla_zarr_cap_refusals_total {}",
         ZARR_METRICS.cap_refusals.load(Ordering::Relaxed)
     );
+}
+
+struct CachedZarrStore {
+    hierarchy: Arc<ZarrHierarchy>,
+    /// Store freshness validator (local `mtime_ns:size` or remote `ETag`/`Last-Modified`).
+    validator: String,
+    fetched_at: Instant,
+}
+
+fn zarr_hierarchy_cache() -> &'static DashMap<String, CachedZarrStore> {
+    static CACHE: OnceLock<DashMap<String, CachedZarrStore>> = OnceLock::new();
+    CACHE.get_or_init(DashMap::new)
+}
+
+/// Flush all cached Zarr store hierarchies (called by `POST /admin/clear-cache`, #387).
+pub(crate) fn clear_zarr_cache() {
+    zarr_hierarchy_cache().clear();
+}
+
+fn zarr_cache_ttl() -> Duration {
+    let secs = std::env::var("COGZILLA_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
+fn zarr_max_open_uris() -> usize {
+    std::env::var("COGZILLA_MAX_OPEN_URIS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4096)
+}
+
+fn zarr_cache_control_header() -> HeaderValue {
+    let max_age = std::env::var("COGZILLA_ZARR_CACHE_CONTROL_MAX_AGE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    if max_age == 0 {
+        HeaderValue::from_static("no-cache")
+    } else {
+        HeaderValue::from_str(&format!("public, max-age={max_age}"))
+            .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=60"))
+    }
+}
+
+fn local_store_validator(root: &std::path::Path) -> String {
+    // Hash mtime + len of whichever root metadata file exists (plus root dir mtime if present).
+    for name in ["zarr.json", ".zmetadata", ".zgroup", ".zarray"] {
+        let p = root.join(name);
+        if let Ok(meta) = std::fs::metadata(&p) {
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            return format!("fs:{name}:{}:{mtime_ns}", meta.len());
+        }
+    }
+    "fs:none".into()
 }
 
 fn record_window_metrics(wb: &cogzilla_zarr::ZarrWindowBlocks) {
@@ -585,6 +649,7 @@ fn binary_ok_with_etag(
     if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
     let etag = compute_zarr_etag(etag_key, &body);
+    let cc = zarr_cache_control_header();
     if let Some(inm) = if_none_match {
         let matched = inm.trim() == "*"
             || inm
@@ -594,10 +659,7 @@ fn binary_ok_with_etag(
             return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(ETAG, HeaderValue::from_str(&etag).unwrap())
-                .header(
-                    CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=3600"),
-                )
+                .header(CACHE_CONTROL, cc)
                 .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
                 .body(Full::new(Bytes::new()))
                 .unwrap();
@@ -607,10 +669,7 @@ fn binary_ok_with_etag(
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
         .header(ETAG, HeaderValue::from_str(&etag).unwrap())
-        .header(
-            CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=3600"),
-        )
+        .header(CACHE_CONTROL, cc)
         .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
         .body(Full::new(body))
         .unwrap()
@@ -760,12 +819,100 @@ fn split_bbox_ext(seg: &str) -> (String, Option<String>) {
     (seg.to_string(), None)
 }
 
-async fn open_store_and_hierarchy(q: &ZarrQuery) -> Result<(ServerZarrStore, ZarrHierarchy), ZarrError> {
+async fn open_store_and_hierarchy(
+    q: &ZarrQuery,
+) -> Result<(ServerZarrStore, Arc<ZarrHierarchy>, String), ZarrError> {
     let url = q.url.as_deref().unwrap_or("");
     let store = ServerZarrStore::from_url(url)?;
-    let hierarchy = ZarrHierarchy::open(&store).await?;
-    ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
-    Ok((store, hierarchy))
+    let cache = zarr_hierarchy_cache();
+
+    match &store {
+        ServerZarrStore::Local(fs) => {
+            let validator = local_store_validator(fs.root());
+            if let Some(entry) = cache.get(url)
+                && entry.validator == validator
+            {
+                return Ok((store, Arc::clone(&entry.hierarchy), validator));
+            }
+            let hierarchy = Arc::new(ZarrHierarchy::open(&store).await?);
+            ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
+            if cache.len() >= zarr_max_open_uris() {
+                cache.clear();
+            }
+            cache.insert(
+                url.to_string(),
+                CachedZarrStore {
+                    hierarchy: Arc::clone(&hierarchy),
+                    validator: validator.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+            Ok((store, hierarchy, validator))
+        }
+        ServerZarrStore::Http { base_url, client } => {
+            let ttl = zarr_cache_ttl();
+            if ttl > Duration::ZERO
+                && let Some(entry) = cache.get(url)
+                && entry.fetched_at.elapsed() < ttl
+            {
+                return Ok((store, Arc::clone(&entry.hierarchy), entry.validator.clone()));
+            }
+
+            // Probe root metadata validator cheaply via HEAD (ETag / Last-Modified)
+            let mut remote_validator = String::new();
+            for meta_name in ["zarr.json", ".zmetadata"] {
+                if let Ok(resp) = client.head(format!("{base_url}/{meta_name}")).send().await
+                    && resp.status().is_success()
+                {
+                    let et = resp
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let lm = resp
+                        .headers()
+                        .get(reqwest::header::LAST_MODIFIED)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let cl = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    remote_validator = format!("http:{meta_name}:{et}:{lm}:{cl}");
+                    break;
+                }
+            }
+
+            if !remote_validator.is_empty()
+                && let Some(mut entry) = cache.get_mut(url)
+                && entry.validator == remote_validator
+            {
+                entry.fetched_at = Instant::now();
+                return Ok((store, Arc::clone(&entry.hierarchy), remote_validator));
+            }
+
+            let hierarchy = Arc::new(ZarrHierarchy::open(&store).await?);
+            ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
+            if cache.len() >= zarr_max_open_uris() {
+                cache.clear();
+            }
+            let validator = if remote_validator.is_empty() {
+                format!("http:gen:{}", ZARR_METRICS.stores_opened.load(Ordering::Relaxed))
+            } else {
+                remote_validator
+            };
+            cache.insert(
+                url.to_string(),
+                CachedZarrStore {
+                    hierarchy: Arc::clone(&hierarchy),
+                    validator: validator.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+            Ok((store, hierarchy, validator))
+        }
+    }
 }
 
 fn dtype_str(dt: DataType) -> &'static str {
@@ -790,7 +937,7 @@ fn wgs84_bounds_for_geo(geo: &cogzilla_zarr::ZarrGeo, width: u32, height: u32) -
 }
 
 async fn handle_info(q: &ZarrQuery, as_geojson: bool) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -904,7 +1051,7 @@ async fn handle_info(q: &ZarrQuery, as_geojson: bool) -> Result<Response<Full<By
 }
 
 async fn handle_bounds(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -919,7 +1066,7 @@ async fn handle_bounds(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError
 }
 
 async fn handle_validate(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
 
@@ -971,20 +1118,20 @@ async fn handle_validate(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrErr
 }
 
 async fn handle_dataset_keys(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (_store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (_store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     let keys = group.data_variables();
     Ok(json_ok(&json!(keys), "application/json"))
 }
 
 async fn handle_dataset_dimensions(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (_store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (_store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     Ok(json_ok(&json!(group.dimensions()), "application/json"))
 }
 
 async fn handle_dataset_dict(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (_store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (_store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     let dims = group.dimensions();
     let data_vars_set: std::collections::BTreeSet<String> =
@@ -1025,7 +1172,7 @@ async fn handle_dataset_coordinate(
     q: &ZarrQuery,
     coord_name: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let group = hierarchy.group(q.group.as_deref())?;
     let meta = group
         .array(coord_name)
@@ -1100,7 +1247,7 @@ async fn handle_tileset_list(
     host: &str,
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1150,7 +1297,7 @@ async fn handle_tileset(
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let tms = require_tms(tms_id)?;
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1210,7 +1357,7 @@ async fn handle_tilejson(
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let tms = require_tms(tms_id)?;
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1262,7 +1409,7 @@ async fn handle_wmts(
     raw_query: &str,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let tms = require_tms(tms_id)?;
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1428,9 +1575,28 @@ async fn handle_tile(
         });
     };
 
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
-    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
-    let group = hierarchy.group(q.group.as_deref())?;
+    let (store, hierarchy, validator) = open_store_and_hierarchy(q).await?;
+    // Honour GeoZarr / OME-Zarr `multiscales` when `?group=` is not explicitly pinned (#375).
+    let mut effective_group = q.group.clone();
+    if effective_group.is_none()
+        && let Ok(root_g) = hierarchy.group(None)
+        && let Ok(Some(pyr)) = MultiscalePyramid::discover(&hierarchy, &root_g, q.variable.as_deref())
+    {
+        let base_lvl = &pyr.levels[0];
+        if let Ok(base_g) = hierarchy.group(Some(&base_lvl.group_path))
+            && let Some(base_meta) = base_g.array(&base_lvl.variable)
+            && let Ok(base_geo) = resolve_geo(&store, &base_g, base_meta).await
+        {
+            let tile_res = ((tile_bounds[2] - tile_bounds[0]).abs() / tile_size as f64)
+                .min((tile_bounds[3] - tile_bounds[1]).abs() / tile_size as f64);
+            let base_res = base_geo.affine.a.abs().min(base_geo.affine.e.abs()).max(1e-9);
+            let req_downsample = tile_res / base_res;
+            let chosen = pyr.select_for_downsample(req_downsample);
+            effective_group = Some(chosen.group_path.clone());
+        }
+    }
+    let sel_var = select_variable(&hierarchy, effective_group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(effective_group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
     let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
 
@@ -1457,7 +1623,7 @@ async fn handle_tile(
     };
 
     let caps = ZarrCaps::from_env();
-    let etag_key = format!("zarr:tile:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
+    let etag_key = format!("zarr:tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
 
     // Fast path for standard 256x256 and 512x512 tiles directly through `render_single_band`
     if tile_size == 256 {
@@ -1723,7 +1889,7 @@ async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes
             detail: format!("invalid coordinates {coords:?}"),
         });
     };
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1805,7 +1971,7 @@ async fn handle_preview(
     raw_query: &str,
     if_none_match: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1883,7 +2049,7 @@ async fn handle_bbox(
     }
     let _ = &mut minx;
 
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -1912,7 +2078,7 @@ async fn handle_bbox(
 }
 
 async fn handle_get_statistics(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
@@ -1963,7 +2129,7 @@ async fn handle_post_statistics(
     body: Bytes,
 ) -> Result<Response<Full<Bytes>>, ZarrError> {
     let geojson: Value = serde_json::from_slice(&body)?;
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
@@ -2167,7 +2333,7 @@ async fn handle_post_feature(
             }
         })?;
 
-    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let (store, hierarchy, _validator) = open_store_and_hierarchy(q).await?;
     let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
     let group = hierarchy.group(q.group.as_deref())?;
     let geo = resolve_geo(&store, &group, sel_var.meta).await?;
