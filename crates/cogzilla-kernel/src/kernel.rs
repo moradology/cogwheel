@@ -2933,6 +2933,45 @@ pub fn encode_rgba_tile(rgba: &[u8], size: u32, all_opaque: bool, format: Output
     }
 }
 
+/// [`encode_rgba_tile`] for a tile of one band drawn in grey (every pixel that is there has
+/// `r == g == b`), written as TiTiler writes one band: a PNG of one channel (`L`) when every
+/// pixel is there and of two (`LA`) when not, and a JPEG of one component. Other formats are
+/// written as [`encode_rgba_tile`] writes them.
+pub fn encode_grey_rgba_tile(rgba: &[u8], size: u32, all_opaque: bool, format: OutputFormat) -> Bytes {
+    let n = size as usize;
+    let luma = |p: &[u8]| if p[3] == 0 { 0 } else { p[0] };
+    match format {
+        OutputFormat::Png => {
+            let channels = if all_opaque { 1 } else { 2 };
+            let row_len = n * channels + 1;
+            let mut filtered = vec![0u8; n * row_len];
+            let mut row = vec![0u8; n * channels];
+            for y in 0..n {
+                let src = &rgba[y * n * 4..(y + 1) * n * 4];
+                let dst = &mut filtered[y * row_len..(y + 1) * row_len];
+                if all_opaque {
+                    for (p, v) in src.chunks_exact(4).zip(row.iter_mut()) {
+                        *v = p[0];
+                    }
+                    filter_sub_u8_row(&row, dst);
+                } else {
+                    for (p, v) in src.chunks_exact(4).zip(row.chunks_exact_mut(2)) {
+                        v[0] = luma(p);
+                        v[1] = p[3];
+                    }
+                    filter_sub_ga_row(&row, dst);
+                }
+            }
+            encode_filtered_png(size, size, if all_opaque { 0 } else { 4 }, &filtered)
+        }
+        OutputFormat::Jpeg { quality } => {
+            let grey: Vec<u8> = rgba.chunks_exact(4).take(n * n).map(luma).collect();
+            crate::jpeg_fast::encode_jpeg_gray(size, size, &grey, quality)
+        }
+        _ => encode_rgba_tile(rgba, size, all_opaque, format),
+    }
+}
+
 // ============================================================================
 // Monomorphized Single-Band Fused Kernels (with SIMD Flat-Block Fast Path!)
 // ============================================================================

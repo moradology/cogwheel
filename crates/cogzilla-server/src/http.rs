@@ -58,6 +58,16 @@ fn percent_decode(input: &str) -> String {
     percent_decode_opts(input, true)
 }
 
+/// A query key as Starlette reads it: percent-decoded (`dst%5Fcrs` is `dst_crs`), borrowed
+/// when there is nothing to decode.
+pub(crate) fn query_key(k: &str) -> std::borrow::Cow<'_, str> {
+    if k.contains('%') {
+        std::borrow::Cow::Owned(percent_decode(k))
+    } else {
+        std::borrow::Cow::Borrowed(k)
+    }
+}
+
 fn percent_decode_opts(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -446,6 +456,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
+        let k = query_key(k);
+        let k = k.as_ref();
         pq.keys.push(k.to_string());
         let mut bad = |what: &str| pq_errors.push(format!("invalid {k}={}: {what}", percent_decode(v)));
         match k {
@@ -1243,10 +1255,10 @@ fn filter_tile_template_query(raw_query: &str) -> String {
     raw_query
         .split('&')
         .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or("");
+            let k = query_key(pair.split('=').next().unwrap_or(""));
             !pair.is_empty()
                 && !matches!(
-                    k,
+                    k.as_ref(),
                     "minzoom" | "maxzoom" | "tile_format" | "tile_scale" | "use_epsg" | "zooms"
                 )
         })
@@ -1272,8 +1284,8 @@ fn apply_tilejson_overrides(
     let filtered_query: String = raw_query
         .split('&')
         .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or("");
-            !pair.is_empty() && !matches!(k, "minzoom" | "maxzoom" | "tile_format" | "tile_scale")
+            let k = query_key(pair.split('=').next().unwrap_or(""));
+            !pair.is_empty() && !matches!(k.as_ref(), "minzoom" | "maxzoom" | "tile_format" | "tile_scale")
         })
         .collect::<Vec<_>>()
         .join("&");
@@ -2989,7 +3001,7 @@ fn build_ogc_tileset_json(
     };
     let tile_q: String = filter_tile_template_query(raw_query)
         .split('&')
-        .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("crs"))
+        .filter(|pair| !pair.is_empty() && query_key(pair.split('=').next().unwrap_or("")) != "crs")
         .collect::<Vec<_>>()
         .join("&");
     let tile_q_suffix = if tile_q.is_empty() {
@@ -10451,7 +10463,7 @@ where
                 for pair in raw_query.split('&').filter(|p| !p.is_empty()) {
                     if let Some((k, v)) = pair.split_once('=') {
                         let dec = percent_decode(v);
-                        match k {
+                        match query_key(k).as_ref() {
                             "id" if !dec.is_empty() => q_id = Some(dec),
                             "collection" if !dec.is_empty() => q_collection = Some(dec),
                             "collection_url" if !dec.is_empty() => q_collection_url = Some(dec),
