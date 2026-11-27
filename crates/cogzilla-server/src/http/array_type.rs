@@ -203,6 +203,13 @@ impl ArrayRule {
 
     /// The type for bands read as `reads`, with `expression` the band math as worked on
     /// (`b1`, `b2`, ... after any asset names are rewritten), several separated by `;`.
+    /// Whether the rule reads the bands with their scale and offset applied.
+    pub(super) fn unscales(&self) -> bool {
+        match self {
+            Self::Data { unscale, .. } | Self::Math { unscale } | Self::Algorithm { unscale, .. } => *unscale,
+        }
+    }
+
     pub(super) fn kind(&self, reads: &[SampleType], expression: Option<&str>) -> Option<SampleType> {
         let (unscale, math) = match self {
             Self::Data { unscale, .. } => (*unscale, false),
