@@ -108,6 +108,12 @@ This document is the living record of every intentional divergence, **why** it e
 
 `algorithm_params` are checked as TiTiler's pydantic models check them (2026-11-26): each algorithm reads its own fields in pydantic's lax mode (`"45"`, `45.0` and `true` are the integer they spell), within its bounds, and passes over other keys; what it refuses is a `400` in pydantic's words (without the line that links to pydantic's documentation), and parameters that are not JSON are FastAPI's `422`, on the routes that apply an algorithm. One field is wider: `contours`' `increment` may be a fraction, for data whose values lie between whole numbers (reflectance, say), where TiTiler takes only a whole number. Parameters that are JSON but not an object, which TiTiler fails on with a `500`, are a `400` here.
 
+### 1.13 The Overview of a Warped, Smoothed Read Is Chosen by Ground Size
+
+A box, feature or statistics read into another projection with a smoothing method (`bilinear`, `cubic`, `average`, `lanczos`, ...) is, in rio-tiler, a read of a GDAL warped VRT at a size. GDAL chooses the overview by the least-reduced axis, as cogzilla does, but measures it in the VRT's own pixels: square in degrees (or Web Mercator metres), sized from the raster's diagonal. In degrees a pixel of longitude is shorter on the ground than one of latitude by `cos(latitude)`, so away from the equator GDAL can read an overview coarser than the output's pixels across. For example, a 64×43 box at 45.7°N has pixels of 146 m across and 207 m down; GDAL reads Sentinel-2's 160 m overview, and cogzilla reads the 80 m one with a kernel widened to each pixel's footprint. Whether GDAL drops a level then depends on the box's aspect: a 64×64 box over the same ground reads 80 m in both.
+
+cogzilla keeps its choice. Against the area mean of the 10 m pixels (the ideal value of each output pixel), cogzilla's 64×43 box has RMSE 35 to 53 under `average`, `bilinear`, `cubic` and `lanczos`. GDAL's choice, made by titiler-pgstac or tried in cogzilla, has RMSE 70 to 88 for the same requests, and is blurrier: its spread is 211 to 226 against 247. So where the two choices differ, cogzilla's pictures and statistics are expected to differ from TiTiler's by being sharper (as in that test): 31 to 40 dB from titiler-pgstac at such sizes, with a higher `std` and a wider range. Where they agree (a 64×64 or 300×200 box), they match TiTiler's to 56 to 70 dB.
+
 ## 2. Deliberate API & Error-Handling Divergences
 
 | Area | TiTiler 2.4.1 | `cogzilla` | Why |
