@@ -8,9 +8,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libvulkan1 \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
-# .cargo/config.toml sets target-cpu=native; an empty RUSTFLAGS overrides it so
-# the image runs on any CPU of its architecture.
-ENV RUSTFLAGS=""
+# .cargo/config.toml sets target-cpu=native; default to empty RUSTFLAGS so the
+# published multi-arch image runs on any CPU of its architecture. Override on
+# EC2/Graviton builds with e.g. `--build-arg RUSTFLAGS="-C target-cpu=neoverse-v2"`.
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS="${RUSTFLAGS}"
 RUN cargo build --release --locked -p cogzilla-server \
     && mkdir -p /out-lib \
     && cp -a /usr/lib/*-linux-gnu/libvulkan.so.1* /out-lib/

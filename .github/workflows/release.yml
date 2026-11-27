@@ -44,8 +44,13 @@ jobs:
       - name: Build
         run: |
           cargo build --release --locked -p cogzilla-server --target ${{ matrix.target }}
-          if [[ "${{ matrix.target }}" == *"-unknown-linux-gnu" ]]; then
-            cargo build --release --locked -p cogzilla-lambda --target ${{ matrix.target }}
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            # AWS Lambda arm64 runs on Graviton2 (Neoverse N1) or newer: safe to enable
+            # ARMv8.1 LSE atomics, CRC32, DotProd, and AES/PMULL across all Lambda arm64 runtimes.
+            RUSTFLAGS="-C target-cpu=neoverse-n1" cargo build --release --locked -p cogzilla-lambda --target ${{ matrix.target }}
+          elif [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            # AWS Lambda x86_64 supports AVX2, FMA, BMI1/2, POPCNT, and MOVBE (x86-64-v3).
+            RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --locked -p cogzilla-lambda --target ${{ matrix.target }}
           fi
       - name: Package
         run: |
