@@ -94,6 +94,33 @@ pub(crate) fn append_zarr_metrics(out: &mut String) {
         "cogzilla_zarr_cap_refusals_total {}",
         ZARR_METRICS.cap_refusals.load(Ordering::Relaxed)
     );
+    let _ = writeln!(out, "# HELP cogzilla_zarr_hierarchy_cache_entries Cached Zarr store hierarchies.");
+    let _ = writeln!(out, "# TYPE cogzilla_zarr_hierarchy_cache_entries gauge");
+    let _ = writeln!(
+        out,
+        "cogzilla_zarr_hierarchy_cache_entries {}",
+        zarr_hierarchy_cache().len()
+    );
+    let _ = writeln!(out, "# HELP cogzilla_zarr_remote_chunk_cache_bytes Resident bytes in the Zarr remote chunk cache.");
+    let _ = writeln!(out, "# TYPE cogzilla_zarr_remote_chunk_cache_bytes gauge");
+    let _ = writeln!(
+        out,
+        "cogzilla_zarr_remote_chunk_cache_bytes {}",
+        ZARR_REMOTE_CHUNK_CACHE_BYTES.load(Ordering::Relaxed)
+    );
+}
+
+/// Snapshot of Zarr telemetry and cache occupancy for `GET /stats`.
+pub(crate) fn zarr_stats_json() -> Value {
+    json!({
+        "stores_opened": ZARR_METRICS.stores_opened.load(Ordering::Relaxed),
+        "chunks_fetched": ZARR_METRICS.chunks_fetched.load(Ordering::Relaxed),
+        "chunk_holes": ZARR_METRICS.chunk_holes.load(Ordering::Relaxed),
+        "bytes_decoded": ZARR_METRICS.bytes_decoded.load(Ordering::Relaxed),
+        "cap_refusals": ZARR_METRICS.cap_refusals.load(Ordering::Relaxed),
+        "hierarchy_cache_entries": zarr_hierarchy_cache().len(),
+        "remote_chunk_cache_bytes": ZARR_REMOTE_CHUNK_CACHE_BYTES.load(Ordering::Relaxed),
+    })
 }
 
 struct CachedZarrStore {
