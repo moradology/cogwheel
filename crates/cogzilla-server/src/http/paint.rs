@@ -66,7 +66,10 @@ impl Paint {
             | BandRequest::Dem { rescale, colormap, .. } => Self::Gray { min: rescale.0, max: rescale.1, colormap: *colormap },
             BandRequest::Rgb { rescale_min, rescale_max, .. }
             | BandRequest::SarRgb { rescale_min, rescale_max, .. } => Self::Rgb { min: *rescale_min, max: *rescale_max },
-            BandRequest::Terrain { .. } | BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => return None,
+            BandRequest::Terrain { .. }
+            | BandRequest::CustomExprRgb { .. }
+            | BandRequest::CustomExprMulti { .. }
+            | BandRequest::MultiBand { .. } => return None,
         })
     }
 

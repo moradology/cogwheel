@@ -99,6 +99,11 @@ pub enum BandRequest {
         rescale: (f32, f32),
         colormap: ColormapName,
     },
+    /// Arbitrary N-band semicolon-separated custom expressions (e.g. 2-band or 4..=15-band)
+    /// for scientific `.tif`/`.npy`/`.npz`/`.f32` output.
+    CustomExprMulti {
+        progs: Vec<ExprProgram>,
+    },
     /// Arbitrary N-band selection (e.g. 2-band or 4..=15-band) for scientific `.tif`/`.npy`/`.f32` output.
     MultiBand {
         bands_1based: Vec<u16>,
@@ -486,6 +491,7 @@ impl TileEngine {
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
                 BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
+                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
@@ -541,6 +547,7 @@ impl TileEngine {
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
                 BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
+                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
@@ -1293,8 +1300,10 @@ impl TileEngine {
                     }
                 }
             }
-            BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
-                "3-band custom expressions are rendered via bbox pipeline".into(),
+            BandRequest::CustomExprRgb { .. }
+            | BandRequest::CustomExprMulti { .. }
+            | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
+                "multi-band custom expressions are rendered via bbox pipeline".into(),
             )),
             BandRequest::CustomExpr {
                 prog,
@@ -1445,6 +1454,7 @@ impl TileEngine {
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
                 BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
+                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
                 _ => 1,
             };
             return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
@@ -1497,6 +1507,7 @@ impl TileEngine {
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
                 BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
+                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
                 _ => 1,
             };
             return Ok(empty_tile_bytes(N as u32, req.format, nb));
@@ -1720,8 +1731,10 @@ impl TileEngine {
                 };
                 Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
             }
-            BandRequest::CustomExprRgb { .. } | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
-                "3-band custom expressions are rendered via bbox pipeline".into(),
+            BandRequest::CustomExprRgb { .. }
+            | BandRequest::CustomExprMulti { .. }
+            | BandRequest::MultiBand { .. } => Err(EngineError::BadRequest(
+                "multi-band custom expressions are rendered via bbox pipeline".into(),
             )),
             BandRequest::CustomExpr {
                 prog,
@@ -1781,6 +1794,7 @@ impl TileEngine {
             | BandRequest::Terrain { .. }
             | BandRequest::CustomExprRgb { .. } => 3,
             BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
+            BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
             _ => 1,
         };
 
@@ -1876,7 +1890,15 @@ impl TileEngine {
                         continue;
                     }
                 };
-                let src = self.render_tile(&cog, &scene_req).await?;
+                let src = match self.render_tile(&cog, &scene_req).await {
+                    Ok(b) => b,
+                    Err(EngineError::Io(e)) if !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                        failed_assets.push(cogzilla_io::redact_http_url(url));
+                        last_open_err = Some(asset_fetch_error(url, e));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if src.len() != f32_bands * total_pixels * 4
                     || src.as_ptr() == empty_f32_sentinel.as_ptr()
                 {
@@ -1991,7 +2013,15 @@ impl TileEngine {
                 }
             };
             let scene_req = fold_scene_unscale(&cog, &base_scene_req);
-            let src = self.render_tile(&cog, &scene_req).await?;
+            let src = match self.render_tile(&cog, &scene_req).await {
+                Ok(b) => b,
+                Err(EngineError::Io(e)) if !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    failed_assets.push(cogzilla_io::redact_http_url(url));
+                    last_open_err = Some(asset_fetch_error(url, e));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if src.len() != total_pixels * 4 || src.as_ptr() == empty_rgba_sentinel.as_ptr() {
                 continue;
             }
@@ -2050,6 +2080,7 @@ impl TileEngine {
                 | BandRequest::Terrain { .. }
                 | BandRequest::CustomExprRgb { .. } => 3,
                 BandRequest::MultiBand { ref bands_1based } => bands_1based.len().max(1),
+                BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
                 _ => 1,
             };
             if req.format == OutputFormat::Npy {

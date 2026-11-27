@@ -2355,7 +2355,7 @@ pub fn reconstruct_i8(
 /// Reconstruct `uint32` or `int32` Predictor 1 or Predictor 2 -> `AlignedF32Slab`.
 #[inline(always)]
 fn check_val_f64(v: f64, finite_nodata: Option<f64>) -> (f64, bool) {
-    if !v.is_finite() {
+    if v.is_nan() {
         return (f64::NAN, true);
     }
     if let Some(nd) = finite_nodata
