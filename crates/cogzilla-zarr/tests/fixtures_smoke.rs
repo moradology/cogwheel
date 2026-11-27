@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cogzilla_zarr::{
-    ArrayMeta, DataType, Endianness, FsStore, OpenMode, ZarrError, ZarrHierarchy, ZarrStore,
+    ArrayMeta, SampleType, Endianness, FsStore, OpenMode, ZarrError, ZarrHierarchy, ZarrStore,
     ZarrVersion, decode_chunk_bytes, read_chunk_window, resolve_geo,
 };
 
@@ -34,7 +34,7 @@ fn zarr_fixtures_parse_with_array_meta() {
         assert_eq!(m.version, ZarrVersion::V2);
         assert_eq!(m.shape, vec![128, 128]);
         assert_eq!(m.chunk_shape, vec![64, 64]);
-        assert_eq!(m.dtype, DataType::Float32);
+        assert_eq!(m.dtype, SampleType::Float32);
         assert!(m.fill_value.unwrap().is_nan());
     }
 
@@ -53,7 +53,7 @@ fn zarr_fixtures_parse_with_array_meta() {
         let m = ArrayMeta::from_v3(&meta).unwrap();
         assert_eq!(m.version, ZarrVersion::V3);
         assert_eq!(m.shape, vec![128, 128]);
-        assert_eq!(m.dtype, DataType::Float32);
+        assert_eq!(m.dtype, SampleType::Float32);
     }
 
     // v3 sharded vs unsharded

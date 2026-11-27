@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cogzilla-raster",
     "crates/cogzilla-tiff",
     "crates/cogzilla-codec",
     "crates/cogzilla-proj",

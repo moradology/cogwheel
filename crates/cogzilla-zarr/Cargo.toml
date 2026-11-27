@@ -8,13 +8,14 @@ license.workspace = true
 cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
 cogzilla-proj = { path = "../cogzilla-proj" }
-cogzilla-tiff = { path = "../cogzilla-tiff" }
+cogzilla-raster = { path = "../cogzilla-raster" }
 thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
+cogzilla-tiff = { path = "../cogzilla-tiff" }
 tokio.workspace = true
 
 [lints]

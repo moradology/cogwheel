@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-cogzilla-tiff = { path = "../cogzilla-tiff" }
+cogzilla-raster = { path = "../cogzilla-raster" }
 cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-proj = { path = "../cogzilla-proj" }
 thiserror.workspace = true

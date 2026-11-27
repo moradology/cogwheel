@@ -1,6 +1,6 @@
 //! Unit tests for `cogzilla_kernel::kernel`.
 
-use cogzilla_tiff::SampleType;
+use cogzilla_raster::SampleType;
 
 use super::dem::eval_hillshade_row_clean;
 use super::rgb::{

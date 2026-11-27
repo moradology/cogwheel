@@ -4467,15 +4467,7 @@ async fn resampled_planes(
 /// done with them after (statistics, band math, a picture) starts from there.
 fn in_raster_type(mut planes: Vec<Vec<f32>>, sample_type: SampleType, unscale: bool) -> Vec<Vec<f32>> {
     // A cubic kernel overshoots: the type's own range holds what it can.
-    let range = match sample_type {
-        SampleType::Uint8 => Some((0.0, 255.0)),
-        SampleType::Int8 => Some((-128.0, 127.0)),
-        SampleType::Uint16 => Some((0.0, 65535.0)),
-        SampleType::Int16 => Some((-32768.0, 32767.0)),
-        SampleType::Uint32 => Some((0.0, u32::MAX as f32)),
-        SampleType::Int32 => Some((i32::MIN as f32, i32::MAX as f32)),
-        _ => None,
-    };
+    let range = sample_type.value_range();
     if let (false, Some((low, high))) = (unscale, range) {
         for plane in &mut planes {
             for v in plane.iter_mut() {

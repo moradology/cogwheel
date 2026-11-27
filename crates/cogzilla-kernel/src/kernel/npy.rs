@@ -1,7 +1,7 @@
 //! NumPy v1.0 `.npy` array serialization and retyping.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use cogzilla_tiff::SampleType;
+use cogzilla_raster::SampleType;
 
 /// Encode a 64-byte-aligned NumPy v1.0 `.npy` header for a C-contiguous array of the
 /// dtype `descr` (`<f4`, `|u1`, ...) and of `shape`: the magic, the version, the length of
@@ -39,19 +39,9 @@ pub fn encode_npy_f32_header(bands: usize, height: u32, width: u32) -> Vec<u8> {
 }
 
 /// The NumPy dtype string of a sample type: little-endian, and `|` for the single bytes.
-pub fn npy_descr(kind: SampleType) -> &'static str {
-    match kind {
-        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => "|u1",
-        SampleType::Int8 => "|i1",
-        SampleType::Uint16 => "<u2",
-        SampleType::Int16 => "<i2",
-        SampleType::Uint32 => "<u4",
-        SampleType::Int32 => "<i4",
-        SampleType::Uint64 => "<u8",
-        SampleType::Int64 => "<i8",
-        SampleType::Float32 => "<f4",
-        SampleType::Float64 => "<f8",
-    }
+#[inline(always)]
+pub const fn npy_descr(kind: SampleType) -> &'static str {
+    kind.npy_descr()
 }
 
 fn write_npy_typed_planes(
@@ -76,6 +66,16 @@ fn write_npy_typed_planes(
         }};
     }
     match kind {
+        SampleType::Bool => {
+            for v in data {
+                out.push(u8::from(v != 0.0 && !v.is_nan()));
+            }
+            if let Some(bits) = mask_bits {
+                for there in bits {
+                    out.push(u8::from(there));
+                }
+            }
+        }
         SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => {
             write_planes!(u8, |v: f64| v as u8)
         }
@@ -86,9 +86,45 @@ fn write_npy_typed_planes(
         SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
         SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
         SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
+        SampleType::Float16 => {
+            for v in data {
+                out.extend_from_slice(&f32_to_f16_bits(v as f32).to_le_bytes());
+            }
+            if let Some(bits) = mask_bits {
+                for there in bits {
+                    // Max finite f16 = 65504.0 (0x7BFF), min finite f16 = -65504.0 (0xFBFF).
+                    let bits: u16 = if there { 0x7BFF } else { 0xFBFF };
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+        }
         SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
         SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
     }
+}
+
+/// Convert `f32` to IEEE-754 binary16 bits (clamping infinities to `±65504.0`).
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let clamped = if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-65504.0, 65504.0)
+    };
+    let bits = clamped.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let frac = bits & 0x007F_FFFF;
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m = (frac | 0x0080_0000) >> (1 - exp + 13);
+        return sign | (m as u16);
+    }
+    if exp >= 31 {
+        return sign | 0x7BFF;
+    }
+    sign | ((exp as u16) << 10) | ((frac >> 13) as u16)
 }
 
 /// A `.npy` array of `bands` planes of `height` by `width`, written in the dtype of `kind`

@@ -329,7 +329,7 @@ fn write_geotiff_placed(
 pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
     use cogzilla_tiff::SampleType as T;
     match kind {
-        T::Uint1 | T::Uint4 | T::Uint8 => GeoTiffSample::U8,
+        T::Bool | T::Uint1 | T::Uint4 | T::Uint8 => GeoTiffSample::U8,
         T::Int8 => GeoTiffSample::I8,
         T::Uint16 => GeoTiffSample::U16,
         T::Int16 => GeoTiffSample::I16,
@@ -337,7 +337,7 @@ pub(crate) fn geotiff_sample(kind: cogzilla_tiff::SampleType) -> GeoTiffSample {
         T::Int32 => GeoTiffSample::I32,
         T::Uint64 => GeoTiffSample::U64,
         T::Int64 => GeoTiffSample::I64,
-        T::Float32 => GeoTiffSample::F32,
+        T::Float16 | T::Float32 => GeoTiffSample::F32,
         T::Float64 => GeoTiffSample::F64,
     }
 }
@@ -472,7 +472,7 @@ pub(crate) fn retype_f32_geotiff_with(
         }
         use cogzilla_tiff::SampleType as T;
         match kind {
-            T::Uint1 | T::Uint4 | T::Uint8 => put!(u8, |v: f64| v as u8),
+            T::Bool | T::Uint1 | T::Uint4 | T::Uint8 => put!(u8, |v: f64| v as u8),
             T::Int8 => put!(i8, |v: f64| v as i8),
             T::Uint16 => put!(u16, |v: f64| v as u16),
             T::Int16 => put!(i16, |v: f64| v as i16),
@@ -480,7 +480,7 @@ pub(crate) fn retype_f32_geotiff_with(
             T::Int32 => put!(i32, |v: f64| v as i32),
             T::Uint64 => put!(u64, |v: f64| v as u64),
             T::Int64 => put!(i64, |v: f64| v as i64),
-            T::Float32 => put!(f32, |v: f64| v as f32),
+            T::Float16 | T::Float32 => put!(f32, |v: f64| v as f32),
             T::Float64 => put!(f64, |v: f64| v),
         }
     }))
@@ -549,7 +549,7 @@ pub(crate) fn write_geotiff_typed_f64(
         }
         use cogzilla_tiff::SampleType as T;
         match kind {
-            T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8, true),
+            T::Bool | T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8, true),
             T::Int8 => put_planes!(i8, |v: f64| v as i8, true),
             T::Uint16 => put_planes!(u16, |v: f64| v as u16, true),
             T::Int16 => put_planes!(i16, |v: f64| v as i16, true),
@@ -557,7 +557,7 @@ pub(crate) fn write_geotiff_typed_f64(
             T::Int32 => put_planes!(i32, |v: f64| v as i32, true),
             T::Uint64 => put_planes!(u64, |v: f64| v as u64, true),
             T::Int64 => put_planes!(i64, |v: f64| v as i64, true),
-            T::Float32 => put_planes!(f32, |v: f64| v as f32, false),
+            T::Float16 | T::Float32 => put_planes!(f32, |v: f64| v as f32, false),
             T::Float64 => put_planes!(f64, |v: f64| v, false),
         }
     })
