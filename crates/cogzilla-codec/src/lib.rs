@@ -63,9 +63,6 @@ pub fn compress_brotli(input: &[u8]) -> Result<Vec<u8>, String> {
         writer
             .write_all(input)
             .map_err(|e| format!("brotli compress error: {e}"))?;
-        writer
-            .flush()
-            .map_err(|e| format!("brotli flush error: {e}"))?;
     }
     Ok(out)
 }
