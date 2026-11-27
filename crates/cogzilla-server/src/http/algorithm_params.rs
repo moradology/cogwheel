@@ -7,55 +7,7 @@
 
 use serde_json::Value;
 
-/// How a field is typed: an `int`, a `float`, or a `float` that may be `null`.
-#[derive(Clone, Copy)]
-enum Kind {
-    Int,
-    Float,
-    OptionalFloat,
-}
-
-/// One field of a model: its name, type and bounds, both inclusive.
-struct Field(&'static str, Kind, f64, f64);
-
-/// The model of TiTiler's algorithm `name` (lowercase), with its fields in their order; `None`
-/// for one without parameters.
-fn model(name: &str) -> Option<(&'static str, &'static [Field])> {
-    use Kind::*;
-    Some(match name {
-        "hillshade" => (
-            "HillShade",
-            &[
-                Field("azimuth", Int, 0.0, 360.0),
-                Field("angle_altitude", Float, -90.0, 90.0),
-                Field("buffer", Int, 0.0, 99.0),
-                Field("z_exaggeration", Float, 1e-6, 1e6),
-            ],
-        ),
-        "slope" => ("Slope", &[Field("buffer", Int, 0.0, 99.0), Field("z_exaggeration", Float, 1e-6, 1e6)]),
-        "contours" => (
-            "Contours",
-            &[
-                // TiTiler's is a whole number; a fraction is taken here, for data whose
-                // values lie between whole numbers (reflectance, say).
-                Field("increment", Float, 0.0, 999.0),
-                Field("thickness", Int, 0.0, 10.0),
-                Field("minz", Int, -99999.0, 99999.0),
-                Field("maxz", Int, -99999.0, 99999.0),
-            ],
-        ),
-        "terrarium" => ("Terrarium", &[Field("nodata_height", OptionalFloat, -99999.0, 99999.0)]),
-        "terrainrgb" => (
-            "TerrainRGB",
-            &[
-                Field("interval", Float, 0.0, 1.0),
-                Field("baseval", Float, -99999.0, 99999.0),
-                Field("nodata_height", OptionalFloat, -99999.0, 99999.0),
-            ],
-        ),
-        _ => return None,
-    })
-}
+use crate::algorithms::{ParamDef, ParamKind, lookup_algorithm};
 
 /// A value as Python writes it in pydantic's messages, and the name of its type.
 fn python(v: &Value) -> (String, &'static str) {
@@ -80,10 +32,10 @@ fn bound(x: f64) -> String {
 
 /// The number a field holds, as pydantic's lax mode reads it, or what it says instead: the
 /// message and its error type.
-fn lax(kind: Kind, v: &Value) -> Result<Option<f64>, (String, &'static str)> {
-    let int = matches!(kind, Kind::Int);
+fn lax(kind: ParamKind, v: &Value) -> Result<Option<f64>, (String, &'static str)> {
+    let int = matches!(kind, ParamKind::Int);
     let number = match v {
-        Value::Null if matches!(kind, Kind::OptionalFloat) => return Ok(None),
+        Value::Null if matches!(kind, ParamKind::OptionalFloat) => return Ok(None),
         Value::Null if int => return Err(("Input should be a valid integer".into(), "int_type")),
         Value::Null => return Err(("Input should be a valid number".into(), "float_type")),
         Value::Bool(b) => f64::from(u8::from(*b)),
@@ -106,12 +58,13 @@ fn lax(kind: Kind, v: &Value) -> Result<Option<f64>, (String, &'static str)> {
     Ok(Some(number))
 }
 
-/// What TiTiler's algorithm `name` (lowercase) says of `params`, a JSON object: `Ok` when its
-/// model takes them, else pydantic's message for every field it refuses.
+/// What TiTiler's algorithm `name` (case-insensitive, aliases accepted) says of `params`, a JSON
+/// object: `Ok` when its model takes them, else pydantic's message for every field it refuses.
 pub(crate) fn check(name: &str, params: &serde_json::Map<String, Value>) -> Result<(), String> {
-    let Some((title, fields)) = model(name) else { return Ok(()) };
+    let Some(def) = lookup_algorithm(name) else { return Ok(()) };
+    let Some(title) = def.pydantic_name else { return Ok(()) };
     let mut errors = Vec::new();
-    for Field(key, kind, lo, hi) in fields {
+    for ParamDef { name: key, kind, min: lo, max: hi, .. } in def.params {
         let Some(v) = params.get(*key) else { continue };
         let refused = match lax(*kind, v) {
             Err(refused) => Some(refused),
@@ -134,7 +87,7 @@ pub(crate) fn check(name: &str, params: &serde_json::Map<String, Value>) -> Resu
 /// A parameter's number as pydantic's lax mode reads it (`"45"`, `true`), for the values the
 /// renderer takes; `None` where [`check`] refuses it or the key is not there.
 pub(crate) fn number(params: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
-    lax(Kind::Float, params.get(key)?).ok().flatten()
+    lax(ParamKind::Float, params.get(key)?).ok().flatten()
 }
 
 #[cfg(test)]

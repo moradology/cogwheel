@@ -246,26 +246,9 @@ impl ArrayRule {
 }
 
 /// The type TiTiler's algorithm `name` writes its output in, from the type `read` of the
-/// bands it works on (numpy's rules: `min`, `max` and `grayscale` keep it, `sum` widens
-/// whole numbers to 64 bits, `mean`, `std` and `var` make doubles, `median` keeps float32);
-/// `cast` takes the type asked. `None` for an algorithm TiTiler does not have.
+/// bands it works on (derived from [`crate::algorithms::ALGORITHMS`]).
 fn algorithm_type(name: &str, cast: Option<SampleType>, read: SampleType) -> Option<SampleType> {
-    use SampleType as T;
-    Some(match name {
-        "cast" => cast?,
-        "ceil" | "floor" | "bitonal" | "hillshade" | "contours" | "terrarium" | "terrainrgb" => T::Uint8,
-        "min" | "max" | "grayscale" => read,
-        "sum" => match read {
-            T::Uint1 | T::Uint4 | T::Uint8 | T::Uint16 | T::Uint32 | T::Uint64 => T::Uint64,
-            T::Int8 | T::Int16 | T::Int32 | T::Int64 => T::Int64,
-            T::Float32 | T::Float64 => read,
-        },
-        "mean" | "std" | "var" => T::Float64,
-        "median" if read == T::Float32 => T::Float32,
-        "median" => T::Float64,
-        "normalizedindex" | "slope" => T::Float32,
-        _ => return None,
-    })
+    crate::algorithms::lookup_algorithm(name)?.out_dtype.resolve(cast, read)
 }
 
 #[cfg(test)]

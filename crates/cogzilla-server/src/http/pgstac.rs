@@ -4635,70 +4635,88 @@ enum BandAlgorithm {
     Hillshade { azimuth: f64, altitude: f64, buffer: usize, z: f64 },
     /// Degrees of slope of the first band, the gradient over the grid's pixel size, as float32.
     Slope { buffer: usize, z: f64 },
+    /// Compass aspect in degrees `[0, 360)` of the first band, as float32 (NaN where flat).
+    Aspect { buffer: usize, z: f64 },
     /// The first band rescaled from `minz..maxz` to 1..255 and coloured with `terrain`, black
     /// where `height % increment < thickness`.
     Contours { increment: f64, thickness: f64, minz: f64, maxz: f64 },
 }
 
 impl BandAlgorithm {
-    /// The algorithm of that name with its `algorithm_params`, `Ok(None)` for one statistics do
-    /// not take, and a parameter out of titiler's range an error, as pydantic refuses it.
+    /// The algorithm of that name with its `algorithm_params`, derived exhaustively from
+    /// [`crate::algorithms::ALGORITHMS`]. Returns `Ok(None)` only for an unknown name or
+    /// `normalizedIndex` (handled as band math `(b2 - b1) / (b2 + b1)` by the caller), and an
+    /// error when a parameter is outside TiTiler's pydantic bounds.
     fn parse(name: &str, params: Option<&str>) -> Result<Option<Self>, String> {
+        use crate::algorithms::AlgorithmId;
+        let Some(def) = crate::algorithms::lookup_algorithm(name) else {
+            return Ok(None);
+        };
         let params: Value = params.and_then(|p| serde_json::from_str(p).ok()).unwrap_or(Value::Null);
         let empty = serde_json::Map::new();
         let params = params.as_object().unwrap_or(&empty);
         // TiTiler's models' checks, shared with every route that applies an algorithm; what
         // they take is then read as pydantic's lax mode reads it.
-        super::algorithm_params::check(name, params)?;
+        super::algorithm_params::check(def.name, params)?;
         let number = |key: &str, default: f64| super::algorithm_params::number(params, key).unwrap_or(default);
-        Ok(Some(match name {
-            "min" => Self::Min,
-            "max" => Self::Max,
-            "sum" => Self::Sum,
-            "mean" => Self::Mean,
-            "median" => Self::Median,
-            "std" => Self::Std,
-            "var" => Self::Var,
-            "grayscale" => Self::Grayscale,
-            "bitonal" => Self::Bitonal,
-            "cast" => Self::Cast,
-            "ceil" => Self::Ceil,
-            "floor" => Self::Floor,
-            "terrarium" => Self::Terrarium,
-            "terrainrgb" => Self::TerrainRgb { interval: number("interval", 0.1), baseval: number("baseval", -10000.0) },
-            "hillshade" => Self::Hillshade {
+        Ok(Some(match def.id {
+            AlgorithmId::Min => Self::Min,
+            AlgorithmId::Max => Self::Max,
+            AlgorithmId::Sum => Self::Sum,
+            AlgorithmId::Mean => Self::Mean,
+            AlgorithmId::Median => Self::Median,
+            AlgorithmId::Std => Self::Std,
+            AlgorithmId::Var => Self::Var,
+            AlgorithmId::Grayscale => Self::Grayscale,
+            AlgorithmId::Bitonal => Self::Bitonal,
+            AlgorithmId::Cast => Self::Cast,
+            AlgorithmId::Ceil => Self::Ceil,
+            AlgorithmId::Floor => Self::Floor,
+            AlgorithmId::Terrarium => Self::Terrarium,
+            AlgorithmId::TerrainRgb => {
+                Self::TerrainRgb { interval: number("interval", 0.1), baseval: number("baseval", -10000.0) }
+            }
+            AlgorithmId::Hillshade => Self::Hillshade {
                 azimuth: number("azimuth", 45.0),
                 altitude: number("angle_altitude", 45.0),
                 buffer: number("buffer", 3.0) as usize,
                 z: number("z_exaggeration", 1.0),
             },
-            "slope" => Self::Slope { buffer: number("buffer", 3.0) as usize, z: number("z_exaggeration", 1.0) },
-            "contours" => Self::Contours {
+            AlgorithmId::Slope => Self::Slope {
+                buffer: number("buffer", 3.0) as usize,
+                z: number("z_exaggeration", 1.0),
+            },
+            AlgorithmId::Aspect => Self::Aspect {
+                buffer: number("buffer", 0.0) as usize,
+                z: number("z_exaggeration", 1.0),
+            },
+            AlgorithmId::Contours => Self::Contours {
                 increment: number("increment", 35.0),
                 thickness: number("thickness", 1.0),
                 minz: number("minz", -12000.0),
                 maxz: number("maxz", 8000.0),
             },
-            _ => return Ok(None),
+            // Handled out-of-band as `(b2 - b1) / (b2 + b1)` band math when `expression` is absent.
+            AlgorithmId::NormalizedIndex => return Ok(None),
         }))
     }
 
     /// The pixels read around the grid on every side, and taken off after.
     fn buffer(&self) -> usize {
         match self {
-            Self::Hillshade { buffer, .. } | Self::Slope { buffer, .. } => *buffer,
+            Self::Hillshade { buffer, .. } | Self::Slope { buffer, .. } | Self::Aspect { buffer, .. } => *buffer,
             _ => 0,
         }
     }
 
-    /// Whether a pixel's value comes from its neighbours too (`hillshade`, `slope`).
+    /// Whether a pixel's value comes from its neighbours too (`hillshade`, `slope`, `aspect`).
     fn looks_around(&self) -> bool {
-        matches!(self, Self::Hillshade { .. } | Self::Slope { .. })
+        matches!(self, Self::Hillshade { .. } | Self::Slope { .. } | Self::Aspect { .. })
     }
 
     /// Whether the values are float32, as rio-tiler's statistics then count them.
     fn float32(&self) -> bool {
-        matches!(self, Self::Slope { .. })
+        matches!(self, Self::Slope { .. } | Self::Aspect { .. })
     }
 
     /// The bands after the algorithm, and their descriptions. `whole` says the bands hold
@@ -4816,6 +4834,22 @@ impl BandAlgorithm {
                     })
                     .collect();
                 one(crop(slope, width, height, *buffer), "slope")
+            }
+            Self::Aspect { buffer, z } => {
+                let (down, across) = gradient(&bands[0], width, height)?;
+                let aspect: Vec<f64> = down
+                    .iter()
+                    .zip(&across)
+                    .map(|(y, x)| {
+                        let (dx, dy) = (x * z / pixel.0, y * z / pixel.1);
+                        if !dx.is_finite() || !dy.is_finite() || (dx.abs() < 1e-12 && dy.abs() < 1e-12) {
+                            f64::NAN
+                        } else {
+                            f64::from((-dx).atan2(dy).to_degrees().rem_euclid(360.0) as f32)
+                        }
+                    })
+                    .collect();
+                one(crop(aspect, width, height, *buffer), "aspect")
             }
             Self::Contours { increment, thickness, minz, maxz } => {
                 if n != 1 {
@@ -9555,17 +9589,94 @@ mod tests {
         assert_eq!(names, ["terrain_r", "terrain_g", "terrain_b"]);
         // Terrarium of 100 m: 32868 = 128 * 256 + 100.
         assert_eq!(BandAlgorithm::Terrarium.apply(vec![vec![100.0]], true, 1, (1.0, 1.0)).unwrap().0, [vec![128.0], vec![100.0], vec![0.0]]);
-        assert_eq!(BandAlgorithm::parse("aspect", None), Ok(None));
+        // `aspect` is parsed and applied (matching `cogzilla-kernel::DemAlgorithm::Aspect`).
+        assert_eq!(BandAlgorithm::parse("aspect", None), Ok(Some(BandAlgorithm::Aspect { buffer: 0, z: 1.0 })));
+        assert!(BandAlgorithm::parse("aspect", Some(r#"{"buffer":100}"#)).is_err());
+        // Elevation decreasing Eastward (left=20, mid=10, right=0) -> aspect = 90° (East).
+        let (east, east_names) = BandAlgorithm::Aspect { buffer: 0, z: 1.0 }
+            .apply(vec![vec![20.0, 10.0, 0.0, 20.0, 10.0, 0.0, 20.0, 10.0, 0.0]], false, 3, (1.0, 1.0))
+            .unwrap();
+        assert_eq!(east_names, ["aspect"]);
+        assert!((east[0][4] - 90.0).abs() < 1e-4, "expected 90° East, got {}", east[0][4]);
+        // Elevation increasing Southward (row 0 = 0, row 1 = 10, row 2 = 20) -> downhill is North (0°).
+        let (north, _) = BandAlgorithm::Aspect { buffer: 0, z: 1.0 }
+            .apply(vec![vec![0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0]], false, 3, (1.0, 1.0))
+            .unwrap();
+        assert!(north[0][4].abs() < 1e-4, "expected 0° North, got {}", north[0][4]);
+        // Flat plane -> NaN aspect.
+        let (flat, _) = BandAlgorithm::Aspect { buffer: 0, z: 1.0 }
+            .apply(vec![vec![5.0; 9]], false, 3, (1.0, 1.0))
+            .unwrap();
+        assert!(flat[0][4].is_nan());
         assert!(BandAlgorithm::parse("hillshade", Some(r#"{"azimuth":400}"#)).is_err());
         // A fractional increment is taken, as on the shared routes; one past TiTiler's bound is not.
         assert!(matches!(BandAlgorithm::parse("contours", Some(r#"{"increment":2.5}"#)), Ok(Some(BandAlgorithm::Contours { increment, .. })) if increment == 2.5));
         assert!(BandAlgorithm::parse("contours", Some(r#"{"increment":1000}"#)).is_err());
         assert_eq!(BandAlgorithm::parse("terrainrgb", Some(r#"{"interval":1}"#)), Ok(Some(BandAlgorithm::TerrainRgb { interval: 1.0, baseval: -10000.0 })));
+        assert_eq!(BandAlgorithm::parse("terrain-rgb", None), Ok(Some(BandAlgorithm::TerrainRgb { interval: 0.1, baseval: -10000.0 })));
+        assert_eq!(BandAlgorithm::parse("mapbox", None), Ok(Some(BandAlgorithm::TerrainRgb { interval: 0.1, baseval: -10000.0 })));
         // numpy's gradient: one-sided on the edges, centred inside.
         let (down, across) = gradient(&[0.0, 1.0, 4.0, 2.0, 4.0, 8.0], 3, 2).unwrap();
         assert_eq!(down, [2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
         assert_eq!(across, [1.0, 2.0, 3.0, 2.0, 3.0, 4.0]);
         assert_eq!(crop((0..16).map(f64::from).collect(), 4, 4, 1), [5.0, 6.0, 9.0, 10.0]);
+    }
+
+    #[test]
+    fn every_advertised_algorithm_is_applied_on_both_route_stacks() {
+        use crate::algorithms::{ALGORITHMS, AlgorithmId};
+        use crate::engine::BandRequest;
+        use cogzilla_tiff::SampleType;
+
+        // 8x8 sloped plane so buffered DEM algorithms (default buffer=3 -> 2x2 inner crop) succeed.
+        let plane = |offset: f64| -> Vec<f64> {
+            (0..64).map(|i| offset + (i % 8) as f64 * 10.0 + (i / 8) as f64 * 5.0).collect()
+        };
+        let three_bands = vec![plane(10.0), plane(50.0), plane(100.0)];
+        let one_band = vec![plane(10.0)];
+
+        for def in ALGORITHMS {
+            // 1. COG/STAC route stack (`http.rs::build_band_request`): never silently falls back to raw bands.
+            let pq = super::super::parse_query(Some(&format!("algorithm={}", def.name)));
+            let req = super::super::build_band_request(&pq, 3, SampleType::Float32)
+                .unwrap_or_else(|e| panic!("build_band_request failed for '{}': {e}", def.name));
+            assert!(
+                matches!(
+                    req,
+                    BandRequest::Dem { .. }
+                        | BandRequest::Terrain { .. }
+                        | BandRequest::CustomExpr { .. }
+                        | BandRequest::CustomExprRgb { .. }
+                ),
+                "algorithm '{}' fell through to raw BandRequest: {req:?}",
+                def.name
+            );
+
+            // 2. pgSTAC route stack (`BandAlgorithm::parse` + `apply`, or `normalizedIndex` band-math path).
+            if def.id == AlgorithmId::NormalizedIndex {
+                assert_eq!(BandAlgorithm::parse(def.name, None), Ok(None));
+                let mut pq_ni = super::super::parse_query(Some("assets=red&assets=nir&algorithm=normalizedIndex"));
+                assert!(normalized_index_as_band_math(&mut pq_ni, Some("png")));
+                assert_eq!(pq_ni.expr_raw.as_deref(), Some("(b2-b1)/(b2+b1)"));
+                continue;
+            }
+            let parsed = BandAlgorithm::parse(def.name, None)
+                .unwrap_or_else(|e| panic!("BandAlgorithm::parse failed for '{}': {e}", def.name))
+                .unwrap_or_else(|| panic!("BandAlgorithm::parse silently returned Ok(None) for '{}'", def.name));
+            let input = if def.input_bands == Some(1) { one_band.clone() } else { three_bands.clone() };
+            let (out_bands, _) = parsed
+                .apply(input, false, 8, (1.0, 1.0))
+                .unwrap_or_else(|e| panic!("BandAlgorithm::apply failed for '{}': {e}", def.name));
+            assert!(!out_bands.is_empty(), "algorithm '{}' produced 0 bands", def.name);
+            if let Some(expected_nb) = def.out_bands {
+                assert_eq!(
+                    out_bands.len(),
+                    usize::from(expected_nb),
+                    "algorithm '{}' output band count mismatch",
+                    def.name
+                );
+            }
+        }
     }
 
     #[test]

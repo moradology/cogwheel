@@ -1016,12 +1016,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     // halo seamlessly, subtract that crop from `pq.buffer` so `?algorithm=hillshade&buffer=3`
     // and `?algorithm=slope&buffer=3` are 256×256, as there. Aspect (cogzilla's own) crops none.
     if pq.buffer > 0.0
-        && let Some(alg) = pq.algorithm.as_deref()
-        && (alg.eq_ignore_ascii_case("hillshade")
-            || alg.eq_ignore_ascii_case("slope")
-            || alg.eq_ignore_ascii_case("aspect"))
+        && let Some(default_crop) = pq
+            .algorithm
+            .as_deref()
+            .and_then(crate::algorithms::lookup_algorithm)
+            .and_then(|def| def.dem_margin)
     {
-        let default_crop = if alg.eq_ignore_ascii_case("aspect") { 0.0 } else { 3.0 };
         let crop = pq.alg_buffer.unwrap_or(default_crop).min(pq.buffer);
         pq.buffer = (pq.buffer - crop).max(0.0);
     }
@@ -1102,11 +1102,13 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         return Err(e.clone());
     }
     if let Some(alg) = pq.algorithm.as_deref()
-        && !crate::titiler::is_supported_algorithm(alg) {
-            return Err(format!(
-                "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
-            ));
-        }
+        && !crate::algorithms::is_supported_algorithm(alg)
+    {
+        return Err(format!(
+            "algorithm '{alg}' is not supported (supported: {})",
+            crate::algorithms::supported_algorithms_display()
+        ));
+    }
 
     // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html,
     // {family}/{tms}/WMTSCapabilities.xml
@@ -2979,22 +2981,23 @@ fn build_band_request(
     default_bands: u16,
     sample_type: cogzilla_tiff::SampleType,
 ) -> Result<BandRequest, EngineError> {
-    if let Some(alg) = pq.algorithm.as_deref() {
+    if let Some(def) = pq.algorithm.as_deref().and_then(crate::algorithms::lookup_algorithm) {
+        use crate::algorithms::AlgorithmId;
         let band_1based = pq.bidx.first().copied().unwrap_or(1);
-        match alg {
-            "terrarium" => {
+        match def.id {
+            AlgorithmId::Terrarium => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::Terrarium,
                 });
             }
-            "terrainrgb" | "terrain-rgb" | "mapbox" => {
+            AlgorithmId::TerrainRgb => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::TerrainRgb,
                 });
             }
-            "hillshade" => {
+            AlgorithmId::Hillshade => {
                 let rescale = pq.rescale.first().copied().unwrap_or((0.0, 255.0));
                 let colormap = if pq.colormap_explicit {
                     pq.colormap
@@ -3012,7 +3015,7 @@ fn build_band_request(
                     colormap,
                 });
             }
-            "slope" => {
+            AlgorithmId::Slope => {
                 let rescale = pq.rescale.first().copied().unwrap_or((0.0, 90.0));
                 return Ok(BandRequest::Dem {
                     band_1based,
@@ -3023,7 +3026,7 @@ fn build_band_request(
                     colormap: pq.colormap,
                 });
             }
-            "aspect" => {
+            AlgorithmId::Aspect => {
                 let rescale = pq.rescale.first().copied().unwrap_or((0.0, 360.0));
                 return Ok(BandRequest::Dem {
                     band_1based,
@@ -3032,7 +3035,7 @@ fn build_band_request(
                     colormap: pq.colormap,
                 });
             }
-            "contours" => {
+            AlgorithmId::Contours => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::Contours {
@@ -3043,8 +3046,21 @@ fn build_band_request(
                     },
                 });
             }
-            "normalizedindex" | "cast" | "ceil" | "floor" | "min" | "max" | "median" | "mean"
-            | "std" | "var" | "sum" | "grayscale" | "bitonal" => {
+            AlgorithmId::NormalizedIndex
+            | AlgorithmId::Cast
+            | AlgorithmId::Ceil
+            | AlgorithmId::Floor
+            | AlgorithmId::Min
+            | AlgorithmId::Max
+            | AlgorithmId::Median
+            | AlgorithmId::Mean
+            | AlgorithmId::Std
+            | AlgorithmId::Var
+            | AlgorithmId::Sum
+            | AlgorithmId::Grayscale
+            | AlgorithmId::Bitonal => {
+                let alg_lower = def.name.to_ascii_lowercase();
+                let alg = alg_lower.as_str();
                 let bands: Vec<u16> = if !pq.bidx.is_empty() {
                     pq.bidx.clone()
                 } else {
@@ -3052,7 +3068,7 @@ fn build_band_request(
                 };
                 let whole = algorithm_math::whole_numbers(sample_type, pq.unscale);
                 let source_range = default_rescale_for_dtype(sample_type, true);
-                if matches!(alg, "cast" | "ceil" | "floor") && bands.len() >= 3 {
+                if matches!(def.id, AlgorithmId::Cast | AlgorithmId::Ceil | AlgorithmId::Floor) && bands.len() >= 3 {
                     // Each of the first three bands, as an RGB picture.
                     let one = |b: u16| -> Result<(ExprProgram, (f32, f32)), EngineError> {
                         let (expr, range) = algorithm_math::integer_band(alg, b, whole, pq.cast_dtype.as_deref());
@@ -3070,13 +3086,13 @@ fn build_band_request(
                 }
                 let expr_str = algorithm_math::band_math(alg, &bands, whole, pq.cast_dtype.as_deref(), pq.threshold)
                     .map_err(EngineError::BadRequest)?;
-                let default_rescale = match alg {
-                    "normalizedindex" => (-1.0, 1.0),
-                    "cast" | "ceil" | "floor" => {
+                let default_rescale = match def.id {
+                    AlgorithmId::NormalizedIndex => (-1.0, 1.0),
+                    AlgorithmId::Cast | AlgorithmId::Ceil | AlgorithmId::Floor => {
                         algorithm_math::integer_band(alg, bands[0], whole, pq.cast_dtype.as_deref()).1.unwrap_or(source_range)
                     }
-                    "bitonal" => (0.0, 255.0),
-                    "sum" => (source_range.0, source_range.1 * bands.len() as f32),
+                    AlgorithmId::Bitonal => (0.0, 255.0),
+                    AlgorithmId::Sum => (source_range.0, source_range.1 * bands.len() as f32),
                     _ => source_range,
                 };
                 let prog = ExprProgram::compile(&expr_str).map_err(EngineError::BadRequest)?;
@@ -3087,7 +3103,6 @@ fn build_band_request(
                     colormap: pq.colormap,
                 });
             }
-            _ => {}
         }
     }
     if let Some(raw_expr) = &pq.expr_raw {
@@ -8534,10 +8549,8 @@ where
                     pgstac::check_item_statistics_expression(expression, &bands, pq.asset_as_band, selected)?;
                 }
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
-                    matches!(
-                        a.to_ascii_lowercase().as_str(),
-                        "hillshade" | "slope" | "aspect" | "contours" | "terrarium" | "terrainrgb" | "terrain-rgb" | "mapbox"
-                    )
+                    crate::algorithms::lookup_algorithm(a)
+                        .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
                 });
                 if is_dem_alg {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
@@ -8778,10 +8791,8 @@ where
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
 
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
-                    matches!(
-                        a.to_ascii_lowercase().as_str(),
-                        "hillshade" | "slope" | "aspect" | "contours" | "terrarium" | "terrainrgb" | "terrain-rgb" | "mapbox"
-                    )
+                    crate::algorithms::lookup_algorithm(a)
+                        .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
                 });
                 let post_expr_progs: Option<Vec<(String, ExprProgram)>> = if let Some(ref expr_str) = rewritten_expr {
                     let parts: Vec<&str> = expr_str.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
@@ -8834,10 +8845,9 @@ where
                                 let mut bands = build_band_request(&pq_clone, db, full.sample_type)?;
                                 if mask.is_empty() {
                                     let alg_name = alg_c.as_deref().unwrap_or("algorithm");
-                                    let nb = match alg_name {
-                                        "terrarium" | "terrainrgb" | "terrain-rgb" | "mapbox" => 3,
-                                        _ => 1,
-                                    };
+                                    let nb = crate::algorithms::lookup_algorithm(alg_name)
+                                        .and_then(|d| d.out_bands)
+                                        .unwrap_or(1) as usize;
                                     let mut map = serde_json::Map::new();
                                     for b in 0..nb {
                                         let desc = if nb == 1 {
@@ -10462,10 +10472,8 @@ where
                 let full = cogs[0].index.full_res();
                 let db = data_band_count(full);
                 let is_dem_alg = pq.algorithm.as_deref().is_some_and(|a| {
-                    matches!(
-                        a.to_ascii_lowercase().as_str(),
-                        "hillshade" | "slope" | "aspect" | "contours" | "terrarium" | "terrainrgb" | "terrain-rgb" | "mapbox"
-                    )
+                    crate::algorithms::lookup_algorithm(a)
+                        .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
                 });
                 if is_dem_alg {
                     let crs = engine.get_or_build_crs(&cogs[0])?;
