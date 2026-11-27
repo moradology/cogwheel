@@ -150,6 +150,27 @@ pub enum SourceFreshness {
     Cloud,
 }
 
+impl SourceFreshness {
+    /// Independent copy of these validators (fresh atomics and lock) for a derived view.
+    fn snapshot(&self) -> Self {
+        match self {
+            SourceFreshness::Local { path, len, mtime, inode } => SourceFreshness::Local {
+                path: path.clone(),
+                len: *len,
+                mtime: *mtime,
+                inode: *inode,
+            },
+            SourceFreshness::Remote { validator, opened_at, last_checked_ms, .. } => SourceFreshness::Remote {
+                validator: validator.clone(),
+                opened_at: *opened_at,
+                last_checked_ms: AtomicU64::new(last_checked_ms.load(Ordering::Relaxed)),
+                revalidate_lock: tokio::sync::Mutex::new(()),
+            },
+            SourceFreshness::Cloud => SourceFreshness::Cloud,
+        }
+    }
+}
+
 pub struct OpenedCog {
     pub id: u64,
     pub uri: String,
@@ -241,6 +262,8 @@ pub struct CogStore {
     next_id: AtomicU64,
     datasets_by_name: DashMap<String, Arc<OpenedCog>, ahash::RandomState>,
     datasets_by_uri: DashMap<String, OpenSlot, ahash::RandomState>,
+    /// `?nodata=` views keyed by `(parent OpenedCog::id, override bits)`; see [`CogStore::with_nodata`].
+    nodata_views: DashMap<(u64, u32), Arc<OpenedCog>, ahash::RandomState>,
     max_open_uris: usize,
     uri_clock: AtomicU64,
     evicting_uris: AtomicBool,
@@ -413,6 +436,7 @@ impl CogStore {
             next_id: AtomicU64::new(1),
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
             datasets_by_uri: DashMap::with_hasher(ahash::RandomState::new()),
+            nodata_views: DashMap::with_hasher(ahash::RandomState::new()),
             max_open_uris: max_open_uris.max(1),
             uri_clock: AtomicU64::new(0),
             evicting_uris: AtomicBool::new(false),
@@ -591,6 +615,42 @@ impl CogStore {
         Ok(cog)
     }
 
+    /// The COG as read with `nodata` in place of its own `GDAL_NODATA` (GDAL's nodata override,
+    /// which TiTiler's `?nodata=` is): pixels equal to `nodata` are masked and pixels equal to
+    /// the file's own nodata become valid data. Returns `cog` itself when there is no override or
+    /// it matches the file's nodata. The view has its own id, so its decoded blocks are cached
+    /// apart from the file's; views are kept per `(cog, nodata)` and dropped in bulk past a bound.
+    pub fn with_nodata(&self, cog: &Arc<OpenedCog>, nodata: Option<f32>) -> Arc<OpenedCog> {
+        const MAX_NODATA_VIEWS: usize = 256;
+        let Some(nd) = nodata else { return cog.clone() };
+        // NaN is no data whatever the file says, so a NaN override over no nodata is no change.
+        let same = match cog.index.nodata {
+            Some(own) => own.to_bits() == nd.to_bits() || (own.is_nan() && nd.is_nan()),
+            None => nd.is_nan(),
+        };
+        if same {
+            return cog.clone();
+        }
+        let key = (cog.id, if nd.is_nan() { f32::NAN.to_bits() } else { nd.to_bits() });
+        if let Some(v) = self.nodata_views.get(&key) {
+            return v.clone();
+        }
+        if self.nodata_views.len() >= MAX_NODATA_VIEWS {
+            self.nodata_views.clear();
+        }
+        let mut index = cog.index.clone();
+        index.nodata = Some(nd);
+        index.nodata_f64 = Some(f64::from(nd));
+        let view = Arc::new(OpenedCog {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            uri: cog.uri.clone(),
+            index,
+            source: cog.source.clone(),
+            freshness: cog.freshness.snapshot(),
+        });
+        self.nodata_views.entry(key).or_insert(view).clone()
+    }
+
     pub fn get_registered(&self, name: &str) -> Option<Arc<OpenedCog>> {
         self.datasets_by_name.get(name).map(|v| v.clone())
     }
@@ -620,6 +680,7 @@ impl CogStore {
     pub fn clear_open_uris(&self) {
         self.datasets_by_uri
             .retain(|_, slot| matches!(slot, OpenSlot::InFlight(_)));
+        self.nodata_views.clear();
         self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(ref dc) = self.disk_cache {
             dc.clear();

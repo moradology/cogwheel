@@ -2147,7 +2147,7 @@ impl Window {
     ) -> Result<(Vec<Vec<f32>>, SampleType), EngineError> {
         let (bbox, mercator, width, height, size, mask, unscale) = match self {
             Window::Tile(request) => {
-                let cog = engine.store.open_uri(href).await?;
+                let cog = engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, nodata))?;
                 let crs = engine.get_or_build_crs(&cog)?;
                 let resample = if matches!(crs, CrsModel::Epsg3857) { resampling } else { reproject };
                 let Some(res) = warped_resolution(&crs, &cog, true).filter(|_| resample == ResampleMode::Nearest) else {
@@ -2208,7 +2208,7 @@ impl Window {
             }
             Window::Part { bbox, mercator, width, height, size, mask, unscale } => (*bbox, *mercator, *width, *height, *size, mask, *unscale),
         };
-        let cog = engine.store.open_uri(href).await?;
+        let cog = engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, nodata))?;
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
         let wanted = TileEngine::wanted_bands(full.samples_per_pixel, full.extra_samples.len(), bands_1based)?;
@@ -3258,7 +3258,7 @@ async fn part_image_of(
         // Assets that do not lie on one grid cannot be read as the bands of one image.
         let mut first = Vec::with_capacity(scenes[0].len());
         for href in &scenes[0] {
-            first.push(engine.store.open_uri(href).await?);
+            first.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, pq.nodata))?);
         }
         // A raster with an alpha band is the renderer's too: it reads the alpha as the mask.
         // So is one of two bands, or four and more, asked for plainly: it draws the first,
@@ -3330,7 +3330,7 @@ async fn part_image_of(
         for (n, scene) in scenes.iter().enumerate() {
             let mut cogs = Vec::with_capacity(scene.len());
             for href in scene {
-                cogs.push(engine.store.open_uri(href).await?);
+                cogs.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, pq.nodata))?);
             }
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
@@ -4571,7 +4571,7 @@ async fn feature_statistics(
         for (name, hrefs) in scenes {
             let mut cogs = Vec::with_capacity(hrefs.len());
             for href in &hrefs {
-                cogs.push(engine.store.open_uri(href).await?);
+                cogs.push(engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, req.nodata))?);
             }
             let mut planes: Vec<Vec<f64>> = Vec::new();
             let mut names: Vec<String> = Vec::new();
@@ -5097,7 +5097,7 @@ async fn point_values(
             let mut values = Vec::new();
             let mut descriptions = Vec::new();
             for (spec, href) in &hrefs {
-                let cog = engine.store.open_uri(href).await?;
+                let cog = engine.store.open_uri(href).await.map(|c| engine.store.with_nodata(&c, nodata))?;
                 let pt = match query_point(&engine, &cog, lon, lat, unscale, nodata).await {
                     Ok(pt) => pt,
                     // The item's footprint holds the point but this raster does not.
