@@ -681,12 +681,60 @@ pub fn build_openapi_spec() -> Value {
         ], "application/json") }),
     );
 
+    // Zarr family + Zarr-specific introspection & validation routes
+    add_family_routes(&mut paths, "/zarr", "Zarr", "Zarr store URL", false, false);
+    paths.insert(
+        "/zarr/validate".into(),
+        json!({ "get": op("Zarr", "Validate Zarr v2/v3 structure, codecs, sharding, regularity and CRS", vec![
+            q_str("url", true, "Zarr store URL"),
+            q_str("variable", false, "Variable name"),
+            q_str("group", false, "Group subtree path"),
+        ], "application/json") }),
+    );
+    paths.insert(
+        "/zarr/dataset/".into(),
+        json!({ "get": op("Zarr", "List data variables in a Zarr store or group", vec![
+            q_str("url", true, "Zarr store URL"),
+            q_str("group", false, "Group subtree path"),
+        ], "application/json") }),
+    );
+    paths.insert(
+        "/zarr/dataset/keys".into(),
+        json!({ "get": op("Zarr", "List data variable keys in a Zarr store or group", vec![
+            q_str("url", true, "Zarr store URL"),
+            q_str("group", false, "Group subtree path"),
+        ], "application/json") }),
+    );
+    paths.insert(
+        "/zarr/dataset/dict".into(),
+        json!({ "get": op("Zarr", "Return xarray-style dataset dictionary (dims, attrs, coords, data_vars)", vec![
+            q_str("url", true, "Zarr store URL"),
+            q_str("group", false, "Group subtree path"),
+        ], "application/json") }),
+    );
+    paths.insert(
+        "/zarr/dataset/dimensions".into(),
+        json!({ "get": op("Zarr", "Return dimension names and sizes for a Zarr store or group", vec![
+            q_str("url", true, "Zarr store URL"),
+            q_str("group", false, "Group subtree path"),
+        ], "application/json") }),
+    );
+    paths.insert(
+        "/zarr/dataset/coordinates/{name}".into(),
+        json!({ "get": op("Zarr", "Return 1-D coordinate array values (with optional CF time decoding)", vec![
+            path_param("name", "string", "Coordinate array name"),
+            q_str("url", true, "Zarr store URL"),
+            q_str("group", false, "Group subtree path"),
+            q_bool("decode_times", false, "Decode CF time coordinates to ISO-8601 (default true)"),
+        ], "application/json") }),
+    );
+
     json!({
         "openapi": "3.1.0",
         "info": {
             "title": "cogzilla",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG, STAC & MosaicJSON tile server"
+            "description": "Zero-GDAL Rust + SIMD drop-in TiTiler COG, STAC, MosaicJSON & Zarr tile server"
         },
         "paths": Value::Object(paths),
         "components": {

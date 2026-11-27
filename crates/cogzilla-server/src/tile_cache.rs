@@ -236,6 +236,30 @@ impl TileCache {
         }
     }
 
+    /// Look up an encoded tile directly in the ready micro-cache.
+    pub fn get(&self, key: &str) -> Option<CachedTile> {
+        if self.max_bytes == 0 {
+            return None;
+        }
+        let entry = self.ready.get(key)?;
+        entry.last_used.store(self.tick(), Ordering::Relaxed);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(entry.tile.clone())
+    }
+
+    /// Insert a rendered encoded tile into the ready micro-cache, respecting `max_bytes` and LRU eviction.
+    pub fn insert(&self, key: String, bytes: Bytes, content_type: &'static str) {
+        if self.max_bytes == 0 {
+            return;
+        }
+        let tile = CachedTile {
+            bytes,
+            content_type,
+            etag: None,
+        };
+        self.insert_ready(key, tile);
+    }
+
     /// Execute `render_fn` with request-level singleflight deduplication and optional LRU caching.
     pub async fn get_or_render<F, Fut>(
         &self,

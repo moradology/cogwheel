@@ -715,10 +715,20 @@ pub(crate) async fn handle_zarr_request(
         }
         (Method::GET, [tms, "WMTSCapabilities.xml"]) => handle_wmts(&q, tms, host, raw_query).await,
         (Method::GET, ["tiles", tms, zs, xs, ys]) => {
-            handle_tile(&q, tms, zs, xs, ys, raw_query, if_none_match).await
+            handle_tile(_engine, &q, tms, zs, xs, ys, raw_query, if_none_match).await
         }
         (Method::GET, ["tiles", zs, xs, ys]) => {
-            handle_tile(&q, "WebMercatorQuad", zs, xs, ys, raw_query, if_none_match).await
+            handle_tile(
+                _engine,
+                &q,
+                "WebMercatorQuad",
+                zs,
+                xs,
+                ys,
+                raw_query,
+                if_none_match,
+            )
+            .await
         }
         (Method::GET, ["point", coords]) => handle_point(&q, &percent_decode(coords)).await,
         (Method::GET, ["preview"]) => handle_preview(&q, None, None, raw_query, if_none_match).await,
@@ -1542,7 +1552,9 @@ fn build_general_tile_plan<const N: usize>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tile(
+    engine: &Arc<TileEngine>,
     q: &ZarrQuery,
     tms_id: &str,
     zs: &str,
@@ -1624,6 +1636,17 @@ async fn handle_tile(
 
     let caps = ZarrCaps::from_env();
     let etag_key = format!("zarr:tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
+    let tile_cache_key = format!("zarr_tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
+
+    // Fast warm-tile cache hit (keyed by store validator so mutated stores never serve stale tiles).
+    if let Some(cached) = engine.tile_cache.get(&tile_cache_key) {
+        return Ok(binary_ok_with_etag(
+            cached.bytes.clone(),
+            content_type,
+            &etag_key,
+            if_none_match,
+        ));
+    }
 
     // Fast path for standard 256x256 and 512x512 tiles directly through `render_single_band`
     if tile_size == 256 {
@@ -1684,6 +1707,7 @@ async fn handle_tile(
         } else {
             render_single_band::<256>(&plan, &src, &style)
         };
+        engine.tile_cache.insert(tile_cache_key, body.clone(), content_type);
         return Ok(binary_ok_with_etag(body, content_type, &etag_key, if_none_match));
     }
 
