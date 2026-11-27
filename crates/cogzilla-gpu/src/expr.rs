@@ -230,7 +230,7 @@ impl GpuExprRenderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-expr-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/expr.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::EXPR_WGSL.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

@@ -39,22 +39,7 @@ struct GpuInstr {
 @group(0) @binding(5) var<storage, read> lut_u32: array<u32>;
 @group(0) @binding(6) var<storage, read_write> dst_words: array<u32>;
 
-const PI: f32 = 3.14159265358979323846;
 const INV_LN10: f32 = 0.4342944819032518;
-
-fn nan_f32() -> f32 {
-    return bitcast<f32>(0x7fc00000u);
-}
-
-fn is_nan_f32(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    return ((bits & 0x7f800000u) == 0x7f800000u) && ((bits & 0x007fffffu) != 0u);
-}
-
-fn is_finite_f32(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    return (bits & 0x7f800000u) != 0x7f800000u;
-}
 
 fn sample_checked(band: u32, x: i32, y: i32) -> f32 {
     if (x < 0 || y < 0 || x >= i32(params.src_w) || y >= i32(params.src_h)) {
@@ -94,17 +79,6 @@ fn sample_bilinear_raw(band: u32, u: f32, v: f32) -> f32 {
     return nan_f32();
 }
 
-fn cubic_weights(t: f32) -> vec4<f32> {
-    let t2 = t * t;
-    let t3 = t2 * t;
-    return vec4<f32>(
-        (-0.5 * t3) + t2 - (0.5 * t),
-        (1.5 * t3) - (2.5 * t2) + 1.0,
-        (-1.5 * t3) + (2.0 * t2) + (0.5 * t),
-        (0.5 * t3) - (0.5 * t2),
-    );
-}
-
 fn sample_cubic(band: u32, u: f32, v: f32) -> f32 {
     if (!is_finite_f32(u) || !is_finite_f32(v)
         || u < -2.0 || v < -2.0
@@ -133,19 +107,6 @@ fn sample_cubic(band: u32, u: f32, v: f32) -> f32 {
         acc += row_acc * wy[j];
     }
     return acc;
-}
-
-fn lanczos3_weight(x: f32) -> f32 {
-    let ax = abs(x);
-    if (ax < 1e-6) {
-        return 1.0;
-    }
-    if (ax >= 3.0) {
-        return 0.0;
-    }
-    let px = PI * ax;
-    let px3 = px * (1.0 / 3.0);
-    return (sin(px) / px) * (sin(px3) / px3);
 }
 
 fn sample_lanczos3(band: u32, u: f32, v: f32) -> f32 {
@@ -410,62 +371,6 @@ fn eval_expr_vm(u: f32, v: f32) -> f32 {
         bvals[b] = sample_band(b, u, v);
     }
     return eval_expr_vm_range(&bvals, 0u, params.num_instrs);
-}
-
-fn eval_uv(px: u32, py: u32) -> vec2<f32> {
-    if (params.coord_mode == 0u) {
-        return vec2<f32>(u_coords[px], v_coords[py]);
-    }
-    if (params.coord_mode == 2u) {
-        let idx = py * params.dst_w + px;
-        return vec2<f32>(u_coords[idx], v_coords[idx]);
-    }
-    if (params.coord_mode == 3u) {
-        let idx = py * params.dst_w + px;
-        let word = bitcast<u32>(v_coords[idx >> 5u]);
-        if ((word & (1u << (idx & 31u))) == 0u) {
-            return vec2<f32>(nan_f32(), nan_f32());
-        }
-        return vec2<f32>(u_coords[px], u_coords[params.dst_w + py]);
-    }
-    if (params.coord_mode == 4u) {
-        let idx = py * params.dst_w + px;
-        let word = bitcast<u32>(v_coords[idx >> 5u]);
-        if ((word & (1u << (idx & 31u))) == 0u) {
-            return vec2<f32>(nan_f32(), nan_f32());
-        }
-        let gx_f = f32(px) * 16.0 / f32(params.dst_w);
-        let gy_f = f32(py) * 16.0 / f32(params.dst_h);
-        let gx0 = min(u32(gx_f), 15u);
-        let gy0 = min(u32(gy_f), 15u);
-        let fx = gx_f - f32(gx0);
-        let fy = gy_f - f32(gy0);
-        let i00 = gy0 * 17u + gx0;
-        let i10 = i00 + 1u;
-        let i01 = i00 + 17u;
-        let i11 = i01 + 1u;
-        let u0 = u_coords[i00] + (u_coords[i10] - u_coords[i00]) * fx;
-        let u1 = u_coords[i01] + (u_coords[i11] - u_coords[i01]) * fx;
-        let v0 = u_coords[289u + i00] + (u_coords[289u + i10] - u_coords[289u + i00]) * fx;
-        let v1 = u_coords[289u + i01] + (u_coords[289u + i11] - u_coords[289u + i01]) * fx;
-        return vec2<f32>(u0 + (u1 - u0) * fy, v0 + (v1 - v0) * fy);
-    }
-    // Grid2D (17x17 coarse warp grid matching cogzilla-proj::CoordPlan::Grid2D)
-    let gx_f = f32(px) * 16.0 / f32(params.dst_w);
-    let gy_f = f32(py) * 16.0 / f32(params.dst_h);
-    let gx0 = min(u32(gx_f), 15u);
-    let gy0 = min(u32(gy_f), 15u);
-    let fx = gx_f - f32(gx0);
-    let fy = gy_f - f32(gy0);
-    let i00 = gy0 * 17u + gx0;
-    let i10 = i00 + 1u;
-    let i01 = i00 + 17u;
-    let i11 = i01 + 1u;
-    let u0 = u_coords[i00] + (u_coords[i10] - u_coords[i00]) * fx;
-    let u1 = u_coords[i01] + (u_coords[i11] - u_coords[i01]) * fx;
-    let v0 = v_coords[i00] + (v_coords[i10] - v_coords[i00]) * fx;
-    let v1 = v_coords[i01] + (v_coords[i11] - v_coords[i01]) * fx;
-    return vec2<f32>(u0 + (u1 - u0) * fy, v0 + (v1 - v0) * fy);
 }
 
 @compute @workgroup_size(16, 16, 1)

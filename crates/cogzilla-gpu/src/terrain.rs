@@ -77,7 +77,7 @@ impl GpuTerrainRenderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-terrain-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::TERRAIN_WGSL.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

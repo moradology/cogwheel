@@ -103,72 +103,19 @@ impl GpuStatsReducer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-stats-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/stats.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::STATS_WGSL.into()),
         });
 
+        use crate::wgpu_util::{bgl_storage_ro, bgl_storage_rw, bgl_uniform};
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cogzilla-stats-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                bgl_uniform(0),
+                bgl_storage_ro(1),
+                bgl_storage_rw(2),
+                bgl_storage_rw(3),
+                bgl_storage_rw(4),
+                bgl_storage_rw(5),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

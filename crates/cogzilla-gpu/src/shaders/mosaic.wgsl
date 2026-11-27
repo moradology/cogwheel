@@ -25,15 +25,6 @@ struct MosaicParams {
 @group(0) @binding(2) var<storage, read> cmap_lut: array<u32>;
 @group(0) @binding(3) var<storage, read_write> dst_words: array<u32>;
 
-fn nan_f32() -> f32 {
-    return bitcast<f32>(0x7fc00000u);
-}
-
-fn is_finite_f32(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    return (bits & 0x7f800000u) != 0x7f800000u;
-}
-
 fn select_pixel_at(base_off: u32, px_idx: u32) -> f32 {
     let n = min(params.num_scenes, 32u);
 
