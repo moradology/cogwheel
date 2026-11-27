@@ -585,7 +585,7 @@ pub fn get_algorithm_json(id: &str) -> Result<serde_json::Value, EngineError> {
             "inputs": { "nbands": 1 },
             "outputs": { "nbands": 1, "dtype": "float32", "min": [0.0], "max": [90.0] },
             "parameters": {
-                "buffer": { "default": 0, "description": "Buffer size for edge effects", "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
+                "buffer": { "default": 3, "description": "Buffer size for edge effects", "maximum": 99, "minimum": 0, "title": "Buffer", "type": "integer" },
                 "z_exaggeration": { "default": 1.0, "maximum": 1000000.0, "minimum": 1e-6, "title": "Z Exaggeration", "type": "number" }
             }
         }),
@@ -7618,46 +7618,12 @@ async fn render_bbox_core(
             .collect()
     };
 
-    let dst_is_merc = matches!(
-        dst_crs,
-        cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator
-    );
-    let dst_is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
-    let dst_unit_m = dst_crs.linear_unit_metres();
-    let dst_center_lat = if dst_is_merc {
-        dst_crs.to_lonlat_deg(cx, cy).1
-    } else {
-        0.5 * (bbox[1] + bbox[3])
-    };
     let native_dem_dxy: Option<(f32, f32)> = if native_preview {
         let full = primary.index.full_res();
         let rx = full.pixel_to_crs.a.hypot(full.pixel_to_crs.d) * (full.width as f64) / (w as f64);
         let ry = full.pixel_to_crs.b.hypot(full.pixel_to_crs.e) * (full.height as f64) / (h as f64);
-        let (dx_m, dy_m) = match &crs {
-            cogzilla_proj::CrsModel::Geographic => {
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                (
-                    (rx * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
-                    (ry * 111_320.0).max(1e-3) as f32,
-                )
-            }
-            cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator => {
-                let lat_rad = (0.5 * (bbox[1] + bbox[3])).to_radians();
-                let cos_lat = lat_rad.cos().max(0.05);
-                (
-                    (rx * cos_lat).max(1e-3) as f32,
-                    (ry * cos_lat).max(1e-3) as f32,
-                )
-            }
-            other => {
-                let unit_m = other.linear_unit_metres();
-                (
-                    (rx * unit_m).max(1e-3) as f32,
-                    (ry * unit_m).max(1e-3) as f32,
-                )
-            }
-        };
-        Some((dx_m, dy_m))
+        // In the raster's own units, as TiTiler divides by the transform's pixel size.
+        Some((rx.max(1e-9) as f32, ry.max(1e-9) as f32))
     } else {
         None
     };
@@ -7921,28 +7887,10 @@ async fn render_bbox_core(
             ring
         };
 
-        let dem_inv_8dxy = || -> (f32, f32) {
-            let (dx_m, dy_m) = if let Some(dxy) = native_dem_dxy {
-                dxy
-            } else if dst_is_merc {
-                let cos_lat = dst_center_lat.to_radians().cos().max(0.05);
-                (
-                    (dlx.abs() * cos_lat).max(1e-3) as f32,
-                    (dly.abs() * cos_lat).max(1e-3) as f32,
-                )
-            } else if dst_is_geo {
-                let lat_rad = dst_center_lat.to_radians();
-                (
-                    (dlx.abs() * 111_320.0 * lat_rad.cos().max(0.05)).max(1e-3) as f32,
-                    (dly.abs() * 111_320.0).max(1e-3) as f32,
-                )
-            } else {
-                (
-                    (dlx.abs() * dst_unit_m).max(1e-3) as f32,
-                    (dly.abs() * dst_unit_m).max(1e-3) as f32,
-                )
-            };
-            (1.0 / (8.0 * dx_m), 1.0 / (8.0 * dy_m))
+        // The DEM grid's pixel size in its own system's units (degrees on a grid in degrees),
+        // as TiTiler's slope divides by the transform's pixel size.
+        let dem_dxy = || -> (f32, f32) {
+            native_dem_dxy.unwrap_or(((dlx.abs()).max(1e-9) as f32, (dly.abs()).max(1e-9) as f32))
         };
 
         // Real RawF32 / Npy output for single-band / expression / DEM / Terrain / RGB requests
@@ -8033,9 +7981,7 @@ async fn render_bbox_core(
                         } => {
                             let refs = get_band_refs(*band_1based, 0);
                             let src = make_src!(&refs);
-                            let (inv_8dx, inv_8dy) = dem_inv_8dxy();
-                            let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
-                            let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                            let (dx_m, dy_m) = dem_dxy();
                             let (cid, b0) = single_band_key(*band_1based);
                             gpu.try_render_bbox_dem_stats(
                                 cid,
@@ -8113,9 +8059,7 @@ async fn render_bbox_core(
                     } => {
                         let refs = get_band_refs(*band_1based, 0);
                         let src = make_src!(&refs);
-                        let (inv_8dx, inv_8dy) = dem_inv_8dxy();
-                        let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
-                        let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                        let (dx_m, dy_m) = dem_dxy();
                         let (cid, b0) = single_band_key(*band_1based);
                         gpu.try_render_bbox_dem_f32(
                             cid,
@@ -8251,26 +8195,14 @@ async fn render_bbox_core(
                     let src = make_src!(&refs);
                     let ring = sample_dem_ring(&src, &coord_map);
                     let rw = w + 2;
-                    let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                    let (dx_m, dy_m) = dem_dxy();
+                    let (inv_dx, inv_dy) = (1.0 / dx_m, 1.0 / dy_m);
                     for py in 0..h {
                         let r0 = py * rw;
                         let r1 = (py + 1) * rw;
                         let r2 = (py + 2) * rw;
                         for px in 0..w {
-                            let val = cogzilla_kernel::eval_horn_3x3_aniso(
-                                ring[r0 + px],
-                                ring[r0 + px + 1],
-                                ring[r0 + px + 2],
-                                ring[r1 + px],
-                                ring[r1 + px + 1],
-                                ring[r1 + px + 2],
-                                ring[r2 + px],
-                                ring[r2 + px + 1],
-                                ring[r2 + px + 2],
-                                inv_8dx,
-                                inv_8dy,
-                                *algorithm,
-                            );
+                            let val = cogzilla_kernel::eval_dem_stencil(ring[r0 + px + 1], ring[r1 + px], ring[r1 + px + 1], ring[r1 + px + 2], ring[r2 + px + 1], inv_dx, inv_dy, *algorithm);
                             out.put_slice(&val.to_le_bytes());
                         }
                     }
@@ -8632,9 +8564,7 @@ async fn render_bbox_core(
                 .and_then(|rgb_lut| {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
-                    let (inv_8dx, inv_8dy) = dem_inv_8dxy();
-                    let dx_m = (1.0 / (8.0 * inv_8dx)).max(1e-3);
-                    let dy_m = (1.0 / (8.0 * inv_8dy)).max(1e-3);
+                    let (dx_m, dy_m) = dem_dxy();
                     let style = cogzilla_kernel::SingleBandStyle {
                         rescale_min: rescale.0,
                         rescale_max: rescale.1,
@@ -8889,26 +8819,14 @@ async fn render_bbox_core(
                 let inv = 255.0 / cogzilla_kernel::safe_rescale_denom(rescale.0, rescale.1);
                 let ring = sample_dem_ring(&src, &coord_map);
                 let rw = w + 2;
-                let (inv_8dx, inv_8dy) = dem_inv_8dxy();
+                let (dx_m, dy_m) = dem_dxy();
+                let (inv_dx, inv_dy) = (1.0 / dx_m, 1.0 / dy_m);
                 for py in 0..h {
                     let r0 = py * rw;
                     let r1 = (py + 1) * rw;
                     let r2 = (py + 2) * rw;
                     for px in 0..w {
-                        let v = cogzilla_kernel::eval_horn_3x3_aniso(
-                            ring[r0 + px],
-                            ring[r0 + px + 1],
-                            ring[r0 + px + 2],
-                            ring[r1 + px],
-                            ring[r1 + px + 1],
-                            ring[r1 + px + 2],
-                            ring[r2 + px],
-                            ring[r2 + px + 1],
-                            ring[r2 + px + 2],
-                            inv_8dx,
-                            inv_8dy,
-                            *algorithm,
-                        );
+                        let v = cogzilla_kernel::eval_dem_stencil(ring[r0 + px + 1], ring[r1 + px], ring[r1 + px + 1], ring[r1 + px + 2], ring[r2 + px + 1], inv_dx, inv_dy, *algorithm);
                         if !v.is_nan() {
                             let i = py * w + px;
                             let [r, g, b, a] = map_color(v, rescale.0, inv, *colormap);

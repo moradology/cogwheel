@@ -3514,26 +3514,85 @@ mod tests {
             assert!(max_err < 1e-2, "Single RawF32 max err {max_err} >= 1e-2");
         }
 
-        // 2. DEM Slope RawF32 Lanczos
-        if let Some(raw) = gpu.try_render_bbox_dem_f32(
-            500,
-            0,
-            0,
-            BboxCoordSource::Separable {
-                u: &u_coords,
-                v: &v_coords,
-            },
-            &s0,
-            DemAlgorithm::Slope { z_factor: 1.0 },
-            30.0,
-            30.0,
-            ResampleMode::Lanczos,
-        ) {
-            assert_eq!(raw.len(), n * n * 4);
-            // Spot-check interior slope values are finite and in [0, 90] degrees
-            let off = (256 * n + 256) * 4;
-            let sv = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-            assert!(sv.is_finite() && (0.0..=90.0).contains(&sv), "unexpected slope {sv}");
+        // 2. DEM Slope (anisotropic dx != dy), Hillshade (including negative altitude), and Aspect CPU/GPU parity
+        let dem_cases: &[(DemAlgorithm, f32, f32, f32)] = &[
+            (DemAlgorithm::Slope { z_factor: 1.5 }, 30.0, 45.0, 2e-2),
+            (
+                DemAlgorithm::Hillshade {
+                    azimuth_deg: 315.0,
+                    altitude_deg: 45.0,
+                    z_factor: 1.0,
+                },
+                1.0,
+                1.0,
+                1.0,
+            ),
+            (
+                DemAlgorithm::Hillshade {
+                    azimuth_deg: 90.0,
+                    altitude_deg: -15.0,
+                    z_factor: 1.0,
+                },
+                1.0,
+                1.0,
+                1.0,
+            ),
+            (DemAlgorithm::Aspect, 30.0, 45.0, 5e-2),
+        ];
+        for &(alg, dx, dy, tol) in dem_cases {
+            if let Some(raw) = gpu.try_render_bbox_dem_f32(
+                500,
+                0,
+                0,
+                BboxCoordSource::Separable {
+                    u: &u_coords,
+                    v: &v_coords,
+                },
+                &s0,
+                alg,
+                dx,
+                dy,
+                ResampleMode::Bilinear,
+            ) {
+                assert_eq!(raw.len(), n * n * 4);
+                let sample = |ix: usize, iy: usize| {
+                    cogzilla_kernel::sample_general_scaled(
+                        &s0,
+                        u_coords[ix],
+                        v_coords[iy],
+                        1.0,
+                        1.0,
+                        ResampleMode::Bilinear,
+                    )
+                };
+                let mut max_err = 0.0f32;
+                for py in (4..n - 4).step_by(29) {
+                    for px in (4..n - 4).step_by(29) {
+                        let off = (py * n + px) * 4;
+                        let gv = f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+                        let cv = cogzilla_kernel::eval_dem_stencil(
+                            sample(px, py - 1),
+                            sample(px - 1, py),
+                            sample(px, py),
+                            sample(px + 1, py),
+                            sample(px, py + 1),
+                            1.0 / dx,
+                            1.0 / dy,
+                            alg,
+                        );
+                        if cv.is_nan() {
+                            assert!(gv.is_nan(), "{alg:?} ({px},{py}): expected NaN, got {gv}");
+                        } else {
+                            let mut err = (gv - cv).abs();
+                            if matches!(alg, DemAlgorithm::Aspect) && err > 180.0 {
+                                err = 360.0 - err;
+                            }
+                            max_err = max_err.max(err);
+                        }
+                    }
+                }
+                assert!(max_err <= tol, "DEM {alg:?} CPU/GPU max err {max_err} > {tol}");
+            }
         }
 
         // 3. Expr NDVI RawF32 Lanczos

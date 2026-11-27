@@ -1,6 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GpuDemAlgorithm {
-    /// Horn 3×3 shaded relief in `[0.0, 255.0]`.
+    /// TiTiler's shaded relief in `[0.0, 255.0]`, from the gradient per pixel.
     Hillshade {
         azimuth_deg: f32,
         altitude_deg: f32,
