@@ -8,7 +8,7 @@
 //! 3. **Stage 2 (`stats_hist_pass2`)**: 9 KB workgroup-privatized shared-memory atomic histograms
 //!    (user `N`-bin + 1024-bin percentile CDF) + exact centered 2-pass variance (`std`).
 
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -385,22 +385,12 @@ impl GpuStatsReducer {
         );
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_buf.slice(..total_readback);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-
-        let stats = {
-            let mapped = slice.get_mapped_range();
-            decode_stats_readback(&mapped, len, n_bins as usize, hist_range, percentiles)
-        };
-        self.staging_buf.unmap();
-        Ok(stats)
+        crate::wgpu_util::readback_staging_sync(
+            &self.device,
+            &self.staging_buf,
+            total_readback,
+            |mapped| decode_stats_readback(mapped, len, n_bins as usize, hist_range, percentiles),
+        )
     }
 }
 

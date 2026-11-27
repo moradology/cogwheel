@@ -61,6 +61,52 @@ struct MosaicParams {
 }
 
 impl MosaicParams {
+    fn raw(
+        width: u32,
+        height: u32,
+        plane_stride: u32,
+        num_scenes: u32,
+        method: GpuPixelSelection,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            plane_stride,
+            num_scenes,
+            method: method.as_u32(),
+            band_stride: 0,
+            _pad1: 0,
+            _pad2: 0,
+            rescale_min: 0.0,
+            inv_range_255: 1.0,
+            inv_range_254: 1.0,
+            _pad3: 0.0,
+            rescale_min_g: 0.0,
+            inv_range_255_g: 1.0,
+            rescale_min_b: 0.0,
+            inv_range_255_b: 1.0,
+        }
+    }
+
+    fn styled(
+        width: u32,
+        height: u32,
+        plane_stride: u32,
+        num_scenes: u32,
+        method: GpuPixelSelection,
+        rescale_min: f32,
+        rescale_max: f32,
+    ) -> Self {
+        let (inv_range_255, inv_range_254) =
+            crate::wgpu_util::safe_inv_ranges(rescale_min, rescale_max);
+        Self {
+            rescale_min,
+            inv_range_255,
+            inv_range_254,
+            ..Self::raw(width, height, plane_stride, num_scenes, method)
+        }
+    }
+
     fn rgb(
         width: u32,
         height: u32,
@@ -70,32 +116,16 @@ impl MosaicParams {
         rescale_min: [f32; 3],
         rescale_max: [f32; 3],
     ) -> Self {
-        let safe_inv = |lo: f32, hi: f32| {
-            let r = hi - lo;
-            let safe = if r.is_finite() && r.abs() > 1e-20 {
-                r
-            } else {
-                1.0
-            };
-            255.0 / safe
-        };
+        let safe_inv = |lo: f32, hi: f32| 255.0 / crate::wgpu_util::safe_range(lo, hi);
         Self {
-            width,
-            height,
-            plane_stride,
-            num_scenes,
-            method: method.as_u32(),
             band_stride: plane_stride * num_scenes,
-            _pad1: 0,
-            _pad2: 0,
             rescale_min: rescale_min[0],
             inv_range_255: safe_inv(rescale_min[0], rescale_max[0]),
-            inv_range_254: 1.0,
-            _pad3: 0.0,
             rescale_min_g: rescale_min[1],
             inv_range_255_g: safe_inv(rescale_min[1], rescale_max[1]),
             rescale_min_b: rescale_min[2],
             inv_range_255_b: safe_inv(rescale_min[2], rescale_max[2]),
+            ..Self::raw(width, height, plane_stride, num_scenes, method)
         }
     }
 }
@@ -265,14 +295,12 @@ impl GpuMosaicCompositor {
         }
     }
 
-    /// Upload `1..=32` scene planes (`width * height` `f32` each) into a contiguous GPU stack
-    /// using zero-copy `mapped_at_creation` (parallelized across scenes for large stacks).
-    pub fn upload_scenes(
+    fn validate_scene_planes(
         &self,
         planes: &[&[f32]],
         width: u32,
         height: u32,
-    ) -> Result<GpuSceneStack, GpuError> {
+    ) -> Result<(usize, usize, usize), GpuError> {
         if planes.is_empty() || planes.len() > 32 || width == 0 || height == 0 {
             return Err(GpuError::InvalidDimensions(format!(
                 "invalid scene stack: scenes={}, {width}x{height}",
@@ -302,6 +330,19 @@ impl GpuMosaicCompositor {
                 self.max_scene_bytes
             )));
         }
+        Ok((plane_stride, plane_bytes, total_bytes))
+    }
+
+    /// Upload `1..=32` scene planes (`width * height` `f32` each) into a contiguous GPU stack
+    /// using zero-copy `mapped_at_creation` (parallelized across scenes for large stacks).
+    pub fn upload_scenes(
+        &self,
+        planes: &[&[f32]],
+        width: u32,
+        height: u32,
+    ) -> Result<GpuSceneStack, GpuError> {
+        let (plane_stride, plane_bytes, total_bytes) =
+            self.validate_scene_planes(planes, width, height)?;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-scene-stack"),
             size: total_bytes as u64,
@@ -356,28 +397,17 @@ impl GpuMosaicCompositor {
     ) -> Result<Vec<f32>, GpuError> {
         let pixels = (stack.width as usize) * (stack.height as usize);
         self.ensure_out_cap(pixels);
-        let params = MosaicParams {
-            width: stack.width,
-            height: stack.height,
-            plane_stride: stack.plane_stride,
-            num_scenes: stack.num_scenes,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
-            rescale_min: 0.0,
-            inv_range_255: 1.0,
-            inv_range_254: 1.0,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+        let params = MosaicParams::raw(
+            stack.width,
+            stack.height,
+            stack.plane_stride,
+            stack.num_scenes,
+            method,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let raw = self.run_pipeline(
-            stack,
+        let raw = self.run_pipeline_binding(
+            stack.buffer.as_entire_buffer_binding(),
             &self.f32_pipeline,
             stack.width.div_ceil(16),
             stack.height.div_ceil(16),
@@ -418,96 +448,20 @@ impl GpuMosaicCompositor {
             .checked_mul(stacks.len())
             .ok_or_else(|| GpuError::InvalidDimensions("batched mosaic words overflow".into()))?;
         self.ensure_out_cap(total_words);
-
-        let params = MosaicParams {
-            width: first.width,
-            height: first.height,
-            plane_stride: first.plane_stride,
-            num_scenes: first.num_scenes,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
-            rescale_min: 0.0,
-            inv_range_255: 1.0,
-            inv_range_254: 1.0,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+        let params = MosaicParams::raw(
+            first.width,
+            first.height,
+            first.plane_stride,
+            first.num_scenes,
+            method,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-
-        let wg_x = first.width.div_ceil(16);
-        let wg_y = first.height.div_ceil(16);
-        let band_bytes = (pixels * 4) as u64;
-        let total_bytes = band_bytes * (stacks.len() as u64);
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-mosaic-bands-enc"),
-            });
-        for (b, stack) in stacks.iter().enumerate() {
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cogzilla-mosaic-band-bg"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.params_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: stack.buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.lut_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.out_buf.as_entire_binding(),
-                    },
-                ],
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cogzilla-mosaic-band-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.f32_pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(wg_x, wg_y, 1);
-            }
-            encoder.copy_buffer_to_buffer(
-                &self.out_buf,
-                0,
-                &self.staging_buf,
-                (b as u64) * band_bytes,
-                band_bytes,
-            );
-        }
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = self.staging_buf.slice(..total_bytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-
-        let mapped = slice.get_mapped_range();
-        let all_f32: &[f32] = bytemuck::cast_slice(&mapped);
-        let out: Vec<Vec<f32>> = all_f32.chunks_exact(pixels).map(|c| c.to_vec()).collect();
-        drop(mapped);
-        self.staging_buf.unmap();
-        Ok(out)
+        let bindings: Vec<wgpu::BufferBinding<'_>> = stacks
+            .iter()
+            .map(|s| s.buffer.as_entire_buffer_binding())
+            .collect();
+        self.run_f32_bands_bindings(&bindings, first.width, first.height, pixels)
     }
 
     /// 1-pass fused GPU multi-scene pixel selection + rescale + colormap → GPU 4:2:0 JPEG FDCT
@@ -526,82 +480,27 @@ impl GpuMosaicCompositor {
     ) -> Result<Vec<u8>, GpuError> {
         let total_words = (stack.width as usize) * (stack.height as usize);
         self.ensure_out_cap(total_words);
-
-        let range = rescale_max - rescale_min;
-        let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-            range
-        } else {
-            1.0
-        };
-        let params = MosaicParams {
-            width: stack.width,
-            height: stack.height,
-            plane_stride: stack.plane_stride,
-            num_scenes: stack.num_scenes,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
+        let params = MosaicParams::styled(
+            stack.width,
+            stack.height,
+            stack.plane_stride,
+            stack.num_scenes,
+            method,
             rescale_min,
-            inv_range_255: 255.0 / safe_range,
-            inv_range_254: 254.0 / safe_range,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+            rescale_max,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
             .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cogzilla-mosaic-jpeg-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: stack.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.lut_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.out_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-mosaic-jpeg-enc"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cogzilla-mosaic-rgba8-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.rgba8_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(stack.width.div_ceil(16), stack.height.div_ceil(16), 1);
-        }
-        let jpeg_out_bytes = jpeg.record_encode_rgba8_from_buffer(
-            &mut encoder,
-            &self.out_buf,
+        self.run_jpeg_binding(
+            stack.buffer.as_entire_buffer_binding(),
+            &self.rgba8_pipeline,
             stack.width,
             stack.height,
+            jpeg,
             quality,
-        )?;
-        self.queue.submit(Some(encoder.finish()));
-        jpeg.readback_jpeg(jpeg_out_bytes, stack.width, stack.height, quality)
+        )
     }
 
     fn write_scene_planes(
@@ -610,35 +509,8 @@ impl GpuMosaicCompositor {
         width: u32,
         height: u32,
     ) -> Result<(usize, u64), GpuError> {
-        if planes.is_empty() || planes.len() > 32 || width == 0 || height == 0 {
-            return Err(GpuError::InvalidDimensions(format!(
-                "invalid scene stack: scenes={}, {width}x{height}",
-                planes.len()
-            )));
-        }
-        let plane_stride = (width as usize)
-            .checked_mul(height as usize)
-            .ok_or_else(|| GpuError::InvalidDimensions("plane_stride overflow".into()))?;
-        for (i, p) in planes.iter().enumerate() {
-            if p.len() < plane_stride {
-                return Err(GpuError::InvalidDimensions(format!(
-                    "scene {i} len {} < {plane_stride}",
-                    p.len()
-                )));
-            }
-        }
-        let plane_bytes = plane_stride
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| GpuError::InvalidDimensions("plane_bytes overflow".into()))?;
-        let total_bytes = plane_bytes
-            .checked_mul(planes.len())
-            .ok_or_else(|| GpuError::InvalidDimensions("total_bytes overflow".into()))?;
-        if (total_bytes as u64) > self.max_scene_bytes {
-            return Err(GpuError::InvalidDimensions(format!(
-                "scene stack {total_bytes} B exceeds adapter limit {} B",
-                self.max_scene_bytes
-            )));
-        }
+        let (plane_stride, plane_bytes, total_bytes) =
+            self.validate_scene_planes(planes, width, height)?;
         self.ensure_scene_cap(total_bytes);
         for (i, p) in planes.iter().enumerate() {
             self.queue.write_buffer(
@@ -660,24 +532,13 @@ impl GpuMosaicCompositor {
     ) -> Result<Vec<f32>, GpuError> {
         let (plane_stride, stack_bytes) = self.write_scene_planes(planes, width, height)?;
         self.ensure_out_cap(plane_stride);
-        let params = MosaicParams {
+        let params = MosaicParams::raw(
             width,
             height,
-            plane_stride: plane_stride as u32,
-            num_scenes: planes.len() as u32,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
-            rescale_min: 0.0,
-            inv_range_255: 1.0,
-            inv_range_254: 1.0,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+            plane_stride as u32,
+            planes.len() as u32,
+            method,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         let raw = self.run_pipeline_binding(
@@ -775,102 +636,24 @@ impl GpuMosaicCompositor {
             .ok_or_else(|| GpuError::InvalidDimensions("batched out words overflow".into()))?;
         self.ensure_out_cap(total_out_words);
 
-        let params = MosaicParams {
+        let params = MosaicParams::raw(
             width,
             height,
-            plane_stride: plane_stride as u32,
-            num_scenes: num_scenes as u32,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
-            rescale_min: 0.0,
-            inv_range_255: 1.0,
-            inv_range_254: 1.0,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+            plane_stride as u32,
+            num_scenes as u32,
+            method,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let wg_x = width.div_ceil(16);
-        let wg_y = height.div_ceil(16);
-        let band_out_bytes = (plane_stride * 4) as u64;
-        let total_out_bytes = band_out_bytes * (band_planes.len() as u64);
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-mosaic-bands-direct-enc"),
-            });
-        for b in 0..band_planes.len() {
-            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cogzilla-mosaic-band-direct-bg"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.params_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &self.scene_buf,
-                            offset: (b as u64) * aligned_band_stride,
-                            size: std::num::NonZeroU64::new(raw_band_bytes),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.lut_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.out_buf.as_entire_binding(),
-                    },
-                ],
-            });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cogzilla-mosaic-band-direct-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.f32_pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(wg_x, wg_y, 1);
-            }
-            encoder.copy_buffer_to_buffer(
-                &self.out_buf,
-                0,
-                &self.staging_buf,
-                (b as u64) * band_out_bytes,
-                band_out_bytes,
-            );
-        }
-        self.queue.submit(Some(encoder.finish()));
-
-        let slice = self.staging_buf.slice(..total_out_bytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-
-        let mapped = slice.get_mapped_range();
-        let all_f32: &[f32] = bytemuck::cast_slice(&mapped);
-        let out: Vec<Vec<f32>> = all_f32
-            .chunks_exact(plane_stride)
-            .map(|c| c.to_vec())
+        let bindings: Vec<wgpu::BufferBinding<'_>> = (0..band_planes.len())
+            .map(|b| wgpu::BufferBinding {
+                buffer: &self.scene_buf,
+                offset: (b as u64) * aligned_band_stride,
+                size: std::num::NonZeroU64::new(raw_band_bytes),
+            })
             .collect();
-        drop(mapped);
-        self.staging_buf.unmap();
-        Ok(out)
+        self.run_f32_bands_bindings(&bindings, width, height, plane_stride)
     }
 
     /// Reduce `planes` fused with rescale + colormap directly via persistent `scene_buf`.
@@ -887,76 +670,27 @@ impl GpuMosaicCompositor {
         output: GpuPixelOutput,
     ) -> Result<Vec<u8>, GpuError> {
         let (plane_stride, stack_bytes) = self.write_scene_planes(planes, width, height)?;
-        let w = width as usize;
-        let h = height as usize;
-        let words_per_row = match output {
-            GpuPixelOutput::Rgba8 => w,
-            GpuPixelOutput::IndexedU8 => w.div_ceil(4),
-        };
-        let total_words = words_per_row * h;
-        self.ensure_out_cap(total_words);
-
-        let range = rescale_max - rescale_min;
-        let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-            range
-        } else {
-            1.0
-        };
-        let params = MosaicParams {
+        self.prepare_styled(
             width,
             height,
-            plane_stride: plane_stride as u32,
-            num_scenes: planes.len() as u32,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
+            plane_stride as u32,
+            planes.len() as u32,
+            method,
             rescale_min,
-            inv_range_255: 255.0 / safe_range,
-            inv_range_254: 254.0 / safe_range,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        if output == GpuPixelOutput::Rgba8 {
-            self.queue
-                .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
-        }
-
-        let (pipeline, wg_x, wg_y) = match output {
-            GpuPixelOutput::Rgba8 => (&self.rgba8_pipeline, width.div_ceil(16), height.div_ceil(16)),
-            GpuPixelOutput::IndexedU8 => (
-                &self.indexed_pipeline,
-                (words_per_row as u32).div_ceil(16),
-                height.div_ceil(16),
-            ),
-        };
-        let raw = self.run_pipeline_binding(
+            rescale_max,
+            lut_rgba_u32,
+            output,
+        );
+        self.run_styled_binding(
             wgpu::BufferBinding {
                 buffer: &self.scene_buf,
                 offset: 0,
                 size: std::num::NonZeroU64::new(stack_bytes),
             },
-            pipeline,
-            wg_x,
-            wg_y,
-            total_words * 4,
-        )?;
-        if output == GpuPixelOutput::IndexedU8 && w % 4 != 0 {
-            let row_bytes = words_per_row * 4;
-            let mut out = Vec::with_capacity(w * h);
-            for py in 0..h {
-                let start = py * row_bytes;
-                out.extend_from_slice(&raw[start..start + w]);
-            }
-            Ok(out)
-        } else {
-            Ok(raw)
-        }
+            width,
+            height,
+            output,
+        )
     }
 
     /// 1-pass fused Mosaic -> GPU JPEG directly via persistent `scene_buf` (zero per-call VRAM
@@ -976,86 +710,31 @@ impl GpuMosaicCompositor {
     ) -> Result<Vec<u8>, GpuError> {
         let (plane_stride, stack_bytes) = self.write_scene_planes(planes, width, height)?;
         self.ensure_out_cap(plane_stride);
-
-        let range = rescale_max - rescale_min;
-        let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-            range
-        } else {
-            1.0
-        };
-        let params = MosaicParams {
+        let params = MosaicParams::styled(
             width,
             height,
-            plane_stride: plane_stride as u32,
-            num_scenes: planes.len() as u32,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
+            plane_stride as u32,
+            planes.len() as u32,
+            method,
             rescale_min,
-            inv_range_255: 255.0 / safe_range,
-            inv_range_254: 254.0 / safe_range,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+            rescale_max,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         self.queue
             .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cogzilla-mosaic-jpeg-direct-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.scene_buf,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(stack_bytes),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.lut_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.out_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-mosaic-jpeg-direct-enc"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cogzilla-mosaic-rgba8-direct-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.rgba8_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
-        }
-        let jpeg_out_bytes = jpeg.record_encode_rgba8_from_buffer(
-            &mut encoder,
-            &self.out_buf,
+        self.run_jpeg_binding(
+            wgpu::BufferBinding {
+                buffer: &self.scene_buf,
+                offset: 0,
+                size: std::num::NonZeroU64::new(stack_bytes),
+            },
+            &self.rgba8_pipeline,
             width,
             height,
+            jpeg,
             quality,
-        )?;
-        self.queue.submit(Some(encoder.finish()));
-        jpeg.readback_jpeg(jpeg_out_bytes, width, height, quality)
+        )
     }
 
     fn write_rgb_scene_planes(
@@ -1189,57 +868,18 @@ impl GpuMosaicCompositor {
         );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cogzilla-mosaic-rgb-jpeg-direct-bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.scene_buf,
-                        offset: 0,
-                        size: std::num::NonZeroU64::new(total_bytes),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.lut_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.out_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cogzilla-mosaic-rgb-jpeg-direct-enc"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cogzilla-mosaic-rgb-rgba8-direct-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.rgb_rgba8_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
-        }
-        let jpeg_out_bytes = jpeg.record_encode_rgba8_from_buffer(
-            &mut encoder,
-            &self.out_buf,
+        self.run_jpeg_binding(
+            wgpu::BufferBinding {
+                buffer: &self.scene_buf,
+                offset: 0,
+                size: std::num::NonZeroU64::new(total_bytes),
+            },
+            &self.rgb_rgba8_pipeline,
             width,
             height,
+            jpeg,
             quality,
-        )?;
-        self.queue.submit(Some(encoder.finish()));
-        jpeg.readback_jpeg(jpeg_out_bytes, width, height, quality)
+        )
     }
 
     /// Reduce `stack` via `method` fused with rescale + colormap into `Rgba8` or `IndexedU8`.
@@ -1253,98 +893,104 @@ impl GpuMosaicCompositor {
         lut_rgba_u32: &[u32; 256],
         output: GpuPixelOutput,
     ) -> Result<Vec<u8>, GpuError> {
-        let w = stack.width as usize;
-        let h = stack.height as usize;
+        self.prepare_styled(
+            stack.width,
+            stack.height,
+            stack.plane_stride,
+            stack.num_scenes,
+            method,
+            rescale_min,
+            rescale_max,
+            lut_rgba_u32,
+            output,
+        );
+        self.run_styled_binding(
+            stack.buffer.as_entire_buffer_binding(),
+            stack.width,
+            stack.height,
+            output,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_styled(
+        &mut self,
+        width: u32,
+        height: u32,
+        plane_stride: u32,
+        num_scenes: u32,
+        method: GpuPixelSelection,
+        rescale_min: f32,
+        rescale_max: f32,
+        lut_rgba_u32: &[u32; 256],
+        output: GpuPixelOutput,
+    ) {
+        let w = width as usize;
+        let h = height as usize;
         let words_per_row = match output {
             GpuPixelOutput::Rgba8 => w,
             GpuPixelOutput::IndexedU8 => w.div_ceil(4),
         };
-        let total_words = words_per_row * h;
-        self.ensure_out_cap(total_words);
-
-        let range = rescale_max - rescale_min;
-        let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-            range
-        } else {
-            1.0
-        };
-        let params = MosaicParams {
-            width: stack.width,
-            height: stack.height,
-            plane_stride: stack.plane_stride,
-            num_scenes: stack.num_scenes,
-            method: method.as_u32(),
-            band_stride: 0,
-            _pad1: 0,
-            _pad2: 0,
+        self.ensure_out_cap(words_per_row * h);
+        let params = MosaicParams::styled(
+            width,
+            height,
+            plane_stride,
+            num_scenes,
+            method,
             rescale_min,
-            inv_range_255: 255.0 / safe_range,
-            inv_range_254: 254.0 / safe_range,
-            _pad3: 0.0,
-            rescale_min_g: 0.0,
-            inv_range_255_g: 1.0,
-            rescale_min_b: 0.0,
-            inv_range_255_b: 1.0,
-        };
+            rescale_max,
+        );
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
         if output == GpuPixelOutput::Rgba8 {
             self.queue
                 .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
         }
+    }
 
+    fn run_styled_binding(
+        &self,
+        scene_binding: wgpu::BufferBinding<'_>,
+        width: u32,
+        height: u32,
+        output: GpuPixelOutput,
+    ) -> Result<Vec<u8>, GpuError> {
+        let w = width as usize;
+        let h = height as usize;
+        let words_per_row = match output {
+            GpuPixelOutput::Rgba8 => w,
+            GpuPixelOutput::IndexedU8 => w.div_ceil(4),
+        };
         let (pipeline, wg_x, wg_y) = match output {
-            GpuPixelOutput::Rgba8 => (
-                &self.rgba8_pipeline,
-                stack.width.div_ceil(16),
-                stack.height.div_ceil(16),
-            ),
+            GpuPixelOutput::Rgba8 => (&self.rgba8_pipeline, width.div_ceil(16), height.div_ceil(16)),
             GpuPixelOutput::IndexedU8 => (
                 &self.indexed_pipeline,
                 (words_per_row as u32).div_ceil(16),
-                stack.height.div_ceil(16),
+                height.div_ceil(16),
             ),
         };
-        let raw = self.run_pipeline(stack, pipeline, wg_x, wg_y, total_words * 4)?;
-        if output == GpuPixelOutput::IndexedU8 && w % 4 != 0 {
-            let row_bytes = words_per_row * 4;
-            let mut out = Vec::with_capacity(w * h);
-            for py in 0..h {
-                let start = py * row_bytes;
-                out.extend_from_slice(&raw[start..start + w]);
-            }
-            Ok(out)
-        } else {
-            Ok(raw)
-        }
-    }
-
-    fn run_pipeline(
-        &self,
-        stack: &GpuSceneStack,
-        pipeline: &wgpu::ComputePipeline,
-        wg_x: u32,
-        wg_y: u32,
-        out_bytes: usize,
-    ) -> Result<Vec<u8>, GpuError> {
-        self.run_pipeline_binding(
-            stack.buffer.as_entire_buffer_binding(),
+        let raw = self.run_pipeline_binding(
+            scene_binding,
             pipeline,
             wg_x,
             wg_y,
-            out_bytes,
-        )
+            words_per_row * h * 4,
+        )?;
+        match output {
+            GpuPixelOutput::Rgba8 => Ok(raw),
+            GpuPixelOutput::IndexedU8 if w.is_multiple_of(4) => Ok(raw),
+            GpuPixelOutput::IndexedU8 => Ok(crate::wgpu_util::unpack_indexed_u8(
+                &raw,
+                w,
+                h,
+                words_per_row,
+            )),
+        }
     }
 
-    fn run_pipeline_binding(
-        &self,
-        scene_binding: wgpu::BufferBinding<'_>,
-        pipeline: &wgpu::ComputePipeline,
-        wg_x: u32,
-        wg_y: u32,
-        out_bytes: usize,
-    ) -> Result<Vec<u8>, GpuError> {
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    fn make_bind_group(&self, scene_binding: wgpu::BufferBinding<'_>) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cogzilla-mosaic-bg"),
             layout: &self.bind_group_layout,
             entries: &[
@@ -1365,7 +1011,102 @@ impl GpuMosaicCompositor {
                     resource: self.out_buf.as_entire_binding(),
                 },
             ],
-        });
+        })
+    }
+
+    fn run_f32_bands_bindings(
+        &self,
+        bindings: &[wgpu::BufferBinding<'_>],
+        width: u32,
+        height: u32,
+        pixels: usize,
+    ) -> Result<Vec<Vec<f32>>, GpuError> {
+        let wg_x = width.div_ceil(16);
+        let wg_y = height.div_ceil(16);
+        let band_bytes = (pixels * 4) as u64;
+        let total_bytes = band_bytes * (bindings.len() as u64);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cogzilla-mosaic-bands-enc"),
+            });
+        for (b, binding) in bindings.iter().enumerate() {
+            let bind_group = self.make_bind_group(binding.clone());
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cogzilla-mosaic-band-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.f32_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(wg_x, wg_y, 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &self.out_buf,
+                0,
+                &self.staging_buf,
+                (b as u64) * band_bytes,
+                band_bytes,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        crate::wgpu_util::readback_staging_sync(
+            &self.device,
+            &self.staging_buf,
+            total_bytes,
+            |mapped| {
+                let all_f32: &[f32] = bytemuck::cast_slice(mapped);
+                all_f32.chunks_exact(pixels).map(|c| c.to_vec()).collect()
+            },
+        )
+    }
+
+    fn run_jpeg_binding(
+        &self,
+        scene_binding: wgpu::BufferBinding<'_>,
+        pipeline: &wgpu::ComputePipeline,
+        width: u32,
+        height: u32,
+        jpeg: &mut crate::GpuJpegEncoder,
+        quality: u8,
+    ) -> Result<Vec<u8>, GpuError> {
+        let bind_group = self.make_bind_group(scene_binding);
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cogzilla-mosaic-jpeg-enc"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cogzilla-mosaic-jpeg-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+        let jpeg_out_bytes = jpeg.record_encode_rgba8_from_buffer(
+            &mut encoder,
+            &self.out_buf,
+            width,
+            height,
+            quality,
+        )?;
+        self.queue.submit(Some(encoder.finish()));
+        jpeg.readback_jpeg(jpeg_out_bytes, width, height, quality)
+    }
+
+    fn run_pipeline_binding(
+        &self,
+        scene_binding: wgpu::BufferBinding<'_>,
+        pipeline: &wgpu::ComputePipeline,
+        wg_x: u32,
+        wg_y: u32,
+        out_bytes: usize,
+    ) -> Result<Vec<u8>, GpuError> {
+        let bind_group = self.make_bind_group(scene_binding);
 
         let mut encoder = self
             .device
@@ -1384,21 +1125,12 @@ impl GpuMosaicCompositor {
         encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging_buf, 0, out_bytes as u64);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_buf.slice(..out_bytes as u64);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-
-        let mapped = slice.get_mapped_range();
-        let out = mapped.to_vec();
-        drop(mapped);
-        self.staging_buf.unmap();
-        Ok(out)
+        crate::wgpu_util::readback_staging_sync(
+            &self.device,
+            &self.staging_buf,
+            out_bytes as u64,
+            |mapped| mapped.to_vec(),
+        )
     }
 }
 

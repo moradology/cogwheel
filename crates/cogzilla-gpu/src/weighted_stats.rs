@@ -422,25 +422,59 @@ impl GpuWeightedStatsReducer {
             }
         }
         let n_bins = num_bins.clamp(1, 1000);
-        let num_wg = ((len as u32).div_ceil(256)).clamp(1, MAX_WG);
         let n_bands = bands.len();
+        let (num_wg, bind_groups) = self.prepare_weighted_common(
+            n_bands,
+            len,
+            win_w,
+            covs,
+            row_areas,
+            area_weighted,
+            cov_eps,
+            pixel_set_eps,
+            n_bins,
+            hist_range,
+            max_elems,
+        );
+        for (bi, &band) in bands.iter().enumerate() {
+            self.queue
+                .write_buffer(&self.slots[bi].src_buf, 0, bytemuck::cast_slice(band));
+        }
+        self.execute_weighted_slots(n_bands, num_wg, n_bins, hist_range, percentiles, &bind_groups, None)
+    }
 
-        while self.slots.len() < n_bands {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_weighted_common(
+        &mut self,
+        n_slots: usize,
+        len: usize,
+        win_w: usize,
+        covs: &[f32],
+        row_areas: &[f32],
+        area_weighted: bool,
+        cov_eps: f32,
+        pixel_set_eps: f32,
+        n_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        max_elems: usize,
+    ) -> (u32, Vec<wgpu::BindGroup>) {
+        let num_wg = ((len as u32).div_ceil(256)).clamp(1, MAX_WG);
+        while self.slots.len() < n_slots {
             self.slots.push(WeightedBandSlot::new(
                 &self.device,
                 len.next_power_of_two().max(1024).min(max_elems),
             ));
         }
-        if n_bands > self.staging_cap_bands {
+        if n_slots > self.staging_cap_bands {
             self.staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("wstats-staging"),
-                size: READBACK_BYTES * (n_bands as u64),
+                size: READBACK_BYTES * (n_slots as u64),
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.staging_cap_bands = n_bands;
+            self.staging_cap_bands = n_slots;
         }
-        for slot in self.slots.iter_mut().take(n_bands) {
+        for slot in self.slots.iter_mut().take(n_slots) {
             Self::ensure_buf(
                 &self.device,
                 &mut slot.src_buf,
@@ -467,7 +501,6 @@ impl GpuWeightedStatsReducer {
             "wstats-row-areas",
         );
 
-        // Upload shared coverage + row areas + params ONCE across all bands!
         self.queue
             .write_buffer(&self.cov_buf, 0, bytemuck::cast_slice(covs));
         self.queue
@@ -494,66 +527,90 @@ impl GpuWeightedStatsReducer {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
-        let mut bind_groups = Vec::with_capacity(n_bands);
-        for (bi, &band) in bands.iter().enumerate() {
-            let slot = &self.slots[bi];
-            self.queue
-                .write_buffer(&slot.src_buf, 0, bytemuck::cast_slice(band));
-            bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("wstats-bg"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.params_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: slot.src_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.cov_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.row_area_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: slot.partials_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: slot.resolved_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: slot.hist_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: slot.var_buf.as_entire_binding(),
-                    },
-                ],
-            }));
-        }
+        let stats_bgs = self
+            .slots
+            .iter()
+            .take(n_slots)
+            .map(|slot| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("wstats-bg"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.params_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: slot.src_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.cov_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.row_area_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: slot.partials_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: slot.resolved_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: slot.hist_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: slot.var_buf.as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+            .collect();
+        (num_wg, stats_bgs)
+    }
 
-        // Encode ALL B bands into ONE CommandEncoder -> ONE submit -> ONE map_async!
+    #[allow(clippy::too_many_arguments)]
+    fn execute_weighted_slots(
+        &self,
+        n_slots: usize,
+        num_wg: u32,
+        n_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+        stats_bgs: &[wgpu::BindGroup],
+        expr_pass: Option<(u32, &[wgpu::BindGroup])>,
+    ) -> Result<Vec<GpuWeightedBandStats>, GpuError> {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("wstats-batched-enc"),
             });
-        for slot in self.slots.iter().take(n_bands) {
+        for slot in self.slots.iter().take(n_slots) {
             enc.clear_buffer(&slot.hist_buf, 0, None);
+        }
+        if let Some((expr_wg, expr_bgs)) = expr_pass {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("wstats-expr-eval-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipe_expr_eval);
+            for bg in expr_bgs {
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(expr_wg, 1, 1);
+            }
         }
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("wstats-3stage-batched"),
                 timestamp_writes: None,
             });
-            for bg in &bind_groups {
+            for bg in stats_bgs {
                 pass.set_bind_group(0, bg, &[]);
                 pass.set_pipeline(&self.pipe_pass1);
                 pass.dispatch_workgroups(num_wg, 1, 1);
@@ -567,7 +624,7 @@ impl GpuWeightedStatsReducer {
         }
         let var_copy_bytes = (num_wg as u64) * 4;
         let per_band_bytes = RESOLVED_BYTES + HIST_BYTES + var_copy_bytes;
-        for (bi, slot) in self.slots.iter().take(n_bands).enumerate() {
+        for (bi, slot) in self.slots.iter().take(n_slots).enumerate() {
             let dst_off = (bi as u64) * per_band_bytes;
             enc.copy_buffer_to_buffer(&slot.resolved_buf, 0, &self.staging_buf, dst_off, RESOLVED_BYTES);
             enc.copy_buffer_to_buffer(
@@ -587,14 +644,14 @@ impl GpuWeightedStatsReducer {
         }
 
         let sub_idx = self.queue.submit(Some(enc.finish()));
-        let total_readback = per_band_bytes * (n_bands as u64);
+        let total_readback = per_band_bytes * (n_slots as u64);
         let slice = self.staging_buf.slice(0..total_readback);
         Self::wait_map_async(&self.device, &slice, sub_idx)?;
 
         let mapped = slice.get_mapped_range();
         let stride_bytes = per_band_bytes as usize;
-        let mut results = Vec::with_capacity(n_bands);
-        for bi in 0..n_bands {
+        let mut results = Vec::with_capacity(n_slots);
+        for bi in 0..n_slots {
             let off = bi * stride_bytes;
             results.push(decode_weighted_readback(
                 &mapped[off..off + stride_bytes],
@@ -674,50 +731,21 @@ impl GpuWeightedStatsReducer {
         }
 
         let n_bins = num_bins.clamp(1, 1000);
-        let num_wg = ((len as u32).div_ceil(256)).clamp(1, MAX_WG);
         let expr_wg = ((len as u32).div_ceil(256)).clamp(1, 65535);
         let n_exprs = exprs.len();
 
-        while self.slots.len() < n_exprs {
-            self.slots.push(WeightedBandSlot::new(
-                &self.device,
-                len.next_power_of_two().max(1024).min(max_elems),
-            ));
-        }
-        if n_exprs > self.staging_cap_bands {
-            self.staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("wstats-staging"),
-                size: READBACK_BYTES * (n_exprs as u64),
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.staging_cap_bands = n_exprs;
-        }
-        for slot in self.slots.iter_mut().take(n_exprs) {
-            Self::ensure_buf(
-                &self.device,
-                &mut slot.src_buf,
-                &mut slot.src_cap_elems,
-                len,
-                max_elems,
-                "wstats-src",
-            );
-        }
-        Self::ensure_buf(
-            &self.device,
-            &mut self.cov_buf,
-            &mut self.cov_cap_elems,
+        let (num_wg, stats_bgs) = self.prepare_weighted_common(
+            n_exprs,
             len,
+            win_w,
+            covs,
+            row_areas,
+            area_weighted,
+            cov_eps,
+            pixel_set_eps,
+            n_bins,
+            hist_range,
             max_elems,
-            "wstats-cov",
-        );
-        Self::ensure_buf(
-            &self.device,
-            &mut self.row_area_buf,
-            &mut self.row_area_cap_elems,
-            row_areas.len(),
-            max_elems,
-            "wstats-row-areas",
         );
         if total_raw_elems > self.raw_bands_cap_elems {
             self.raw_bands_cap_elems = total_raw_elems;
@@ -738,7 +766,7 @@ impl GpuWeightedStatsReducer {
             });
         }
 
-        // Upload shared raw bands + coverage + row areas + packed instructions ONCE!
+        // Upload shared raw bands + packed instructions ONCE!
         let band_bytes = (len * 4) as u64;
         for (bi, &band) in raw_bands.iter().enumerate() {
             self.queue.write_buffer(
@@ -747,10 +775,6 @@ impl GpuWeightedStatsReducer {
                 bytemuck::cast_slice(band),
             );
         }
-        self.queue
-            .write_buffer(&self.cov_buf, 0, bytemuck::cast_slice(covs));
-        self.queue
-            .write_buffer(&self.row_area_buf, 0, bytemuck::cast_slice(row_areas));
 
         let mut packed_instrs = Vec::with_capacity(total_instrs);
         let mut expr_ranges = Vec::with_capacity(n_exprs);
@@ -763,29 +787,7 @@ impl GpuWeightedStatsReducer {
         self.queue
             .write_buffer(&self.instrs_buf, 0, bytemuck::cast_slice(&packed_instrs));
 
-        let (has_hist_range, h_min, h_max) = match hist_range {
-            Some((lo, hi)) => (1u32, lo as f32, hi as f32),
-            None => (0u32, 0.0, 0.0),
-        };
-        let params = WeightedStatsParams {
-            len: len as u32,
-            win_w: win_w as u32,
-            num_wg,
-            num_bins: n_bins as u32,
-            has_hist_range,
-            area_weighted: u32::from(area_weighted),
-            h_min,
-            h_max,
-            cov_eps,
-            pixel_set_eps,
-            _pad0: 0,
-            _pad1: 0,
-        };
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-
         let mut expr_bgs = Vec::with_capacity(n_exprs);
-        let mut stats_bgs = Vec::with_capacity(n_exprs);
         for (ei, &(pc_start, pc_end, band_mask)) in expr_ranges.iter().enumerate() {
             let slot = &self.slots[ei];
             let ep = WeightedExprParams {
@@ -826,132 +828,17 @@ impl GpuWeightedStatsReducer {
                     },
                 ],
             }));
-            stats_bgs.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("wstats-bg"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.params_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: slot.src_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.cov_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.row_area_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: slot.partials_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: slot.resolved_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: slot.hist_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: slot.var_buf.as_entire_binding(),
-                    },
-                ],
-            }));
         }
 
-        // Encode ALL E expression evals + 3-stage weighted stats into ONE CommandEncoder -> ONE submit!
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wstats-expr-batched-enc"),
-            });
-        for slot in self.slots.iter().take(n_exprs) {
-            enc.clear_buffer(&slot.hist_buf, 0, None);
-        }
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wstats-expr-eval-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipe_expr_eval);
-            for bg in &expr_bgs {
-                pass.set_bind_group(0, bg, &[]);
-                pass.dispatch_workgroups(expr_wg, 1, 1);
-            }
-        }
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wstats-3stage-batched"),
-                timestamp_writes: None,
-            });
-            for bg in &stats_bgs {
-                pass.set_bind_group(0, bg, &[]);
-                pass.set_pipeline(&self.pipe_pass1);
-                pass.dispatch_workgroups(num_wg, 1, 1);
-
-                pass.set_pipeline(&self.pipe_finalize1);
-                pass.dispatch_workgroups(1, 1, 1);
-
-                pass.set_pipeline(&self.pipe_pass2);
-                pass.dispatch_workgroups(num_wg, 1, 1);
-            }
-        }
-        let var_copy_bytes = (num_wg as u64) * 4;
-        let per_band_bytes = RESOLVED_BYTES + HIST_BYTES + var_copy_bytes;
-        for (ei, slot) in self.slots.iter().take(n_exprs).enumerate() {
-            let dst_off = (ei as u64) * per_band_bytes;
-            enc.copy_buffer_to_buffer(
-                &slot.resolved_buf,
-                0,
-                &self.staging_buf,
-                dst_off,
-                RESOLVED_BYTES,
-            );
-            enc.copy_buffer_to_buffer(
-                &slot.hist_buf,
-                0,
-                &self.staging_buf,
-                dst_off + RESOLVED_BYTES,
-                HIST_BYTES,
-            );
-            enc.copy_buffer_to_buffer(
-                &slot.var_buf,
-                0,
-                &self.staging_buf,
-                dst_off + RESOLVED_BYTES + HIST_BYTES,
-                var_copy_bytes,
-            );
-        }
-
-        let sub_idx = self.queue.submit(Some(enc.finish()));
-        let total_readback = per_band_bytes * (n_exprs as u64);
-        let slice = self.staging_buf.slice(0..total_readback);
-        Self::wait_map_async(&self.device, &slice, sub_idx)?;
-
-        let mapped = slice.get_mapped_range();
-        let stride_bytes = per_band_bytes as usize;
-        let mut results = Vec::with_capacity(n_exprs);
-        for ei in 0..n_exprs {
-            let off = ei * stride_bytes;
-            results.push(decode_weighted_readback(
-                &mapped[off..off + stride_bytes],
-                num_wg as usize,
-                n_bins,
-                hist_range,
-                percentiles,
-            ));
-        }
-        drop(mapped);
-        self.staging_buf.unmap();
-
-        Ok(results)
+        self.execute_weighted_slots(
+            n_exprs,
+            num_wg,
+            n_bins,
+            hist_range,
+            percentiles,
+            &stats_bgs,
+            Some((expr_wg, &expr_bgs)),
+        )
     }
 }
 

@@ -27,21 +27,7 @@ struct ColormapParams {
 @group(0) @binding(5) var<storage, read_write> dst_words: array<u32>;
 
 fn sample_mode(u: f32, v: f32) -> f32 {
-    if (params.mode == 0u) {
-        return sample_bilinear(u, v);
-    } else if (params.mode == 1u) {
-        return sample_cubic(u, v);
-    } else if (params.mode == 3u) {
-        if (!is_finite_f32(u) || !is_finite_f32(v)
-            || u < -0.5 || v < -0.5
-            || u > f32(params.src_w) - 0.5
-            || v > f32(params.src_h) - 0.5) {
-            return nan_f32();
-        }
-        return sample_checked(i32(floor(u + 0.5)), i32(floor(v + 0.5)));
-    } else {
-        return sample_lanczos3(u, v);
-    }
+    return sample_mode_1band(params.mode, u, v);
 }
 
 fn value_to_rgba8(val: f32) -> u32 {

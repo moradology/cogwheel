@@ -38,31 +38,12 @@ impl GpuMultiBandSlab {
         let total_elems = band_stride
             .checked_mul(num_bands)
             .ok_or_else(|| GpuError::InvalidDimensions("total_elems overflow".into()))?;
-        let byte_size = total_elems
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| GpuError::InvalidDimensions("multi-band slab byte size overflow".into()))?
-            as u64;
-        let limits = device.limits();
-        let max_bytes =
-            (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
-        if byte_size > max_bytes {
-            return Err(GpuError::InvalidDimensions(format!(
-                "multi-band slab {byte_size} B exceeds adapter limit {max_bytes} B"
-            )));
-        }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cogzilla-multiband-slab"),
-            size: byte_size,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: true,
-        });
-        let res = {
-            let mut mapped = buffer.slice(..).get_mapped_range_mut();
-            let dst: &mut [f32] = bytemuck::cast_slice_mut(&mut mapped);
-            fill(dst)
-        };
-        buffer.unmap();
-        res?;
+        let buffer = crate::wgpu_util::create_mapped_f32_storage(
+            device,
+            "cogzilla-multiband-slab",
+            total_elems,
+            fill,
+        )?;
         Ok(Self {
             buffer,
             width,

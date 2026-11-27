@@ -239,18 +239,8 @@ impl GpuTileBatcher {
             self.v_scratch.extend_from_slice(t.v_coords);
         }
 
-        let range = rescale_max - rescale_min;
-        let safe_range = if range.is_finite() && range.abs() > 1e-20 {
-            range
-        } else {
-            1.0
-        };
-        let mode_u32 = match mode {
-            GpuColormapMode::Bilinear => 0u32,
-            GpuColormapMode::Cubic => 1u32,
-            GpuColormapMode::Lanczos3 => 2u32,
-            GpuColormapMode::Nearest => 3u32,
-        };
+        let (inv_range_255, inv_range_254) =
+            crate::wgpu_util::safe_inv_ranges(rescale_min, rescale_max);
         let params = BatchParams {
             src_w: slab.width,
             src_h: slab.height,
@@ -258,11 +248,11 @@ impl GpuTileBatcher {
             tile_w: tile_w as u32,
             tile_h: tile_h as u32,
             batch_size: batch_size as u32,
-            mode: mode_u32,
+            mode: mode.as_u32(),
             _pad0: 0,
             rescale_min,
-            inv_range_255: 255.0 / safe_range,
-            inv_range_254: 254.0 / safe_range,
+            inv_range_255,
+            inv_range_254,
             _pad1: 0.0,
         };
 
@@ -339,40 +329,30 @@ impl GpuTileBatcher {
         encoder.copy_buffer_to_buffer(&self.out_buf, 0, &self.staging_buf, 0, out_bytes);
         self.queue.submit(Some(encoder.finish()));
 
-        let slice = self.staging_buf.slice(..out_bytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?
-            .map_err(|e| GpuError::BufferMap(e.to_string()))?;
-
-        let mapped = slice.get_mapped_range();
-        let result = match output {
-            GpuPixelOutput::Rgba8 => mapped.to_vec(),
-            GpuPixelOutput::IndexedU8 => {
-                if tile_w % 4 == 0 {
-                    mapped.to_vec()
-                } else {
-                    let row_bytes = words_per_row * 4;
-                    let tile_stride = row_bytes * tile_h;
-                    let mut out = Vec::with_capacity(batch_size * tile_w * tile_h);
-                    for t in 0..batch_size {
-                        for py in 0..tile_h {
-                            let start = t * tile_stride + py * row_bytes;
-                            out.extend_from_slice(&mapped[start..start + tile_w]);
+        crate::wgpu_util::readback_staging_sync(
+            &self.device,
+            &self.staging_buf,
+            out_bytes,
+            |mapped| match output {
+                GpuPixelOutput::Rgba8 => mapped.to_vec(),
+                GpuPixelOutput::IndexedU8 => {
+                    if tile_w.is_multiple_of(4) {
+                        mapped.to_vec()
+                    } else {
+                        let row_bytes = words_per_row * 4;
+                        let tile_stride = row_bytes * tile_h;
+                        let mut out = Vec::with_capacity(batch_size * tile_w * tile_h);
+                        for t in 0..batch_size {
+                            for py in 0..tile_h {
+                                let start = t * tile_stride + py * row_bytes;
+                                out.extend_from_slice(&mapped[start..start + tile_w]);
+                            }
                         }
+                        out
                     }
-                    out
                 }
-            }
-        };
-        drop(mapped);
-        self.staging_buf.unmap();
-
-        Ok(result)
+            },
+        )
     }
 }
 
