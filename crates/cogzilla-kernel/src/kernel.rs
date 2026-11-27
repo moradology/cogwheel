@@ -2537,6 +2537,43 @@ pub fn npy_descr(kind: SampleType) -> &'static str {
 ///
 /// This is not the float32 path of [`wrap_raw_f32_as_npy_with_mask`], which copies its
 /// planes as they are, counts an infinity as absent and writes `255.0` in its mask.
+fn write_npy_typed_planes(
+    out: &mut Vec<u8>,
+    kind: SampleType,
+    data: impl Iterator<Item = f64>,
+    mask_bits: Option<impl Iterator<Item = bool>>,
+) {
+    macro_rules! write_planes {
+        ($t:ty, $cast:expr) => {{
+            let cast = $cast;
+            for v in data {
+                let x: $t = cast(v);
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            if let Some(bits) = mask_bits {
+                for there in bits {
+                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }};
+    }
+    match kind {
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => {
+            write_planes!(u8, |v: f64| v as u8)
+        }
+        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
+        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
+        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
+        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
+        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
+        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
+        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
+        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
+    }
+}
+
 pub fn encode_npy_typed(
     values: &[f32],
     bands: usize,
@@ -2553,35 +2590,15 @@ pub fn encode_npy_typed(
     out.extend_from_slice(&hdr);
     let absent = f64::from(absent.unwrap_or(0.0));
     let data = &values[..(bands * pixels).min(values.len())];
-    // One loop for each type, so the type is not asked about per value.
-    macro_rules! write_planes {
-        ($t:ty, $cast:expr) => {{
-            let cast = $cast;
-            for v in data {
-                let x: $t = cast(if v.is_nan() { absent } else { f64::from(*v) });
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-            if mask {
-                for i in 0..pixels {
-                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
-                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-            }
-        }};
-    }
-    match kind {
-        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
-        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
-        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
-        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
-        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
-        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
-        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
-        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
-        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
-        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
-    }
+    let vals = data
+        .iter()
+        .map(|v| if v.is_nan() { absent } else { f64::from(*v) });
+    let mask_bits = mask.then(|| {
+        (0..pixels).map(|i| {
+            (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()))
+        })
+    });
+    write_npy_typed_planes(&mut out, kind, vals, mask_bits);
     Bytes::from(out)
 }
 
@@ -2628,38 +2645,21 @@ pub fn retype_f32_npy_with(npy: &[u8], kind: SampleType, mask: bool, prepare: im
     if planes == 0 || body.len() != planes.checked_mul(pixels)?.checked_mul(4)? {
         return None;
     }
-    let values = body.chunks_exact(4).map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
     let bands = planes - usize::from(mask);
+    let data_bytes = bands * pixels * 4;
     let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
     let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
     out.extend_from_slice(&hdr);
-    macro_rules! write_planes {
-        ($t:ty, $cast:expr) => {{
-            let cast = $cast;
-            for (i, v) in values.enumerate() {
-                let x: $t = if i < bands * pixels {
-                    cast(prepare(f64::from(v)))
-                } else if v.is_finite() && v != 0.0 {
-                    <$t>::MAX
-                } else {
-                    <$t>::MIN
-                };
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        }};
-    }
-    match kind {
-        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
-        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
-        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
-        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
-        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
-        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
-        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
-        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
-        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
-        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
-    }
+    let data = body[..data_bytes]
+        .chunks_exact(4)
+        .map(|v| prepare(f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]]))));
+    let mask_bits = mask.then(|| {
+        body[data_bytes..].chunks_exact(4).map(|v| {
+            let m = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            m.is_finite() && m != 0.0
+        })
+    });
+    write_npy_typed_planes(&mut out, kind, data, mask_bits);
     Some(Bytes::from(out))
 }
 
@@ -2684,34 +2684,13 @@ pub fn encode_npy_typed_f64(
         _ => 0.0,
     });
     let data = &values[..(bands * pixels).min(values.len())];
-    macro_rules! write_planes {
-        ($t:ty, $cast:expr) => {{
-            let cast = $cast;
-            for &v in data {
-                let x: $t = cast(if v.is_nan() { absent } else { v });
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-            if mask {
-                for i in 0..pixels {
-                    let there = (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()));
-                    let x: $t = if there { <$t>::MAX } else { <$t>::MIN };
-                    out.extend_from_slice(&x.to_le_bytes());
-                }
-            }
-        }};
-    }
-    match kind {
-        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => write_planes!(u8, |v: f64| v as u8),
-        SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
-        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
-        SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
-        SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
-        SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),
-        SampleType::Uint64 => write_planes!(u64, |v: f64| v as u64),
-        SampleType::Int64 => write_planes!(i64, |v: f64| v as i64),
-        SampleType::Float32 => write_planes!(f32, |v: f64| (v as f32).clamp(f32::MIN, f32::MAX)),
-        SampleType::Float64 => write_planes!(f64, |v: f64| v.clamp(f64::MIN, f64::MAX)),
-    }
+    let vals = data.iter().map(|&v| if v.is_nan() { absent } else { v });
+    let mask_bits = mask.then(|| {
+        (0..pixels).map(|i| {
+            (0..bands).any(|band| data.get(band * pixels + i).is_some_and(|v| !v.is_nan()))
+        })
+    });
+    write_npy_typed_planes(&mut out, kind, vals, mask_bits);
     Bytes::from(out)
 }
 
@@ -5307,18 +5286,26 @@ fn render_plane_single<const N: usize>(plane: &[f32], style: &SingleBandStyle) -
     render_eval_fn(&index_plan::<N>(), style, |u, v| plane_at::<N>(plane, u, v))
 }
 
-/// Fused 1-band spectral transform kernel (e.g. SAR linear power -> dB `10*log10(x)`).
-pub fn render_bandmath1<const N: usize>(
+/// Shared const-generic N-band spectral evaluation dispatcher across all `ResampleMode`s,
+/// centralizing nodata short-circuit, `clean` in-bounds detection, and separable `widened_plane`.
+fn render_nband_eval<const N: usize, const B: usize>(
     plan: &CoordPlan<N>,
-    src: &BandSource<'_>,
-    expr: SpectralExpr,
+    srcs: [&BandSource<'_>; B],
     style: &SingleBandStyle,
+    eval: impl Fn([f32; B]) -> f32,
 ) -> Bytes {
-    if src.all_nodata {
+    if srcs.iter().any(|s| s.all_nodata) {
         return empty_tile_bytes(N as u32, style.format, 1);
     }
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
+    let clean = plan.all_in_bounds() && srcs.iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
+    let eval_checked = |vals: [f32; B]| {
+        if vals.iter().any(|v| v.is_nan()) {
+            f32::NAN
+        } else {
+            eval(vals)
+        }
+    };
 
     match (style.resample, clean) {
         (
@@ -5326,31 +5313,47 @@ pub fn render_bandmath1<const N: usize>(
             _,
         ) if plan_widened_scale(plan, mode).is_some() => {
             let (sx, sy) = coord_plan_scale(plan);
-            let plane = widened_plane(plan, src, mode, sx, sy);
-            render_eval_fn(&index_plan::<N>(), style, |u, v| expr.eval1(plane_at::<N>(&plane, u, v)))
+            let planes: [Vec<f32>; B] =
+                std::array::from_fn(|i| widened_plane(plan, srcs[i], mode, sx, sy));
+            render_eval_fn(&index_plan::<N>(), style, |u, v| {
+                let vals = std::array::from_fn(|i| plane_at::<N>(&planes[i], u, v));
+                eval_checked(vals)
+            })
         }
-        (ResampleMode::Bilinear, true) => {
-            render_eval_fn(plan, style, |u, v| expr.eval1(sample_bilinear::<true>(src, u, v)))
-        }
-        (ResampleMode::Bilinear, false) => {
-            render_eval_fn(plan, style, |u, v| expr.eval1(sample_bilinear::<false>(src, u, v)))
-        }
-        (ResampleMode::Nearest, true) => {
-            render_eval_fn(plan, style, |u, v| expr.eval1(sample_nearest::<true>(src, u, v)))
-        }
-        (ResampleMode::Nearest, false) => {
-            render_eval_fn(plan, style, |u, v| expr.eval1(sample_nearest::<false>(src, u, v)))
-        }
-        (ResampleMode::Cubic, _) => {
-            render_eval_fn(plan, style, |u, v| expr.eval1(sample_cubic(src, u, v)))
-        }
+        (ResampleMode::Bilinear, true) => render_eval_fn(plan, style, |u, v| {
+            eval(std::array::from_fn(|i| sample_bilinear::<true>(srcs[i], u, v)))
+        }),
+        (ResampleMode::Bilinear, false) => render_eval_fn(plan, style, |u, v| {
+            eval_checked(std::array::from_fn(|i| sample_bilinear::<false>(srcs[i], u, v)))
+        }),
+        (ResampleMode::Nearest, true) => render_eval_fn(plan, style, |u, v| {
+            eval(std::array::from_fn(|i| sample_nearest::<true>(srcs[i], u, v)))
+        }),
+        (ResampleMode::Nearest, false) => render_eval_fn(plan, style, |u, v| {
+            eval_checked(std::array::from_fn(|i| sample_nearest::<false>(srcs[i], u, v)))
+        }),
+        (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| {
+            eval_checked(std::array::from_fn(|i| sample_cubic(srcs[i], u, v)))
+        }),
         (other, _) => {
             let (scale_x, scale_y) = coord_plan_scale(plan);
             render_eval_fn(plan, style, |u, v| {
-                expr.eval1(sample_general_unwidened(src, u, v, scale_x, scale_y, other))
+                eval_checked(std::array::from_fn(|i| {
+                    sample_general_unwidened(srcs[i], u, v, scale_x, scale_y, other)
+                }))
             })
         }
     }
+}
+
+/// Fused 1-band spectral transform kernel (e.g. SAR linear power -> dB `10*log10(x)`).
+pub fn render_bandmath1<const N: usize>(
+    plan: &CoordPlan<N>,
+    src: &BandSource<'_>,
+    expr: SpectralExpr,
+    style: &SingleBandStyle,
+) -> Bytes {
+    render_nband_eval(plan, [src], style, |[a]| expr.eval1(a))
 }
 
 /// Fused Dual-Pol SAR False-Color RGB kernel (`[VV, VH]` linear power -> `[VV_dB, VH_dB, VV_dB - VH_dB]`).
@@ -5516,82 +5519,7 @@ pub fn render_bandmath2<const N: usize>(
     expr: SpectralExpr,
     style: &SingleBandStyle,
 ) -> Bytes {
-    if srcs[0].all_nodata || srcs[1].all_nodata {
-        return empty_tile_bytes(N as u32, style.format, 1);
-    }
-    let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = plan.all_in_bounds()
-        && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
-        && srcs[1].is_clean_inbounds(c0, c1, r0, r1);
-
-    match (style.resample, clean) {
-        (
-            mode @ (ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos),
-            _,
-        ) if plan_widened_scale(plan, mode).is_some() => {
-            let (sx, sy) = coord_plan_scale(plan);
-            let pa = widened_plane(plan, &srcs[0], mode, sx, sy);
-            let pb = widened_plane(plan, &srcs[1], mode, sx, sy);
-            render_eval_fn(&index_plan::<N>(), style, |u, v| {
-                let a = plane_at::<N>(&pa, u, v);
-                let b = plane_at::<N>(&pb, u, v);
-                if a.is_nan() || b.is_nan() {
-                    f32::NAN
-                } else {
-                    expr.eval2(a, b)
-                }
-            })
-        }
-        (ResampleMode::Bilinear, true) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_bilinear::<true>(&srcs[0], u, v);
-            let b = sample_bilinear::<true>(&srcs[1], u, v);
-            expr.eval2(a, b)
-        }),
-        (ResampleMode::Bilinear, false) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_bilinear::<false>(&srcs[0], u, v);
-            let b = sample_bilinear::<false>(&srcs[1], u, v);
-            if a.is_nan() || b.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval2(a, b)
-            }
-        }),
-        (ResampleMode::Nearest, true) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_nearest::<true>(&srcs[0], u, v);
-            let b = sample_nearest::<true>(&srcs[1], u, v);
-            expr.eval2(a, b)
-        }),
-        (ResampleMode::Nearest, false) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_nearest::<false>(&srcs[0], u, v);
-            let b = sample_nearest::<false>(&srcs[1], u, v);
-            if a.is_nan() || b.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval2(a, b)
-            }
-        }),
-        (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_cubic(&srcs[0], u, v);
-            let b = sample_cubic(&srcs[1], u, v);
-            if a.is_nan() || b.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval2(a, b)
-            }
-        }),
-        (other, _) => {
-            let (scale_x, scale_y) = coord_plan_scale(plan);
-            render_eval_fn(plan, style, |u, v| {
-                let a = sample_general_unwidened(&srcs[0], u, v, scale_x, scale_y, other);
-                let b = sample_general_unwidened(&srcs[1], u, v, scale_x, scale_y, other);
-                if a.is_nan() || b.is_nan() {
-                    f32::NAN
-                } else {
-                    expr.eval2(a, b)
-                }
-            })
-        }
-    }
+    render_nband_eval(plan, [&srcs[0], &srcs[1]], style, |[a, b]| expr.eval2(a, b))
 }
 
 /// Fused 3-band spectral index kernel (EVI).
@@ -5601,91 +5529,9 @@ pub fn render_bandmath3<const N: usize>(
     expr: SpectralExpr,
     style: &SingleBandStyle,
 ) -> Bytes {
-    if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
-        return empty_tile_bytes(N as u32, style.format, 1);
-    }
-    let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-    let clean = plan.all_in_bounds()
-        && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
-        && srcs[1].is_clean_inbounds(c0, c1, r0, r1)
-        && srcs[2].is_clean_inbounds(c0, c1, r0, r1);
-
-    match (style.resample, clean) {
-        (
-            mode @ (ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos),
-            _,
-        ) if plan_widened_scale(plan, mode).is_some() => {
-            let (sx, sy) = coord_plan_scale(plan);
-            let pa = widened_plane(plan, &srcs[0], mode, sx, sy);
-            let pb = widened_plane(plan, &srcs[1], mode, sx, sy);
-            let pc = widened_plane(plan, &srcs[2], mode, sx, sy);
-            render_eval_fn(&index_plan::<N>(), style, |u, v| {
-                let a = plane_at::<N>(&pa, u, v);
-                let b = plane_at::<N>(&pb, u, v);
-                let c = plane_at::<N>(&pc, u, v);
-                if a.is_nan() || b.is_nan() || c.is_nan() {
-                    f32::NAN
-                } else {
-                    expr.eval3(a, b, c)
-                }
-            })
-        }
-        (ResampleMode::Bilinear, true) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_bilinear::<true>(&srcs[0], u, v);
-            let b = sample_bilinear::<true>(&srcs[1], u, v);
-            let c = sample_bilinear::<true>(&srcs[2], u, v);
-            expr.eval3(a, b, c)
-        }),
-        (ResampleMode::Bilinear, false) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_bilinear::<false>(&srcs[0], u, v);
-            let b = sample_bilinear::<false>(&srcs[1], u, v);
-            let c = sample_bilinear::<false>(&srcs[2], u, v);
-            if a.is_nan() || b.is_nan() || c.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval3(a, b, c)
-            }
-        }),
-        (ResampleMode::Nearest, true) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_nearest::<true>(&srcs[0], u, v);
-            let b = sample_nearest::<true>(&srcs[1], u, v);
-            let c = sample_nearest::<true>(&srcs[2], u, v);
-            expr.eval3(a, b, c)
-        }),
-        (ResampleMode::Nearest, false) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_nearest::<false>(&srcs[0], u, v);
-            let b = sample_nearest::<false>(&srcs[1], u, v);
-            let c = sample_nearest::<false>(&srcs[2], u, v);
-            if a.is_nan() || b.is_nan() || c.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval3(a, b, c)
-            }
-        }),
-        (ResampleMode::Cubic, _) => render_eval_fn(plan, style, |u, v| {
-            let a = sample_cubic(&srcs[0], u, v);
-            let b = sample_cubic(&srcs[1], u, v);
-            let c = sample_cubic(&srcs[2], u, v);
-            if a.is_nan() || b.is_nan() || c.is_nan() {
-                f32::NAN
-            } else {
-                expr.eval3(a, b, c)
-            }
-        }),
-        (other, _) => {
-            let (scale_x, scale_y) = coord_plan_scale(plan);
-            render_eval_fn(plan, style, |u, v| {
-                let a = sample_general_unwidened(&srcs[0], u, v, scale_x, scale_y, other);
-                let b = sample_general_unwidened(&srcs[1], u, v, scale_x, scale_y, other);
-                let c = sample_general_unwidened(&srcs[2], u, v, scale_x, scale_y, other);
-                if a.is_nan() || b.is_nan() || c.is_nan() {
-                    f32::NAN
-                } else {
-                    expr.eval3(a, b, c)
-                }
-            })
-        }
-    }
+    render_nband_eval(plan, [&srcs[0], &srcs[1], &srcs[2]], style, |[a, b, c]| {
+        expr.eval3(a, b, c)
+    })
 }
 
 /// Evaluate an arbitrary compiled TiTiler `?expression=` bytecode program across any number of
