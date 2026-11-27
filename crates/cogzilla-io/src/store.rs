@@ -1315,11 +1315,7 @@ impl CogStore {
             cogzilla_tiff::PlanarConfig::Chunky => ifd.samples_per_pixel as usize,
             cogzilla_tiff::PlanarConfig::Planar => 1,
         };
-        let bytes_per_sample = match ifd.sample_type {
-            cogzilla_tiff::SampleType::Uint8 => 1usize,
-            cogzilla_tiff::SampleType::Uint16 => 2usize,
-            _ => 4usize,
-        };
+        let bytes_per_sample = ifd.sample_type.bytes_per_sample();
         let per_block_bytes = (ifd.tile_width as usize)
             .saturating_mul(ifd.tile_height as usize)
             .saturating_mul(bands_per_block)
@@ -2727,4 +2723,100 @@ fn is_cloud_scheme(uri: &str) -> bool {
         || uri.starts_with("abfs://")
         || uri.starts_with("abfss://")
         || uri.starts_with("/vsiaz/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal sparse 1-tile tiled TIFF on disk with the given tile size, bit depth,
+    /// and TIFF SampleFormat (1=uint, 2=int, 3=float). `TileByteCounts` is 0 so the file is
+    /// ~200 bytes regardless of tile dimensions.
+    fn write_sparse_tiled_tiff(
+        path: &std::path::Path,
+        tile_dim: u32,
+        bits_per_sample: u16,
+        sample_format: u16,
+    ) {
+        let entries: [(u16, u16, u32, u32); 12] = [
+            (256, 4, 1, tile_dim),              // ImageWidth
+            (257, 4, 1, tile_dim),              // ImageLength
+            (258, 3, 1, bits_per_sample as u32), // BitsPerSample
+            (259, 3, 1, 1),                     // Compression: none
+            (262, 3, 1, 1),                     // MinIsBlack
+            (277, 3, 1, 1),                     // SamplesPerPixel
+            (284, 3, 1, 1),                     // PlanarConfiguration: chunky
+            (322, 4, 1, tile_dim),              // TileWidth
+            (323, 4, 1, tile_dim),              // TileLength
+            (324, 4, 1, 0),                     // TileOffsets: [0] (inline)
+            (325, 4, 1, 0),                     // TileByteCounts: [0] (inline sparse)
+            (339, 3, 1, sample_format as u32),  // SampleFormat
+        ];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, ty, count, val) in entries {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&ty.to_le_bytes());
+            buf.extend_from_slice(&count.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoded_bytes_cap_uses_exact_bytes_per_sample_for_f64_and_i8() {
+        let dir = std::env::temp_dir().join(format!(
+            "cogzilla-io-cap-475-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Float64 (8 bytes/sample), 512x512 tiles => 2 MiB per block.
+        // 129 blocks = 258 MiB > 256 MiB cap => must be refused (previously under-counted as 129 MiB).
+        let f64_path = dir.join("sparse_f64.tif");
+        write_sparse_tiled_tiff(&f64_path, 512, 64, 3);
+        let store = CogStore::new(4 * 1024 * 1024);
+        let f64_cog = store
+            .open_uri(&f64_path.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(
+            f64_cog.index.ifds[0].sample_type,
+            cogzilla_tiff::SampleType::Float64
+        );
+        let over_cap = vec![Some(0u32); 129];
+        let err = store
+            .get_blocks(&f64_cog, 0, &over_cap)
+            .await
+            .err()
+            .expect("expected 256 MiB decoded-bytes cap error for 129 Float64 blocks");
+        assert!(
+            err.to_string().contains("256 MiB"),
+            "expected 256 MiB decoded-bytes cap error for 129 Float64 blocks, got: {err}"
+        );
+        // 128 blocks = exactly 256 MiB => must succeed.
+        let at_cap = vec![Some(0u32); 128];
+        assert!(store.get_blocks(&f64_cog, 0, &at_cap).await.is_ok());
+
+        // Int8 (1 byte/sample), 512x512 tiles => 256 KiB per block.
+        // 300 blocks = 75 MiB <= 256 MiB cap => must succeed (previously over-counted as 300 MiB).
+        let i8_path = dir.join("sparse_i8.tif");
+        write_sparse_tiled_tiff(&i8_path, 512, 8, 2);
+        let i8_cog = store
+            .open_uri(&i8_path.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(
+            i8_cog.index.ifds[0].sample_type,
+            cogzilla_tiff::SampleType::Int8
+        );
+        let i8_blocks = vec![Some(0u32); 300];
+        assert!(store.get_blocks(&i8_cog, 0, &i8_blocks).await.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
