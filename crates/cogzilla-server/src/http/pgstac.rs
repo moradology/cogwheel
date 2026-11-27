@@ -6388,10 +6388,7 @@ fn item_proj_grid(item: &Value, readable: &[String]) -> Option<ProjGrid> {
     for name in readable {
         let asset = &item["assets"][name];
         if let (Some(grid), Some(t)) = (proj_grid_of(asset), asset.get("proj:transform")) {
-            match proj_crs_string(asset).or_else(|| item_crs.clone()) {
-                Some(crs) => crs_strings.push(crs),
-                None => return None,
-            }
+            crs_strings.push(proj_crs_string(asset).or_else(|| item_crs.clone())?);
             let xres = t[0].as_f64().unwrap_or(0.0);
             let yres = t[4].as_f64().unwrap_or(0.0);
             grids.push((grid, xres, yres));
