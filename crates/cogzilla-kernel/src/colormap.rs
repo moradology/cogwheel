@@ -50,7 +50,10 @@ pub enum CustomColormap {
         stops: Vec<(f32, [u8; 4])>,
         direct_lookup: bool,
     },
-    Intervals(Vec<(f32, f32, [u8; 4])>),
+    Intervals {
+        intervals: Vec<(f32, f32, [u8; 4])>,
+        direct_lookup: bool,
+    },
 }
 
 impl CustomColormap {
@@ -163,7 +166,10 @@ impl CustomColormap {
                 })?;
                 intervals.push((lo, hi, color));
             }
-            Ok(Self::Intervals(intervals))
+            Ok(Self::Intervals {
+                intervals,
+                direct_lookup: !rescale_explicit,
+            })
         } else {
             Err(
                 "colormap JSON must be an object {idx: color} or interval array [[[min,max], color], ...]"
@@ -176,10 +182,9 @@ impl CustomColormap {
     #[inline(always)]
     pub fn uses_direct_lookup(&self) -> bool {
         match self {
-            Self::Discrete { direct_lookup, .. } | Self::Linear { direct_lookup, .. } => {
-                *direct_lookup
-            }
-            Self::Intervals(_) => true,
+            Self::Discrete { direct_lookup, .. }
+            | Self::Linear { direct_lookup, .. }
+            | Self::Intervals { direct_lookup, .. } => *direct_lookup,
         }
     }
 
@@ -246,9 +251,17 @@ impl CustomColormap {
                     lerp(c0[3], c1[3]),
                 ]
             }
-            Self::Intervals(intervals) => {
+            Self::Intervals {
+                intervals,
+                direct_lookup,
+            } => {
+                let x = if *direct_lookup {
+                    v
+                } else {
+                    ((v - rescale_min) * inv_range).clamp(0.0, 255.0)
+                };
                 for &(lo, hi, rgba) in intervals {
-                    if v >= lo && v < hi {
+                    if x >= lo && x < hi {
                         return rgba;
                     }
                 }
@@ -478,6 +491,14 @@ mod tests {
         assert_eq!(cmap.lookup(100.0, 0.0, 1.0), [0, 255, 0, 255]);
         assert_eq!(cmap.lookup(499.9, 0.0, 1.0), [0, 255, 0, 255]);
         assert_eq!(cmap.lookup(500.0, 0.0, 1.0), [0, 0, 0, 0]);
+
+        // With explicit `?rescale=0,1000`, interval bounds apply to the rescaled 0..=255 value.
+        let json_rescaled = r#"[[[0,128],[0,0,255,255]],[[128,256],[255,0,0,255]]]"#;
+        let rcmap = CustomColormap::from_json_str(json_rescaled, true).unwrap();
+        assert!(!rcmap.uses_direct_lookup());
+        let inv = 255.0 / 1000.0;
+        assert_eq!(rcmap.lookup(200.0, 0.0, inv), [0, 0, 255, 255]); // 51 -> [0, 128)
+        assert_eq!(rcmap.lookup(800.0, 0.0, inv), [255, 0, 0, 255]); // 204 -> [128, 256)
     }
 
     #[test]
