@@ -19,8 +19,7 @@ pub(super) fn render_stats_json(engine: &TileEngine) -> String {
             "read_errors": s.read_errors,
         })
     });
-    #[cfg(feature = "gpu")]
-    let gpu_stats = engine.gpu.as_ref().map(|gpu| {
+    let gpu_stats = engine.accelerated().map(|gpu| {
         let s = gpu.slab_cache.stats();
         let ms = gpu.multi_slab_cache.stats();
         serde_json::json!({
@@ -40,8 +39,6 @@ pub(super) fn render_stats_json(engine: &TileEngine) -> String {
             },
         })
     });
-    #[cfg(not(feature = "gpu"))]
-    let gpu_stats: Option<serde_json::Value> = None;
     let pgstac_stats = engine.pgstac().map(|pg| {
         let s = pg.stats();
         serde_json::json!({
@@ -178,8 +175,7 @@ pub(super) fn render_prometheus_metrics(engine: &TileEngine) -> String {
         let _ = writeln!(out, "cogzilla_disk_cache_read_errors_total {}", s.read_errors);
     }
 
-    #[cfg(feature = "gpu")]
-    if let Some(gpu) = &engine.gpu {
+    if let Some(gpu) = engine.accelerated() {
         let s = gpu.slab_cache.stats();
         let ms = gpu.multi_slab_cache.stats();
         let _ = writeln!(out, "# HELP cogzilla_gpu_dispatches_total Total GPU compute dispatches.");

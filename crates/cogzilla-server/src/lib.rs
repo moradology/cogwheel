@@ -7,6 +7,9 @@ pub mod config;
 pub mod engine;
 #[cfg(feature = "gpu")]
 pub mod gpu_backend;
+#[cfg(not(feature = "gpu"))]
+#[path = "gpu_stub.rs"]
+pub mod gpu_backend;
 mod geotiff;
 pub mod histogram;
 pub mod http;
