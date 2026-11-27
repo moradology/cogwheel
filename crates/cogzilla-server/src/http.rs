@@ -22,6 +22,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use tokio::net::TcpListener;
 
 mod algorithm_math;
+mod algorithm_params;
 mod array_type;
 #[cfg(test)]
 mod asset_query_pins;
@@ -328,6 +329,12 @@ struct ParsedQuery {
     contour_minz: f32,
     contour_maxz: f32,
     cast_dtype: Option<String>,
+    /// `algorithm_params` as given, when it is a JSON object.
+    algorithm_params: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What TiTiler's model of the algorithm says of its parameters, which it answers `400`.
+    algorithm_error: Option<String>,
+    /// `algorithm_params` as given when it is not JSON, which FastAPI answers `422`.
+    algorithm_params_unread: Option<String>,
     colormap_explicit: bool,
     colormap_name_set: bool,
     colormap_type_linear: bool,
@@ -407,6 +414,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         contour_minz: -12000.0,
         contour_maxz: 8000.0,
         cast_dtype: None,
+        algorithm_params: None,
+        algorithm_error: None,
+        algorithm_params_unread: None,
         colormap_explicit: false,
         colormap_name_set: false,
         colormap_type_linear: false,
@@ -530,42 +540,24 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 let dec = percent_decode(v);
                 match serde_json::from_str::<serde_json::Value>(&dec) {
                     Ok(serde_json::Value::Object(obj)) => {
-                        if let Some(val) = obj.get("azimuth") {
-                            match val.as_f64().map(|a| a as f32) {
-                                Some(a) if a.is_finite() => {
-                                    // TiTiler's HillShade uses a 90°-rotated azimuth convention
-                                    // (default 45° == compass 315°); convert to compass degrees
-                                    // while preserving cogzilla's native `?azimuth=` compass param.
-                                    pq.azimuth = (a - 90.0).rem_euclid(360.0);
-                                }
-                                _ => bad("azimuth must be a finite number"),
-                            }
+                        // Read as pydantic's lax mode reads them (`"45"`, `true`); what the
+                        // algorithm's model refuses is answered once the algorithm is known
+                        // (`algorithm_error`), and a value refused here is not taken.
+                        let number = |key: &str| algorithm_params::number(&obj, key).filter(|x| x.is_finite());
+                        if let Some(a) = number("azimuth") {
+                            // TiTiler's HillShade uses a 90°-rotated azimuth convention
+                            // (default 45° == compass 315°); convert to compass degrees
+                            // while preserving cogzilla's native `?azimuth=` compass param.
+                            pq.azimuth = (a as f32 - 90.0).rem_euclid(360.0);
                         }
-                        if let Some(val) = obj
-                            .get("angle_altitude")
-                            .or_else(|| obj.get("altitude"))
-                            .or_else(|| obj.get("angle"))
-                        {
-                            match val.as_f64().map(|a| a as f32) {
-                                Some(a) if a.is_finite() => pq.altitude = a.clamp(0.0, 90.0),
-                                _ => bad("altitude must be a finite number"),
-                            }
+                        if let Some(a) = number("angle_altitude").or_else(|| number("altitude")).or_else(|| number("angle")) {
+                            pq.altitude = (a as f32).clamp(0.0, 90.0);
                         }
-                        if let Some(val) = obj
-                            .get("z_exaggeration")
-                            .or_else(|| obj.get("z_factor"))
-                            .or_else(|| obj.get("zfactor"))
-                        {
-                            match val.as_f64().map(|z| z as f32) {
-                                Some(z) if z.is_finite() => pq.z_factor = z.max(1e-4),
-                                _ => bad("z_factor must be a finite number"),
-                            }
+                        if let Some(z) = number("z_exaggeration").or_else(|| number("z_factor")).or_else(|| number("zfactor")) {
+                            pq.z_factor = (z as f32).max(1e-4);
                         }
-                        if let Some(val) = obj.get("threshold") {
-                            match val.as_f64().map(|t| t as f32) {
-                                Some(t) if t.is_finite() => pq.threshold = t,
-                                _ => bad("threshold must be a finite number"),
-                            }
+                        if let Some(t) = number("threshold") {
+                            pq.threshold = t as f32;
                         }
                         if let Some(val) = obj.get("dtype") {
                             match val.as_str() {
@@ -573,40 +565,27 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                                 None => bad("dtype must be a string"),
                             }
                         }
-                        if let Some(val) = obj.get("increment") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(x) if x.is_finite() && x > 0.0 => pq.contour_increment = x,
-                                _ => bad("increment must be a positive finite number"),
-                            }
+                        if let Some(x) = number("increment").filter(|x| *x > 0.0) {
+                            pq.contour_increment = x as f32;
                         }
-                        if let Some(val) = obj.get("thickness") {
-                            match val.as_u64() {
-                                Some(t) if (1..=16).contains(&t) => pq.contour_thickness = t as u32,
-                                _ => bad("thickness must be an integer in 1..=16"),
-                            }
+                        if let Some(t) = number("thickness").filter(|t| (0.0..=10.0).contains(t)) {
+                            pq.contour_thickness = t as u32;
                         }
-                        if let Some(val) = obj.get("minz") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(x) if x.is_finite() => pq.contour_minz = x,
-                                _ => bad("minz must be a finite number"),
-                            }
+                        if let Some(x) = number("minz") {
+                            pq.contour_minz = x as f32;
                         }
-                        if let Some(val) = obj.get("buffer") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(b) if b.is_finite() && (0.0..=99.0).contains(&b) => {
-                                    pq.alg_buffer = Some(b);
-                                }
-                                _ => bad("buffer must be a number in 0..=99"),
-                            }
+                        if let Some(b) = number("buffer").filter(|b| (0.0..=99.0).contains(b)) {
+                            pq.alg_buffer = Some(b as f32);
                         }
-                        if let Some(val) = obj.get("maxz") {
-                            match val.as_f64().map(|x| x as f32) {
-                                Some(x) if x.is_finite() => pq.contour_maxz = x,
-                                _ => bad("maxz must be a finite number"),
-                            }
+                        if let Some(x) = number("maxz") {
+                            pq.contour_maxz = x as f32;
                         }
+                        pq.algorithm_params = Some(obj);
                     }
-                    _ => bad("expected a JSON object"),
+                    // Not a mapping: TiTiler fails with a 500 there, and a 400 says why here.
+                    Ok(_) => pq.algorithm_error = Some("algorithm_params should be a JSON object".into()),
+                    // Answered only where an algorithm is applied, as FastAPI's dependency is.
+                    Err(_) => pq.algorithm_params_unread = Some(dec.clone()),
                 }
             }
             "azimuth" => {
@@ -1023,6 +1002,12 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         let crop = pq.alg_buffer.unwrap_or(default_crop).min(pq.buffer);
         pq.buffer = (pq.buffer - crop).max(0.0);
     }
+    match (pq.algorithm.as_deref(), pq.algorithm_params.as_ref()) {
+        (Some(alg), Some(params)) => pq.algorithm_error = algorithm_params::check(alg, params).err(),
+        // Without an algorithm its parameters are not read, whatever they are.
+        (None, _) => pq.algorithm_error = None,
+        _ => {}
+    }
     pq.errors = pq_errors;
     pq
 }
@@ -1095,6 +1080,18 @@ fn route_supports_pixel_selection(segs: &[&str]) -> bool {
         | ["mosaicjson", "tilejson.json" | "map.html" | "WMTSCapabilities.xml"] => true,
         _ => false,
     }
+}
+
+/// Whether a route applies `algorithm`, as TiTiler's do that take its post-processing:
+/// tiles and what points at them, pictures of a box, a feature or the whole, statistics.
+fn route_applies_algorithm(segs: &[&str]) -> bool {
+    if !matches!(segs.first(), Some(&("cog" | "stac" | "mosaicjson"))) {
+        return false;
+    }
+    let named = |route: &str| segs.get(1).is_some_and(|s| *s == route || s.strip_prefix(route).is_some_and(|ext| ext.starts_with('.')));
+    matches!(segs.last(), Some(&("tilejson.json" | "map.html" | "WMTSCapabilities.xml")))
+        || (segs.get(1) == Some(&"tiles") && segs.len() > 3)
+        || ["preview", "bbox", "feature", "statistics"].iter().any(|r| named(r))
 }
 
 fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
@@ -6009,6 +6006,22 @@ where
             StatusCode::BAD_REQUEST,
             "parameter 'pixel_selection' is only supported on mosaic tiles, bbox, feature, and statistics routes",
         ));
+    }
+    // Parameters the algorithm's model refuses, as TiTiler answers them, on the routes that
+    // apply an algorithm.
+    if route_applies_algorithm(&segs) {
+        if let Some(input) = &pq.algorithm_params_unread {
+            let body = serde_json::json!({"detail": [{
+                "type": "value_error",
+                "loc": ["query", "algorithm_params"],
+                "msg": "Value error, invalid JSON content",
+                "input": input,
+            }]});
+            return Ok(plain_resp(StatusCode::UNPROCESSABLE_ENTITY, Bytes::from(body.to_string()), "application/json"));
+        }
+        if let Some(msg) = pq.algorithm_error.as_deref() {
+            return Ok(json_error_resp(StatusCode::BAD_REQUEST, msg));
+        }
     }
 
     // ------------------------------------------------------------------------
