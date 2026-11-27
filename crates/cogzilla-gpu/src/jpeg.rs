@@ -634,15 +634,19 @@ impl GpuJpegEncoder {
                 "invalid RGBA8 buffer for GPU JPEG".into(),
             ));
         }
+        let max_binding = self.device.limits().max_storage_buffer_binding_size as usize;
+        if expected > max_binding {
+            return Err(GpuError::InvalidDimensions(format!(
+                "JPEG RGBA8 input ({expected} bytes) exceeds adapter max_storage_buffer_binding_size ({max_binding} bytes)"
+            )));
+        }
         if expected > self.src_cap_bytes {
-            self.src_cap_bytes = expected.next_power_of_two();
+            self.src_cap_bytes = expected.next_power_of_two().min(max_binding);
             self.src_buf = Self::alloc_src(&self.device, self.src_cap_bytes);
         }
         self.queue.write_buffer(&self.src_buf, 0, &rgba[..expected]);
-        let src_buf_ptr = &self.src_buf as *const wgpu::Buffer;
-        // SAFETY: `encode_rgba8_from_buffer_inner` only borrows `src_buf` immutably to create the
-        // bind group and never reallocates `self.src_buf`.
-        unsafe { self.encode_rgba8_from_buffer_inner(&*src_buf_ptr, width, height, quality) }
+        let src_buf = self.src_buf.clone();
+        self.encode_rgba8_from_buffer_inner(&src_buf, width, height, quality)
     }
 
     /// Encode an RGBA8 image already resident in a GPU `STORAGE` buffer (zero CPU→GPU upload).

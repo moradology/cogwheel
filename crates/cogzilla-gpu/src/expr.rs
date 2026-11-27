@@ -1301,8 +1301,8 @@ mod tests {
             for gx in 0..17 {
                 let fx = gx as f32 / 16.0;
                 let fy = gy as f32 / 16.0;
-                grid_u[gy * 17 + gx] = 10.0 + fx * 230.0 + 4.0 * (fy * 3.14).sin();
-                grid_v[gy * 17 + gx] = 10.0 + fy * 230.0 - 4.0 * (fx * 3.14).sin();
+                grid_u[gy * 17 + gx] = 10.0 + fx * 230.0 + 4.0 * (fy * std::f32::consts::PI).sin();
+                grid_v[gy * 17 + gx] = 10.0 + fy * 230.0 - 4.0 * (fx * std::f32::consts::PI).sin();
             }
         }
         let eval_grid = |px: usize, py: usize| -> (f32, f32) {

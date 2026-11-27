@@ -281,17 +281,22 @@ impl GpuStatsReducer {
         if pixels.is_empty() {
             return Ok(empty_stats(0, percentiles));
         }
+        let needed_bytes = (pixels.len() as u64).saturating_mul(4);
+        let max_binding = self.device.limits().max_storage_buffer_binding_size as u64;
+        if needed_bytes > max_binding {
+            return Err(GpuError::InvalidDimensions(format!(
+                "stats input ({needed_bytes} bytes) exceeds adapter max_storage_buffer_binding_size ({max_binding} bytes)"
+            )));
+        }
         if pixels.len() > self.src_cap_elems {
-            self.src_cap_elems = pixels.len().next_power_of_two();
+            let max_elems = (max_binding / 4) as usize;
+            self.src_cap_elems = pixels.len().next_power_of_two().min(max_elems);
             self.src_buf = Self::alloc_src(&self.device, self.src_cap_elems);
         }
         self.queue
             .write_buffer(&self.src_buf, 0, bytemuck::cast_slice(pixels));
-        let ptr = &self.src_buf as *const wgpu::Buffer;
-        // SAFETY: `reduce_buffer` only reads `src_buf` and never reallocates `self.src_buf`.
-        unsafe {
-            self.reduce_buffer(&*ptr, pixels.len(), nodata, num_bins, hist_range, percentiles)
-        }
+        let src_buf = self.src_buf.clone();
+        self.reduce_buffer(&src_buf, pixels.len(), nodata, num_bins, hist_range, percentiles)
     }
 
     /// Compute full band statistics directly on a GPU-resident `GpuSlab` (zero CPU→GPU upload!).
