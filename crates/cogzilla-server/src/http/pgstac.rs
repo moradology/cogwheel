@@ -6134,14 +6134,14 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
     if resp.status() != StatusCode::OK {
         return resp;
     }
-    // A parameter as the handlers that drew the picture read it: by its key as written,
-    // not percent-decoded, and the last one given.
+    // A parameter as the handlers that drew the picture read it: by its key, percent-decoded
+    // as Starlette decodes it, and the last one given.
     let asked = |key: &str| {
         raw_query
             .split('&')
             .rev()
             .filter_map(|pair| pair.split_once('='))
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| super::query_key(k) == key)
             .map(|(_, v)| super::percent_decode(v))
     };
     match sub {
@@ -6772,7 +6772,8 @@ pub(super) async fn item_route(
         let query: String = query
             .split('&')
             .filter(|part| {
-                let name = part.split('=').next().unwrap_or(part);
+                let name = super::query_key(part.split('=').next().unwrap_or(part));
+                let name = name.as_ref();
                 !CHECKED.contains(&name) || item_route_reads(method, rest, name)
             })
             .collect::<Vec<_>>()
@@ -8458,8 +8459,8 @@ mod tests {
         ] {
             assert_eq!(said(sub, query), None, "{sub:?} {query}");
         }
-        // A key the handlers do not read as that parameter is not read as it here either.
-        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857").unwrap().1, crs(4326));
+        // A percent-encoded key is the key it spells, as the handlers read it.
+        assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst%5Fcrs=EPSG:3857").unwrap().1, crs(3857));
         assert_eq!(said(&["bbox", "6.3,43.6,6.5,43.8.png"], "dst_crs=epsg:3857&dst_crs=epsg:4326").unwrap().1, crs(4326));
         // Degrees asked for as CRS84 are named so; a buffered tile is not placed.
         let ogc = "<http://www.opengis.net/def/crs/OGC/0/CRS84>";
