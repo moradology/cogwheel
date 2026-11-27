@@ -1765,8 +1765,6 @@ fn resample_method(parameter: &str, method: &str) -> Option<ResampleMode> {
         "max" | "min" | "med" | "q1" | "q3" | "sum" if !of_the_warp => None,
         // A spelling the shared routes take and rasterio has not.
         "cubicspline" => None,
-        // Drawn with the cubic kernel on these routes.
-        "cubic_spline" | "lanczos" => Some(ResampleMode::Cubic),
         _ => super::parse_resample_mode(method),
     }
 }
@@ -7254,6 +7252,19 @@ async fn mosaic_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_resampling_method_is_its_own_kernel() {
+        // `cubic_spline` and `lanczos` are drawn with their own kernels, as rasterio's are.
+        for parameter in ["resampling", "reproject"] {
+            assert_eq!(resample_method(parameter, "cubic_spline"), Some(ResampleMode::CubicSpline));
+            assert_eq!(resample_method(parameter, "lanczos"), Some(ResampleMode::Lanczos));
+            assert_eq!(resample_method(parameter, "cubic"), Some(ResampleMode::Cubic));
+            assert_eq!(resample_method(parameter, "cubicspline"), None, "not rasterio's spelling");
+        }
+        assert_eq!(resample_method("reproject", "gauss"), None);
+        assert_eq!(resample_method("resampling", "sum"), None);
+    }
 
     #[test]
     fn complaints_are_matched_by_the_parameter_they_name() {
