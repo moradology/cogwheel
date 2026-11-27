@@ -124,7 +124,7 @@ fn a_pixel_selection_paints_whatever_bands_the_request_leaves() {
     assert_eq!(rgba, [255, 127, 63, 255]);
     // Bands with no range of their own are bytes as they are: a terrain encoding's
     // three, and the first three of however many were asked for.
-    let terrain = BandRequest::Terrain { band_1based: 1, encoding: TerrainEncoding::Terrarium };
+    let terrain = BandRequest::Terrain { band_1based: 1, algorithm: DemAlgorithm::Terrarium };
     let rgba = paint_selected(selected(3, &[128.0, 7.0, 255.0]), 1, &terrain, &pq, None).unwrap();
     assert_eq!(rgba, [128, 7, 255, 255]);
     let four = BandRequest::MultiBand { bands_1based: vec![1, 2, 3, 4] };

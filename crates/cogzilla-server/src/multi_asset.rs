@@ -445,7 +445,7 @@ pub(crate) async fn render_mixed_grid_bbox(
             }
             BandRequest::Terrain {
                 band_1based,
-                encoding,
+                algorithm,
             } => {
                 let p = get_plane(*band_1based);
                 let mut g_p = Vec::with_capacity(npix * 4);
@@ -456,7 +456,7 @@ pub(crate) async fn render_mixed_grid_bbox(
                         g_p.extend_from_slice(&f32::NAN.to_le_bytes());
                         b_p.extend_from_slice(&f32::NAN.to_le_bytes());
                     } else {
-                        let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*encoding, elev);
+                        let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*algorithm, elev);
                         out.put_slice(&(r as f32).to_le_bytes());
                         g_p.extend_from_slice(&(g as f32).to_le_bytes());
                         b_p.extend_from_slice(&(b as f32).to_le_bytes());
@@ -681,11 +681,11 @@ pub(crate) async fn render_mixed_grid_bbox(
         }
         BandRequest::Terrain {
             band_1based,
-            encoding,
+            algorithm,
         } => {
             for (i, &v) in get_plane(*band_1based).iter().enumerate() {
                 if !v.is_nan() {
-                    let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*encoding, v);
+                    let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*algorithm, v);
                     rgba[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, 255]);
                 }
             }

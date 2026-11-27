@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use cogzilla_kernel::{
     ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram, OutputFormat,
-    ResampleMode, SpectralExpr, TerrainEncoding,
+    ResampleMode, SpectralExpr,
 };
 use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
@@ -1373,13 +1373,13 @@ fn build_band_request(
             AlgorithmId::Terrarium => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
-                    encoding: TerrainEncoding::Terrarium,
+                    algorithm: DemAlgorithm::Terrarium,
                 });
             }
             AlgorithmId::TerrainRgb => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
-                    encoding: TerrainEncoding::TerrainRgb,
+                    algorithm: DemAlgorithm::TerrainRgb,
                 });
             }
             AlgorithmId::Hillshade => {
@@ -1423,7 +1423,7 @@ fn build_band_request(
             AlgorithmId::Contours => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
-                    encoding: TerrainEncoding::Contours {
+                    algorithm: DemAlgorithm::Contours {
                         increment: pq.contour_increment.max(1e-6),
                         thickness: pq.contour_thickness,
                         minz: pq.contour_minz,

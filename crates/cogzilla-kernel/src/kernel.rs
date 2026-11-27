@@ -23,7 +23,7 @@ mod single_band;
 mod widened;
 
 pub use self::dem::{
-    DemAlgorithm, TerrainEncoding, dem_gradient, encode_contours_rgb, encode_terrain_pixel,
+    DemAlgorithm, dem_gradient, encode_contours_rgb, encode_terrain_pixel,
     encode_terrain_rgb, encode_terrarium_rgb, eval_dem_stencil, render_dem_algorithm,
     render_terrain_tile, safe_rescale_denom,
 };

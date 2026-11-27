@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use cogzilla_kernel::{
     BandSource, ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram,
-    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr, TerrainEncoding,
+    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr,
 };
 use cogzilla_proj::CoordPlan;
 
@@ -120,7 +120,7 @@ pub enum GpuBboxBands<'a> {
         ifd_idx: usize,
         band0: u16,
         src: &'a BandSource<'a>,
-        encoding: TerrainEncoding,
+        algorithm: DemAlgorithm,
     },
     Spectral {
         cache_key: Option<MultiBandSlabKey>,
@@ -444,7 +444,7 @@ impl GpuBackend {
         _ty0: u32,
         _plan: &CoordPlan<N>,
         _src: &BandSource<'_>,
-        _encoding: TerrainEncoding,
+        _algorithm: DemAlgorithm,
         _resample: ResampleMode,
         _format: OutputFormat,
     ) -> Option<Bytes> {

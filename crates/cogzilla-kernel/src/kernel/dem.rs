@@ -22,12 +22,10 @@ use super::{
 };
 
 pub use cogzilla_raster::DemAlgorithm;
-/// Alias for [`DemAlgorithm`] kept for callers constructing `Terrarium` / `TerrainRgb` / `Contours`.
-pub type TerrainEncoding = DemAlgorithm;
 
 #[inline(always)]
-pub fn encode_terrain_pixel(encoding: DemAlgorithm, elev_m: f32) -> [u8; 3] {
-    match encoding {
+pub fn encode_terrain_pixel(algorithm: DemAlgorithm, elev_m: f32) -> [u8; 3] {
+    match algorithm {
         DemAlgorithm::Terrarium => encode_terrarium_rgb(elev_m),
         DemAlgorithm::TerrainRgb => encode_terrain_rgb(elev_m),
         DemAlgorithm::Contours {
@@ -85,7 +83,7 @@ pub fn encode_terrain_rgb(elev_m: f32) -> [u8; 3] {
 pub fn render_terrain_tile<const N: usize>(
     plan: &CoordPlan<N>,
     src: &BandSource<'_>,
-    encoding: TerrainEncoding,
+    algorithm: DemAlgorithm,
     resample: ResampleMode,
     format: OutputFormat,
 ) -> Bytes {
@@ -95,7 +93,7 @@ pub fn render_terrain_tile<const N: usize>(
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
-    let encode_px = |v: f32| -> [u8; 3] { encode_terrain_pixel(encoding, v) };
+    let encode_px = |v: f32| -> [u8; 3] { encode_terrain_pixel(algorithm, v) };
     let (scale_x, scale_y) = coord_plan_scale(plan);
     let widen = resample != ResampleMode::Nearest && plan_widened_scale(plan, resample).is_some();
     let wide = widen.then(|| WidenedSampler::new(resample, scale_x, scale_y));
