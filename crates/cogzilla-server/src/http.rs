@@ -4219,12 +4219,14 @@ async fn render_mosaic_tile_pixel_selection(
                 scenes.iter().map(|s| &s[b_off..b_off + n_px]).collect()
             })
             .collect();
-        gpu.try_composite_mosaic_f32_bands(
-            out_dim,
-            out_dim,
-            &band_planes,
-            cogzilla_gpu::GpuPixelSelection::Median,
-        )
+        gpu.try_composite_mosaic(&crate::gpu_backend::MosaicCompositeRequest {
+            width: out_dim,
+            height: out_dim,
+            input: crate::gpu_backend::MosaicCompositeInput::Bands(&band_planes),
+            method: cogzilla_gpu::GpuPixelSelection::Median,
+            output: crate::gpu_backend::MosaicCompositeOutput::F32,
+        })
+        .and_then(crate::gpu_backend::MosaicCompositeResult::into_f32_bands)
         .map(|gpu_bands| {
             engine
                 .stats
