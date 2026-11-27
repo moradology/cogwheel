@@ -1424,10 +1424,10 @@ fn build_band_request(
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     encoding: TerrainEncoding::Contours {
-                        increment: (pq.contour_increment.round() as i32).max(1),
-                        thickness: pq.contour_thickness.min(255) as u8,
-                        minz: pq.contour_minz.round() as i32,
-                        maxz: pq.contour_maxz.round() as i32,
+                        increment: pq.contour_increment.max(1e-6),
+                        thickness: pq.contour_thickness,
+                        minz: pq.contour_minz,
+                        maxz: pq.contour_maxz,
                     },
                 });
             }

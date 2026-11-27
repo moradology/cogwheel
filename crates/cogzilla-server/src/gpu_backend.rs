@@ -16,7 +16,7 @@ const _: () = {
 };
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuCoalescer,
-    GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuJpegEncoder,
+    GpuColorFormula, GpuColormapMode, GpuContext, GpuJpegEncoder,
     GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuSlab,
     GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedStatsReducer,
     MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, pack_rgb_lut,
@@ -197,23 +197,6 @@ fn map_resample_on(mode: ResampleMode, coords: &BboxCoordSource<'_>) -> Option<G
         }
     }
     Some(gpu_mode)
-}
-
-fn map_dem_algorithm(alg: DemAlgorithm) -> Option<GpuDemAlgorithm> {
-    match alg {
-        DemAlgorithm::Hillshade {
-            azimuth_deg,
-            altitude_deg,
-            z_factor,
-        } => Some(GpuDemAlgorithm::Hillshade {
-            azimuth_deg,
-            altitude_deg,
-            z_factor,
-        }),
-        DemAlgorithm::Slope { z_factor } => Some(GpuDemAlgorithm::Slope { z_factor }),
-        DemAlgorithm::Aspect => Some(GpuDemAlgorithm::Aspect),
-        DemAlgorithm::Contours { .. } => None,
-    }
 }
 
 fn multiband_policy_op(mode: GpuColormapMode) -> GpuOp {
@@ -1749,7 +1732,7 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let gpu_alg = map_dem_algorithm(alg)?;
+        let gpu_alg = alg.gpu_mode().map(|_| alg)?;
         let out_kind = styled_pixel_output(style.format, return_mask)?;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
@@ -1840,10 +1823,10 @@ impl GpuBackend {
         active: usize,
     ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample_on(resample, &coords)?;
-        let gpu_alg = match encoding {
-            TerrainEncoding::Terrarium => GpuDemAlgorithm::Terrarium,
-            TerrainEncoding::TerrainRgb => GpuDemAlgorithm::TerrainRgb,
-            TerrainEncoding::Contours { .. } => return None,
+        let gpu_alg = if encoding.is_terrain_rgb_encoding() {
+            encoding
+        } else {
+            return None;
         };
         if !is_rgba_format(format) {
             return None;
@@ -2927,7 +2910,7 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample_on(resample, &coords)?;
-        let gpu_alg = map_dem_algorithm(alg)?;
+        let gpu_alg = alg.gpu_mode().map(|_| alg)?;
         let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels() {
             return None;
@@ -2973,7 +2956,7 @@ impl GpuBackend {
         resample: ResampleMode,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample_on(resample, &coords)?;
-        let gpu_alg = map_dem_algorithm(alg)?;
+        let gpu_alg = alg.gpu_mode().map(|_| alg)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;

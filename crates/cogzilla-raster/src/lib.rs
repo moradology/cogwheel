@@ -1,7 +1,11 @@
-//! Shared raster vocabulary across all cogzilla crates (`SampleType` and `Affine2D`).
+//! Shared raster vocabulary across all cogzilla crates (`SampleType`, `Affine2D`, and `DemAlgorithm`).
 //!
 //! Kept format-agnostic with zero dependencies so TIFF, Zarr, kernel, codec, projection,
-//! IO, GPU, and server crates share one definition of pixel sample types and 2D geotransforms.
+//! IO, GPU, and server crates share one definition of pixel sample types, 2D geotransforms,
+//! and DEM algorithm descriptors.
+
+pub mod dem;
+pub use dem::DemAlgorithm;
 
 /// Pixel sample type shared by TIFF/COG, Zarr, kernel, codec, and server layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

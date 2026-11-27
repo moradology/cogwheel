@@ -5141,7 +5141,7 @@ async fn render_bbox_core(
                             g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                             b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                         } else {
-                            let [r, g, b] = encoding.encode_rgb(elev);
+                            let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*encoding, elev);
                             out.put_slice(&(r as f32).to_le_bytes());
                             g_plane.extend_from_slice(&(g as f32).to_le_bytes());
                             b_plane.extend_from_slice(&(b as f32).to_le_bytes());
@@ -5745,7 +5745,7 @@ async fn render_bbox_core(
                 coord_map.for_each_uv(w, h, |i, u, v| {
                     let val = sample(&src, u, v);
                     if !val.is_nan() {
-                        let [r, g, b] = encoding.encode_rgb(val);
+                        let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*encoding, val);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;

@@ -21,49 +21,35 @@ use super::{
     sample_kernel_widened, sample_nearest,
 };
 
-/// Standard RGB terrain elevation encodings for 3D web map engines (MapLibre, Mapbox, Deck.gl, Cesium).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerrainEncoding {
-    /// Mapzen / AWS Terrarium: `elev = (R * 256 + G + B / 256) - 32768` (~3.9 mm precision).
-    Terrarium,
-    /// Mapbox Terrain-RGB: `elev = -10000 + ((R * 65536 + G * 256 + B) * 0.1)` (0.1 m precision).
-    TerrainRgb,
-    /// TiTiler DEM Contours: `linear_rescale(elev, (minz, maxz), (1, 255))` -> `terrain` colormap,
-    /// with black (`[0, 0, 0]`) contour lines where `elev.rem_euclid(increment) < thickness`.
-    Contours {
-        increment: i32,
-        thickness: u8,
-        minz: i32,
-        maxz: i32,
-    },
-}
+pub use cogzilla_raster::DemAlgorithm;
+/// Alias for [`DemAlgorithm`] kept for callers constructing `Terrarium` / `TerrainRgb` / `Contours`.
+pub type TerrainEncoding = DemAlgorithm;
 
-impl TerrainEncoding {
-    #[inline(always)]
-    pub fn encode_rgb(self, elev_m: f32) -> [u8; 3] {
-        match self {
-            TerrainEncoding::Terrarium => encode_terrarium_rgb(elev_m),
-            TerrainEncoding::TerrainRgb => encode_terrain_rgb(elev_m),
-            TerrainEncoding::Contours {
-                increment,
-                thickness,
-                minz,
-                maxz,
-            } => encode_contours_rgb(elev_m, increment, thickness, minz, maxz),
-        }
+#[inline(always)]
+pub fn encode_terrain_pixel(encoding: DemAlgorithm, elev_m: f32) -> [u8; 3] {
+    match encoding {
+        DemAlgorithm::Terrarium => encode_terrarium_rgb(elev_m),
+        DemAlgorithm::TerrainRgb => encode_terrain_rgb(elev_m),
+        DemAlgorithm::Contours {
+            increment,
+            thickness,
+            minz,
+            maxz,
+        } => encode_contours_rgb(elev_m, increment, thickness, minz, maxz),
+        _ => [0, 0, 0],
     }
 }
 
 #[inline(always)]
 pub fn encode_contours_rgb(
     elev_m: f32,
-    increment: i32,
-    thickness: u8,
-    minz: i32,
-    maxz: i32,
+    increment: f32,
+    thickness: u32,
+    minz: f32,
+    maxz: f32,
 ) -> [u8; 3] {
     let data = elev_m as f64;
-    if increment > 0 && thickness > 0 && data.rem_euclid(increment as f64) < thickness as f64 {
+    if increment > 0.0 && thickness > 0 && data.rem_euclid(increment as f64) < thickness as f64 {
         return [0, 0, 0];
     }
     let lo = minz as f64;
@@ -109,7 +95,7 @@ pub fn render_terrain_tile<const N: usize>(
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds() && src.is_clean_inbounds(c0, c1, r0, r1);
 
-    let encode_px = |v: f32| -> [u8; 3] { encoding.encode_rgb(v) };
+    let encode_px = |v: f32| -> [u8; 3] { encode_terrain_pixel(encoding, v) };
     let (scale_x, scale_y) = coord_plan_scale(plan);
     let widen = resample != ResampleMode::Nearest && plan_widened_scale(plan, resample).is_some();
     let wide = widen.then(|| WidenedSampler::new(resample, scale_x, scale_y));
@@ -323,28 +309,6 @@ pub fn render_terrain_tile<const N: usize>(
     }
 }
 
-/// On-the-fly DEM derivative algorithms, from numpy's gradient as TiTiler takes it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DemAlgorithm {
-    /// TiTiler's shaded relief in `[0.0, 255.0]`: lit from the gradient per pixel.
-    Hillshade {
-        azimuth_deg: f32,
-        altitude_deg: f32,
-        z_factor: f32,
-    },
-    /// Terrain slope in degrees `[0.0, 90.0]`, over the grid's pixel size in its own units.
-    Slope { z_factor: f32 },
-    /// Compass aspect in degrees `[0.0, 360.0)` clockwise from North (`0=N, 90=E, 180=S, 270=W`).
-    Aspect,
-    /// Elevation contour lines at multiples of `increment` overlaid on `[minz, maxz]`.
-    Contours {
-        increment: f32,
-        thickness: u32,
-        minz: f32,
-        maxz: f32,
-    },
-}
-
 /// Rescale denominator preserving sign for inverted stretches (`?rescale=255,0`) and negative
 /// GDAL `scale` (`?unscale=true`), while avoiding division by zero on degenerate `min == max`.
 #[inline(always)]
@@ -457,6 +421,7 @@ pub fn eval_dem_stencil(
                 (((z_c - minz) / safe_rescale_denom(minz, maxz)) * 255.0).clamp(1.0, 255.0)
             }
         }
+        DemAlgorithm::Terrarium | DemAlgorithm::TerrainRgb => z_c,
     }
 }
 
