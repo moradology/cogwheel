@@ -459,12 +459,44 @@ impl MosaicJsonCatalog {
             .get("asset_prefix")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let minzoom = val.get("minzoom").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-        let maxzoom = val.get("maxzoom").and_then(|v| v.as_u64()).unwrap_or(22) as u8;
-        let bounds = val
-            .get("bounds")
-            .and_then(parse_bbox4_val)
-            .unwrap_or([-180.0, -85.05112878, 180.0, 85.05112878]);
+        let minzoom_u64 = match val.get("minzoom") {
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| "MosaicJSON 'minzoom' must be a non-negative integer".to_string())?,
+            None => return Err("missing required 'minzoom' field in MosaicJSON".to_string()),
+        };
+        let maxzoom_u64 = match val.get("maxzoom") {
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| "MosaicJSON 'maxzoom' must be a non-negative integer".to_string())?,
+            None => return Err("missing required 'maxzoom' field in MosaicJSON".to_string()),
+        };
+        if minzoom_u64 > 30 {
+            return Err(format!("MosaicJSON minzoom {minzoom_u64} exceeds maximum supported zoom 30"));
+        }
+        if maxzoom_u64 > 30 {
+            return Err(format!("MosaicJSON maxzoom {maxzoom_u64} exceeds maximum supported zoom 30"));
+        }
+        if minzoom_u64 > maxzoom_u64 {
+            return Err(format!(
+                "MosaicJSON minzoom ({minzoom_u64}) must be <= maxzoom ({maxzoom_u64})"
+            ));
+        }
+        let minzoom = minzoom_u64 as u8;
+        let maxzoom = maxzoom_u64 as u8;
+        let bounds = match val.get("bounds") {
+            None | Some(serde_json::Value::Null) => [-180.0, -85.05112878, 180.0, 85.05112878],
+            Some(v) => {
+                let b = parse_bbox4_val(v).ok_or_else(|| {
+                    "MosaicJSON 'bounds' must be a 4-element finite numeric array [minx, miny, maxx, maxy]"
+                        .to_string()
+                })?;
+                if b[0] > b[2] || b[1] > b[3] {
+                    return Err("MosaicJSON 'bounds' has min > max".to_string());
+                }
+                b
+            }
+        };
         let tiles_obj = val
             .get("tiles")
             .and_then(|v| v.as_object())
@@ -474,24 +506,36 @@ impl MosaicJsonCatalog {
         let mut tiles: HashMap<String, Vec<String>, ahash::RandomState> =
             HashMap::with_capacity_and_hasher(tiles_obj.len(), ahash::RandomState::new());
         for (qk, arr) in tiles_obj {
+            if !qk.bytes().all(|b| matches!(b, b'0'..=b'3')) {
+                return Err(format!(
+                    "MosaicJSON 'tiles' key '{qk}' is not a valid quadkey (expected digits 0-3)"
+                ));
+            }
             if inferred_qk_zoom.is_none() {
                 inferred_qk_zoom = Some(qk.len());
             }
-            if let Some(urls) = arr.as_array() {
-                let list: Vec<String> = urls
-                    .iter()
-                    .filter_map(|u| u.as_str().map(|s| apply_asset_prefix(asset_prefix, s)))
-                    .collect();
-                if !list.is_empty() {
-                    tiles.insert(qk.clone(), list);
-                }
+            let urls = arr.as_array().ok_or_else(|| {
+                format!("MosaicJSON 'tiles[{qk}]' must be an array of asset URI strings")
+            })?;
+            let mut list: Vec<String> = Vec::with_capacity(urls.len());
+            for u in urls {
+                let s = u.as_str().ok_or_else(|| {
+                    format!("MosaicJSON 'tiles[{qk}]' entries must be strings")
+                })?;
+                list.push(apply_asset_prefix(asset_prefix, s));
+            }
+            if !list.is_empty() {
+                tiles.insert(qk.clone(), list);
             }
         }
-        let raw_qk_zoom = val
-            .get("quadkey_zoom")
-            .and_then(|v| v.as_u64())
-            .or_else(|| inferred_qk_zoom.map(|z| z as u64))
-            .unwrap_or(minzoom as u64);
+        let raw_qk_zoom = match val.get("quadkey_zoom") {
+            None | Some(serde_json::Value::Null) => {
+                inferred_qk_zoom.map(|z| z as u64).unwrap_or(minzoom as u64)
+            }
+            Some(v) => v.as_u64().ok_or_else(|| {
+                "MosaicJSON 'quadkey_zoom' must be a non-negative integer".to_string()
+            })?,
+        };
         if raw_qk_zoom > 30 {
             return Err(format!(
                 "MosaicJSON quadkey_zoom {raw_qk_zoom} exceeds maximum supported zoom 30"
@@ -877,5 +921,20 @@ mod tests {
             extract_stac_feature_uri(&feat).as_deref(),
             Some("https://pc.example.com/B08.tif?se=2026-01-01&sig=abc")
         );
+
+        // Audit #102: strict MosaicJSON schema validation rejects invalid zooms, bounds, and tiles
+        for bad in [
+            r#"{"mosaicjson":"0.0.3","maxzoom":5,"tiles":{}}"#,
+            r#"{"mosaicjson":"0.0.3","minzoom":256,"maxzoom":5,"tiles":{}}"#,
+            r#"{"mosaicjson":"0.0.3","minzoom":8,"maxzoom":4,"tiles":{}}"#,
+            r#"{"mosaicjson":"0.0.3","minzoom":0,"maxzoom":5,"bounds":"bad","tiles":{}}"#,
+            r#"{"mosaicjson":"0.0.3","minzoom":0,"maxzoom":5,"tiles":{"xyz":["/a.tif"]}}"#,
+            r#"{"mosaicjson":"0.0.3","minzoom":0,"maxzoom":5,"tiles":{"0123":123}}"#,
+        ] {
+            assert!(
+                MosaicJsonCatalog::from_json_str(bad).is_err(),
+                "expected invalid MosaicJSON to be rejected: {bad}"
+            );
+        }
     }
 }

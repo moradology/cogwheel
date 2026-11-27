@@ -1623,7 +1623,10 @@ pub fn encode_npy_typed_f64(
     let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
     let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
     out.extend_from_slice(&hdr);
-    let absent = absent.unwrap_or(0.0);
+    let absent = absent.unwrap_or(match kind {
+        SampleType::Float32 | SampleType::Float64 => f64::NAN,
+        _ => 0.0,
+    });
     let data = &values[..(bands * pixels).min(values.len())];
     macro_rules! write_planes {
         ($t:ty, $cast:expr) => {{

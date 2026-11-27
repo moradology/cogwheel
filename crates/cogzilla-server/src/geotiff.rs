@@ -524,10 +524,10 @@ pub(crate) fn write_geotiff_typed_f64(
     write_geotiff(&spec, |buf| {
         let data = &values[..(bands * pixels).min(values.len())];
         macro_rules! put_planes {
-            ($t:ty, $cast:expr) => {{
+            ($t:ty, $cast:expr, $nan_to_zero:expr) => {{
                 let cast = $cast;
                 for &v in data {
-                    let x: $t = cast(if v.is_nan() { 0.0 } else { v });
+                    let x: $t = cast(if $nan_to_zero && v.is_nan() { 0.0 } else { v });
                     buf.put_slice(&x.to_le_bytes());
                 }
                 if return_mask {
@@ -542,16 +542,16 @@ pub(crate) fn write_geotiff_typed_f64(
         }
         use cogzilla_tiff::SampleType as T;
         match kind {
-            T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8),
-            T::Int8 => put_planes!(i8, |v: f64| v as i8),
-            T::Uint16 => put_planes!(u16, |v: f64| v as u16),
-            T::Int16 => put_planes!(i16, |v: f64| v as i16),
-            T::Uint32 => put_planes!(u32, |v: f64| v as u32),
-            T::Int32 => put_planes!(i32, |v: f64| v as i32),
-            T::Uint64 => put_planes!(u64, |v: f64| v as u64),
-            T::Int64 => put_planes!(i64, |v: f64| v as i64),
-            T::Float32 => put_planes!(f32, |v: f64| v as f32),
-            T::Float64 => put_planes!(f64, |v: f64| v),
+            T::Uint1 | T::Uint4 | T::Uint8 => put_planes!(u8, |v: f64| v as u8, true),
+            T::Int8 => put_planes!(i8, |v: f64| v as i8, true),
+            T::Uint16 => put_planes!(u16, |v: f64| v as u16, true),
+            T::Int16 => put_planes!(i16, |v: f64| v as i16, true),
+            T::Uint32 => put_planes!(u32, |v: f64| v as u32, true),
+            T::Int32 => put_planes!(i32, |v: f64| v as i32, true),
+            T::Uint64 => put_planes!(u64, |v: f64| v as u64, true),
+            T::Int64 => put_planes!(i64, |v: f64| v as i64, true),
+            T::Float32 => put_planes!(f32, |v: f64| v as f32, false),
+            T::Float64 => put_planes!(f64, |v: f64| v, false),
         }
     })
 }
