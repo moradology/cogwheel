@@ -54,6 +54,43 @@ pub fn compress_gzip(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Compress a byte slice into a Brotli stream (RFC 7932) at fast HTTP quality (level 4, lgwin 22).
+pub fn compress_brotli(input: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut out = Vec::with_capacity(input.len() / 2);
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut out, 4096, 4, 22);
+        writer
+            .write_all(input)
+            .map_err(|e| format!("brotli compress error: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Decompress a Brotli-encoded buffer with an upper bound on decompressed size.
+pub fn decompress_brotli_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    if max_out_bytes == 0 {
+        return Err("brotli payload exceeds 0 B limit".into());
+    }
+    let mut reader = brotli::Decompressor::new(input, 4096);
+    let mut out = Vec::with_capacity(input.len().min(max_out_bytes));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("brotli decompress error: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if out.len().saturating_add(n) > max_out_bytes {
+            return Err(format!("brotli payload exceeds {max_out_bytes} B limit"));
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
 /// Decompress a gzip-encoded buffer using `libdeflater` with an upper bound on decompressed size
 /// to guard against decompression bombs.
 pub fn decompress_gzip_limited(input: &[u8], max_out_bytes: usize) -> Result<Vec<u8>, String> {
@@ -1677,5 +1714,15 @@ mod tests {
         hostile[1] = 0x8b;
         hostile[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decompress_gzip_limited(&hostile, 64 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn compress_and_decompress_brotli_roundtrip_and_limit() {
+        let payload = b"cogzilla brotli roundtrip test payload ".repeat(64);
+        let br = compress_brotli(&payload).unwrap();
+        assert!(br.len() < payload.len());
+        assert_eq!(decompress_brotli_limited(&br, payload.len()).unwrap(), payload);
+        assert!(decompress_brotli_limited(&br, 16).is_err());
+        assert!(decompress_brotli_limited(&br, 0).is_err());
     }
 }

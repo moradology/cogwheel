@@ -351,6 +351,21 @@ fn add_family_routes(
             format!("{prefix}/{{tileMatrixSetId}}/WMTSCapabilities.xml"),
             json!({ "get": op(tag, &format!("{tag} OGC WMTS Capabilities"), wp, "application/xml") }),
         );
+        if prefix == "/cog" {
+            let mut wms_q = extra_family();
+            wms_q.extend(common_band_render_params());
+            wms_q.push(q_str("REQUEST", true, "WMS request type (GetCapabilities or GetMap)"));
+            wms_q.push(q_str("VERSION", false, "WMS version (1.3.0 or 1.1.1)"));
+            wms_q.push(q_str("CRS", false, "CRS for GetMap (e.g. EPSG:3857, CRS:84, EPSG:4326)"));
+            wms_q.push(q_str("BBOX", false, "Bounding box minx,miny,maxx,maxy"));
+            wms_q.push(q_int("WIDTH", "Output image width (1..4096)"));
+            wms_q.push(q_int("HEIGHT", "Output image height (1..4096)"));
+            wms_q.push(q_str("FORMAT", false, "Output format (image/png, image/jpeg, image/webp, image/tiff)"));
+            paths.insert(
+                "/cog/wms".to_string(),
+                json!({ "get": op(tag, "COG OGC WMS 1.1.1 / 1.3.0 (GetCapabilities & GetMap)", wms_q, "image/png") }),
+            );
+        }
     }
 
     // Point
