@@ -4535,7 +4535,7 @@ fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Re
         };
     }
     if let Some(v) = query_value(pairs, "histogram_range") {
-        let range = super::query::parse_histogram_range_spec(v, true).map_err(|_| {
+        let range = super::query::parse_histogram_range_strict(v, true).map_err(|_| {
             invalid_param("query", "histogram_range", "Input should be two numbers, the lower one first")
         })?;
         opts.range = Some(range);

@@ -118,18 +118,18 @@ impl ParsedQuery {
     }
 }
 
-/// Shared boolean query-parameter decoder across all route stacks.
+/// Shared boolean query-parameter decoder across all route stacks (exact match, no whitespace trimming).
 pub(super) fn parse_bool(v: &str) -> Option<bool> {
-    match v.trim().to_ascii_lowercase().as_str() {
+    match v.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" | "t" | "y" => Some(true),
         "false" | "0" | "no" | "off" | "f" | "n" => Some(false),
         _ => None,
     }
 }
 
-/// Percent-decode then parse a boolean query parameter.
+/// Percent-decode, trim, then parse a boolean query parameter.
 pub(super) fn parse_bool_encoded(v: &str) -> Option<bool> {
-    parse_bool(&percent_decode(v))
+    parse_bool(percent_decode(v).trim())
 }
 
 /// Parse a `nodata` query value (`nan`, `inf`, `-inf`, or a finite `f32`).
@@ -208,6 +208,23 @@ pub(super) fn parse_histogram_range_spec(
         Ok((lo, hi))
     } else {
         Err("expected histogram_range=min,max with min < max")
+    }
+}
+
+/// Strict `histogram_range=min,max` parser for pgSTAC routes (rejects brackets and whitespace).
+pub(super) fn parse_histogram_range_strict(
+    raw: &str,
+    allow_equal: bool,
+) -> Result<(f64, f64), &'static str> {
+    if let Some((a, b)) = raw.split_once(',')
+        && let (Ok(lo), Ok(hi)) = (a.parse::<f64>(), b.parse::<f64>())
+        && lo.is_finite()
+        && hi.is_finite()
+        && if allow_equal { lo <= hi } else { lo < hi }
+    {
+        Ok((lo, hi))
+    } else {
+        Err("expected histogram_range=min,max")
     }
 }
 
@@ -528,7 +545,7 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                     // Not a mapping: TiTiler fails with a 500 there, and a 400 says why here.
                     Ok(_) => pq.algorithm_error = Some("algorithm_params should be a JSON object".into()),
                     // Answered only where an algorithm is applied, as FastAPI's dependency is.
-                    Err(_) => pq.algorithm_params_unread = Some(dec.clone()),
+                    Err(_) => pq.algorithm_params_unread = Some(dec),
                 }
             }
             "azimuth" => {
@@ -968,12 +985,16 @@ mod tests {
 
     #[test]
     fn shared_primitives_match_expected_semantics() {
-        for t in ["true", "TRUE", "1", "yes", "on", "t", "y", " true "] {
+        for t in ["true", "TRUE", "1", "yes", "on", "t", "y"] {
             assert_eq!(parse_bool(t), Some(true), "{t}");
         }
-        for f in ["false", "FALSE", "0", "no", "off", "f", "n", " 0 "] {
+        for f in ["false", "FALSE", "0", "no", "off", "f", "n"] {
             assert_eq!(parse_bool(f), Some(false), "{f}");
         }
+        assert_eq!(parse_bool(" true "), None);
+        assert_eq!(parse_bool(" 0 "), None);
+        assert_eq!(parse_bool_encoded("%20true%20"), Some(true));
+        assert_eq!(parse_bool_encoded("%200%20"), Some(false));
         assert_eq!(parse_bool("maybe"), None);
 
         assert!(parse_nodata_value("nan").unwrap().is_nan());
@@ -996,6 +1017,9 @@ mod tests {
         assert_eq!(parse_histogram_range_spec("0,100", false), Ok((0.0, 100.0)));
         assert!(parse_histogram_range_spec("5,5", false).is_err());
         assert_eq!(parse_histogram_range_spec("5,5", true), Ok((5.0, 5.0)));
+        assert_eq!(parse_histogram_range_strict("0,100", true), Ok((0.0, 100.0)));
+        assert!(parse_histogram_range_strict("[0,100]", true).is_err());
+        assert!(parse_histogram_range_strict(" 0 , 100 ", true).is_err());
 
         assert!(looks_like_rfc3339_datetime("2024-06-15"));
         assert!(looks_like_rfc3339_datetime("2024-06-15T12:30:45Z"));
