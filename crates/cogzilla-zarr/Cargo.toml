@@ -1,0 +1,8 @@
+[package]
+name = "cogzilla-zarr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde_json.workspace = true

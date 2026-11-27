@@ -6,6 +6,7 @@ members = [
     "crates/cogzilla-proj",
     "crates/cogzilla-kernel",
     "crates/cogzilla-io",
+    "crates/cogzilla-zarr",
     "crates/cogzilla-server",
     "crates/cogzilla-lambda",
     "benches/cogmark",

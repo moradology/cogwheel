@@ -366,6 +366,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cogzilla-zarr"
+version = "0.8.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
