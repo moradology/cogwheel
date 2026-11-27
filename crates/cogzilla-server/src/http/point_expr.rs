@@ -37,6 +37,8 @@ enum More {
     Cmp(Cmp, Node, Node),
     /// `&` (`true`) or `|` (`false`): logic over comparisons, bits over whole numbers.
     Bits(bool, Node, Node),
+    /// `<<` (`true`) or `>>` (`false`): bit shifts over whole numbers.
+    Shift(bool, Node, Node),
     /// `~`: not, over a comparison; the bits turned over, over a whole number.
     Not(Node),
     /// Python's floor division, which numexpr follows.
@@ -131,7 +133,7 @@ impl Node {
             Node::Bin(b'/', ..) => Kind::Double,
             Node::Bin(_, a, b) => a.kind().max(b.kind()).max(Kind::Whole),
             Node::More(more) => match more.as_ref() {
-                More::FloorDiv(a, b) => a.kind().max(b.kind()).max(Kind::Whole),
+                More::FloorDiv(a, b) | More::Shift(_, a, b) => a.kind().max(b.kind()).max(Kind::Whole),
                 More::Bits(_, a, b) | More::Where(_, a, b) => a.kind().max(b.kind()),
                 More::Not(a) => a.kind(),
                 More::Cmp(..) => Kind::Bool,
@@ -168,6 +170,18 @@ impl More {
                 (Some(a), Some(b)) => (if *and { a & b } else { a | b }) as f64,
                 _ => f64::NAN,
             },
+            More::Shift(left, a, b) => match (whole(a.eval(bands)), whole(b.eval(bands))) {
+                (Some(a), Some(b)) if b >= 0 => {
+                    if b >= 64 {
+                        if *left || a >= 0 { 0.0 } else { -1.0 }
+                    } else if *left {
+                        a.wrapping_shl(b as u32) as f64
+                    } else {
+                        a.wrapping_shr(b as u32) as f64
+                    }
+                }
+                _ => f64::NAN,
+            },
             More::Not(a) => {
                 let v = a.eval(bands);
                 if is_logical(a) {
@@ -192,7 +206,11 @@ impl More {
     fn reads(&self, into: &mut Vec<usize>) {
         match self {
             More::Not(a) => a.reads(into),
-            More::Call2(_, a, b) | More::Cmp(_, a, b) | More::Bits(_, a, b) | More::FloorDiv(a, b) => {
+            More::Call2(_, a, b)
+            | More::Cmp(_, a, b)
+            | More::Bits(_, a, b)
+            | More::Shift(_, a, b)
+            | More::FloorDiv(a, b) => {
                 a.reads(into);
                 b.reads(into);
             }
@@ -437,12 +455,27 @@ impl Parser<'_> {
     }
 
     fn bit_and(&mut self) -> Result<Node, String> {
-        let mut v = self.sum()?;
+        let mut v = self.shift()?;
         while self.eat("&") {
             self.extended = true;
-            v = Node::More(Box::new(More::Bits(true, v, self.sum()?)));
+            v = Node::More(Box::new(More::Bits(true, v, self.shift()?)));
         }
         Ok(v)
+    }
+
+    fn shift(&mut self) -> Result<Node, String> {
+        let mut v = self.sum()?;
+        loop {
+            if self.eat("<<") {
+                self.extended = true;
+                v = Node::More(Box::new(More::Shift(true, v, self.sum()?)));
+            } else if self.eat(">>") {
+                self.extended = true;
+                v = Node::More(Box::new(More::Shift(false, v, self.sum()?)));
+            } else {
+                return Ok(v);
+            }
+        }
     }
 
     fn sum(&mut self) -> Result<Node, String> {
@@ -738,7 +771,19 @@ mod tests {
         assert!(run("where(b1,b2)", &v).unwrap_err().contains("takes 3 arguments"));
         assert!(run("minimum(b1)", &v).unwrap_err().contains("takes 2 arguments"));
         assert!(run("f(b1,b2,b1,b2)", &v).unwrap_err().contains("at most three"));
-        assert!(run("b1<<b2", &v).is_err());
+        // Bit shifts over whole numbers (`<<` and `>>`), with precedence between `&` and `+`.
+        assert_eq!(one("b1<<2"), f64::from(77 << 2));
+        assert_eq!(one("b1>>2"), f64::from(77 >> 2));
+        assert_eq!(one("1+2<<1"), 6.0);
+        assert_eq!(one("b1&(3<<2)"), f64::from(77 & (3 << 2)));
+        assert_eq!(one("b1&3<<2"), f64::from(77 & (3 << 2)));
+        assert_eq!(one("b1<<64"), 0.0);
+        assert_eq!(one("b1>>64"), 0.0);
+        assert_eq!(one("(-b1)>>64"), -1.0);
+        // Negative shift count produces NaN -> 0.0 via nan_to_num when all bands are present.
+        assert_eq!(one("b1<<(-1)"), 0.0);
+        assert_eq!(Program::parse("b1<<2", 2).unwrap().kind(), Kind::Whole);
+        assert!(!Program::parse("b1<<2", 2).unwrap().plain());
         // A band with no value is no value through all of it.
         assert_eq!(run("where(b1>0,1,0);~(b1>0)", &[None, Some(1.0)]).unwrap().0, [None, None]);
         // Who reads what: plain arithmetic, or more.
