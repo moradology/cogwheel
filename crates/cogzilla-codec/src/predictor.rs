@@ -607,7 +607,6 @@ unsafe fn reconstruct_predictor2_le_neon(
 // SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within `row.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = row.len();
@@ -617,13 +616,14 @@ unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
     let mut i = 0usize;
 
     while i + 16 <= len {
-        let mut v = _mm_loadu_si128(ptr.add(i) as *const __m128i);
+        // SAFETY: `i + 16 <= len` guarantees 16 readable/writable bytes at `ptr.add(i)`.
+        let mut v = unsafe { _mm_loadu_si128(ptr.add(i) as *const __m128i) };
         v = _mm_add_epi8(v, _mm_slli_si128::<1>(v));
         v = _mm_add_epi8(v, _mm_slli_si128::<2>(v));
         v = _mm_add_epi8(v, _mm_slli_si128::<4>(v));
         v = _mm_add_epi8(v, _mm_slli_si128::<8>(v));
         v = _mm_add_epi8(v, carry);
-        _mm_storeu_si128(ptr.add(i) as *mut __m128i, v);
+        unsafe { _mm_storeu_si128(ptr.add(i) as *mut __m128i, v) };
         carry = _mm_shuffle_epi8(v, bcast_last);
         i += 16;
     }
@@ -641,7 +641,6 @@ unsafe fn prefix_sum_stride1_avx2(row: &mut [u8]) {
 // SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within `row.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn prefix_sum_stride3_avx2(row: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = row.len();
@@ -678,7 +677,6 @@ unsafe fn prefix_sum_stride3_avx2(row: &mut [u8]) {
 // SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loops stay within input/output slice bounds.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn reconstruct_u8_rgb3_avx2(
     slice: &mut [u8],
     w: usize,
@@ -794,10 +792,9 @@ unsafe fn reconstruct_u8_rgb3_avx2(
     }
 }
 
-// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within row/out slice bounds.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")` and ensures `p0..p3` each have `>= dst.len()` bytes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn unshuffle_row_stride1_avx2(
     p0: &[u8],
     p1: &[u8],
@@ -823,11 +820,15 @@ unsafe fn unshuffle_row_stride1_avx2(
     let v_nd = _mm256_set1_ps(finite_nodata.unwrap_or(0.0));
 
     while i + 32 <= n {
-        // Load 32 bytes from each of the 4 planes -> 32 f32s (128 bytes)
-        let b0 = _mm256_loadu_si256(p3.as_ptr().add(i) as *const __m256i);
-        let b1 = _mm256_loadu_si256(p2.as_ptr().add(i) as *const __m256i);
-        let b2 = _mm256_loadu_si256(p1.as_ptr().add(i) as *const __m256i);
-        let b3 = _mm256_loadu_si256(p0.as_ptr().add(i) as *const __m256i);
+        // SAFETY: `i + 32 <= n` and `p0..p3` each have `>= n` bytes.
+        let (b0, b1, b2, b3) = unsafe {
+            (
+                _mm256_loadu_si256(p3.as_ptr().add(i) as *const __m256i),
+                _mm256_loadu_si256(p2.as_ptr().add(i) as *const __m256i),
+                _mm256_loadu_si256(p1.as_ptr().add(i) as *const __m256i),
+                _mm256_loadu_si256(p0.as_ptr().add(i) as *const __m256i),
+            )
+        };
 
         // Permute lanes to keep linear order after in-lane AVX2 unpacks
         let lo01 = _mm256_unpacklo_epi8(b0, b1);
@@ -871,10 +872,13 @@ unsafe fn unshuffle_row_stride1_avx2(
         proc_avx!(f2);
         proc_avx!(f3);
 
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), f0);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), f1);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 16), f2);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i + 24), f3);
+        // SAFETY: `i + 32 <= dst.len()`.
+        unsafe {
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), f0);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 8), f1);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 16), f2);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i + 24), f3);
+        }
         i += 32;
     }
 
@@ -882,8 +886,11 @@ unsafe fn unshuffle_row_stride1_avx2(
         *any_valid = true;
         let mut mn_arr = [0.0f32; 8];
         let mut mx_arr = [0.0f32; 8];
-        _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
-        _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        // SAFETY: `mn_arr` and `mx_arr` are 8-element `f32` stack arrays (32 bytes).
+        unsafe {
+            _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
+            _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        }
         for k in 0..8 {
             if mn_arr[k] < *min_val {
                 *min_val = mn_arr[k];
@@ -916,10 +923,9 @@ unsafe fn unshuffle_row_stride1_avx2(
     }
 }
 
-// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within input/output slice bounds.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")` and ensures `raw.len() >= dst.len() * 4`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn reconstruct_predictor1_le_avx2(
     raw: &[u8],
     dst: &mut [f32],
@@ -943,11 +949,16 @@ unsafe fn reconstruct_predictor1_le_avx2(
     let all_ones = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
 
     while i + 32 <= pixels {
-        let src_ptr = raw.as_ptr().add(i * 4) as *const f32;
-        let mut f0 = _mm256_loadu_ps(src_ptr);
-        let mut f1 = _mm256_loadu_ps(src_ptr.add(8));
-        let mut f2 = _mm256_loadu_ps(src_ptr.add(16));
-        let mut f3 = _mm256_loadu_ps(src_ptr.add(24));
+        // SAFETY: `i + 32 <= pixels` and `raw.len() >= pixels * 4`.
+        let (mut f0, mut f1, mut f2, mut f3) = unsafe {
+            let src_ptr = raw.as_ptr().add(i * 4) as *const f32;
+            (
+                _mm256_loadu_ps(src_ptr),
+                _mm256_loadu_ps(src_ptr.add(8)),
+                _mm256_loadu_ps(src_ptr.add(16)),
+                _mm256_loadu_ps(src_ptr.add(24)),
+            )
+        };
 
         macro_rules! proc_avx1 {
             ($fv:expr) => {{
@@ -972,11 +983,14 @@ unsafe fn reconstruct_predictor1_le_avx2(
         proc_avx1!(f2);
         proc_avx1!(f3);
 
-        let dst_ptr = dst.as_mut_ptr().add(i);
-        _mm256_storeu_ps(dst_ptr, f0);
-        _mm256_storeu_ps(dst_ptr.add(8), f1);
-        _mm256_storeu_ps(dst_ptr.add(16), f2);
-        _mm256_storeu_ps(dst_ptr.add(24), f3);
+        // SAFETY: `i + 32 <= dst.len()`.
+        unsafe {
+            let dst_ptr = dst.as_mut_ptr().add(i);
+            _mm256_storeu_ps(dst_ptr, f0);
+            _mm256_storeu_ps(dst_ptr.add(8), f1);
+            _mm256_storeu_ps(dst_ptr.add(16), f2);
+            _mm256_storeu_ps(dst_ptr.add(24), f3);
+        }
         i += 32;
     }
 
@@ -984,8 +998,11 @@ unsafe fn reconstruct_predictor1_le_avx2(
         any_valid = true;
         let mut mn_arr = [0.0f32; 8];
         let mut mx_arr = [0.0f32; 8];
-        _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
-        _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        // SAFETY: `mn_arr` and `mx_arr` are 8-element `f32` stack arrays (32 bytes).
+        unsafe {
+            _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
+            _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        }
         for k in 0..8 {
             if mn_arr[k] < min_val {
                 min_val = mn_arr[k];
@@ -1021,10 +1038,9 @@ unsafe fn reconstruct_predictor1_le_avx2(
 }
 
 /// SIMD 8-lane `u32` horizontal prefix-sum -> `f32` + nodata/stats on x86_64 AVX2 (Predictor 2).
-// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within input/output slice bounds.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; row slices bound every 32-byte load/store.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn reconstruct_predictor2_le_avx2(
     raw: &[u8],
     tile_w: u32,
@@ -1058,7 +1074,8 @@ unsafe fn reconstruct_predictor2_le_avx2(
         let mut i = 0usize;
 
         while i + 8 <= w {
-            let mut v = _mm256_loadu_si256(row_src.as_ptr().add(i * 4) as *const __m256i);
+            // SAFETY: `i + 8 <= w` and `row_src.len() == w * 4`, `row_dst.len() == w`.
+            let mut v = unsafe { _mm256_loadu_si256(row_src.as_ptr().add(i * 4) as *const __m256i) };
             // In-lane 4-wide u32 prefix sum
             v = _mm256_add_epi32(v, _mm256_slli_si256::<4>(v));
             v = _mm256_add_epi32(v, _mm256_slli_si256::<8>(v));
@@ -1083,7 +1100,7 @@ unsafe fn reconstruct_predictor2_le_avx2(
             }
             v_min = _mm256_min_ps(v_min, _mm256_blendv_ps(v_min, fv, valid));
             v_max = _mm256_max_ps(v_max, _mm256_blendv_ps(v_max, fv, valid));
-            _mm256_storeu_ps(row_dst.as_mut_ptr().add(i), fv);
+            unsafe { _mm256_storeu_ps(row_dst.as_mut_ptr().add(i), fv) };
             i += 8;
         }
 
@@ -1116,8 +1133,11 @@ unsafe fn reconstruct_predictor2_le_avx2(
         any_valid = true;
         let mut mn_arr = [0.0f32; 8];
         let mut mx_arr = [0.0f32; 8];
-        _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
-        _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        // SAFETY: `mn_arr` and `mx_arr` are 8-element `f32` stack arrays (32 bytes).
+        unsafe {
+            _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min);
+            _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max);
+        }
         for k in 0..8 {
             if mn_arr[k] < min_val { min_val = mn_arr[k]; }
             if mx_arr[k] > max_val { max_val = mx_arr[k]; }
@@ -1131,10 +1151,9 @@ unsafe fn reconstruct_predictor2_le_avx2(
 }
 
 /// SIMD 8-lane `u16` horizontal prefix-sum directly into compact `u16` + nodata/stats on x86_64 AVX2.
-// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within input/output slice bounds.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")` and ensures `src_u16.len() >= dst_u16.len() * 2`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn u16_pred2_row_avx2(
     src_u16: &[u8],
     dst_u16: &mut [u16],
@@ -1161,13 +1180,14 @@ unsafe fn u16_pred2_row_avx2(
 
     let mut i = 0usize;
     while i + 8 <= w {
-        let mut v = _mm_loadu_si128(src_u16.as_ptr().add(i * 2) as *const __m128i);
+        // SAFETY: `i + 8 <= w` and `src_u16.len() >= w * 2`, `dst_u16.len() == w`.
+        let mut v = unsafe { _mm_loadu_si128(src_u16.as_ptr().add(i * 2) as *const __m128i) };
         v = _mm_add_epi16(v, _mm_slli_si128::<2>(v));
         v = _mm_add_epi16(v, _mm_slli_si128::<4>(v));
         v = _mm_add_epi16(v, _mm_slli_si128::<8>(v));
         v = _mm_add_epi16(v, carry);
         carry = _mm_shuffle_epi8(v, bcast_last);
-        _mm_storeu_si128(dst_u16.as_mut_ptr().add(i) as *mut __m128i, v);
+        unsafe { _mm_storeu_si128(dst_u16.as_mut_ptr().add(i) as *mut __m128i, v) };
 
         if has_nd {
             let is_nd = _mm_cmpeq_epi16(v, v_nd);
@@ -1191,8 +1211,11 @@ unsafe fn u16_pred2_row_avx2(
         *any_valid = true;
         let mut mn_arr = [0u16; 8];
         let mut mx_arr = [0u16; 8];
-        _mm_storeu_si128(mn_arr.as_mut_ptr() as *mut __m128i, v_min);
-        _mm_storeu_si128(mx_arr.as_mut_ptr() as *mut __m128i, v_max);
+        // SAFETY: `mn_arr` and `mx_arr` are 8-element `u16` stack arrays (16 bytes).
+        unsafe {
+            _mm_storeu_si128(mn_arr.as_mut_ptr() as *mut __m128i, v_min);
+            _mm_storeu_si128(mx_arr.as_mut_ptr() as *mut __m128i, v_max);
+        }
         for k in 0..8 {
             let mn = mn_arr[k] as f32;
             let mx = mx_arr[k] as f32;
@@ -1229,10 +1252,9 @@ unsafe fn u16_pred2_row_avx2(
 
 /// Hardware-accelerated 3-band chunky Predictor-3 unshuffle + planar deinterleave on x86_64 AVX2
 /// using `pshufb` 3-way deinterleave (16 RGB pixels / 48 floats / 192 bytes per iteration).
-// SAFETY: Caller checks `is_x86_feature_detected!("avx2")`; SIMD loads/stores stay within row/out slice bounds.
+// SAFETY: Caller checks `is_x86_feature_detected!("avx2")` and ensures `p0..p3` have `>= w * 3` bytes and `dst0..dst2` have `>= w` elements.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn unshuffle_row_stride3_avx2(
     p0: &[u8],
     p1: &[u8],
@@ -1276,9 +1298,15 @@ unsafe fn unshuffle_row_stride3_avx2(
 
     macro_rules! deinterleave_plane {
         ($ptr:expr) => {{
-            let a = _mm_loadu_si128($ptr as *const __m128i);
-            let b = _mm_loadu_si128($ptr.add(16) as *const __m128i);
-            let c = _mm_loadu_si128($ptr.add(32) as *const __m128i);
+            let p = $ptr;
+            // SAFETY: `x + 16 <= w` guarantees `byte_off + 48 <= w * 3`.
+            let (a, b, c) = unsafe {
+                (
+                    _mm_loadu_si128(p as *const __m128i),
+                    _mm_loadu_si128(p.add(16) as *const __m128i),
+                    _mm_loadu_si128(p.add(32) as *const __m128i),
+                )
+            };
             let c0 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(a, r_a), _mm_shuffle_epi8(b, r_b)), _mm_shuffle_epi8(c, r_c));
             let c1 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(a, g_a), _mm_shuffle_epi8(b, g_b)), _mm_shuffle_epi8(c, g_c));
             let c2 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(a, b_a), _mm_shuffle_epi8(b, b_b)), _mm_shuffle_epi8(c, b_c));
@@ -1316,21 +1344,26 @@ unsafe fn unshuffle_row_stride3_avx2(
                 v_min[$bi] = _mm256_min_ps(v_min[$bi], _mm256_blendv_ps(v_min[$bi], *fv, valid));
                 v_max[$bi] = _mm256_max_ps(v_max[$bi], _mm256_blendv_ps(v_max[$bi], *fv, valid));
             }
-            _mm256_storeu_ps($dst, v0);
-            _mm256_storeu_ps($dst.add(8), v1);
+            let dst_p = $dst;
+            // SAFETY: `x + 16 <= w` guarantees 16 writable `f32` elements at `dst_p`.
+            unsafe {
+                _mm256_storeu_ps(dst_p, v0);
+                _mm256_storeu_ps(dst_p.add(8), v1);
+            }
         }};
     }
 
     while x + 16 <= w {
         let byte_off = x * 3;
-        let d3 = deinterleave_plane!(p3.as_ptr().add(byte_off));
-        let d2 = deinterleave_plane!(p2.as_ptr().add(byte_off));
-        let d1 = deinterleave_plane!(p1.as_ptr().add(byte_off));
-        let d0 = deinterleave_plane!(p0.as_ptr().add(byte_off));
+        // SAFETY: `byte_off + 48 <= w * 3` and `x + 16 <= w`.
+        let d3 = deinterleave_plane!(unsafe { p3.as_ptr().add(byte_off) });
+        let d2 = deinterleave_plane!(unsafe { p2.as_ptr().add(byte_off) });
+        let d1 = deinterleave_plane!(unsafe { p1.as_ptr().add(byte_off) });
+        let d0 = deinterleave_plane!(unsafe { p0.as_ptr().add(byte_off) });
 
-        transpose_store_16!(d3.0, d2.0, d1.0, d0.0, dst0.as_mut_ptr().add(x), 0);
-        transpose_store_16!(d3.1, d2.1, d1.1, d0.1, dst1.as_mut_ptr().add(x), 1);
-        transpose_store_16!(d3.2, d2.2, d1.2, d0.2, dst2.as_mut_ptr().add(x), 2);
+        transpose_store_16!(d3.0, d2.0, d1.0, d0.0, unsafe { dst0.as_mut_ptr().add(x) }, 0);
+        transpose_store_16!(d3.1, d2.1, d1.1, d0.1, unsafe { dst1.as_mut_ptr().add(x) }, 1);
+        transpose_store_16!(d3.2, d2.2, d1.2, d0.2, unsafe { dst2.as_mut_ptr().add(x) }, 2);
         x += 16;
     }
 
@@ -1339,8 +1372,11 @@ unsafe fn unshuffle_row_stride3_avx2(
             any_valid[b] = true;
             let mut mn_arr = [0.0f32; 8];
             let mut mx_arr = [0.0f32; 8];
-            _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min[b]);
-            _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max[b]);
+            // SAFETY: `mn_arr` and `mx_arr` are 8-element `f32` stack arrays (32 bytes).
+            unsafe {
+                _mm256_storeu_ps(mn_arr.as_mut_ptr(), v_min[b]);
+                _mm256_storeu_ps(mx_arr.as_mut_ptr(), v_max[b]);
+            }
             for k in 0..8 {
                 if mn_arr[k] < min_val[b] { min_val[b] = mn_arr[k]; }
                 if mx_arr[k] > max_val[b] { max_val[b] = mx_arr[k]; }
