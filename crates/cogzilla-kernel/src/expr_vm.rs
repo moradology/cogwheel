@@ -9,10 +9,11 @@ pub enum Op {
     Mul,
     Div,
     Mod,
-    /// `% c` by a constant positive power of two `c` (and its reciprocal, as exact), the
-    /// floored remainder worked as `a - c * floor(a / c)`: exact for such `c`, and free of a
-    /// `fmod` call per pixel.
-    ModPow2(f32, f32),
+    /// `% c` by a constant positive power of two `c`, the floored remainder worked as
+    /// `a - c * floor(a / c)`: exact for such `c`, and free of a `fmod` call per pixel. Only
+    /// `c` is held, not its reciprocal too, so that an op stays eight bytes (see the test):
+    /// `a / c` and `a * (1 / c)` are the same number when `c` is a power of two.
+    ModPow2(f32),
     Pow,
     BitAnd,
     BitOr,
@@ -191,9 +192,9 @@ impl ExprProgram {
                         stack[sp - 1] / d
                     };
                 }
-                Op::ModPow2(c, r) => {
+                Op::ModPow2(c) => {
                     let a = stack[sp - 1];
-                    stack[sp - 1] = a - c * (a * r).floor();
+                    stack[sp - 1] = a - c * (a / c).floor();
                 }
                 Op::Mod => {
                     sp -= 1;
@@ -598,8 +599,9 @@ impl ExprProgram {
                         lhs[i] = if d.abs() < 1e-12 { f32::NAN } else { lhs[i] / d };
                     }
                 }
-                Op::ModPow2(c, r) => {
+                Op::ModPow2(c) => {
                     let s = &mut stack[sp - 1];
+                    let r = c.recip();
                     for v in s.iter_mut() {
                         *v -= c * (*v * r).floor();
                     }
@@ -1274,7 +1276,7 @@ impl<'a> Parser<'a> {
                     match self.ops.last() {
                         Some(&Op::PushConst(c)) if c > 0.0 && c.is_normal() && c.to_bits() & 0x007f_ffff == 0 => {
                             self.ops.pop();
-                            self.ops.push(Op::ModPow2(c, c.recip()));
+                            self.ops.push(Op::ModPow2(c));
                         }
                         _ => self.ops.push(Op::Mod),
                     }
@@ -1485,9 +1487,15 @@ mod tests {
     }
 
     #[test]
+    fn an_op_is_eight_bytes() {
+        // The VM walks its ops for every pixel; a wider one makes all band math slower.
+        assert_eq!(std::mem::size_of::<Op>(), 8);
+    }
+
+    #[test]
     fn remainder_by_a_power_of_two_is_the_floored_remainder() {
         let fast = ExprProgram::compile("b1 % 256").unwrap();
-        assert_eq!(fast.ops.last(), Some(&Op::ModPow2(256.0, 1.0 / 256.0)));
+        assert_eq!(fast.ops.last(), Some(&Op::ModPow2(256.0)));
         let general = ExprProgram::compile("b1 % (b2 + 256)").unwrap();
         assert_eq!(ExprProgram::compile("b1 % 7").unwrap().ops.last(), Some(&Op::Mod));
         let values = [0.0, 300.0, -1.0, -300.7, 255.9, 256.0, -256.0, 70_000.5, 1e10, -1e10, 16_777_215.0, -0.5];
