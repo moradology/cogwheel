@@ -39,6 +39,7 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
                 match (unsigned * 2).max(own) {
                     16 => T::Int16,
                     32 => T::Int32,
+                    64 => T::Int64,
                     _ => T::Float64,
                 }
             }
@@ -248,7 +249,7 @@ mod tests {
             (T::Uint8, T::Uint16, T::Uint16), (T::Uint16, T::Int16, T::Int32), (T::Uint8, T::Int8, T::Int16),
             (T::Uint8, T::Int16, T::Int16), (T::Uint8, T::Int32, T::Int32), (T::Int8, T::Int16, T::Int16),
             (T::Uint16, T::Float32, T::Float32), (T::Uint32, T::Float32, T::Float64), (T::Float32, T::Float64, T::Float64),
-            (T::Uint32, T::Int32, T::Float64), (T::Uint8, T::Uint8, T::Uint8), (T::Uint16, T::Uint32, T::Uint32),
+            (T::Uint32, T::Int32, T::Int64), (T::Uint64, T::Int32, T::Float64), (T::Uint8, T::Uint8, T::Uint8), (T::Uint16, T::Uint32, T::Uint32),
         ] {
             assert_eq!(wider_type(a, b), both, "{a:?} with {b:?}");
             assert_eq!(wider_type(b, a), both, "{b:?} with {a:?}");

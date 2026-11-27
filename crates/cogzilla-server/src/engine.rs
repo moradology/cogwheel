@@ -190,6 +190,7 @@ pub struct EngineStats {
     pub empty_short_circuits: AtomicU64,
     pub passthrough_hits: AtomicU64,
     pub http_304_not_modified: AtomicU64,
+    pub gpu_dispatches: AtomicU64,
 }
 
 /// Map a fetch/I/O error on an asset referenced by a STAC item or MosaicJSON document to
@@ -221,6 +222,26 @@ pub struct TileEngine {
     tile_cache_epoch: AtomicU64,
     pub stats: Arc<EngineStats>,
     pgstac: std::sync::OnceLock<Arc<cogzilla_pgstac::PgStac>>,
+    pub aimd: crate::aimd::AimdLimiter,
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<Arc<crate::gpu_backend::GpuBackend>>,
+}
+
+/// Run a synchronous CPU tile render, moving heavy non-Nearest renders (`N >= 256`) off Tokio's
+/// async I/O worker pool via `block_in_place` (when running on a multi-threaded Tokio runtime)
+/// so `/healthz`, `/metrics`, and AIMD `429 Too Many Requests` shedding stay responsive under
+/// CPU-only saturation.
+#[inline]
+fn run_cpu_render<R>(n: usize, resample: ResampleMode, f: impl FnOnce() -> R) -> R {
+    if n >= 256
+        && !matches!(resample, ResampleMode::Nearest)
+        && tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
 }
 
 fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
@@ -408,6 +429,13 @@ impl TileEngine {
     }
 
     pub fn with_store_and_tile_cache(store: Arc<CogStore>, tile_cache_max_bytes: usize) -> Self {
+        #[cfg(feature = "gpu")]
+        let gpu = crate::gpu_backend::GpuBackend::try_init(256 * 1024 * 1024);
+        #[cfg(feature = "gpu")]
+        let has_gpu = gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let has_gpu = false;
+
         Self {
             store,
             crs_cache: DashMap::with_hasher(ahash::RandomState::new()),
@@ -419,6 +447,9 @@ impl TileEngine {
             tile_cache_epoch: AtomicU64::new(0),
             stats: Arc::new(EngineStats::default()),
             pgstac: std::sync::OnceLock::new(),
+            aimd: crate::aimd::AimdLimiter::from_env(has_gpu),
+            #[cfg(feature = "gpu")]
+            gpu,
         }
     }
 
@@ -443,6 +474,12 @@ impl TileEngine {
         Ok(self.set_pgstac(Arc::new(pgstac)))
     }
 
+    /// Replace the engine's AIMD concurrency limiter (useful for tests and custom deployments).
+    pub fn with_aimd(mut self, aimd: crate::aimd::AimdLimiter) -> Self {
+        self.aimd = aimd;
+        self
+    }
+
     /// Flush the rendered tile cache if any underlying source was invalidated or replaced.
     /// Costs a single relaxed/acquire atomic load on the warm path.
     #[inline(always)]
@@ -451,6 +488,11 @@ impl TileEngine {
         let seen = self.tile_cache_epoch.load(Ordering::Relaxed);
         if cur != seen && self.tile_cache_epoch.swap(cur, Ordering::AcqRel) != cur {
             self.tile_cache.clear();
+            #[cfg(feature = "gpu")]
+            if let Some(gpu) = &self.gpu {
+                gpu.slab_cache.clear();
+                gpu.multi_slab_cache.clear();
+            }
         }
     }
 
@@ -530,7 +572,7 @@ impl TileEngine {
             if let Some(b1) = bands_1based {
                 let kind = cog.index.full_res().sample_type;
                 let (minx, miny, maxx, maxy) = cogzilla_proj::tile_bounds_3857(req.tile);
-                return crate::titiler::render_exact_f64_array(
+                return Box::pin(crate::titiler::render_exact_f64_array(
                     self,
                     cog,
                     [minx, miny, maxx, maxy],
@@ -547,7 +589,7 @@ impl TileEngine {
                     true,
                     matches!(req.format, OutputFormat::RawF64),
                     true,
-                )
+                ))
                 .await;
             }
         }
@@ -555,8 +597,8 @@ impl TileEngine {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
             let raw = match raw_req.tile_size {
-                256 => self.render_tile_sized::<256>(cog, &raw_req).await?,
-                512 => self.render_tile_sized::<512>(cog, &raw_req).await?,
+                256 => Box::pin(self.render_tile_sized::<256>(cog, &raw_req)).await?,
+                512 => Box::pin(self.render_tile_sized::<512>(cog, &raw_req)).await?,
                 other => {
                     return Err(EngineError::BadRequest(format!(
                         "unsupported tile_size={other}, expected 256 or 512"
@@ -581,12 +623,267 @@ impl TileEngine {
             ));
         }
         match req.tile_size {
-            256 => self.render_tile_sized::<256>(cog, req).await,
-            512 => self.render_tile_sized::<512>(cog, req).await,
+            256 => Box::pin(self.render_tile_sized::<256>(cog, req)).await,
+            512 => Box::pin(self.render_tile_sized::<512>(cog, req)).await,
             other => Err(EngineError::BadRequest(format!(
                 "unsupported tile_size={other}, expected 256 or 512"
             ))),
         }
+    }
+
+    /// Render a batch of XYZ tiles for a single COG (e.g. a map viewport burst or pyramid
+    /// cache-warming pass).
+    ///
+    /// When built with `--features gpu` and a hardware GPU is active, eligible single-band
+    /// separable tiles that share the same `(ifd_idx, band, tile-block neighborhood, style)` are
+    /// fused into a single 3D GPU micro-batch (`GpuTileBatcher`), amortizing the Metal/Vulkan
+    /// dispatch floor across all `K` tiles. Any remaining tiles fall back transparently to
+    /// `render_tile`.
+    pub async fn render_tiles_batch(
+        &self,
+        cog: &OpenedCog,
+        reqs: &[TileRequest],
+    ) -> Vec<Result<Bytes, EngineError>> {
+        if reqs.is_empty() {
+            return Vec::new();
+        }
+        #[allow(unused_mut)]
+        let mut results: Vec<Option<Result<Bytes, EngineError>>> =
+            (0..reqs.len()).map(|_| None).collect();
+
+        #[cfg(feature = "gpu")]
+        if reqs.len() >= 2
+            && let Some(ref gpu) = self.gpu
+            && let Ok(crs) = self.get_or_build_crs(cog)
+        {
+            #[derive(Hash, PartialEq, Eq)]
+            struct BatchKey {
+                ifd_idx: usize,
+                band0: u16,
+                tx0: u32,
+                ty0: u32,
+                grid_w: u32,
+                grid_h: u32,
+                tile_size: u32,
+                resample: u8,
+                rmin_bits: u32,
+                rmax_bits: u32,
+                colormap: String,
+                format_tag: u8,
+                format_q: u32,
+            }
+            struct BatchItem {
+                req_idx: usize,
+                u: Vec<f32>,
+                v: Vec<f32>,
+            }
+            let mut groups: std::collections::HashMap<BatchKey, (SingleBandStyle, Vec<BatchItem>)> =
+                std::collections::HashMap::new();
+
+            for (idx, req) in reqs.iter().enumerate() {
+                if req.unscale {
+                    continue;
+                }
+                let BandRequest::Single {
+                    band_1based,
+                    rescale,
+                    colormap,
+                } = req.bands
+                else {
+                    continue;
+                };
+                if req.tile_size != 256 && req.tile_size != 512 {
+                    continue;
+                }
+                let (format_tag, format_q) = match req.format {
+                    OutputFormat::Png => (0u8, 0u32),
+                    OutputFormat::RawRgba => (1u8, 0u32),
+                    OutputFormat::Webp { quality } => {
+                        (2u8, quality.map(f32::to_bits).unwrap_or(0))
+                    }
+                    OutputFormat::Jpeg { quality } => (3u8, quality as u32),
+                    _ => continue,
+                };
+                let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, req.tile_size);
+                let ifd_idx = cog.index.select_ifd(target_rx, target_ry);
+                let ifd = &cog.index.ifds[ifd_idx];
+                let band0 = band_1based.saturating_sub(1);
+                if band0 >= ifd.samples_per_pixel {
+                    continue;
+                }
+                let pad = match req.resample {
+                    ResampleMode::Nearest => 0i64,
+                    ResampleMode::Bilinear => 1i64,
+                    ResampleMode::Cubic => 2i64,
+                    _ => 3i64,
+                };
+                let uv_bounds: Option<(Vec<f32>, Vec<f32>, f32, f32, f32, f32)> =
+                    if req.tile_size == 256 {
+                        CoordPlan::<256>::build_with_gcp(
+                            &crs,
+                            &ifd.crs_to_pixel,
+                            ifd.gcp_poly.as_deref(),
+                            ifd.width,
+                            ifd.height,
+                            req.tile,
+                        )
+                        .and_then(|p| match p {
+                            CoordPlan::Separable1D { u, v, .. } => {
+                                let (mut u0, mut u1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                let (mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                for &x in u.iter() {
+                                    u0 = u0.min(x);
+                                    u1 = u1.max(x);
+                                }
+                                for &y in v.iter() {
+                                    v0 = v0.min(y);
+                                    v1 = v1.max(y);
+                                }
+                                Some((u.to_vec(), v.to_vec(), u0, u1, v0, v1))
+                            }
+                            _ => None,
+                        })
+                    } else {
+                        CoordPlan::<512>::build_with_gcp(
+                            &crs,
+                            &ifd.crs_to_pixel,
+                            ifd.gcp_poly.as_deref(),
+                            ifd.width,
+                            ifd.height,
+                            req.tile,
+                        )
+                        .and_then(|p| match p {
+                            CoordPlan::Separable1D { u, v, .. } => {
+                                let (mut u0, mut u1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                let (mut v0, mut v1) = (f32::INFINITY, f32::NEG_INFINITY);
+                                for &x in u.iter() {
+                                    u0 = u0.min(x);
+                                    u1 = u1.max(x);
+                                }
+                                for &y in v.iter() {
+                                    v0 = v0.min(y);
+                                    v1 = v1.max(y);
+                                }
+                                Some((u.to_vec(), v.to_vec(), u0, u1, v0, v1))
+                            }
+                            _ => None,
+                        })
+                    };
+                let Some((u_vec, v_vec, min_u, max_u, min_v, max_v)) = uv_bounds else {
+                    continue;
+                };
+                if !min_u.is_finite() || !min_v.is_finite() {
+                    continue;
+                }
+                let px0 = (min_u.floor() as i64 - pad).clamp(0, ifd.width.saturating_sub(1) as i64) as u32;
+                let py0 = (min_v.floor() as i64 - pad).clamp(0, ifd.height.saturating_sub(1) as i64) as u32;
+                let px1 = (max_u.ceil() as i64 + pad).clamp(0, ifd.width.saturating_sub(1) as i64) as u32;
+                let py1 = (max_v.ceil() as i64 + pad).clamp(0, ifd.height.saturating_sub(1) as i64) as u32;
+                let tx0 = px0 / ifd.tile_width;
+                let ty0 = py0 / ifd.tile_height;
+                let tx1 = (px1 / ifd.tile_width).min(ifd.tiles_across.saturating_sub(1));
+                let ty1 = (py1 / ifd.tile_height).min(ifd.tiles_down.saturating_sub(1));
+                let grid_w = tx1 - tx0 + 1;
+                let grid_h = ty1 - ty0 + 1;
+
+                let key = BatchKey {
+                    ifd_idx,
+                    band0,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
+                    tile_size: req.tile_size,
+                    resample: req.resample as u8,
+                    rmin_bits: rescale.0.to_bits(),
+                    rmax_bits: rescale.1.to_bits(),
+                    colormap: format!("{colormap:?}"),
+                    format_tag,
+                    format_q,
+                };
+                let style = SingleBandStyle {
+                    rescale_min: rescale.0,
+                    rescale_max: rescale.1,
+                    colormap,
+                    resample: req.resample,
+                    format: req.format,
+                };
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (style, Vec::new()))
+                    .1
+                    .push(BatchItem {
+                        req_idx: idx,
+                        u: u_vec,
+                        v: v_vec,
+                    });
+            }
+
+            for (key, (style, items)) in groups {
+                if items.len() < 2 {
+                    continue;
+                }
+                let ifd = &cog.index.ifds[key.ifd_idx];
+                let mut indices = Vec::with_capacity((key.grid_w * key.grid_h) as usize);
+                for ty in key.ty0..key.ty0 + key.grid_h {
+                    for tx in key.tx0..key.tx0 + key.grid_w {
+                        indices.push(Some(ifd.tile_index(tx, ty, key.band0) as u32));
+                    }
+                }
+                let Ok(tiles) = self.store.get_blocks(cog, key.ifd_idx, &indices).await else {
+                    continue;
+                };
+                let band_in_decoded = match ifd.planar_config {
+                    PlanarConfig::Chunky => key.band0 as usize,
+                    PlanarConfig::Planar => 0,
+                };
+                let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+                    .iter()
+                    .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+                    .collect();
+                let src = BandSource::new(
+                    ifd.width,
+                    ifd.height,
+                    ifd.tile_width,
+                    ifd.tile_height,
+                    key.tx0,
+                    key.ty0,
+                    key.grid_w,
+                    key.grid_h,
+                    &block_refs,
+                );
+                let uvs: Vec<(&[f32], &[f32])> = items
+                    .iter()
+                    .map(|it| (it.u.as_slice(), it.v.as_slice()))
+                    .collect();
+                if let Some(batch_out) = gpu.try_render_single_band_batch(
+                    cog.id,
+                    key.ifd_idx,
+                    key.band0,
+                    key.tile_size as usize,
+                    &uvs,
+                    &src,
+                    &style,
+                ) {
+                    self.stats
+                        .tiles_served
+                        .fetch_add(items.len() as u64, Ordering::Relaxed);
+                    self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                    for (item, bytes) in items.into_iter().zip(batch_out.into_iter()) {
+                        results[item.req_idx] = Some(Ok(bytes));
+                    }
+                }
+            }
+        }
+
+        let mut final_out = Vec::with_capacity(reqs.len());
+        for (slot, req) in results.into_iter().zip(reqs.iter()) {
+            match slot {
+                Some(res) => final_out.push(res),
+                None => final_out.push(self.render_tile(cog, req).await),
+            }
+        }
+        final_out
     }
 
     async fn render_tile_sized<const N: usize>(
@@ -702,7 +999,21 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_single_band::<N>(&plan, &src, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_single_band::<N>(
+                            cog.id, ifd_idx, band0, tx0, ty0, &plan, &src, &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_single_band::<N>(&plan, &src, &style)
+                }))
             }
             BandRequest::Terrain {
                 band_1based,
@@ -754,13 +1065,30 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(render_terrain_tile::<N>(
-                    &plan,
-                    &src,
-                    *encoding,
-                    req.resample,
-                    req.format,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_terrain::<N>(
+                            cog.id,
+                            ifd_idx,
+                            band0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *encoding,
+                            req.resample,
+                            req.format,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, req.resample, || {
+                    render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
+                }))
             }
             BandRequest::Dem {
                 band_1based,
@@ -826,13 +1154,30 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_dem_algorithm::<N>(
-                    &plan,
-                    &src,
-                    *algorithm,
-                    pixel_size_m,
-                    &style,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_dem::<N>(
+                            cog.id,
+                            ifd_idx,
+                            band0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *algorithm,
+                            pixel_size_m,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_dem_algorithm::<N>(&plan, &src, *algorithm, pixel_size_m, &style)
+                }))
             }
             BandRequest::Spectral1 {
                 expr,
@@ -882,7 +1227,27 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            cog.id,
+                            ifd_idx,
+                            &[*band_1based],
+                            &plan,
+                            std::slice::from_ref(&src),
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath1::<N>(&plan, &src, *expr, &style)
+                }))
             }
             BandRequest::SarRgb {
                 bands_1based,
@@ -949,7 +1314,26 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_sar_rgb::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    *bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_sar_rgb::<N>(&plan, &srcs, &style)
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * 2);
@@ -983,7 +1367,26 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_sar_rgb::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    *bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_sar_rgb::<N>(&plan, &srcs, &style)
+                }))
                     }
                 }
             }
@@ -1072,7 +1475,19 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                            render_rgb_bands::<N>(&plan, &srcs, &style)
+                        }))
                     }
                     PlanarConfig::Planar => {
                         // Fetch all 3 planes in one coalesced call
@@ -1133,7 +1548,19 @@ impl TileEngine {
                         if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
-                        Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                            render_rgb_bands::<N>(&plan, &srcs, &style)
+                        }))
                     }
                 }
             }
@@ -1204,7 +1631,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath2::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * 2);
@@ -1238,7 +1685,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s1, o1),
                         ];
-                        Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath2::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                 }
             }
@@ -1320,7 +1787,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath3::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * 3);
@@ -1374,7 +1861,27 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_spectral::<N>(
+                                    cog.id,
+                                    ifd_idx,
+                                    bands_1based,
+                                    &plan,
+                                    &srcs,
+                                    *expr,
+                                    &style,
+                                )
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath3::<N>(&plan, &srcs, *expr, &style)
+                }))
                     }
                 }
             }
@@ -1453,7 +1960,19 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height))
+                }))
                     }
                     PlanarConfig::Planar => {
                         let mut indices = Vec::with_capacity(grid_len * nb);
@@ -1496,7 +2015,19 @@ impl TileEngine {
                                 .with_scale_offset(sc, off)
                             })
                             .collect();
-                        Ok(render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height)))
+                        #[cfg(feature = "gpu")]
+                        if let Some(gpu) = &self.gpu {
+                            if let Some(bytes) = gpu
+                                .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
+                                .await
+                            {
+                                self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                                return Ok(bytes);
+                            }
+                        }
+                        Ok(run_cpu_render(N, style.resample, || {
+                    render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height))
+                }))
                     }
                 }
             }
@@ -1670,6 +2201,24 @@ impl TileEngine {
             .with_scale_offset(sc, off))
         };
 
+        #[cfg(feature = "gpu")]
+        let scene_cog_id = |bands_1based: &[u16]| -> u64 {
+            // Deterministic FNV-1a hash with high-bit tag so multi-COG scene keys never collide
+            // with single-COG `OpenedCog::id` values in `GpuMultiBandCache`.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in bands_1based {
+                let cid = cogs
+                    .get(b.saturating_sub(1) as usize)
+                    .map(|c| c.id)
+                    .unwrap_or(0);
+                for byte in cid.to_le_bytes() {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            h | (1u64 << 63)
+        };
+
         match &req.bands {
             BandRequest::Single {
                 band_1based,
@@ -1684,20 +2233,51 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_single_band::<N>(&plan, &src, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_single_band::<N>(cid, ifd_idx, 0, tx0, ty0, &plan, &src, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_single_band::<N>(&plan, &src, &style)
+                }))
             }
             BandRequest::Terrain {
                 band_1based,
                 encoding,
             } => {
                 let src = make_src(*band_1based)?;
-                Ok(render_terrain_tile::<N>(
-                    &plan,
-                    &src,
-                    *encoding,
-                    req.resample,
-                    req.format,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_terrain::<N>(
+                            cid,
+                            ifd_idx,
+                            0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *encoding,
+                            req.resample,
+                            req.format,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, req.resample, || {
+                    render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
+                }))
             }
             BandRequest::Dem {
                 band_1based,
@@ -1717,13 +2297,31 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_dem_algorithm::<N>(
-                    &plan,
-                    &src,
-                    *algorithm,
-                    pixel_size_m,
-                    &style,
-                ))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_dem::<N>(
+                            cid,
+                            ifd_idx,
+                            0,
+                            tx0,
+                            ty0,
+                            &plan,
+                            &src,
+                            *algorithm,
+                            pixel_size_m,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_dem_algorithm::<N>(&plan, &src, *algorithm, pixel_size_m, &style)
+                }))
             }
             BandRequest::Spectral1 {
                 expr,
@@ -1739,7 +2337,28 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath1::<N>(&plan, &src, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            cid,
+                            ifd_idx,
+                            &[1],
+                            &plan,
+                            std::slice::from_ref(&src),
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath1::<N>(&plan, &src, *expr, &style)
+                }))
             }
             BandRequest::SarRgb {
                 bands_1based,
@@ -1753,7 +2372,20 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_sar_rgb::<N>(&plan, &srcs, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_sar_rgb::<N>(sid, ifd_idx, [1, 2], &plan, &srcs, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_sar_rgb::<N>(&plan, &srcs, &style)
+                }))
             }
             BandRequest::Spectral2 {
                 expr,
@@ -1769,7 +2401,20 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath2::<N>(&plan, &srcs, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(sid, ifd_idx, &[1, 2], &plan, &srcs, *expr, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath2::<N>(&plan, &srcs, *expr, &style)
+                }))
             }
             BandRequest::Spectral3 {
                 expr,
@@ -1789,7 +2434,28 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_bandmath3::<N>(&plan, &srcs, *expr, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_spectral::<N>(
+                            sid,
+                            ifd_idx,
+                            &[1, 2, 3],
+                            &plan,
+                            &srcs,
+                            *expr,
+                            &style,
+                        )
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_bandmath3::<N>(&plan, &srcs, *expr, &style)
+                }))
             }
             BandRequest::Rgb {
                 bands_1based,
@@ -1807,7 +2473,20 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                Ok(render_rgb_bands::<N>(&plan, &srcs, &style))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(bands_1based);
+                    if let Some(bytes) = gpu
+                        .try_render_rgb::<N>(sid, ifd_idx, [1, 2, 3], &plan, &srcs, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_rgb_bands::<N>(&plan, &srcs, &style)
+                }))
             }
             BandRequest::CustomExprRgb { .. }
             | BandRequest::CustomExprMulti { .. }
@@ -1830,7 +2509,20 @@ impl TileEngine {
                 for &b in &prog.used_bands {
                     ordered.push(make_src(b)?);
                 }
-                Ok(render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height)))
+                #[cfg(feature = "gpu")]
+                if let Some(gpu) = &self.gpu {
+                    let sid = scene_cog_id(&prog.used_bands);
+                    if let Some(bytes) = gpu
+                        .try_render_expr::<N>(sid, ifd_idx, &plan, &ordered, prog, &style)
+                        .await
+                    {
+                        self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
+                        return Ok(bytes);
+                    }
+                }
+                Ok(run_cpu_render(N, style.resample, || {
+                    render_expr_vm::<N>(&plan, &ordered, prog, &style, (ifd.width, ifd.height))
+                }))
             }
         }
     }

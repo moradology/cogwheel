@@ -3,6 +3,10 @@ name = "cogzilla-server"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["gpu"]
+gpu = ["dep:cogzilla-gpu"]
+
 [dependencies]
 cogzilla-tiff = { path = "../cogzilla-tiff" }
 cogzilla-codec = { path = "../cogzilla-codec" }
@@ -10,6 +14,7 @@ cogzilla-proj = { path = "../cogzilla-proj" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
 cogzilla-io = { path = "../cogzilla-io" }
 cogzilla-pgstac = { path = "../cogzilla-pgstac" }
+cogzilla-gpu = { path = "../cogzilla-gpu", optional = true }
 thiserror.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
@@ -26,6 +31,15 @@ futures-util.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
 
+[[example]]
+name = "e2e_realistic_workload_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_torture_test"
+required-features = ["gpu"]
+
 [dev-dependencies]
 libdeflater.workspace = true
 tokio-postgres.workspace = true
+zune-jpeg.workspace = true
