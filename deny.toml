@@ -2,7 +2,7 @@
 # Run locally with: `cargo deny check`
 
 [graph]
-all-features = false
+all-features = true
 
 [advisories]
 # Fail CI on known RustSec security vulnerabilities; warn on yanked crates.
@@ -28,7 +28,7 @@ confidence-threshold = 0.8
 [bans]
 # Transitive crates occasionally pull two semver lines (e.g., hashbrown, getrandom);
 # forbid wildcard crates.io version requirements while allowing local workspace path deps.
-multiple-versions = "allow"
+multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
