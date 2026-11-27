@@ -72,14 +72,12 @@ def tile_to_quadkey(z: int, x: int, y: int) -> str:
 def ensure_mosaicjson_fixture(sat_path: str) -> str:
     """Write a local MosaicJSON 0.0.2 fixture pointing at `sat_path` covering tile 12/652/1583."""
     out = FIXTURES / "satellite_mosaic.json"
-    qk = tile_to_quadkey(12, 652, 1583)
     # Include the 3x3 neighbourhood around 12/652/1583 so bbox/point/stats queries cover it too.
     tiles = {
         tile_to_quadkey(12, x, y): [sat_path]
         for x in range(651, 654)
         for y in range(1582, 1585)
     }
-    tiles[qk] = [sat_path]
     doc = {
         "mosaicjson": "0.0.2",
         "name": "cogzilla_oracle_satellite",
@@ -103,28 +101,29 @@ def build_shared_mosaicjson_cases(
 ) -> list[tuple[str, str, str, dict | None, str]]:
     """Family-parameterised shared differential cases for `/mosaicjson/*` (#450)."""
     p = "/mosaicjson"
+    q_url = quote(mosaic_url, safe="")
     return [
-        (f"GET {p}/WebMercatorQuad/tilejson.json", "GET", f"{p}/WebMercatorQuad/tilejson.json?url={mosaic_url}", None, "json_tj"),
-        (f"GET {p}/WebMercatorQuad/WMTSCapabilities.xml", "GET", f"{p}/WebMercatorQuad/WMTSCapabilities.xml?url={mosaic_url}", None, "wmts_xml"),
-        (f"GET {p}/tiles/WebMercatorQuad/12/652/1583.png (RGB)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.png?tilesize=512", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&tilesize=512&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.jpg (JPEG)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.jpg?url={mosaic_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.webp (WebP)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.webp?url={mosaic_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.png (colormap viridis)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&rescale=0,0.35&colormap_name=viridis", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.png (expression NDVI)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&expression=(b2-b1)/(b2%2Bb1)&rescale=-1,1&colormap_name=rdylgn", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.png (algorithm=hillshade)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&algorithm=hillshade&algorithm_params={hs_params}", None, "png_loose"),
-        (f"GET {p}/tiles/.../12/652/1583.png (nodata=0)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&rescale=0,0.35&nodata=0", None, "png"),
-        (f"GET {p}/tiles/.../12/652/1583.npy (NPY)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.npy?url={mosaic_url}&bidx=1&bidx=2&bidx=3", None, "npy"),
-        (f"GET {p}/tiles/.../12/652/1583.tif (GeoTIFF)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.tif?url={mosaic_url}&bidx=1&bidx=2&bidx=3", None, "geotiff"),
-        (f"GET {p}/point/-122.65,37.75", "GET", f"{p}/point/-122.65,37.75?url={mosaic_url}", None, "json_point"),
-        (f"POST {p}/statistics (polygon)", "POST", f"{p}/statistics?url={mosaic_url}&bidx=1", poly_feature, "json_post_stats"),
+        (f"GET {p}/WebMercatorQuad/tilejson.json", "GET", f"{p}/WebMercatorQuad/tilejson.json?url={q_url}", None, "json_tj"),
+        (f"GET {p}/WebMercatorQuad/WMTSCapabilities.xml", "GET", f"{p}/WebMercatorQuad/WMTSCapabilities.xml?url={q_url}", None, "wmts_xml"),
+        (f"GET {p}/tiles/WebMercatorQuad/12/652/1583.png (RGB)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={q_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png?tilesize=512", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={q_url}&tilesize=512&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.jpg (JPEG)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.jpg?url={q_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.webp (WebP)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.webp?url={q_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png (colormap viridis)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={q_url}&bidx=1&rescale=0,0.35&colormap_name=viridis", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png (expression NDVI)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={q_url}&expression=(b2-b1)/(b2%2Bb1)&rescale=-1,1&colormap_name=rdylgn", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png (algorithm=hillshade)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={q_url}&bidx=1&algorithm=hillshade&algorithm_params={hs_params}", None, "png_loose"),
+        (f"GET {p}/tiles/.../12/652/1583.png (nodata=0)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={q_url}&bidx=1&rescale=0,0.35&nodata=0", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.npy (NPY)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.npy?url={q_url}&bidx=1&bidx=2&bidx=3", None, "npy"),
+        (f"GET {p}/tiles/.../12/652/1583.tif (GeoTIFF)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.tif?url={q_url}&bidx=1&bidx=2&bidx=3", None, "geotiff"),
+        (f"GET {p}/point/-122.65,37.75", "GET", f"{p}/point/-122.65,37.75?url={q_url}", None, "json_mosaic_point"),
+        (f"POST {p}/statistics (polygon)", "POST", f"{p}/statistics?url={q_url}&bidx=1", poly_feature, "json_post_stats"),
     ]
 
 
-def build_shared_zarr_cases(zarr_url: str) -> list[tuple[str, str, str, dict | None, str]]:
+def build_shared_zarr_cases(zarr_url: str, variable: str = "data") -> list[tuple[str, str, str, dict | None, str]]:
     """Family-parameterised shared differential cases for `/zarr/*` when `titiler.xarray` is mounted."""
     p = "/zarr"
-    q = f"url={quote(zarr_url, safe='')}"
+    q = f"url={quote(zarr_url, safe='')}&variable={quote(variable, safe='')}"
     return [
         (f"GET {p}/info", "GET", f"{p}/info?{q}", None, "json_info"),
         (f"GET {p}/WebMercatorQuad/tilejson.json", "GET", f"{p}/WebMercatorQuad/tilejson.json?{q}", None, "json_tj"),
@@ -311,17 +310,31 @@ def main(argv: list[str] | None = None):
         return
 
     requested_families = [f.strip() for f in args.families.split(",") if f.strip()]
+    if not requested_families:
+        raise SystemExit("No route families requested (--families was empty)")
     unknown = [f for f in requested_families if f not in FAMILIES]
     if unknown:
         raise SystemExit(f"Unknown route family(ies): {unknown} (valid: {list(FAMILIES)})")
+    if "searches" in requested_families:
+        raise SystemExit(
+            "Family 'searches' requires PostgreSQL/pgSTAC; run benches/pgstac_diff_oracle.py instead"
+        )
 
+    default_fams = ",".join(k for k, v in FAMILIES.items() if v["default"])
+    explicit_request = args.families != default_fams
     active_families: set[str] = set()
     for fam in requested_families:
         needs = FAMILIES[fam]["needs"]
         if needs and importlib.util.find_spec(str(needs)) is None:
+            if explicit_request:
+                raise SystemExit(
+                    f"Requested family '{fam}' requires reference package '{needs}', which is not installed"
+                )
             print(f"[oracle] skipping family '{fam}': optional reference package '{needs}' is not installed")
             continue
         active_families.add(fam)
+    if not active_families:
+        raise SystemExit("No active route families left to test after dependency checks")
 
     RESULTS.mkdir(parents=True, exist_ok=True)
     if not COGZILLA_BIN.exists():
@@ -340,12 +353,18 @@ def main(argv: list[str] | None = None):
         ")",
     ]
     if "mosaicjson" in active_families:
+        app_lines.append("from titiler.mosaic.errors import MOSAIC_STATUS_CODES")
         app_lines.append("from titiler.mosaic.factory import MosaicTilerFactory")
     if "zarr" in active_families:
         app_lines.append("from titiler.xarray.factory import TilerFactory as XarrayTilerFactory")
+    status_expr = (
+        "{**DEFAULT_STATUS_CODES, **MOSAIC_STATUS_CODES, PointOutsideBounds: 404}"
+        if "mosaicjson" in active_families
+        else "{**DEFAULT_STATUS_CODES, PointOutsideBounds: 404}"
+    )
     app_lines += [
         "app = FastAPI()",
-        "add_exception_handlers(app, {**DEFAULT_STATUS_CODES, PointOutsideBounds: 404})",
+        f"add_exception_handlers(app, {status_expr})",
         "cog = TilerFactory(router_prefix='/cog', add_ogc_maps=True)",
         "stac = MultiBaseTilerFactory(reader=STACReader, router_prefix='/stac', add_ogc_maps=True)",
         "cmaps = ColorMapFactory()",
@@ -359,7 +378,7 @@ def main(argv: list[str] | None = None):
     ]
     if "mosaicjson" in active_families:
         app_lines += [
-            "mosaic = MosaicTilerFactory(router_prefix='/mosaicjson', add_ogc_maps=True)",
+            "mosaic = MosaicTilerFactory(router_prefix='/mosaicjson', add_ogc_maps=True, add_statistics=True)",
             "app.include_router(mosaic.router, prefix='/mosaicjson')",
         ]
     if "zarr" in active_families:
@@ -736,9 +755,12 @@ def main(argv: list[str] | None = None):
             mosaic_url = ensure_mosaicjson_fixture(sat)
             cases.extend(build_shared_mosaicjson_cases(mosaic_url, poly_feature, hs_params))
         if "zarr" in active_families:
-            zarr_target = args.zarr_url or str((FIXTURES / "zarr" / "v2_2d.zarr").resolve())
-            if Path(zarr_target).exists() or zarr_target.startswith(("http://", "https://", "s3://", "gs://")):
-                cases.extend(build_shared_zarr_cases(zarr_target))
+            zarr_target = args.zarr_url or str((FIXTURES / "zarr" / "geotiff_twin.zarr").resolve())
+            if not (Path(zarr_target).exists() or zarr_target.startswith(("http://", "https://", "s3://", "gs://"))):
+                raise SystemExit(
+                    f"Zarr fixture not found at {zarr_target}; run benches/generate_zarr_fixtures.py or pass --zarr-url"
+                )
+            cases.extend(build_shared_zarr_cases(zarr_target))
 
         print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks; families: {', '.join(sorted(active_families))}) ===")
         print(f"{'St':4s} | {'Endpoint':54s} | {'cogzilla':>9s} | {'TiTiler':>9s} | {'Speedup':>8s} | Parity vs TiTiler")
@@ -801,6 +823,17 @@ def main(argv: list[str] | None = None):
                         v_err = max(abs(a - b) for a, b in zip(j_cw["values"], j_tt["values"]))
                         ok = len(j_cw["values"]) == len(j_tt["values"]) and v_err < 1e-4
                         parity = f"max_val_err={v_err:.7f} bands={j_cw['band_names']}"
+                    elif kind == "json_mosaic_point":
+                        j_cw, j_tt = r_cw.json(), r_tt.json()
+                        a_cw, a_tt = j_cw.get("assets", []), j_tt.get("assets", [])
+                        if not a_cw or not a_tt:
+                            ok = False
+                            parity = f"empty assets cw={len(a_cw)} tt={len(a_tt)}"
+                        else:
+                            v_cw, v_tt = a_cw[0]["values"], a_tt[0]["values"]
+                            v_err = max((abs(a - b) for a, b in zip(v_cw, v_tt)), default=0.0)
+                            ok = len(a_cw) == len(a_tt) and len(v_cw) == len(v_tt) and v_err < 1e-4
+                            parity = f"assets={len(a_cw)}=={len(a_tt)} max_val_err={v_err:.7f}"
                     elif kind == "json_stats":
                         j_cw, j_tt = r_cw.json(), r_tt.json()
                         m_err = abs(j_cw["b1"]["mean"] - j_tt["b1"]["mean"])
@@ -957,10 +990,14 @@ def main(argv: list[str] | None = None):
                 print(f"  - {lbl}: {msg}")
             sys.exit(1)
     finally:
-        cw_proc.terminate()
-        tt_proc.terminate()
-        cw_proc.wait(timeout=5)
-        tt_proc.wait(timeout=5)
+        for proc in (cw_proc, tt_proc):
+            proc.terminate()
+        for proc in (cw_proc, tt_proc):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
