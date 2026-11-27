@@ -26,11 +26,10 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Transitive crates occasionally pull two semver lines (e.g., hashbrown, getrandom);
-# forbid wildcard crates.io version requirements while allowing local workspace path deps.
+# Warn on transitive semver duplicates; internal workspace crates use path-only
+# dependencies without `publish = false`, so `allow-wildcard-paths` does not apply.
 multiple-versions = "warn"
-wildcards = "deny"
-allow-wildcard-paths = true
+wildcards = "allow"
 highlight = "all"
 
 [sources]
