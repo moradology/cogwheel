@@ -728,9 +728,9 @@ impl GpuBackend {
         };
         let mut policy = DispatchPolicy::calibrate(&ctx);
         // `GpuCoalescer` packs up to 32 concurrent jobs per batch asynchronously (without
-        // blocking Tokio worker threads), so allow up to 32 coalesced batches (1,024 concurrent
+        // blocking Tokio worker threads), so allow up to 128 coalesced batches (4,096 concurrent
         // requests) before shedding load to synchronous CPU fallback.
-        policy.max_in_flight = 32;
+        policy.max_in_flight = 128;
         tracing::info!(
             adapter = %ctx.info.name,
             backend = ?ctx.info.backend,

@@ -111,6 +111,16 @@ pub enum OwnedCoordPlan {
 }
 
 impl OwnedCoordPlan {
+    fn dims(&self) -> (usize, usize) {
+        match self {
+            Self::Separable1D { u, v } => (u.len(), v.len()),
+            Self::Grid2D { dst_w, dst_h, .. }
+            | Self::Exact2D { dst_w, dst_h, .. }
+            | Self::SeparableMasked { dst_w, dst_h, .. }
+            | Self::Grid2DMasked { dst_w, dst_h, .. } => (*dst_w, *dst_h),
+        }
+    }
+
     fn dims_mode_slices(&self) -> Result<(usize, usize, u32, &[u8], &[u8]), GpuError> {
         match self {
             Self::Separable1D { u, v } => Ok((
@@ -295,6 +305,83 @@ pub enum CoalescedJob {
         num_bins: usize,
         hist_range: Option<(f64, f64)>,
     },
+}
+
+impl CoalescedJob {
+    /// Conservative upper bound on `(staging_bytes, max_slot_storage_bytes)` required by this job.
+    /// Used to guard `wgpu::Device::limits()` before submission and cap per-batch staging size.
+    pub(crate) fn estimated_staging_and_slot_bytes(&self) -> (u64, u64) {
+        let plan_dims = |plan: &OwnedCoordPlan| -> (u64, u64) {
+            let (w, h) = plan.dims();
+            (w as u64, h as u64)
+        };
+        let out_bytes_for = |w: u64, h: u64, out: CoalescedOutput| -> u64 {
+            match out {
+                CoalescedOutput::IndexedU8 => w.div_ceil(4).saturating_mul(h).saturating_mul(4),
+                CoalescedOutput::Rgba8 | CoalescedOutput::RawF32 => {
+                    w.saturating_mul(h).saturating_mul(4)
+                }
+            }
+        };
+        match self {
+            CoalescedJob::Colormap { plan, output, .. }
+            | CoalescedJob::Terrain { plan, output, .. }
+            | CoalescedJob::Expr { plan, output, .. } => {
+                let (w, h) = plan_dims(plan);
+                let b = out_bytes_for(w, h, *output);
+                (b, b)
+            }
+            CoalescedJob::Rgb { plan, .. }
+            | CoalescedJob::SarRgb { plan, .. }
+            | CoalescedJob::ExprRgb { plan, .. } => {
+                let (w, h) = plan_dims(plan);
+                let b = w.saturating_mul(h).saturating_mul(4);
+                (b, b)
+            }
+            CoalescedJob::MultiBandF32 { slab, plan, .. } => {
+                let (w, h) = plan_dims(plan);
+                let b = (slab.num_bands as u64)
+                    .saturating_mul(w)
+                    .saturating_mul(h)
+                    .saturating_mul(4);
+                (b, b)
+            }
+            CoalescedJob::ExprRgbF32 { plan, .. } => {
+                let (w, h) = plan_dims(plan);
+                let b = 3u64
+                    .saturating_mul(w)
+                    .saturating_mul(h)
+                    .saturating_mul(4);
+                (b, b)
+            }
+            CoalescedJob::WithJpeg { inner, .. } => {
+                let (_, inner_slot) = inner.estimated_staging_and_slot_bytes();
+                let (w, h) = match inner.as_ref() {
+                    CoalescedJob::Colormap { plan, .. }
+                    | CoalescedJob::Terrain { plan, .. }
+                    | CoalescedJob::Expr { plan, .. }
+                    | CoalescedJob::Rgb { plan, .. }
+                    | CoalescedJob::SarRgb { plan, .. }
+                    | CoalescedJob::ExprRgb { plan, .. }
+                    | CoalescedJob::MultiBandF32 { plan, .. }
+                    | CoalescedJob::ExprRgbF32 { plan, .. } => plan_dims(plan),
+                    _ => (0, 0),
+                };
+                let jpeg_bytes = w
+                    .div_ceil(16)
+                    .saturating_mul(h.div_ceil(16))
+                    .saturating_mul(192 * 4);
+                (jpeg_bytes, inner_slot.max(jpeg_bytes))
+            }
+            CoalescedJob::WithStats { inner, .. } => {
+                let (_, inner_slot) = inner.estimated_staging_and_slot_bytes();
+                let stats_bytes = (std::mem::size_of::<crate::stats::ResolvedStats>()
+                    + 2 * crate::stats::CDF_BINS * 4
+                    + (crate::stats::MAX_WG as usize) * 4) as u64;
+                (stats_bytes, inner_slot.max(stats_bytes))
+            }
+        }
+    }
 }
 
 /// Telemetry counters for `GpuCoalescer`.
@@ -2066,7 +2153,11 @@ impl WorkerState {
         }
 
         if total_staging_words > frame.staging_words_cap {
-            frame.staging_words_cap = total_staging_words.next_power_of_two();
+            let max_words = (self.device.limits().max_buffer_size / 4) as usize;
+            frame.staging_words_cap = total_staging_words
+                .next_power_of_two()
+                .min(max_words)
+                .max(total_staging_words);
             frame.staging_buf = Self::alloc_staging(&self.device, frame.staging_words_cap);
         }
 
@@ -2347,6 +2438,8 @@ pub struct GpuCoalescer {
     max_batch_seen: Arc<AtomicUsize>,
     pending_count: Arc<AtomicUsize>,
     max_pending: usize,
+    max_frame_staging_bytes: u64,
+    max_slot_storage_bytes: u64,
 }
 
 impl GpuCoalescer {
@@ -2371,8 +2464,14 @@ impl GpuCoalescer {
         let max_pending = std::env::var("COGZILLA_GPU_MAX_QUEUED")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048)
+            .unwrap_or(4096)
             .max(max_batch);
+        let limits = ctx.device.limits();
+        let max_slot_storage_bytes =
+            (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        // Cap per-batch staging buffer at half of max_buffer_size (max 256 MiB) so coalescing
+        // multiple large 4096² bboxes can never exceed `Device::limits().max_buffer_size`.
+        let max_frame_staging_bytes = (limits.max_buffer_size / 2).min(256 * 1024 * 1024);
 
         let (tx, rx) = mpsc::channel::<PendingRequest>();
         let batches_submitted = Arc::new(AtomicU64::new(0));
@@ -2390,6 +2489,7 @@ impl GpuCoalescer {
             .name("cogzilla-gpu-coalescer".into())
             .spawn(move || {
                 let mut batch: Vec<PendingRequest> = Vec::with_capacity(max_batch);
+                let mut deferred: Option<PendingRequest> = None;
                 let mut in_burst = false;
                 let mut disconnected = false;
                 loop {
@@ -2403,27 +2503,64 @@ impl GpuCoalescer {
                         continue;
                     }
 
-                    let push_if_live = |batch: &mut Vec<PendingRequest>, req: PendingRequest| {
+                    let mut batch_staging_bytes: u64 = 0;
+                    // Returns `true` if `req` was added (or discarded as cancelled), `false` if
+                    // adding it would exceed `max_frame_staging_bytes` (so caller defers it).
+                    let try_push_if_live = |batch: &mut Vec<PendingRequest>,
+                                            batch_bytes: &mut u64,
+                                            deferred: &mut Option<PendingRequest>,
+                                            req: PendingRequest|
+                     -> bool {
                         if req.is_cancelled() {
                             (req.reply)(Err(GpuError::BufferMap("cancelled".into())));
-                        } else {
-                            batch.push(req);
+                            return true;
                         }
+                        let (req_bytes, _) = req.job.estimated_staging_and_slot_bytes();
+                        if !batch.is_empty()
+                            && batch_bytes.saturating_add(req_bytes) > max_frame_staging_bytes
+                        {
+                            *deferred = Some(req);
+                            return false;
+                        }
+                        *batch_bytes = batch_bytes.saturating_add(req_bytes);
+                        batch.push(req);
+                        true
                     };
 
-                    // 3. Acquire the next live job (skipping any requests cancelled while queued).
+                    // 3. Acquire the next live job (first from `deferred`, then from `rx`).
                     batch.clear();
-                    if state.in_flight_order.is_empty() {
+                    if let Some(prev) = deferred.take() {
+                        let _ = try_push_if_live(
+                            &mut batch,
+                            &mut batch_staging_bytes,
+                            &mut deferred,
+                            prev,
+                        );
+                    } else if state.in_flight_order.is_empty() {
                         if disconnected {
                             break;
                         }
                         match rx.recv() {
-                            Ok(first) => push_if_live(&mut batch, first),
+                            Ok(first) => {
+                                let _ = try_push_if_live(
+                                    &mut batch,
+                                    &mut batch_staging_bytes,
+                                    &mut deferred,
+                                    first,
+                                );
+                            }
                             Err(_) => break,
                         }
                     } else {
                         match rx.try_recv() {
-                            Ok(first) => push_if_live(&mut batch, first),
+                            Ok(first) => {
+                                let _ = try_push_if_live(
+                                    &mut batch,
+                                    &mut batch_staging_bytes,
+                                    &mut deferred,
+                                    first,
+                                );
+                            }
                             Err(mpsc::TryRecvError::Empty) => {
                                 // No new job ready yet; wait for oldest in-flight frame to finish.
                                 state.drain_completed(true);
@@ -2437,10 +2574,20 @@ impl GpuCoalescer {
                         }
                     }
 
-                    // 4. Immediately scoop any other live jobs already sitting in the channel.
-                    while batch.len() < max_batch {
+                    // 4. Immediately scoop any other live jobs already sitting in the channel,
+                    //    stopping if adding the next job would overflow `max_frame_staging_bytes`.
+                    while batch.len() < max_batch && deferred.is_none() {
                         match rx.try_recv() {
-                            Ok(next) => push_if_live(&mut batch, next),
+                            Ok(next) => {
+                                if !try_push_if_live(
+                                    &mut batch,
+                                    &mut batch_staging_bytes,
+                                    &mut deferred,
+                                    next,
+                                ) {
+                                    break;
+                                }
+                            }
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 disconnected = true;
@@ -2459,12 +2606,14 @@ impl GpuCoalescer {
                     //    concurrent traffic is active (and never wait past a completed frame).
                     let active_waiters = p_stat.load(Ordering::Acquire);
                     if !disconnected
+                        && deferred.is_none()
                         && !window.is_zero()
                         && batch.len() < max_batch
+                        && batch_staging_bytes < max_frame_staging_bytes
                         && (batch.len() > 1 || active_waiters > 1 || in_burst)
                     {
                         let deadline = Instant::now() + window;
-                        while batch.len() < max_batch {
+                        while batch.len() < max_batch && deferred.is_none() {
                             if !state.in_flight_order.is_empty() && state.drain_completed(false) > 0
                             {
                                 // Harvest completed replies right away so Tokio PNG encoders start!
@@ -2475,7 +2624,16 @@ impl GpuCoalescer {
                             }
                             let slice_wait = (deadline - now).min(Duration::from_micros(100));
                             match rx.recv_timeout(slice_wait) {
-                                Ok(next) => push_if_live(&mut batch, next),
+                                Ok(next) => {
+                                    if !try_push_if_live(
+                                        &mut batch,
+                                        &mut batch_staging_bytes,
+                                        &mut deferred,
+                                        next,
+                                    ) {
+                                        break;
+                                    }
+                                }
                                 Err(mpsc::RecvTimeoutError::Timeout) => {
                                     if Instant::now() >= deadline {
                                         break;
@@ -2521,6 +2679,8 @@ impl GpuCoalescer {
             max_batch_seen,
             pending_count,
             max_pending,
+            max_frame_staging_bytes,
+            max_slot_storage_bytes,
         }
     }
 
@@ -2556,6 +2716,13 @@ impl GpuCoalescer {
         let Some(ref tx) = self.tx else {
             return Err(GpuError::BufferMap("coalescer shut down".into()));
         };
+        let (staging_bytes, slot_bytes) = job.estimated_staging_and_slot_bytes();
+        if staging_bytes > self.max_frame_staging_bytes || slot_bytes > self.max_slot_storage_bytes
+        {
+            return Err(GpuError::InvalidDimensions(format!(
+                "coalesced job output ({staging_bytes} B staging / {slot_bytes} B slot) exceeds adapter buffer limit"
+            )));
+        }
         if self.pending_count.load(Ordering::Relaxed) >= self.max_pending {
             return Err(GpuError::BufferMap("coalescer queue full".into()));
         }

@@ -43,6 +43,14 @@ impl GpuMultiBandSlab {
             .checked_mul(num_bands)
             .ok_or_else(|| GpuError::InvalidDimensions("total_elems overflow".into()))?;
         let byte_size = (total_elems * std::mem::size_of::<f32>()) as u64;
+        let limits = device.limits();
+        let max_bytes =
+            (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        if byte_size > max_bytes {
+            return Err(GpuError::InvalidDimensions(format!(
+                "multi-band slab {byte_size} B exceeds adapter limit {max_bytes} B"
+            )));
+        }
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cogzilla-multiband-slab"),
             size: byte_size,
