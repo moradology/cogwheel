@@ -19,7 +19,7 @@ use cogzilla_pgstac::{
 };
 use cogzilla_proj::mercator::lonlat_deg_to_mercator;
 use cogzilla_proj::{CrsModel, TileCoord, mercator_to_lonlat_deg, tile_bounds_3857};
-use cogzilla_tiff::SampleType;
+use cogzilla_raster::SampleType;
 use http_body_util::Full;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
@@ -5475,8 +5475,8 @@ fn normalized_index_as_band_math(pq: &mut ParsedQuery, ext: Option<&str>) -> boo
 
 /// Whether samples of this kind can hold `named`. GDAL refuses a no-data value they
 /// cannot; a fraction among whole numbers it takes, and no sample is ever equal to it.
-fn nodata_fits(named: f32, kind: cogzilla_tiff::SampleType) -> bool {
-    use cogzilla_tiff::SampleType as T;
+fn nodata_fits(named: f32, kind: cogzilla_raster::SampleType) -> bool {
+    use cogzilla_raster::SampleType as T;
     let named = f64::from(named);
     let within = |lo: f64, hi: f64| named >= lo && named <= hi;
     match kind {
@@ -5815,7 +5815,7 @@ fn grid_extent(crs: &CrsModel, grid: ProjGrid) -> ItemExtent {
     };
     let mercator = span(&merc_pts);
     // The same rule `/cog` and `/stac` TileJSON use, on the item's grid.
-    let pixel_to_crs = cogzilla_tiff::Affine2D {
+    let pixel_to_crs = cogzilla_raster::Affine2D {
         a: (grid.bounds[2] - grid.bounds[0]) / grid.width,
         b: 0.0,
         c: grid.bounds[0],
@@ -7896,7 +7896,7 @@ mod tests {
     #[test]
     fn pictures_take_the_projections_pixel_in_hostile_cases() {
         use cogzilla_proj::{Ellipsoid, Sinusoidal};
-        use cogzilla_tiff::Affine2D;
+        use cogzilla_raster::Affine2D;
 
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move || {
@@ -8334,7 +8334,7 @@ mod tests {
 
     #[test]
     fn a_nodata_the_samples_cannot_hold_is_refused() {
-        use cogzilla_tiff::SampleType as T;
+        use cogzilla_raster::SampleType as T;
         assert!(nodata_fits(1000.0, T::Uint16) && nodata_fits(1000.5, T::Uint16) && nodata_fits(-1.0, T::Int16));
         for bad in [f32::NAN, f32::INFINITY, -1.0, 70000.0] {
             assert!(!nodata_fits(bad, T::Uint16));
@@ -8532,7 +8532,7 @@ mod tests {
     fn every_advertised_algorithm_is_applied_on_both_route_stacks() {
         use crate::algorithms::{ALGORITHMS, AlgorithmId};
         use crate::engine::BandRequest;
-        use cogzilla_tiff::SampleType;
+        use cogzilla_raster::SampleType;
 
         // 8x8 sloped plane so buffered DEM algorithms (default buffer=3 -> 2x2 inner crop) succeed.
         let plane = |offset: f64| -> Vec<f64> {

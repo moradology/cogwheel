@@ -7,7 +7,7 @@
 //! (an integer type, not unscaled), and `None` when they may have fractions (a float
 //! raster, unscaled values, or a type not known): only then do they need rounding.
 
-use cogzilla_tiff::SampleType;
+use cogzilla_raster::SampleType;
 
 use super::array_type::{cast_type, integer_range};
 

@@ -13,7 +13,8 @@ use cogzilla_kernel::{
 use cogzilla_proj::{
     CoordPlan, CrsModel, ProjError, TileCoord, tile_bounds_3857,
 };
-use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, SampleType};
+use cogzilla_raster::SampleType;
+use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig};
 use dashmap::DashMap;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use thiserror::Error;
@@ -229,7 +230,7 @@ fn format_float_tile(raw_f32: Bytes, bands: usize, tile_size: u32, fmt: OutputFo
                 bands,
                 tile_size as usize,
                 tile_size as usize,
-                cogzilla_tiff::SampleType::Float64,
+                cogzilla_raster::SampleType::Float64,
                 None,
                 true,
             )
@@ -326,7 +327,7 @@ fn run_cpu_render<R>(n: usize, resample: ResampleMode, f: impl FnOnce() -> R) ->
     block_in_place_if_multithread(n >= 256 && !matches!(resample, ResampleMode::Nearest), f)
 }
 
-fn affines_match(a: &cogzilla_tiff::Affine2D, b: &cogzilla_tiff::Affine2D) -> bool {
+fn affines_match(a: &cogzilla_raster::Affine2D, b: &cogzilla_raster::Affine2D) -> bool {
     let close = |x: f64, y: f64| (x - y).abs() <= 1e-6 * (1.0 + x.abs().max(y.abs()));
     close(a.a, b.a)
         && close(a.b, b.b)
@@ -2819,7 +2820,7 @@ impl TileEngine {
         resampling: ResampleMode,
         reproject: ResampleMode,
         nodata: Option<f32>,
-    ) -> Result<(Vec<Vec<f32>>, cogzilla_tiff::SampleType), EngineError> {
+    ) -> Result<(Vec<Vec<f32>>, cogzilla_raster::SampleType), EngineError> {
         let cog = self.store.with_nodata(&self.store.open_uri(uri).await?, nodata);
         let full = cog.index.full_res();
         let sample_type = full.sample_type;
@@ -3370,7 +3371,7 @@ fn splice_jpeg_tables(tables: &[u8], raw: &[u8]) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cogzilla_tiff::Affine2D;
+    use cogzilla_raster::Affine2D;
 
     fn make_aligned_ifd(
         tile: TileCoord,

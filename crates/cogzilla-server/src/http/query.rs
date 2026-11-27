@@ -178,7 +178,7 @@ pub(super) struct ParsedQuery {
     /// The type of the band math's results where the assets' own band math was folded into
     /// it (`expand_stac_asset_bidx`), as numpy types them stage by stage: what an algorithm
     /// over them is given. `None` when the expression is the request's own.
-    pub(super) band_math_type: Option<cogzilla_tiff::SampleType>,
+    pub(super) band_math_type: Option<cogzilla_raster::SampleType>,
     /// The ops the band math may compile to: more than an expression as written only where
     /// an algorithm was worked over its outputs (`algorithm_math::over_results`).
     pub(super) expr_op_budget: usize,

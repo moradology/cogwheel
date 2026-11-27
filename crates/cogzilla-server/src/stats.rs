@@ -557,7 +557,7 @@ fn compute_statistics_cpu(
             && opts.histogram_edges.is_none()
             && !matches!(
                 ifd.sample_type,
-                cogzilla_tiff::SampleType::Uint8 | cogzilla_tiff::SampleType::Uint16
+                cogzilla_raster::SampleType::Uint8 | cogzilla_raster::SampleType::Uint16
             )
             && !ifd.sample_type.needs_f64()
             && let Some(gpu_ref) = gpu
@@ -2431,7 +2431,7 @@ pub async fn render_exact_f64_array(
     resample: ResampleMode,
     nodata_override: Option<f32>,
     unscale: bool,
-    out_kind: cogzilla_tiff::SampleType,
+    out_kind: cogzilla_raster::SampleType,
     return_mask: bool,
     as_raw_f64: bool,
     allow_empty: bool,

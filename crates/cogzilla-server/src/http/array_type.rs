@@ -4,7 +4,7 @@
 //! type before it is answered.
 
 use cogzilla_kernel::ResampleMode;
-use cogzilla_tiff::SampleType;
+use cogzilla_raster::SampleType;
 
 use super::ParsedQuery;
 

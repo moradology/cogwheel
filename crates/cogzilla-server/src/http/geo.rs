@@ -871,7 +871,7 @@ mod tests {
 
         // Zonal densify_ring_lonlat_to_pixel must preserve Helmert datum shift on datum-shifted geographic CRSes.
         let nad27 = CrsModel::from_epsg(4267).unwrap();
-        let identity = cogzilla_tiff::Affine2D {
+        let identity = cogzilla_raster::Affine2D {
             a: 1.0,
             b: 0.0,
             c: 0.0,

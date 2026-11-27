@@ -287,7 +287,7 @@ fn parse_pixel_selection(name: &str) -> Option<Selection> {
 
 /// Whether a request's values are the raster's own whole numbers, which `mean` and `median`
 /// are cast back to; only then does the cast lose anything.
-fn reads_whole_numbers(unscale: bool, bands: &BandRequest, sample_type: cogzilla_tiff::SampleType) -> bool {
+fn reads_whole_numbers(unscale: bool, bands: &BandRequest, sample_type: cogzilla_raster::SampleType) -> bool {
     !unscale
         && matches!(
             bands,
@@ -295,7 +295,7 @@ fn reads_whole_numbers(unscale: bool, bands: &BandRequest, sample_type: cogzilla
         )
         && !matches!(
             sample_type,
-            cogzilla_tiff::SampleType::Float32 | cogzilla_tiff::SampleType::Float64
+            cogzilla_raster::SampleType::Float32 | cogzilla_raster::SampleType::Float64
         )
 }
 
@@ -587,11 +587,11 @@ fn apply_info_bounds_crs(
 const GEOTIFF_CONTENT_TYPE: &str = "image/tiff; application=geotiff";
 
 /// Return the widest `SampleType` across one or more stacked COGs (matching numpy band stacking).
-fn widest_sample_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_tiff::SampleType {
+fn widest_sample_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_raster::SampleType {
     cogs.iter()
         .map(|c| c.index.full_res().sample_type)
         .reduce(array_type::wider_type)
-        .unwrap_or(cogzilla_tiff::SampleType::Uint8)
+        .unwrap_or(cogzilla_raster::SampleType::Uint8)
 }
 
 /// Return true when a `.tif`/`.tiff` request should emit a native IEEE Float32 GeoTIFF
@@ -601,7 +601,7 @@ fn wants_f32_geotiff(
     pq: &ParsedQuery,
     source_cog: Option<&cogzilla_io::OpenedCog>,
     bands: &BandRequest,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
 ) -> bool {
     if ct != GEOTIFF_CONTENT_TYPE {
         return false;
@@ -623,10 +623,10 @@ fn wants_f32_geotiff(
         BandRequest::Single { .. } => {
             pq.unscale
                 || (source_cog.is_none_or(|c| c.index.color_map.is_none())
-                    && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8))
+                    && !matches!(sample_type, cogzilla_raster::SampleType::Uint8))
         }
         BandRequest::Rgb { .. } => {
-            pq.unscale || !matches!(sample_type, cogzilla_tiff::SampleType::Uint8)
+            pq.unscale || !matches!(sample_type, cogzilla_raster::SampleType::Uint8)
         }
         BandRequest::CustomExpr { .. }
         | BandRequest::CustomExprRgb { .. }
@@ -645,7 +645,7 @@ fn geotiff_render_format(
     pq: &ParsedQuery,
     source_cog: Option<&cogzilla_io::OpenedCog>,
     bands: &BandRequest,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
     allow_f64: bool,
 ) -> OutputFormat {
     let can_exact_f64 = allow_f64
@@ -682,11 +682,11 @@ fn wants_u16_png(
     pq: &ParsedQuery,
     source_cog: Option<&cogzilla_io::OpenedCog>,
     bands: &BandRequest,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
 ) -> bool {
     fmt == OutputFormat::Png
         && ct == "image/png"
-        && sample_type == cogzilla_tiff::SampleType::Uint16
+        && sample_type == cogzilla_raster::SampleType::Uint16
         && !pq.unscale
         && pq.rescale.is_empty()
         && !pq.colormap_explicit
@@ -708,7 +708,7 @@ fn render_output_format(
     pq: &ParsedQuery,
     source_cog: Option<&cogzilla_io::OpenedCog>,
     bands: &BandRequest,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
     allow_f64: bool,
 ) -> OutputFormat {
     if wants_u16_png(fmt, ct, pq, source_cog, bands, sample_type) {
@@ -741,7 +741,7 @@ fn wrap_geotiff_fmt(
                 n_bands,
                 w,
                 h,
-                cogzilla_tiff::SampleType::Float64,
+                cogzilla_raster::SampleType::Float64,
                 bbox,
                 epsg,
                 return_mask,
@@ -790,7 +790,7 @@ fn may_be_f32_array(data: &[u8]) -> bool {
 /// An array the renderers wrote in float32, as `.npy` or as a GeoTIFF, rewritten in `kind`,
 /// the type TiTiler writes it in ([`array_type`]); with `mask`, its last band is the mask.
 /// Left as it is without a type, or when it is not a float32 array of the bands it says.
-fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask: bool) -> Bytes {
+fn array_in_its_type(data: Bytes, kind: Option<cogzilla_raster::SampleType>, mask: bool) -> Bytes {
     array_in_its_type_rounded(data, kind, mask, None)
 }
 
@@ -798,7 +798,7 @@ fn array_in_its_type(data: Bytes, kind: Option<cogzilla_tiff::SampleType>, mask:
 /// numpy's `astype` puts it ([`array_type::astype`]): what `cast`, `ceil` and `floor` do.
 fn array_in_its_type_rounded(
     data: Bytes,
-    kind: Option<cogzilla_tiff::SampleType>,
+    kind: Option<cogzilla_raster::SampleType>,
     mask: bool,
     rounding: Option<fn(f64) -> f64>,
 ) -> Bytes {
@@ -1074,13 +1074,13 @@ async fn mosaic_array_in_its_type(
     if let ArrayAsked::Typed(_, _, _, mask, _) = &asked {
         match selection {
             pixel_selection::Selection::Stdev => {
-                return array_in_its_type(data, Some(cogzilla_tiff::SampleType::Float32), *mask);
+                return array_in_its_type(data, Some(cogzilla_raster::SampleType::Float32), *mask);
             }
             pixel_selection::Selection::Count => {
                 let kind = if urls.len().min(64) <= 255 {
-                    cogzilla_tiff::SampleType::Uint8
+                    cogzilla_raster::SampleType::Uint8
                 } else {
-                    cogzilla_tiff::SampleType::Uint16
+                    cogzilla_raster::SampleType::Uint16
                 };
                 return array_in_its_type(data, Some(kind), *mask);
             }
@@ -1302,14 +1302,14 @@ fn capped_native_bbox_dims(
 }
 
 /// Default rescale range matching TiTiler's `dtype_ranges` when `?rescale=` is omitted.
-fn default_rescale_for_dtype(st: cogzilla_tiff::SampleType, single: bool) -> (f32, f32) {
+fn default_rescale_for_dtype(st: cogzilla_raster::SampleType, single: bool) -> (f32, f32) {
     st.value_range().unwrap_or(if single { (0.0, 1000.0) } else { (0.0, 1.0) })
 }
 
 /// The band math of a request whose `algorithm` works over its `expression`'s outputs
 /// ([`algorithm_math::over_results`]), with the algorithm's own default range for a picture
 /// when none was asked; `None` when there is no such pair.
-fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::SampleType>) -> Result<Option<ParsedQuery>, EngineError> {
+fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_raster::SampleType>) -> Result<Option<ParsedQuery>, EngineError> {
     let (Some(alg), Some(expr)) = (pq.algorithm.as_deref(), pq.expr_raw.as_deref()) else {
         return Ok(None);
     };
@@ -1324,7 +1324,7 @@ fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::Sampl
     // The range a picture of the algorithm spans when none is asked, as without band math,
     // from the type of the band math's outputs.
     let lower = alg.to_ascii_lowercase();
-    let source = default_rescale_for_dtype(typed.unwrap_or(cogzilla_tiff::SampleType::Float32), true);
+    let source = default_rescale_for_dtype(typed.unwrap_or(cogzilla_raster::SampleType::Float32), true);
     let range = match lower.as_str() {
         // A cast to a float has no integer range: the values keep the band math's own.
         "cast" | "ceil" | "floor" => algorithm_math::integer_band(&lower, 1, None, pq.cast_dtype.as_deref()).1.or(Some(source)),
@@ -1350,10 +1350,10 @@ fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::Sampl
 fn band_math_output_type(
     pq: &ParsedQuery,
     parts: &[(String, String)],
-    read: Option<cogzilla_tiff::SampleType>,
-) -> Option<cogzilla_tiff::SampleType> {
+    read: Option<cogzilla_raster::SampleType>,
+) -> Option<cogzilla_raster::SampleType> {
     pq.band_math_type.or_else(|| {
-        let read = if pq.unscale { cogzilla_tiff::SampleType::Float32 } else { read? };
+        let read = if pq.unscale { cogzilla_raster::SampleType::Float32 } else { read? };
         Some(array_type::band_math_type(parts.iter().map(|(_, text)| text), read))
     })
 }
@@ -1361,7 +1361,7 @@ fn band_math_output_type(
 fn build_band_request(
     pq: &ParsedQuery,
     default_bands: u16,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
 ) -> Result<BandRequest, EngineError> {
     if let Some(composed) = algorithm_over_expression(pq, Some(sample_type))? {
         return build_band_request(&composed, default_bands, sample_type);
@@ -2090,7 +2090,7 @@ fn keep_algorithm_bands(
 fn build_band_request_for_output(
     pq: &ParsedQuery,
     default_bands: u16,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
     fmt: OutputFormat,
     ct: &str,
 ) -> Result<BandRequest, EngineError> {
@@ -2106,7 +2106,7 @@ fn build_tile_request(
     ext_opt: Option<&str>,
     pq: &ParsedQuery,
     default_bands: u16,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
     is_crs84: bool,
     source_cog: Option<&cogzilla_io::OpenedCog>,
 ) -> Result<(TileRequest, &'static str), EngineError> {
@@ -2139,7 +2139,7 @@ fn build_tile_request_for_tms(
     ext_opt: Option<&str>,
     pq: &ParsedQuery,
     default_bands: u16,
-    sample_type: cogzilla_tiff::SampleType,
+    sample_type: cogzilla_raster::SampleType,
     tms_id: &str,
     source_cog: Option<&cogzilla_io::OpenedCog>,
     typed_arrays: bool,
@@ -2257,16 +2257,16 @@ fn build_tile_request_for_tms(
 }
 
 /// The range of an integer sample type (`None` for floats), for the statistics read.
-pub(crate) fn array_type_range(kind: cogzilla_tiff::SampleType) -> Option<(f64, f64)> {
+pub(crate) fn array_type_range(kind: cogzilla_raster::SampleType) -> Option<(f64, f64)> {
     array_type::integer_range(kind)
 }
 
 /// The type that holds every band of `cogs` as read.
-fn reads_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_tiff::SampleType {
+fn reads_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_raster::SampleType {
     cogs.iter()
         .map(|cog| cog.index.full_res().sample_type)
         .reduce(array_type::wider_type)
-        .unwrap_or(cogzilla_tiff::SampleType::Float32)
+        .unwrap_or(cogzilla_raster::SampleType::Float32)
 }
 
 /// The statistics' band math, each output's description and expression compiled, with the
@@ -2277,7 +2277,7 @@ fn reads_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_tiff::SampleType
 fn compile_stats_parts(
     pq: &ParsedQuery,
     parts: Vec<(String, String)>,
-    read: Option<cogzilla_tiff::SampleType>,
+    read: Option<cogzilla_raster::SampleType>,
 ) -> Result<(Vec<(String, ExprProgram)>, Option<crate::stats::histogram::HistDtype>), EngineError> {
     if parts.len() > 16 {
         return Err(EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
@@ -2307,7 +2307,7 @@ fn build_stats_options_with_bands(
     pq: &ParsedQuery,
     allow_expr: bool,
     default_bands: u16,
-    read: Option<cogzilla_tiff::SampleType>,
+    read: Option<cogzilla_raster::SampleType>,
 ) -> Result<StatsOptions, EngineError> {
     let mut opts = StatsOptions { resample: pq.resample, ..StatsOptions::default() };
     if !pq.percentiles.is_empty() {
@@ -3212,7 +3212,7 @@ fn expand_stac_asset_bidx(
     // The type of the folded band math's results, as numpy types them stage by stage: each
     // asset's own over its raster, stacked, then the request's (what an algorithm is given).
     if options.iter().any(|(own, _)| own.is_some()) {
-        let reads: Vec<cogzilla_tiff::SampleType> = cogs.iter().map(|c| c.index.full_res().sample_type).collect();
+        let reads: Vec<cogzilla_raster::SampleType> = cogs.iter().map(|c| c.index.full_res().sample_type).collect();
         let own: Vec<Option<String>> = options.iter().map(|(own, _)| own.clone()).collect();
         let request = pq.expr_raw.clone().unwrap_or_default();
         pq.band_math_type = array_type::ArrayRule::Math { unscale: pq.unscale }.staged_kind(&reads, &own, &request);
@@ -3882,7 +3882,7 @@ async fn compute_mosaic_statistics_with_fold(
 
     let mut eff_bbox = wgs_bbox;
     let mut out_dims: Option<(u32, u32)> = None;
-    let mut first_sample_type: Option<cogzilla_tiff::SampleType> = None;
+    let mut first_sample_type: Option<cogzilla_raster::SampleType> = None;
     let mut selected_bidx: Vec<u16> = Vec::new();
     let mut band_descs: Vec<String> = Vec::new();
     let mut fold: Option<Fold> = None;
@@ -6191,7 +6191,7 @@ where
                                 ext,
                                 &pq,
                                 empty_default_bands,
-                                cogzilla_tiff::SampleType::Uint8,
+                                cogzilla_raster::SampleType::Uint8,
                                 tms,
                                 None,
                                 true,
@@ -6270,7 +6270,7 @@ where
                                 ext,
                                 &pq,
                                 empty_default_bands,
-                                cogzilla_tiff::SampleType::Uint8,
+                                cogzilla_raster::SampleType::Uint8,
                                 false,
                                 None,
                             )?;
@@ -6537,7 +6537,7 @@ where
                                 ext,
                                 &pq,
                                 empty_default_bands,
-                                cogzilla_tiff::SampleType::Uint8,
+                                cogzilla_raster::SampleType::Uint8,
                                 false,
                                 None,
                             )?;

@@ -200,10 +200,10 @@ fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
     let pq_rescaled = parse_query(Some("rescale=0,1000"));
     let pq_cmap = parse_query(Some("colormap_name=viridis"));
     let single = BandRequest::Single { band_1based: 1, rescale: (0.0, 65535.0), colormap: ColormapName::Grayscale };
-    assert!(wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_tiff::SampleType::Uint16));
-    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_tiff::SampleType::Uint8));
-    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_rescaled, None, &single, cogzilla_tiff::SampleType::Uint16));
-    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_cmap, None, &single, cogzilla_tiff::SampleType::Uint16));
+    assert!(wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_raster::SampleType::Uint16));
+    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_raster::SampleType::Uint8));
+    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_rescaled, None, &single, cogzilla_raster::SampleType::Uint16));
+    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_cmap, None, &single, cogzilla_raster::SampleType::Uint16));
 
     // 4x1 single-band f32 buffer testing clamp (-1.0 -> 0, 70000.0 -> 65535),
     // rounding (123.6 -> 124), and NaN (0, alpha=0) in 16-bit Grey+Alpha PNG.
@@ -249,7 +249,7 @@ fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
         Some("png"),
         &pq_2b,
         2,
-        cogzilla_tiff::SampleType::Uint16,
+        cogzilla_raster::SampleType::Uint16,
         "WebMercatorQuad",
         None,
         false,
@@ -292,7 +292,7 @@ fn pixel_selection_names_keep_their_aliases_and_any_case() {
 
 #[test]
 fn mean_and_median_are_cast_back_only_for_a_raster_s_own_whole_numbers() {
-    use cogzilla_tiff::SampleType as T;
+    use cogzilla_raster::SampleType as T;
     let single = BandRequest::Single { band_1based: 1, rescale: (0.0, 255.0), colormap: ColormapName::Grayscale };
     let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [255.0; 3] };
     let multi = BandRequest::MultiBand { bands_1based: vec![1, 2] };
@@ -328,7 +328,7 @@ fn the_median_budget_is_64_mib_of_held_scenes() {
 fn colormap_param_sets_explicit_for_hillshade_and_stac_bbox_accepts_coord_crs() {
     let pq = parse_query(Some("algorithm=hillshade&colormap=terrain"));
     assert!(pq.colormap_explicit);
-    let bands = build_band_request(&pq, 1, cogzilla_tiff::SampleType::Float32)
+    let bands = build_band_request(&pq, 1, cogzilla_raster::SampleType::Float32)
         .expect("valid hillshade request");
     match bands {
         BandRequest::Dem { colormap, .. } => {
@@ -349,7 +349,7 @@ fn xyz_bounds_and_http_error_status_mapping() {
     let pq = parse_query(None);
     assert_eq!(pq.resample, ResampleMode::Nearest);
     assert_eq!(pq.reproject, ResampleMode::Nearest);
-    let u8t = cogzilla_tiff::SampleType::Uint8;
+    let u8t = cogzilla_raster::SampleType::Uint8;
     // WebMercatorQuad at z=2 has 4x4 tiles (0..=3)
     assert!(build_tile_request(None, TileCoord { z: 2, x: 3, y: 3 }, None, Some("png"), &pq, 3, u8t, false, None).is_ok());
     assert!(build_tile_request(None, TileCoord { z: 2, x: 4, y: 0 }, None, Some("png"), &pq, 3, u8t, false, None).is_err());
@@ -392,8 +392,8 @@ fn xyz_bounds_and_http_error_status_mapping() {
     assert!(validate_query(&["cog", "WebMercatorQuad", "tilejson.json"], &pq_bad_z).is_err());
 
     // Default dtype rescale ranges & aspect-preserving dims & hex colormaps
-    assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Uint16, false), (0.0, 65535.0));
-    assert_eq!(default_rescale_for_dtype(cogzilla_tiff::SampleType::Int16, true), (-32768.0, 32767.0));
+    assert_eq!(default_rescale_for_dtype(cogzilla_raster::SampleType::Uint16, false), (0.0, 65535.0));
+    assert_eq!(default_rescale_for_dtype(cogzilla_raster::SampleType::Int16, true), (-32768.0, 32767.0));
     assert_eq!(aspect_preserving_dims([0.0, 0.0, 2.0, 1.0], 512), (512, 256));
     assert_eq!(aspect_preserving_dims([0.0, 0.0, 1.0, 4.0], 512), (128, 512));
     let hex_lut = cogzilla_kernel::ColormapLut::from_json_str(r##"{"0":"#112233","255":"#ff000080"}"##).unwrap();
@@ -698,7 +698,7 @@ fn geospatial_bounds_reproject_and_user_defined_crs_parity() {
         Some("png"),
         &pq_cdb_buf,
         1,
-        cogzilla_tiff::SampleType::Uint8,
+        cogzilla_raster::SampleType::Uint8,
         "CDB1GlobalGrid",
         None,
         true,
@@ -895,7 +895,7 @@ fn audit88_attach_x_failed_assets_redacts_credentials_and_presigned_queries() {
 #[test]
 fn audit91_native_bbox_dims_aspect_antimeridian_and_0_360() {
     let make_ifd = |w: u32, h: u32, a: f64, e: f64, c: f64, f: f64| {
-        let p2c = cogzilla_tiff::Affine2D { a, b: 0.0, c, d: 0.0, e, f };
+        let p2c = cogzilla_raster::Affine2D { a, b: 0.0, c, d: 0.0, e, f };
         cogzilla_tiff::IfdMeta {
             width: w,
             height: h,
@@ -903,7 +903,7 @@ fn audit91_native_bbox_dims_aspect_antimeridian_and_0_360() {
             tile_height: 256,
             tiles_across: w.div_ceil(256),
             tiles_down: h.div_ceil(256),
-            sample_type: cogzilla_tiff::SampleType::Uint8,
+            sample_type: cogzilla_raster::SampleType::Uint8,
             samples_per_pixel: 1,
             planar_config: cogzilla_tiff::PlanarConfig::Chunky,
             compression: cogzilla_tiff::Compression::None,
@@ -1296,7 +1296,7 @@ async fn x_request_id_echoes_valid_generates_when_absent_or_invalid_and_on_429()
 
 #[test]
 fn a_cast_to_float_over_band_math_keeps_the_band_math_s_range() {
-    use cogzilla_tiff::SampleType as T;
+    use cogzilla_raster::SampleType as T;
     // No integer range to cast into: the picture spans what the band math gives, as
     // without the expression.
     let pq = parse_query(Some("expression=b1&algorithm=cast&algorithm_params=%7B%22dtype%22%3A%22float32%22%7D"));

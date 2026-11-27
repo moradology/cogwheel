@@ -26,9 +26,9 @@ pub enum HistDtype {
 impl HistDtype {
     /// The edge type numpy uses for a band read with this sample type. rio-tiler casts a band to
     /// float32 when it applies scales and offsets, so an unscaled band of any type is float32.
-    pub fn for_sample_type(st: cogzilla_tiff::SampleType, unscale: bool) -> Self {
-        if st == cogzilla_tiff::SampleType::Float32
-            || (unscale && st != cogzilla_tiff::SampleType::Float64)
+    pub fn for_sample_type(st: cogzilla_raster::SampleType, unscale: bool) -> Self {
+        if st == cogzilla_raster::SampleType::Float32
+            || (unscale && st != cogzilla_raster::SampleType::Float64)
         {
             Self::Float32
         } else {
@@ -424,15 +424,15 @@ mod tests {
         assert_eq!(HistDtype::infer([1.0, 2.0, f32::NAN]), HistDtype::Float64);
         assert_eq!(HistDtype::infer([1.0, 2.5]), HistDtype::Float32);
         assert_eq!(
-            HistDtype::for_sample_type(cogzilla_tiff::SampleType::Uint16, true),
+            HistDtype::for_sample_type(cogzilla_raster::SampleType::Uint16, true),
             HistDtype::Float32
         );
         assert_eq!(
-            HistDtype::for_sample_type(cogzilla_tiff::SampleType::Int16, false),
+            HistDtype::for_sample_type(cogzilla_raster::SampleType::Int16, false),
             HistDtype::Float64
         );
         assert_eq!(
-            HistDtype::for_sample_type(cogzilla_tiff::SampleType::Float64, true),
+            HistDtype::for_sample_type(cogzilla_raster::SampleType::Float64, true),
             HistDtype::Float64
         );
     }

@@ -1,4 +1,5 @@
-use cogzilla_tiff::{Affine2D, GeoKeys};
+use cogzilla_raster::Affine2D;
+use cogzilla_tiff::GeoKeys;
 use thiserror::Error;
 
 use crate::ellipsoid::{
