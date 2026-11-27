@@ -2031,6 +2031,14 @@ impl WorkerState {
             }
             if let Some(quality) = jpeg_quality {
                 if prepared.len() > prev_len {
+                    if prepared.last().unwrap().output != CoalescedOutput::Rgba8 {
+                        let bad = prepared.pop().unwrap();
+                        total_staging_words -= bad.out_words;
+                        (bad.reply)(Err(GpuError::InvalidDimensions(
+                            "WithJpeg requires an inner Rgba8 job".into(),
+                        )));
+                        continue;
+                    }
                     let pj = prepared.last_mut().unwrap();
                     total_staging_words -= pj.out_words;
                     let mcu_w = (pj.dst_w as u32).div_ceil(16);
@@ -2089,6 +2097,20 @@ impl WorkerState {
             }
             if let Some((nodata, num_bins, hist_range)) = stats_cfg {
                 if prepared.len() > prev_len {
+                    let valid_inner = {
+                        let last = prepared.last().unwrap();
+                        last.output == CoalescedOutput::RawF32
+                            && last.wg_z == 1
+                            && last.out_words == last.dst_w.saturating_mul(last.dst_h)
+                    };
+                    if !valid_inner {
+                        let bad = prepared.pop().unwrap();
+                        total_staging_words -= bad.out_words;
+                        (bad.reply)(Err(GpuError::InvalidDimensions(
+                            "WithStats requires an inner single-band RawF32 job".into(),
+                        )));
+                        continue;
+                    }
                     let pj = prepared.last_mut().unwrap();
                     let len = pj.dst_w * pj.dst_h;
                     let len_u32 = len as u32;
