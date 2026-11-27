@@ -313,7 +313,7 @@ async fn zarr_raster_routes_and_geotiff_twin_http_tile_parity() {
     // 10. POST /zarr/feature/64x64.png returns a valid PNG
     let feat_req = Request::builder()
         .method("POST")
-        .uri(&format!("/zarr/feature/64x64.png?url={zarr_url}&rescale=100,900"))
+        .uri(format!("/zarr/feature/64x64.png?url={zarr_url}&rescale=100,900"))
         .header("Content-Type", "application/json")
         .body(Full::new(poly_bytes))
         .unwrap();

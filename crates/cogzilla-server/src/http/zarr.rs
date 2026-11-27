@@ -1952,10 +1952,10 @@ async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes
 
     let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as i32;
     let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as i32;
-    if let Some(min_lon) = geo.crs.model.geographic_0_360_min_lon(&geo.affine, ifd_w as u32) {
-        if sx < min_lon {
-            sx += 360.0;
-        }
+    if let Some(min_lon) = geo.crs.model.geographic_0_360_min_lon(&geo.affine, ifd_w as u32)
+        && sx < min_lon
+    {
+        sx += 360.0;
     }
 
     let crs_to_pixel = geo.affine.invert().ok_or_else(|| ZarrError::IrregularGrid {

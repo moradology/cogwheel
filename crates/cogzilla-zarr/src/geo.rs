@@ -160,10 +160,10 @@ fn derive_regular_geo_with_dtypes(
                 if let Some(norm_first) = normalize_geographic_lon(x_vals[0]) {
                     x_origin = norm_first - 0.5 * dx;
                 }
-            } else if dx > 0.0 {
-                if let Some(split) = x_vals.iter().position(|&lon| lon >= 180.0) {
-                    lon_wrap_shift = split as u32;
-                }
+            } else if dx > 0.0
+                && let Some(split) = x_vals.iter().position(|&lon| lon >= 180.0)
+            {
+                lon_wrap_shift = split as u32;
             }
         }
     }
