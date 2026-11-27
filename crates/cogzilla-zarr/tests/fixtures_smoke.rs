@@ -7,8 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cogzilla_zarr::{
-    ArrayMeta, DataType, Endianness, FsStore, OpenMode, ZarrHierarchy, ZarrStore, ZarrVersion,
-    decode_chunk_bytes, read_chunk_window,
+    ArrayMeta, DataType, Endianness, FsStore, OpenMode, ZarrError, ZarrHierarchy, ZarrStore,
+    ZarrVersion, decode_chunk_bytes, read_chunk_window, resolve_geo,
 };
 
 fn fixtures_dir() -> Option<PathBuf> {
@@ -421,4 +421,89 @@ async fn v3_sharded_reads_identically_to_unsharded_via_ranged_reads() {
         }
     }
     drop(shard0_wb);
+}
+
+#[tokio::test]
+async fn crs_and_geo_resolve_correctly_across_all_fixtures() {
+    let Some(dir) = fixtures_dir() else {
+        eprintln!("skipping: benches/fixtures/zarr not generated");
+        return;
+    };
+
+    use cogzilla_proj::CrsModel;
+
+    // 1. CF grid_mapping (UTM 10N Transverse Mercator)
+    let cf_store = FsStore::new(dir.join("crs_cf_grid_mapping.zarr"));
+    let cf_h = ZarrHierarchy::open(&cf_store).await.unwrap();
+    let cf_g = cf_h.group(None).unwrap();
+    let cf_geo = resolve_geo(&cf_store, &cf_g, cf_g.array("band").unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(cf_geo.crs.model, CrsModel::TransverseMercator(_)));
+    assert!((cf_geo.bounds[0] - 500_000.0).abs() < 1e-6);
+    assert!((cf_geo.bounds[1] - 4_150_000.0).abs() < 1e-6);
+    assert!((cf_geo.bounds[2] - 561_440.0).abs() < 1e-6);
+    assert!((cf_geo.bounds[3] - 4_211_440.0).abs() < 1e-6);
+
+    // 2. spatial_ref WKT (EPSG:3857)
+    let wkt_store = FsStore::new(dir.join("crs_spatial_ref_wkt.zarr"));
+    let wkt_h = ZarrHierarchy::open(&wkt_store).await.unwrap();
+    let wkt_g = wkt_h.group(None).unwrap();
+    let wkt_geo = resolve_geo(&wkt_store, &wkt_g, wkt_g.array("band").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(wkt_geo.crs.epsg, Some(3857));
+    assert!(matches!(wkt_geo.crs.model, CrsModel::Epsg3857));
+
+    // 3. No CRS -> defaults to EPSG:4326
+    let none_store = FsStore::new(dir.join("crs_none.zarr"));
+    let none_h = ZarrHierarchy::open(&none_store).await.unwrap();
+    let none_g = none_h.group(None).unwrap();
+    let none_geo = resolve_geo(&none_store, &none_g, none_g.array("band").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(none_geo.crs.epsg, Some(4326));
+    assert!(matches!(none_geo.crs.model, CrsModel::Geographic));
+    assert!((none_geo.bounds[0] - (-123.0)).abs() < 1e-9);
+    assert!((none_geo.bounds[1] - 37.0).abs() < 1e-9);
+    assert!((none_geo.bounds[2] - (-121.5)).abs() < 1e-9);
+    assert!((none_geo.bounds[3] - 38.5).abs() < 1e-9);
+
+    // 4. GeoTIFF twin affine matches geotiff_twin.tif to < 1e-9
+    let tif_bytes = fs::read(dir.join("geotiff_twin.tif")).unwrap();
+    let cog = cogzilla_tiff::parse_cog(&tif_bytes).unwrap();
+    let tif_aff = cog.ifds[0].pixel_to_crs;
+    let twin_store = FsStore::new(dir.join("geotiff_twin.zarr"));
+    let twin_h = ZarrHierarchy::open(&twin_store).await.unwrap();
+    let twin_g = twin_h.group(None).unwrap();
+    let twin_geo = resolve_geo(&twin_store, &twin_g, twin_g.array("data").unwrap())
+        .await
+        .unwrap();
+    assert!((twin_geo.affine.a - tif_aff.a).abs() < 1e-9);
+    assert!((twin_geo.affine.c - tif_aff.c).abs() < 1e-9);
+    assert!((twin_geo.affine.e - tif_aff.e).abs() < 1e-9);
+    assert!((twin_geo.affine.f - tif_aff.f).abs() < 1e-9);
+
+    // 5. 0..360 longitudes + descending Y
+    let l360_store = FsStore::new(dir.join("lon_0_360_desc_y.zarr"));
+    let l360_h = ZarrHierarchy::open(&l360_store).await.unwrap();
+    let l360_g = l360_h.group(None).unwrap();
+    let l360_geo = resolve_geo(&l360_store, &l360_g, l360_g.array("sst").unwrap())
+        .await
+        .unwrap();
+    assert!(l360_geo.lon_0_360);
+    assert!(l360_geo.affine.e < 0.0);
+    assert_eq!(l360_geo.bounds, [-180.0, -90.0, 180.0, 90.0]);
+
+    // 6. Irregular coordinate spacing must be refused with dim name & index
+    let irr_store = FsStore::new(dir.join("irregular_coords.zarr"));
+    let irr_h = ZarrHierarchy::open(&irr_store).await.unwrap();
+    let irr_g = irr_h.group(None).unwrap();
+    let err = resolve_geo(&irr_store, &irr_g, irr_g.array("warped").unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ZarrError::IrregularGrid { dim, index, .. } if dim == "x" && *index == 2),
+        "{err}"
+    );
 }

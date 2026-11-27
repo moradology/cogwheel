@@ -32,6 +32,8 @@
 
 pub mod blosc;
 pub mod codecs;
+pub mod crs;
+pub mod geo;
 pub mod hierarchy;
 pub mod reader;
 pub mod sharding;
@@ -41,6 +43,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 pub use codecs::{MAX_DECODED_CHUNK_BYTES, SUPPORTED_CODECS, decode_chunk_bytes};
+pub use crs::{ZarrCrs, resolve_crs};
+pub use geo::{ZarrGeo, read_coord_1d, resolve_geo};
 pub use hierarchy::{FsStore, GroupMeta, GroupView, MemoryStore, OpenMode, ZarrHierarchy, ZarrNode, ZarrStore};
 pub use reader::{ChunkWindow, ZarrWindowBlocks, read_chunk_window, read_chunk_window_for_band};
 pub use sharding::{IndexLocation, ShardIndex, ShardIndexCache, ShardingConfig};
@@ -88,6 +92,14 @@ pub enum ZarrError {
     MissingChunk { chunk_key: String },
     #[error("invalid pixel or band selection: {detail}")]
     InvalidSelection { detail: String },
+    #[error("unsupported CRS {crs:?}: {detail}")]
+    UnsupportedCrs { crs: String, detail: String },
+    #[error("irregular or curvilinear grid on dimension {dim:?} at index {index}: {detail}")]
+    IrregularGrid {
+        dim: String,
+        index: usize,
+        detail: String,
+    },
 }
 
 /// Which revision of the Zarr specification a store was written to.

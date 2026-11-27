@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
+cogzilla-proj = { path = "../cogzilla-proj" }
+cogzilla-tiff = { path = "../cogzilla-tiff" }
 thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -14,6 +16,4 @@ zstd-sys.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
-cogzilla-tiff = { path = "../cogzilla-tiff" }
-cogzilla-proj = { path = "../cogzilla-proj" }
 tokio.workspace = true
