@@ -20,6 +20,81 @@ use super::{
 #[allow(dead_code)]
 pub(super) type RequestParams = ParsedQuery;
 
+/// The 5 genuinely Zarr-specific query parameters (`variable`, `group`, `sel`, `decode_times`,
+/// `show_times`). All 12 shared parameters (`url`, `bidx`, `rescale`, `colormap_name`,
+/// `resampling`/`reproject`, `nodata`, `unscale`, `return_mask`, `max_size`, `tilesize`,
+/// `format`/`f`, `coord_crs`) are parsed once by [`parse_query`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ZarrParams {
+    pub(super) variable: Option<String>,
+    pub(super) group: Option<String>,
+    pub(super) sel: Vec<String>,
+    pub(super) decode_times: bool,
+    pub(super) show_times: bool,
+}
+
+impl Default for ZarrParams {
+    fn default() -> Self {
+        Self {
+            variable: None,
+            group: None,
+            sel: Vec::new(),
+            decode_times: true,
+            show_times: false,
+        }
+    }
+}
+
+/// Per-route-family query extension paired with [`ParsedQuery`].
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(super) enum FamilyParams {
+    Cog,
+    Stac,
+    MosaicJson,
+    Searches,
+    Zarr(ZarrParams),
+}
+
+/// Unified request parameters: shared [`ParsedQuery`] + per-family extension.
+#[derive(Clone)]
+pub(super) struct FamilyRequestParams {
+    pub(super) common: ParsedQuery,
+    pub(super) family: FamilyParams,
+}
+
+/// Parse a `/zarr/*` query string using [`parse_query`] for all 12 common parameters and
+/// extracting only the 5 Zarr-specific fields (`variable`, `group`, `sel`, `decode_times`,
+/// `show_times`).
+pub(super) fn parse_zarr_request(raw_query: &str) -> FamilyRequestParams {
+    let common = parse_query(Some(raw_query));
+    let mut zp = ZarrParams::default();
+    for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = query_key(k);
+        match key.as_ref() {
+            "variable" => zp.variable = Some(percent_decode(v)),
+            "group" => zp.group = Some(percent_decode(v)),
+            "sel" => zp.sel.push(percent_decode(v)),
+            "decode_times" => {
+                if let Some(b) = parse_bool_encoded(v) {
+                    zp.decode_times = b;
+                }
+            }
+            "show_times" => {
+                if let Some(b) = parse_bool_encoded(v) {
+                    zp.show_times = b;
+                }
+            }
+            _ => {}
+        }
+    }
+    FamilyRequestParams {
+        common,
+        family: FamilyParams::Zarr(zp),
+    }
+}
+
 /// Parsed histogram bin specification shared across `/cog`, `/stac`, and `/searches` statistics.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum HistogramBinsSpec {
@@ -1026,5 +1101,53 @@ mod tests {
         assert!(looks_like_rfc3339_datetime("2024-06-15T12:30:45Z"));
         assert!(looks_like_rfc3339_datetime("2024-06-15T12:30:45.123+02:00"));
         assert!(!looks_like_rfc3339_datetime("not-a-date"));
+    }
+
+    #[test]
+    fn zarr_request_shares_common_parser_for_all_12_fields_and_parses_5_zarr_fields() {
+        let qs = concat!(
+            "url=https://example.com/era5.zarr",
+            "&variable=temperature",
+            "&group=surface",
+            "&sel=time=2024-01-01",
+            "&sel=level=500",
+            "&bidx=2",
+            "&decode_times=false",
+            "&show_times=true",
+            "&rescale=250,310",
+            "&colormap_name=viridis",
+            "&resampling=bilinear",
+            "&nodata=-9999",
+            "&unscale=true",
+            "&return_mask=false",
+            "&max_size=512",
+            "&tilesize=512",
+            "&format=webp",
+            "&coord_crs=EPSG:3857",
+        );
+        let base = parse_query(Some(qs));
+        let zarr = parse_zarr_request(qs);
+        // All 12 common fields must match `parse_query` identically.
+        assert_eq!(zarr.common.urls, base.urls);
+        assert_eq!(zarr.common.bidx, vec![2]);
+        assert_eq!(zarr.common.rescale, vec![(250.0, 310.0)]);
+        assert_eq!(zarr.common.colormap, base.colormap);
+        assert_eq!(zarr.common.resample, ResampleMode::Bilinear);
+        assert_eq!(zarr.common.nodata, Some(-9999.0));
+        assert!(zarr.common.unscale);
+        assert!(!zarr.common.return_mask);
+        assert_eq!(zarr.common.max_size, 512);
+        assert_eq!(zarr.common.tile_size, 512);
+        assert_eq!(zarr.common.format_param.as_deref(), Some("webp"));
+        assert_eq!(zarr.common.coord_crs_epsg, Some(3857));
+        // The 5 Zarr-specific fields.
+        let FamilyParams::Zarr(zp) = zarr.family else {
+            panic!("expected FamilyParams::Zarr");
+        };
+        assert_eq!(zp.variable.as_deref(), Some("temperature"));
+        assert_eq!(zp.group.as_deref(), Some("surface"));
+        assert_eq!(zp.sel, vec!["time=2024-01-01", "level=500"]);
+        assert!(!zp.decode_times);
+        assert!(zp.show_times);
     }
 }

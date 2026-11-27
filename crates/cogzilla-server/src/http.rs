@@ -35,7 +35,7 @@ mod wms;
 mod zarr;
 mod zonal;
 
-use query::{ParsedQuery, parse_bool_encoded as parse_bool_param, parse_query, parse_resample_mode};
+use query::{ParsedQuery, parse_bool_encoded as parse_bool_param, parse_query};
 
 pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
 pub(crate) use self::geo::{parse_coord_crs_with_epsg, tile_box_intersects_cog};
