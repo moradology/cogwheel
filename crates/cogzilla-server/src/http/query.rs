@@ -17,7 +17,6 @@ use super::{
 };
 
 /// Alias for [`ParsedQuery`] as the shared request-parameter carrier across route families.
-#[allow(dead_code)]
 pub(super) type RequestParams = ParsedQuery;
 
 /// The 5 genuinely Zarr-specific query parameters (`variable`, `group`, `sel`, `decode_times`,
@@ -57,8 +56,7 @@ impl Default for ZarrParams {
     }
 }
 
-/// Per-route-family query extension paired with [`ParsedQuery`].
-#[allow(dead_code)]
+/// Per-route-family query extension paired with [`RequestParams`].
 #[derive(Clone)]
 pub(super) enum FamilyParams {
     Cog,
@@ -68,11 +66,54 @@ pub(super) enum FamilyParams {
     Zarr(ZarrParams),
 }
 
-/// Unified request parameters: shared [`ParsedQuery`] + per-family extension.
+/// Unified request parameters: shared [`RequestParams`] + per-family extension.
 #[derive(Clone)]
 pub(super) struct FamilyRequestParams {
-    pub(super) common: ParsedQuery,
+    pub(super) common: RequestParams,
     pub(super) family: FamilyParams,
+}
+
+/// Parse a `/cog/*` (or root-level) query string into [`FamilyRequestParams`].
+pub(super) fn parse_cog_request(raw_query: &str) -> FamilyRequestParams {
+    FamilyRequestParams {
+        common: parse_query((!raw_query.is_empty()).then_some(raw_query)),
+        family: FamilyParams::Cog,
+    }
+}
+
+/// Parse a `/stac/*` query string into [`FamilyRequestParams`].
+pub(super) fn parse_stac_request(raw_query: &str) -> FamilyRequestParams {
+    FamilyRequestParams {
+        common: parse_query((!raw_query.is_empty()).then_some(raw_query)),
+        family: FamilyParams::Stac,
+    }
+}
+
+/// Parse a `/mosaicjson/*` (or `/mosaic/*`) query string into [`FamilyRequestParams`].
+pub(super) fn parse_mosaic_request(raw_query: &str) -> FamilyRequestParams {
+    FamilyRequestParams {
+        common: parse_query((!raw_query.is_empty()).then_some(raw_query)),
+        family: FamilyParams::MosaicJson,
+    }
+}
+
+/// Parse a `/searches/*` (or `/collections/*`) query string into [`FamilyRequestParams`].
+pub(super) fn parse_searches_request(raw_query: &str) -> FamilyRequestParams {
+    FamilyRequestParams {
+        common: parse_query((!raw_query.is_empty()).then_some(raw_query)),
+        family: FamilyParams::Searches,
+    }
+}
+
+/// Parse a request query string for the route family named by its leading path segment.
+pub(super) fn parse_family_request(family_segment: Option<&str>, raw_query: &str) -> FamilyRequestParams {
+    match family_segment {
+        Some("stac") => parse_stac_request(raw_query),
+        Some("mosaicjson" | "mosaic") => parse_mosaic_request(raw_query),
+        Some("searches" | "collections") => parse_searches_request(raw_query),
+        Some("zarr") => parse_zarr_request(raw_query),
+        _ => parse_cog_request(raw_query),
+    }
 }
 
 /// Parse a `/zarr/*` query string using [`parse_query`] for shared parameters and
@@ -1275,5 +1316,60 @@ mod tests {
         let FamilyParams::Zarr(zb) = req.family else { unreachable!() };
         assert_eq!(zb.bidx, Some(70_000));
         assert_eq!(req.common.rescale.last().copied(), Some((250.0, 310.0)));
+    }
+
+    #[test]
+    fn all_five_families_share_identical_common_parameters() {
+        let qs = concat!(
+            "url=https://example.com/a.tif",
+            "&bidx=2",
+            "&rescale=10,250",
+            "&colormap_name=viridis",
+            "&resampling=bilinear",
+            "&reproject=cubic",
+            "&nodata=-9999",
+            "&unscale=true",
+            "&return_mask=false",
+            "&max_size=512",
+            "&tilesize=512",
+            "&format=webp",
+            "&coord_crs=EPSG:3857",
+            "&algorithm=hillshade",
+            "&pixel_selection=median",
+        );
+        let families = [
+            ("cog", parse_cog_request(qs)),
+            ("stac", parse_stac_request(qs)),
+            ("mosaicjson", parse_mosaic_request(qs)),
+            ("searches", parse_searches_request(qs)),
+            ("zarr", parse_zarr_request(qs)),
+        ];
+        assert!(matches!(families[0].1.family, FamilyParams::Cog));
+        assert!(matches!(families[1].1.family, FamilyParams::Stac));
+        assert!(matches!(families[2].1.family, FamilyParams::MosaicJson));
+        assert!(matches!(families[3].1.family, FamilyParams::Searches));
+        assert!(matches!(families[4].1.family, FamilyParams::Zarr(_)));
+
+        let base = &families[0].1.common;
+        for (name, req) in &families[1..] {
+            let c = &req.common;
+            assert_eq!(c.urls, base.urls, "{name}: urls");
+            assert_eq!(c.bidx, base.bidx, "{name}: bidx");
+            assert_eq!(c.rescale, base.rescale, "{name}: rescale");
+            assert_eq!(c.colormap, base.colormap, "{name}: colormap");
+            assert_eq!(c.resample, base.resample, "{name}: resample");
+            assert_eq!(c.reproject, base.reproject, "{name}: reproject");
+            assert_eq!(c.nodata, base.nodata, "{name}: nodata");
+            assert_eq!(c.unscale, base.unscale, "{name}: unscale");
+            assert_eq!(c.return_mask, base.return_mask, "{name}: return_mask");
+            assert_eq!(c.max_size, base.max_size, "{name}: max_size");
+            assert_eq!(c.tile_size, base.tile_size, "{name}: tile_size");
+            assert_eq!(c.format_param, base.format_param, "{name}: format_param");
+            assert_eq!(c.coord_crs_epsg, base.coord_crs_epsg, "{name}: coord_crs_epsg");
+            assert_eq!(c.algorithm, base.algorithm, "{name}: algorithm");
+            assert_eq!(c.pixel_selection, base.pixel_selection, "{name}: pixel_selection");
+            assert_eq!(c.keys, base.keys, "{name}: keys");
+            assert_eq!(c.errors, base.errors, "{name}: errors");
+        }
     }
 }

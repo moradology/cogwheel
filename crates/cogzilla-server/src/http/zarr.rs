@@ -465,11 +465,10 @@ struct ZarrQuery {
 }
 
 impl ZarrQuery {
-    fn parse(raw_query: &str) -> Self {
-        let req = super::query::parse_zarr_request(raw_query);
+    fn from_family_request(req: super::query::FamilyRequestParams) -> Self {
         let common = req.common;
         let super::query::FamilyParams::Zarr(zp) = req.family else {
-            unreachable!("parse_zarr_request always returns FamilyParams::Zarr");
+            unreachable!("handle_zarr_request must receive FamilyParams::Zarr");
         };
         let has_key = |names: &[&str]| common.keys.iter().any(|k| names.contains(&k.as_str()));
         Self {
@@ -546,10 +545,11 @@ fn binary_ok_with_etag(
 }
 
 /// Main dispatcher for all `/zarr/*` routes.
-pub(crate) async fn handle_zarr_request(
+pub(super) async fn handle_zarr_request(
     engine: &Arc<TileEngine>,
     method: Method,
     sub: &[&str],
+    req_params: super::query::FamilyRequestParams,
     raw_query: &str,
     host: &str,
     if_none_match: Option<&str>,
@@ -558,7 +558,7 @@ pub(crate) async fn handle_zarr_request(
     let io = &engine.store;
     let is_head = method == Method::HEAD;
     let dispatch_method = if is_head { Method::GET } else { method };
-    let q = ZarrQuery::parse(raw_query);
+    let q = ZarrQuery::from_family_request(req_params);
     let result = match (dispatch_method, sub) {
         // Metadata & introspection family (#372)
         (Method::GET, ["info"]) => handle_info(io, &q, false).await,

@@ -6542,7 +6542,7 @@ pub(super) async fn item_route(
             })
             .collect::<Vec<_>>()
             .join("&");
-        let (own, pairs) = (super::parse_query((!query.is_empty()).then_some(query.as_str())), query_pairs(&query));
+        let (own, pairs) = (super::query::parse_searches_request(&query).common, query_pairs(&query));
         return Done(mosaic_route(&ctx, pg, &base, &rec, rest, body.as_ref(), own, &pairs).await);
     }
     ItemRoute::Stac(item, extent)
@@ -6600,13 +6600,20 @@ pub(super) async fn handle<B>(
     ctx: Ctx<'_>,
     method: &Method,
     segs: &[&str],
-    pq: ParsedQuery,
+    req_params: super::query::FamilyRequestParams,
     req: Request<B>,
 ) -> Resp
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
+    let super::query::FamilyRequestParams {
+        common: pq,
+        family: super::query::FamilyParams::Searches,
+    } = req_params
+    else {
+        unreachable!("pgstac::handle must receive FamilyParams::Searches");
+    };
     let Some(pg) = ctx.engine.pgstac() else {
         return detail(
             StatusCode::SERVICE_UNAVAILABLE,

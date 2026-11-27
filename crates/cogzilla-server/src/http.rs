@@ -35,7 +35,9 @@ mod wms;
 mod zarr;
 mod zonal;
 
-use query::{ParsedQuery, parse_bool_encoded as parse_bool_param, parse_query};
+use query::{ParsedQuery, parse_bool_encoded as parse_bool_param};
+#[cfg(test)]
+use query::parse_query;
 
 pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
 pub(crate) use self::geo::{parse_coord_crs_with_epsg, tile_box_intersects_cog};
@@ -5184,13 +5186,12 @@ where
         return Ok(plain_resp(StatusCode::OK, Bytes::from_static(b"cleared"), "text/plain"));
     }
 
-    let mut pq = parse_query(if raw_query.is_empty() {
-        None
-    } else {
-        Some(&raw_query)
-    });
-
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let req_params = query::parse_family_request(segs.first().copied(), &raw_query);
+    let query::FamilyRequestParams {
+        common: mut pq,
+        family: req_family,
+    } = req_params;
 
     // titiler-pgstac's item routes, /collections/{c}/items/{i}/..., are the /stac router over
     // an item read from pgSTAC instead of from `url`.
@@ -5325,7 +5326,11 @@ where
         };
         let list = matches!(segs[..], ["searches"] | ["searches", "" | "list"]);
         let cacheable = method == Method::GET && !list;
-        let mut resp = Box::pin(pgstac::handle(ctx, &method, &segs, pq, req)).await;
+        let search_params = query::FamilyRequestParams {
+            common: pq,
+            family: req_family,
+        };
+        let mut resp = Box::pin(pgstac::handle(ctx, &method, &segs, search_params, req)).await;
         if list && method == Method::GET && resp.status() == StatusCode::OK {
             // Prevent handle_request's default GET Cache-Control from caching live search listings.
             resp.headers_mut()
@@ -8931,10 +8936,15 @@ where
         } else {
             None
         };
+        let zarr_params = query::FamilyRequestParams {
+            common: pq,
+            family: req_family,
+        };
         let resp = Box::pin(zarr::handle_zarr_request(
             &engine,
             method,
             sub,
+            zarr_params,
             &raw_query,
             &host,
             if_none_match.as_deref(),
