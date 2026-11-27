@@ -23,6 +23,34 @@ pub trait ZarrStore: Send + Sync {
     /// `/`). Returns `Ok(None)` when the key does not exist.
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, ZarrError>>;
 
+    /// Fetch byte range `[start..end)` of `key`. Default falls back to `get(key)` and slices.
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        end: u64,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ZarrError>> {
+        Box::pin(async move {
+            let Some(all) = self.get(key).await? else {
+                return Ok(None);
+            };
+            let s = usize::try_from(start).unwrap_or(all.len());
+            let e = usize::try_from(end).unwrap_or(all.len());
+            if s > e || e > all.len() {
+                return Err(ZarrError::Io {
+                    key: key.to_string(),
+                    message: format!("range {start}..{end} out of bounds for len {}", all.len()),
+                });
+            }
+            Ok(Some(all[s..e].to_vec()))
+        })
+    }
+
+    /// Return the byte length of `key`, or `Ok(None)` if missing.
+    fn size<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<u64>, ZarrError>> {
+        Box::pin(async move { Ok(self.get(key).await?.map(|b| b.len() as u64)) })
+    }
+
     /// List immediate child directory/node names under `prefix` (empty string `""` for the store
     /// root). Returns `Ok(None)` when the backend does not support directory listing (e.g. plain
     /// HTTP without an index).
@@ -542,12 +570,14 @@ fn direct_child<'a>(parent: &str, candidate: &'a str) -> Option<&'a str> {
     }
 }
 
-/// In-memory [`ZarrStore`] with GET counters for deterministic unit tests.
+/// In-memory [`ZarrStore`] with GET and byte counters for deterministic unit tests.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     entries: BTreeMap<String, Vec<u8>>,
     get_count: AtomicUsize,
     hit_count: AtomicUsize,
+    range_count: AtomicUsize,
+    bytes_read: AtomicUsize,
 }
 
 impl MemoryStore {
@@ -569,6 +599,16 @@ impl MemoryStore {
     pub fn hit_count(&self) -> usize {
         self.hit_count.load(Ordering::Relaxed)
     }
+
+    /// Total number of `get_range()` calls issued so far.
+    pub fn range_count(&self) -> usize {
+        self.range_count.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes transferred across `get()` and `get_range()`.
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
 }
 
 impl ZarrStore for MemoryStore {
@@ -576,10 +616,44 @@ impl ZarrStore for MemoryStore {
         let norm = normalize_path(key);
         self.get_count.fetch_add(1, Ordering::Relaxed);
         let found = self.entries.get(&norm).cloned();
-        if found.is_some() {
+        if let Some(ref b) = found {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(b.len(), Ordering::Relaxed);
         }
         Box::pin(async move { Ok(found) })
+    }
+
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        end: u64,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ZarrError>> {
+        let norm = normalize_path(key);
+        self.range_count.fetch_add(1, Ordering::Relaxed);
+        let res = match self.entries.get(&norm) {
+            None => Ok(None),
+            Some(all) => {
+                let s = usize::try_from(start).unwrap_or(all.len());
+                let e = usize::try_from(end).unwrap_or(all.len());
+                if s > e || e > all.len() {
+                    Err(ZarrError::Io {
+                        key: norm,
+                        message: format!("range {start}..{end} out of bounds for len {}", all.len()),
+                    })
+                } else {
+                    self.bytes_read.fetch_add(e - s, Ordering::Relaxed);
+                    Ok(Some(all[s..e].to_vec()))
+                }
+            }
+        };
+        Box::pin(async move { res })
+    }
+
+    fn size<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<u64>, ZarrError>> {
+        let norm = normalize_path(key);
+        let sz = self.entries.get(&norm).map(|v| v.len() as u64);
+        Box::pin(async move { Ok(sz) })
     }
 
     fn list_dir<'a>(
@@ -633,6 +707,64 @@ impl ZarrStore for FsStore {
         Box::pin(async move {
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(ZarrError::Io {
+                    key: norm,
+                    message: e.to_string(),
+                }),
+            }
+        })
+    }
+
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        end: u64,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, ZarrError>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let norm = normalize_path(key);
+        let path = self.root.join(&norm);
+        Box::pin(async move {
+            if start > end {
+                return Err(ZarrError::Io {
+                    key: norm,
+                    message: format!("invalid byte range {start}..{end}"),
+                });
+            }
+            let mut f = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(ZarrError::Io {
+                        key: norm,
+                        message: e.to_string(),
+                    });
+                }
+            };
+            let len = usize::try_from(end - start).map_err(|_| ZarrError::Io {
+                key: norm.clone(),
+                message: format!("byte range {start}..{end} too large"),
+            })?;
+            f.seek(SeekFrom::Start(start)).map_err(|e| ZarrError::Io {
+                key: norm.clone(),
+                message: e.to_string(),
+            })?;
+            let mut buf = vec![0u8; len];
+            f.read_exact(&mut buf).map_err(|e| ZarrError::Io {
+                key: norm,
+                message: e.to_string(),
+            })?;
+            Ok(Some(buf))
+        })
+    }
+
+    fn size<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<u64>, ZarrError>> {
+        let norm = normalize_path(key);
+        let path = self.root.join(&norm);
+        Box::pin(async move {
+            match std::fs::metadata(&path) {
+                Ok(m) => Ok(Some(m.len())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(ZarrError::Io {
                     key: norm,

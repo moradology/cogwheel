@@ -33,6 +33,8 @@
 pub mod blosc;
 pub mod codecs;
 pub mod hierarchy;
+pub mod reader;
+pub mod sharding;
 
 use std::collections::BTreeMap;
 
@@ -40,6 +42,8 @@ use serde_json::Value;
 
 pub use codecs::{MAX_DECODED_CHUNK_BYTES, SUPPORTED_CODECS, decode_chunk_bytes};
 pub use hierarchy::{FsStore, GroupMeta, GroupView, MemoryStore, OpenMode, ZarrHierarchy, ZarrNode, ZarrStore};
+pub use reader::{ChunkWindow, ZarrWindowBlocks, read_chunk_window, read_chunk_window_for_band};
+pub use sharding::{IndexLocation, ShardIndex, ShardIndexCache, ShardingConfig};
 
 /// Anything that can go wrong reading Zarr metadata, navigating a store, or decoding chunks.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +84,10 @@ pub enum ZarrError {
         bytes: usize,
         cap: usize,
     },
+    #[error("chunk {chunk_key:?} is missing and array has no fill value")]
+    MissingChunk { chunk_key: String },
+    #[error("invalid pixel or band selection: {detail}")]
+    InvalidSelection { detail: String },
 }
 
 /// Which revision of the Zarr specification a store was written to.
@@ -495,6 +503,32 @@ impl ArrayMeta {
         match self.rank() {
             2 | 3 => Ok(()),
             other => Err(ZarrError::UnsupportedRank(other)),
+        }
+    }
+
+    /// Effective nodata value: CF `_FillValue`, then `missing_value`, then Zarr `fill_value`.
+    pub fn effective_nodata(&self) -> Option<f64> {
+        fill_value(self.attributes.get("_FillValue"))
+            .or_else(|| fill_value(self.attributes.get("missing_value")))
+            .or(self.fill_value)
+    }
+
+    /// CF `scale_factor` and `add_offset` if either is non-identity.
+    pub fn scale_offset(&self) -> Option<(f32, f32)> {
+        let scale = self
+            .attributes
+            .get("scale_factor")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0) as f32;
+        let offset = self
+            .attributes
+            .get("add_offset")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32;
+        if scale != 1.0 || offset != 0.0 {
+            Some((scale, offset))
+        } else {
+            None
         }
     }
 }
