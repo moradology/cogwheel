@@ -381,7 +381,6 @@ impl CogSource {
             } => {
                 let range_hdr = format!("bytes={start}-{}", end.saturating_sub(1));
                 let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
-                metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
                 let data = crate::s3::fetch_s3_object_capped(
                     client,
                     bucket,
@@ -391,11 +390,9 @@ impl CogSource {
                     Some(&range_hdr),
                     expected_len,
                     Some(limiter),
+                    Some(metrics),
                 )
                 .await?;
-                metrics
-                    .remote_bytes_fetched
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
                 Ok(RangeResponse {
                     bytes: data,
                     etag: None,
@@ -413,136 +410,26 @@ impl CogSource {
                 let strong_etag = validator
                     .and_then(|v| v.etag.as_deref())
                     .filter(|e| !e.trim_start().starts_with("W/"));
-                let mut attempt = 0u32;
-                loop {
-                    let permit = limiter.acquire().await;
-                    metrics.remote_range_requests.fetch_add(1, Ordering::Relaxed);
-                    let mut req = client.get(url).header("Range", &range_hdr);
-                    if let Some(etag) = strong_etag {
-                        req = req.header("If-Match", etag);
-                    }
-                    let resp = match req.send().await {
-                        Ok(r) => r,
-                        Err(e) if attempt < *max_retries && is_retryable_transport_error(&e) => {
-                            permit.on_throttle();
-                            tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
-                            attempt += 1;
-                            continue;
+                let redacted = redact_http_url(url);
+                crate::retry::execute_get_with_retry(
+                    || {
+                        let mut req = client.get(url).header("Range", &range_hdr);
+                        if let Some(etag) = strong_etag {
+                            req = req.header("If-Match", etag);
                         }
-                        Err(e) => {
-                            if is_retryable_transport_error(&e) {
-                                permit.on_throttle();
-                            }
-                            return Err(io_error_from_reqwest(e));
-                        }
-                    };
-                    let status = resp.status().as_u16();
-                    if status == 412 {
-                        return Err(IoError::SourceChanged {
-                            url: redact_http_url(url),
-                        });
-                    }
-                    let resp_etag = resp
-                        .headers()
-                        .get("etag")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    let resp_lm = resp
-                        .headers()
-                        .get("last-modified")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    if (status == 200 || status == 206)
-                        && let Some(v) = validator
-                    {
-                        let etag_changed = matches!(
-                            (&v.etag, &resp_etag),
-                            (Some(exp), Some(got)) if exp != got
-                        );
-                        let lm_changed = matches!(
-                            (&v.last_modified, &resp_lm),
-                            (Some(exp), Some(got)) if exp != got
-                        );
-                        if etag_changed || lm_changed {
-                            return Err(IoError::SourceChanged {
-                                url: redact_http_url(url),
-                            });
-                        }
-                    }
-                    let expected_len = end.saturating_sub(start).min(64 * 1024 * 1024) as usize;
-                    if status == 200
-                        && (start > 0
-                            || resp
-                                .content_length()
-                                .is_some_and(|cl| cl > expected_len as u64))
-                    {
-                        // Server ignored Range header and sent full object:
-                        // returning those bytes would silently corrupt tile/IFD data or OOM.
-                        return Err(IoError::RangeNotSupported {
-                            url: redact_http_url(url),
-                        });
-                    }
-                    if status == 206 && !validate_content_range_start(&resp, start) {
-                        return Err(IoError::RangeNotSupported {
-                            url: redact_http_url(url),
-                        });
-                    }
-                    if status == 200 || status == 206 {
-                        let data = match crate::cloud::read_response_capped(resp, expected_len).await
-                        {
-                            Ok(d) => d,
-                            Err(IoError::ResponseTooLarge { .. }) if status == 200 => {
-                                return Err(IoError::RangeNotSupported {
-                                    url: redact_http_url(url),
-                                });
-                            }
-                            Err(IoError::Http(e))
-                                if attempt < *max_retries && is_retryable_transport_error(&e) =>
-                            {
-                                permit.on_throttle();
-                                tokio::time::sleep(retry_backoff_duration(attempt, None)).await;
-                                attempt += 1;
-                                continue;
-                            }
-                            Err(IoError::Http(e)) => {
-                                if is_retryable_transport_error(&e) {
-                                    permit.on_throttle();
-                                }
-                                return Err(IoError::Http(e.without_url()));
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        permit.on_success();
-                        metrics
-                            .remote_bytes_fetched
-                            .fetch_add(data.len() as u64, Ordering::Relaxed);
-                        return Ok(RangeResponse {
-                            bytes: data,
-                            etag: resp_etag,
-                            last_modified: resp_lm,
-                        });
-                    }
-                    if attempt < *max_retries && is_retryable_status(status) {
-                        let retry_after = resp
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok());
-                        permit.on_throttle();
-                        tokio::time::sleep(retry_backoff_duration(attempt, retry_after)).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    if is_retryable_status(status) {
-                        permit.on_throttle();
-                    }
-                    return Err(IoError::HttpStatus {
-                        status,
-                        url: redact_http_url(url),
-                    });
-                }
+                        Ok((req, redacted.clone()))
+                    },
+                    crate::retry::FetchSpec {
+                        range: Some((start, end)),
+                        max_bytes: None,
+                        validator,
+                        max_retries: *max_retries,
+                        strip_url_on_http_err: false,
+                    },
+                    limiter,
+                    metrics,
+                )
+                .await
             }
             Self::RemoteGcs {
                 bucket,

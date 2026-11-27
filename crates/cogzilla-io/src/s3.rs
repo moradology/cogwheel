@@ -922,10 +922,23 @@ pub async fn fetch_s3_object_limited(
     range_header: Option<&str>,
     limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
 ) -> Result<bytes::Bytes, IoError> {
-    fetch_s3_inner(client, bucket, key, cfg, dynamic_creds, range_header, None, limiter).await
+    fetch_s3_inner(
+        client,
+        bucket,
+        key,
+        cfg,
+        dynamic_creds,
+        range_header,
+        None,
+        limiter,
+        None,
+    )
+    .await
 }
 
-/// Same as [`fetch_s3_object_limited`], with a hard streaming byte cap (`max_bytes`) to prevent OOM.
+/// Same as [`fetch_s3_object_limited`], with a hard streaming byte cap (`max_bytes`) to prevent OOM
+/// and unified [`crate::backend::IoMetrics`] accounting (counting each upstream attempt uniformly
+/// with HTTP, GCS, and Azure).
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_s3_object_capped(
     client: &reqwest::Client,
@@ -936,6 +949,7 @@ pub async fn fetch_s3_object_capped(
     range_header: Option<&str>,
     max_bytes: usize,
     limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
+    metrics: Option<&crate::backend::IoMetrics>,
 ) -> Result<bytes::Bytes, IoError> {
     fetch_s3_inner(
         client,
@@ -946,6 +960,7 @@ pub async fn fetch_s3_object_capped(
         range_header,
         Some(max_bytes),
         limiter,
+        metrics,
     )
     .await
 }
@@ -960,6 +975,7 @@ async fn fetch_s3_inner(
     range_header: Option<&str>,
     max_bytes: Option<usize>,
     limiter: Option<&Arc<crate::limiter::AimdLimiter>>,
+    metrics: Option<&crate::backend::IoMetrics>,
 ) -> Result<bytes::Bytes, IoError> {
     let mut region = bucket_region_cache()
         .get(bucket)
@@ -985,6 +1001,10 @@ async fn fetch_s3_inner(
             Some(l) => Some(l.acquire().await),
             None => None,
         };
+        if let Some(m) = metrics {
+            m.remote_range_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let (url, host, canonical_uri) = build_s3_endpoint(bucket, key, &region, cfg);
         let mut req = client.get(&url);
@@ -1080,6 +1100,10 @@ async fn fetch_s3_inner(
                 Ok(body) => {
                     if let Some(p) = permit {
                         p.on_success();
+                    }
+                    if let Some(m) = metrics {
+                        m.remote_bytes_fetched
+                            .fetch_add(body.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                     return Ok(body);
                 }

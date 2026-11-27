@@ -2490,6 +2490,7 @@ impl CogStore {
                 None,
                 max_bytes,
                 Some(&self.upstream_limiter),
+                Some(&self.metrics),
             )
             .await;
         }
@@ -2548,88 +2549,21 @@ impl CogStore {
             None
         };
         if let Some(uri) = http_uri {
-            let max_retries = std::env::var("GDAL_HTTP_MAX_RETRY")
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .unwrap_or(4)
-                .min(10);
-            for attempt in 0..=max_retries {
-                let permit = self.upstream_limiter.acquire().await;
-                let send_res = self.client.get(uri).send().await;
-                let resp = match send_res {
-                    Ok(r) => r,
-                    Err(e) => {
-                        if crate::s3::is_retryable_transport_error(&e) {
-                            permit.on_throttle();
-                            if attempt < max_retries {
-                                tokio::time::sleep(crate::s3::retry_backoff_duration(
-                                    attempt, None,
-                                ))
-                                .await;
-                                continue;
-                            }
-                        }
-                        return Err(crate::backend::io_error_from_reqwest(e));
-                    }
-                };
-                let status = resp.status().as_u16();
-                if crate::s3::is_retryable_status(status) {
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.trim().parse::<u64>().ok());
-                    permit.on_throttle();
-                    if attempt < max_retries {
-                        tokio::time::sleep(crate::s3::retry_backoff_duration(
-                            attempt,
-                            retry_after,
-                        ))
-                        .await;
-                        continue;
-                    }
-                    return Err(IoError::HttpStatus {
-                        status,
-                        url: crate::backend::redact_http_url(uri),
-                    });
-                }
-                if !resp.status().is_success() {
-                    return Err(IoError::HttpStatus {
-                        status,
-                        url: crate::backend::redact_http_url(uri),
-                    });
-                }
-                match crate::cloud::read_response_capped(resp, max_bytes).await {
-                    Ok(data) => {
-                        permit.on_success();
-                        self.metrics
-                            .remote_range_requests
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.metrics
-                            .remote_bytes_fetched
-                            .fetch_add(data.len() as u64, Ordering::Relaxed);
-                        return Ok(data);
-                    }
-                    Err(IoError::Http(e)) => {
-                        if crate::s3::is_retryable_transport_error(&e) {
-                            permit.on_throttle();
-                            if attempt < max_retries {
-                                tokio::time::sleep(crate::s3::retry_backoff_duration(
-                                    attempt, None,
-                                ))
-                                .await;
-                                continue;
-                            }
-                        }
-                        return Err(crate::backend::io_error_from_reqwest(e));
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            return Err(IoError::HttpStatus {
-                status: 503,
-                url: crate::backend::redact_http_url(uri),
-            });
+            let max_retries = crate::retry::RetryPolicy::from_env_with_default(4).max_retries;
+            let redacted = crate::backend::redact_http_url(uri);
+            return crate::retry::execute_get_bytes_with_retry(
+                || Ok((self.client.get(uri), redacted.clone())),
+                crate::retry::FetchSpec {
+                    range: None,
+                    max_bytes: Some(max_bytes),
+                    validator: None,
+                    max_retries,
+                    strip_url_on_http_err: false,
+                },
+                &self.upstream_limiter,
+                &self.metrics,
+            )
+            .await;
         }
 
         let local = crate::backend::resolve_local_or_reject_scheme(uri)?;

@@ -4,6 +4,7 @@ pub mod cache;
 pub mod cloud;
 pub mod disk_cache;
 pub mod limiter;
+pub mod retry;
 pub mod s3;
 pub mod store;
 
