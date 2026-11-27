@@ -6027,12 +6027,12 @@ where
                     Ok(body) => body,
                     Err(e) => return Ok(pgstac::engine_error(&e)),
                 };
-                return Ok(match pgstac::item_route(&ctx, &method, c, i, rest, &pq, Some(body)).await {
+                return Ok(match Box::pin(pgstac::item_route(&ctx, &method, c, i, rest, &pq, Some(body))).await {
                     pgstac::ItemRoute::Done(resp) => resp,
                     pgstac::ItemRoute::Stac(..) => pgstac::bad_request("an item's statistics of a posted feature are worked out from the item alone".into()),
                 });
             }
-            match pgstac::item_route(&ctx, &method, c, i, rest, &pq, None).await {
+            match Box::pin(pgstac::item_route(&ctx, &method, c, i, rest, &pq, None)).await {
                 pgstac::ItemRoute::Done(resp) => return Ok(pgstac_cacheable(resp, &method)),
                 pgstac::ItemRoute::Stac(item, extent) => {
                     pgstac_item = Some(item);
@@ -6116,7 +6116,7 @@ where
         };
         let list = matches!(segs[..], ["searches"] | ["searches", "" | "list"]);
         let cacheable = method == Method::GET && !list;
-        let resp = pgstac::handle(ctx, &method, &segs, pq, req).await;
+        let resp = Box::pin(pgstac::handle(ctx, &method, &segs, pq, req)).await;
         return Ok(if cacheable { pgstac_cacheable(resp, &Method::GET) } else { resp });
     }
     if pq.keys.iter().any(|k| k == "pixel_selection") && !route_supports_pixel_selection(&segs) {
