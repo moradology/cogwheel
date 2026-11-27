@@ -2012,7 +2012,7 @@ pub(super) fn asset_entry_names(raw_query: &str) -> Option<Vec<String>> {
 
 /// Whether an `assets` option may be band math (`red|expression=b1*2`): a look at the
 /// decoded values that spares the requests without it a parse of their assets.
-fn asset_math_asked(pairs: &[(String, String)]) -> bool {
+pub(super) fn asset_math_asked(pairs: &[(String, String)]) -> bool {
     pairs.iter().any(|(k, v)| k == "assets" && v.contains("expression="))
 }
 
@@ -2051,11 +2051,14 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
     let several = specs.len() > 1;
     let chosen = entry_selections(pairs);
     for (slot, spec) in specs.iter().enumerate() {
+        if spec.name == ":all:" {
+            return Err("':all:' cannot be used with per-asset expressions".into());
+        }
         let first = [format!("b{}", slot + 1)];
         let (own, names): (Vec<String>, Vec<String>) = match &spec.expression {
             Some(expression) => {
                 let program = Program::parse(expression, if several { 1 } else { MAX_BANDS_PER_ITEM }).map_err(|e| {
-                    if several {
+                    if several && Program::parse(expression, MAX_BANDS_PER_ITEM).is_ok() {
                         format!("assets={}|expression= reads past the asset's first band, which an item's preview or statistics of several assets does not stack yet", spec.name)
                     } else {
                         e
@@ -2067,7 +2070,7 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
             // The first band, which is what is read, may be asked for; no other.
             None if chosen.get(slot).is_some_and(|c| c.as_ref().is_some_and(|c| c.as_slice() != [1])) => {
                 return Err(format!(
-                    "assets={}|bidx= with band math on another asset is not supported on an item's statistics yet, but for the first band",
+                    "assets={}|bidx= with band math on another asset is not supported on an item's preview or statistics yet, but for the first band",
                     spec.name
                 ));
             }
@@ -2083,13 +2086,32 @@ pub(super) fn item_asset_math(rest: &[&str], pairs: &[(String, String)]) -> Resu
         };
         parts.extend(own);
         described.extend(names);
+        if parts.len() > super::point_expr::MAX_RESULTS {
+            return Err(format!("expression has more than {} results", super::point_expr::MAX_RESULTS));
+        }
     }
     match request_expression(pairs) {
-        None => Ok(Some((parts.join(";"), described))),
+        None => {
+            let joined = parts.join(";");
+            if joined.len() > super::point_expr::MAX_EXPRESSION_BYTES {
+                return Err(format!(
+                    "expression is longer than {} bytes",
+                    super::point_expr::MAX_EXPRESSION_BYTES
+                ));
+            }
+            Ok(Some((joined, described)))
+        }
         Some(request) => {
             let program = Program::parse(request, parts.len())?;
             let wrapped: Vec<String> = parts.iter().map(|p| format!("({p})")).collect();
-            Ok(Some((program.describe(&wrapped).join(";"), program.describe(&described))))
+            let joined = program.describe(&wrapped).join(";");
+            if joined.len() > super::point_expr::MAX_EXPRESSION_BYTES {
+                return Err(format!(
+                    "expression is longer than {} bytes",
+                    super::point_expr::MAX_EXPRESSION_BYTES
+                ));
+            }
+            Ok(Some((joined, program.describe(&described))))
         }
     }
 }
@@ -2120,14 +2142,20 @@ pub(super) fn check_item_asset_math(
     names: &[String],
     cogs: &[Arc<cogzilla_io::OpenedCog>],
 ) -> Result<(), EngineError> {
-    let Ok(specs) = parse_assets(&query_pairs(raw_query)) else { return Ok(()) };
+    let pairs = query_pairs(raw_query);
+    let Ok(specs) = parse_assets(&pairs) else { return Ok(()) };
     if specs.len() < 2 {
         return Ok(());
     }
+    let chosen = entry_selections(&pairs);
     for (name, cog) in names.iter().zip(cogs) {
-        let bands = cog.index.full_res().samples_per_pixel;
-        let plain = specs.iter().any(|s| &s.name == name && s.expression.is_none());
-        if plain && bands > 1 {
+        let bands = super::data_band_count(cog.index.full_res());
+        let plain_unselected = specs.iter().enumerate().any(|(slot, s)| {
+            &s.name == name
+                && s.expression.is_none()
+                && !chosen.get(slot).is_some_and(|c| c.as_ref().is_some_and(|c| c.as_slice() == [1]))
+        });
+        if plain_unselected && bands > 1 {
             return Err(EngineError::BadRequest(format!(
                 "assets={name} has {bands} bands: an item's preview or statistics of several assets with band math of their own takes plain assets of one band only, for now"
             )));
@@ -5393,11 +5421,14 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
     let (mut out, mut described) = (Vec::new(), Vec::new());
     let mut at = 0;
     for (spec, chosen) in specs.iter().zip(chosen) {
+        if spec.name == ":all:" {
+            return Err("':all:' cannot be used with per-asset expressions".into());
+        }
         // Every asset is read whole (`point_asset_math_reads`): its run is its bands from the
         // first, so an asset asked for twice is read twice.
         let n = descriptions[at..].iter().enumerate().take_while(|(i, d)| band_of(&spec.name, d) == Some(i + 1)).count();
         if n == 0 {
-            return Ok(());
+            return Err(format!("could not match bands for asset '{}' in point response", spec.name));
         }
         let bands = &values[at..at + n];
         at += n;
@@ -5411,7 +5442,7 @@ fn point_asset_math(doc: &mut Value, pairs: &[(String, String)]) -> Result<(), S
         described.extend(names);
     }
     if at != values.len() {
-        return Ok(());
+        return Err("point response bands did not match requested assets".into());
     }
     doc["values"] = json!(out.iter().map(|v| if v.is_finite() { json!(v) } else { Value::Null }).collect::<Vec<_>>());
     doc["band_names"] = json!((1..=out.len()).map(|i| format!("b{i}")).collect::<Vec<_>>());
@@ -8082,6 +8113,22 @@ mod tests {
         assert!(math("assets=visual%7Cexpression%3Db1%3Bb2&asset_as_band=true").is_err());
         assert_eq!(math("assets=red&expression=b1*2"), Ok(None), "no asset's own band math");
         assert_eq!(item_asset_math(&["point", "1,2"], &query_pairs("assets=red%7Cexpression%3Db1*2")), Ok(None));
+        // Preview route variants are supported identically to statistics.
+        for route in [&["preview"][..], &["preview.png"][..], &["preview", "64x64.png"][..]] {
+            assert_eq!(
+                item_asset_math(route, &query_pairs("assets=red%7Cexpression%3Db1*2")),
+                some("b1*2", &["red_b1*2"]),
+                "{route:?}"
+            );
+        }
+        // Empty expression and `:all:` are rejected, and syntax errors keep their real message when several == true.
+        assert!(math("assets=red%7Cexpression%3D").is_err(), "empty asset expression must error");
+        assert!(math("assets=:all:%7Cexpression%3Db1*2").is_err(), ":all: cannot carry asset math");
+        let syn_err = math("assets=red%7Cexpression%3Db1***2&assets=nir").unwrap_err();
+        assert!(!syn_err.contains("reads past the asset's first band"), "unexpected error override: {syn_err}");
+        // More than MAX_RESULTS combined parts is rejected.
+        let ten = "b1;b1;b1;b1;b1;b1;b1;b1;b1;b1";
+        assert!(math(&format!("assets=red|expression={ten}&assets=nir|expression={ten}")).is_err());
     }
 
     /// An asset's band math is over all of its bands: the bands it chooses are dropped, and the
@@ -8153,6 +8200,19 @@ mod tests {
         let mut doc = json!({ "values": [77.0, 81.0, 83.0, 77.0, 81.0, 83.0], "band_descriptions": ["visual_b1", "visual_b2", "visual_b3", "visual_b1", "visual_b2", "visual_b3"] });
         point_asset_math(&mut doc, &query_pairs("assets=visual%7Cexpression%3Db3&assets=visual%7Cbidx%3D1")).unwrap();
         assert_eq!((&doc["values"], &doc["band_descriptions"]), (&json!([83.0, 77.0]), &json!(["visual_b3", "visual_b1"])));
+        // Null (nodata) propagates as null; 0/0 maps via nan_to_num to 0.0; empty expression errors.
+        let mut doc = json!({ "values": [null, 0.0], "band_descriptions": ["red_b1", "nir_b1"] });
+        point_asset_math(&mut doc, &query_pairs("assets=red%7Cexpression%3Db1*2&assets=nir%7Cexpression%3Db1/b1")).unwrap();
+        assert_eq!(doc["values"], json!([null, 0.0]));
+        let mut doc = json!({ "values": [10.0], "band_descriptions": ["red_b1"] });
+        assert!(point_asset_math(&mut doc, &query_pairs("assets=red%7Cexpression%3D")).is_err());
+        assert!(point_asset_math(&mut doc, &query_pairs("assets=:all:%7Cexpression%3Db1*2")).is_err());
+        // point_asset_math_reads clears bidx/asset_bidx/asset_exprs/asset_as_band and preserves asset order/duplicates.
+        let raw = "assets=red%7Cexpression%3Db1*2&assets=red&bidx=1&asset_bidx=red%7C1&asset_as_band=true";
+        let mut pq = super::super::parse_query(Some(raw));
+        point_asset_math_reads(&mut pq, raw);
+        assert_eq!(pq.assets, vec!["red".to_string(), "red".to_string()]);
+        assert!(pq.bidx.is_empty() && pq.asset_bidx.is_empty() && pq.asset_exprs.is_empty() && !pq.asset_as_band);
     }
 
     #[test]

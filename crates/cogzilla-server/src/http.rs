@@ -6665,7 +6665,12 @@ where
                     }
                     // Each asset's band math on a preview or the statistics: one expression
                     // over the stacked bands, read whole.
-                    let math = if pq.asset_exprs.is_empty() { Ok(None) } else { pgstac::item_asset_math(rest, &pgstac::query_pairs(&raw_query)) };
+                    let has_asset_math = !pq.asset_exprs.is_empty() || raw_query.contains("expression");
+                    let math = if has_asset_math {
+                        pgstac::item_asset_math(rest, &pgstac::query_pairs(&raw_query))
+                    } else {
+                        Ok(None)
+                    };
                     match math {
                         Err(message) => return Ok(pgstac::bad_request(message)),
                         Ok(Some((expression, _))) => {
@@ -6683,8 +6688,11 @@ where
                     }
                     // Each asset's band math on a point is applied by `pgstac::item_fixup` to
                     // every band of the asset, named as such; `asset_as_band` names them there.
-                    if matches!(rest, ["point", _]) && !pq.asset_exprs.is_empty() {
-                        pgstac::point_asset_math_reads(&mut pq, &raw_query);
+                    if matches!(rest, ["point", _]) && has_asset_math {
+                        let pairs = pgstac::query_pairs(&raw_query);
+                        if pgstac::asset_math_asked(&pairs) {
+                            pgstac::point_asset_math_reads(&mut pq, &raw_query);
+                        }
                     }
                     if matches!(rest, ["point", _]) && pq.expr_raw.take().is_some() {
                         pq.bidx.clear();
