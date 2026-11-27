@@ -1079,6 +1079,12 @@ def main() -> int:
         o.check("statistics, bin count and range", "zonal",
                 f"{st}?assets=red&max_size=64&histogram_bins=4&histogram_range=0,2000", "POST", five)
         o.check("statistics over several items", "zonal", f"{st}?assets=red&max_size=512", "POST", large)
+        # A mean of band math is cast back to the type numexpr gave it: whole numbers toward
+        # zero, comparisons to true where any item's is.
+        two = "assets=red&assets=nir&asset_as_band=true&max_size=128&pixel_selection=mean"
+        for label, band_math in (("whole", "b1*2;b2%2Bb1"), ("negative", "b1-b2"), ("a comparison", "b1%3E1000"),
+                            ("a fraction", "b1/3"), ("where", "where(b1%3E1000,b1,0)")):
+            o.check(f"statistics of a mean of band math, {label}", "zonal", f"{st}?{two}&expression={band_math}", "POST", large)
         o.check("statistics, filtered search", "zonal", f"/searches/{sid_meta}/statistics?assets=red&max_size=64", "POST", five)
         o.check("statistics of a feature collection", "zonal", f"{st}?assets=red&max_size=64", "POST",
                 {"type": "FeatureCollection", "features": [five, holed]})

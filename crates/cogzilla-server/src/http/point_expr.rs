@@ -44,6 +44,15 @@ enum More {
     Where(Node, Node, Node),
 }
 
+/// The type numexpr gives a result over bands of whole numbers, narrowest first: numpy
+/// stacks a program's results in the widest of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Kind {
+    Bool,
+    Whole,
+    Double,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Cmp {
     Lt,
@@ -107,6 +116,27 @@ impl Node {
                 b.reads(into);
             }
             Node::More(more) => more.reads(into),
+        }
+    }
+
+    /// What numexpr makes of this tree over bands of whole numbers: sums, differences,
+    /// products, `%`, `//`, `**`, bits and `where` keep them whole; a division, a function
+    /// (`abs` included) and a literal with a fraction make doubles; a comparison is a bool.
+    /// The tree is one parsed with `typing`, where a literal with a fraction is marked.
+    fn kind(&self) -> Kind {
+        match self {
+            Node::Num(_) | Node::Band(_) => Kind::Whole,
+            Node::Call(..) => Kind::Double,
+            Node::Neg(a) => a.kind().max(Kind::Whole),
+            Node::Bin(b'/', ..) => Kind::Double,
+            Node::Bin(_, a, b) => a.kind().max(b.kind()).max(Kind::Whole),
+            Node::More(more) => match more.as_ref() {
+                More::FloorDiv(a, b) => a.kind().max(b.kind()).max(Kind::Whole),
+                More::Bits(_, a, b) | More::Where(_, a, b) => a.kind().max(b.kind()),
+                More::Not(a) => a.kind(),
+                More::Cmp(..) => Kind::Bool,
+                More::Call2(..) => Kind::Double,
+            },
         }
     }
 }
@@ -202,7 +232,7 @@ impl Program {
             if parts.len() == MAX_RESULTS {
                 return Err(format!("expression has more than {MAX_RESULTS} results"));
             }
-            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands, depth: 0, extended: false };
+            let mut parser = Parser { src: part.as_bytes(), pos: 0, bands, depth: 0, extended: false, typing: false };
             let node = parser.comparison()?;
             extended |= parser.extended;
             parser.skip_space();
@@ -223,6 +253,22 @@ impl Program {
     /// `floor`...), whose type the shared typing of band math reads from the text.
     pub(super) fn plain(&self) -> bool {
         !self.extended
+    }
+
+    /// The type of the results stacked, over bands of whole numbers, as numexpr and numpy
+    /// give it: bools if every result is a comparison, doubles if any is, whole otherwise.
+    ///
+    /// Each part is parsed again to read it: the tree that is worked out per pixel does not
+    /// tell `2.0` from `2`, so that the loop over a plane's pixels stays as it is.
+    pub(super) fn kind(&self) -> Kind {
+        self.parts
+            .iter()
+            .map(|(_, text, _)| {
+                let mut parser = Parser { src: text.as_bytes(), pos: 0, bands: usize::MAX, depth: 0, extended: false, typing: true };
+                parser.comparison().map_or(Kind::Double, |tree| tree.kind())
+            })
+            .max()
+            .unwrap_or(Kind::Double)
     }
 
     /// How many values the expression gives.
@@ -327,6 +373,14 @@ struct Parser<'a> {
     depth: usize,
     /// Whether anything beyond arithmetic and the first functions was read.
     extended: bool,
+    /// Whether the tree is read for its type ([`Program::kind`]): a literal with a fraction
+    /// or an exponent, a double to numexpr, is then a call, which types as one.
+    typing: bool,
+}
+
+/// What a literal with a fraction is wrapped in when a tree is read for its type.
+fn real(x: f64) -> f64 {
+    x
 }
 
 impl Parser<'_> {
@@ -491,7 +545,12 @@ impl Parser<'_> {
                 }
             }
             let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
-            return text.parse::<f64>().map(Node::Num).map_err(|_| format!("Invalid number '{text}'"));
+            let v = text.parse::<f64>().map_err(|_| format!("Invalid number '{text}'"))?;
+            return Ok(if self.typing && text.bytes().any(|b| matches!(b, b'.' | b'e' | b'E')) {
+                Node::Call(real, Box::new(Node::Num(v)))
+            } else {
+                Node::Num(v)
+            });
         }
         if c.is_ascii_alphabetic() || c == b'_' {
             while self.src.get(self.pos).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_') {
@@ -613,6 +672,21 @@ mod tests {
         assert_eq!(out, [Some(3446.0), Some(1326.0)]);
         assert_eq!(names, ["red_b1+nir_b1", "nir_b1-red_b1"]);
         assert_eq!(run("b1*2", &v).unwrap().0, [Some(2120.0)]);
+    }
+
+    #[test]
+    fn whole_numbers_as_numexpr_types_them() {
+        // Read from numexpr itself, over uint16 bands.
+        let kind = |e: &str| Program::parse(e, 2).unwrap().kind();
+        for e in ["b1*2", "b1+b2;b2-b1", "-b1", "b1%3", "b1//2", "b1**2", "where(b1>5,b1,0)", "where(b1>1.5,b1,0)", "b1&3", "b1>5;b1*2"] {
+            assert_eq!(kind(e), Kind::Whole, "{e}");
+        }
+        for e in ["b1/1", "abs(b1)", "b1*2.0", "b1*1e1", ".5*b1", "minimum(b1,b2)", "b1*2;b1/2", "where(b1>5,b1,0.5)"] {
+            assert_eq!(kind(e), Kind::Double, "{e}");
+        }
+        for e in ["b1>5", "(b1>5)&(b2<3)", "~(b1>5);b2==1"] {
+            assert_eq!(kind(e), Kind::Bool, "{e}");
+        }
     }
 
     #[test]
