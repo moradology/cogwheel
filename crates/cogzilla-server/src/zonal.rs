@@ -108,15 +108,7 @@ impl Ord for OrderedF64 {
     }
 }
 
-#[inline]
-fn format_category_key(v: f64) -> String {
-    let v = if v == 0.0 { 0.0 } else { v };
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        (v as i64).to_string()
-    } else {
-        v.to_string()
-    }
-}
+use crate::titiler::format_category_key;
 
 /// Semantic geometry dimensionality for zonal statistics (`area` vs `length` vs point weights).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

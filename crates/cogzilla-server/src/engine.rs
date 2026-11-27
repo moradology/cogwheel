@@ -480,6 +480,15 @@ pub(crate) fn validate_multi_cog_grid(
     Ok(())
 }
 
+/// Shared startup configuration for `cogzilla-server` and `cogzilla-lambda`.
+#[derive(Debug, Clone)]
+pub struct EngineBootConfig {
+    pub cache_mb: usize,
+    pub tile_cache_mb: usize,
+    pub disk_cache_mb: u64,
+    pub disk_cache_dir: Option<std::path::PathBuf>,
+}
+
 impl TileEngine {
     pub fn new(cache_max_bytes: usize) -> Self {
         Self::with_store(Arc::new(CogStore::new(cache_max_bytes)))
@@ -512,6 +521,41 @@ impl TileEngine {
             #[cfg(feature = "gpu")]
             gpu,
         }
+    }
+
+    /// Build a `TileEngine` from `EngineBootConfig`, opening the optional tier-2
+    /// compressed-block disk cache if `disk_cache_mb > 0`.
+    pub fn boot(cfg: EngineBootConfig) -> Arc<Self> {
+        let mut store = CogStore::new(cfg.cache_mb.saturating_mul(1024 * 1024));
+        if cfg.disk_cache_mb > 0 {
+            let dir = cfg
+                .disk_cache_dir
+                .unwrap_or_else(|| std::env::temp_dir().join("cogzilla-disk-cache"));
+            match cogzilla_io::DiskBlockCache::open(
+                &dir,
+                cfg.disk_cache_mb.saturating_mul(1024 * 1024),
+            ) {
+                Ok(dc) => {
+                    tracing::info!(
+                        dir = %dir.display(),
+                        disk_cache_mb = cfg.disk_cache_mb,
+                        "enabled tier-2 compressed-block disk cache"
+                    );
+                    store = store.with_disk_cache(dc);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to open disk cache directory; continuing with tier 2 disabled"
+                    );
+                }
+            }
+        }
+        Arc::new(Self::with_store_and_tile_cache(
+            Arc::new(store),
+            cfg.tile_cache_mb.saturating_mul(1024 * 1024),
+        ))
     }
 
     /// Attach the pgSTAC database behind the `/searches` routes. The first call wins.
