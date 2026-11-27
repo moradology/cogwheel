@@ -5434,6 +5434,54 @@ pub async fn render_mercator_bbox(
     .await
 }
 
+/// Three bands of band math painted as RGB: each channel's program evaluated a run of pixels
+/// at a time on the row VM (which works each value as the one-pixel VM does), each sampled at
+/// `(u_map, v_map)`, and rescaled by `rescale_min` and `inv`; a pixel with no place or a
+/// channel without a value is left as it is. Kept out of line, away from the other renders.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn paint_rgb_band_math(
+    progs: &[cogzilla_kernel::ExprProgram; 3],
+    all_srcs: &[Vec<BandSource<'_>>],
+    sample: &impl Fn(&BandSource<'_>, f32, f32) -> f32,
+    u_map: &[f32],
+    v_map: &[f32],
+    rescale_min: [f32; 3],
+    inv: [f32; 3],
+    rgba: &mut [u8],
+) {
+    const RUN: usize = 64;
+    let npix = u_map.len();
+    let mut rows = vec![[0.0f32; RUN]; 16];
+    let mut scratch: Vec<[f32; RUN]> = Vec::new();
+    let mut rgb = [[0.0f32; RUN]; 3];
+    for start in (0..npix).step_by(RUN) {
+        let n = RUN.min(npix - start);
+        for c in 0..3 {
+            let srcs = &all_srcs[c];
+            let nb = srcs.len().min(16);
+            for t in 0..n {
+                let (u, v) = (u_map[start + t], v_map[start + t]);
+                for k in 0..nb {
+                    rows[k][t] = if u.is_nan() { f32::NAN } else { sample(&srcs[k], u, v) };
+                }
+            }
+            progs[c].eval_row_with_scratch::<RUN>(&rows[..nb], &mut scratch, &mut rgb[c]);
+        }
+        for t in 0..n {
+            let i = start + t;
+            let px = [rgb[0][t], rgb[1][t], rgb[2][t]];
+            if u_map[i].is_nan() || px.iter().any(|v| v.is_nan()) {
+                continue;
+            }
+            for c in 0..3 {
+                rgba[i * 4 + c] = ((px[c] - rescale_min[c]) * inv[c]).clamp(0.0, 255.0) as u8;
+            }
+            rgba[i * 4 + 3] = 255;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn render_bbox_impl(
     engine: &TileEngine,
@@ -6983,35 +7031,7 @@ async fn render_bbox_impl(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
-                let mut vals = [0.0f32; 16];
-                for i in 0..(w * h) {
-                    if u_map[i].is_nan() {
-                        continue;
-                    }
-                    let mut rgb = [0.0f32; 3];
-                    let mut ok = true;
-                    for c in 0..3 {
-                        let srcs = &all_srcs[c];
-                        let nb = srcs.len().min(16);
-                        for k in 0..nb {
-                            vals[k] = sample(&srcs[k], u_map[i], v_map[i]);
-                        }
-                        let v = progs[c].eval(&vals[..nb]);
-                        if v.is_nan() {
-                            ok = false;
-                            break;
-                        }
-                        rgb[c] = v;
-                    }
-                    if ok {
-                        rgba[i * 4] = ((rgb[0] - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 1] =
-                            ((rgb[1] - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 2] =
-                            ((rgb[2] - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
-                        rgba[i * 4 + 3] = 255;
-                    }
-                }
+                paint_rgb_band_math(progs, &all_srcs, &sample, &u_map, &v_map, *rescale_min, inv, &mut rgba);
             }
             BandRequest::Spectral1 {
                 expr,

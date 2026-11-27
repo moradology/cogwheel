@@ -1565,6 +1565,12 @@ pub fn f32_npy_shape(npy: &[u8]) -> Option<(Vec<usize>, usize)> {
 /// as rio-tiler's `ImageData.mask` is. The values under the mask are kept as they are: what
 /// the renderer put there is the raster's own fill.
 pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes> {
+    retype_f32_npy_with(npy, kind, mask, |v| v)
+}
+
+/// [`retype_f32_npy`], each value (not the mask) passed through `prepare` before it is cast:
+/// how an algorithm rounds or wraps it into `kind`.
+pub fn retype_f32_npy_with(npy: &[u8], kind: SampleType, mask: bool, prepare: impl Fn(f64) -> f64) -> Option<Bytes> {
     let (shape, start) = f32_npy_shape(npy)?;
     let [planes, height, width] = shape[..] else { return None };
     let body = &npy[start..];
@@ -1582,7 +1588,7 @@ pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes>
             let cast = $cast;
             for (i, v) in values.enumerate() {
                 let x: $t = if i < bands * pixels {
-                    cast(f64::from(v))
+                    cast(prepare(f64::from(v)))
                 } else if v.is_finite() && v != 0.0 {
                     <$t>::MAX
                 } else {
