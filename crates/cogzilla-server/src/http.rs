@@ -3230,31 +3230,28 @@ fn expand_stac_asset_bidx(
                 pq.bidx.clear();
             }
             // Band math over the bands chosen reads them in their order: `bN` is the Nth
-            // chosen (an asset's name, written for its own band, is left to it).
-            (None, Some(sel)) if pq.bidx.is_empty() => match pq.expr_raw.as_deref() {
-                Some(expr) if !named => {
-                    let mut beyond = None;
-                    let parts: Vec<String> = expression_parts(expr)
-                        .map(|part| {
-                            substitute_band_tokens(part, |k| match sel.get(k.wrapping_sub(1)) {
-                                Some(b) => Some(format!("b{b}")),
-                                None => {
-                                    beyond.get_or_insert(k);
-                                    None
-                                }
-                            })
-                        })
-                        .collect();
-                    if let Some(k) = beyond {
-                        return Err(EngineError::BadRequest(format!(
-                            "band {k} out of range for asset '{}' ({} bands chosen)",
-                            names[0],
-                            sel.len()
-                        )));
-                    }
-                    pq.expr_raw = Some(parts.join(";"));
+            // chosen, whatever top-level `bidx` came with it. On `/stac` the asset's name, read
+            // first and whole, is the first band chosen and `{asset}_b{k}` its band `k`.
+            (None, Some(sel)) => match original.as_deref() {
+                Some(expr) if pq.expr_raw.is_some() => {
+                    let read = if read_names { names } else { &[] };
+                    let remapped = crate::stac::rewrite_stac_expr_with(
+                        expr,
+                        read,
+                        |_, _, band| Ok(band.unwrap_or_else(|| sel.first().map_or(1, |&b| usize::from(b)))),
+                        |k| match sel.get(k.wrapping_sub(1)) {
+                            Some(&b) => Ok(Some(usize::from(b))),
+                            None => Err(EngineError::BadRequest(format!(
+                                "band {k} out of range for asset '{}' ({} bands chosen)",
+                                names[0],
+                                sel.len()
+                            ))),
+                        },
+                    )?;
+                    pq.expr_raw = Some(remapped);
                 }
-                _ => pq.bidx = sel.clone(),
+                _ if pq.bidx.is_empty() => pq.bidx = sel.clone(),
+                _ => {}
             },
             _ => {}
         }
