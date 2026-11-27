@@ -63,7 +63,6 @@ deadpool-postgres = "0.14"
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.release]
 opt-level = 3

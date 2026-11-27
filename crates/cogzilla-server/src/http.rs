@@ -3762,8 +3762,9 @@ fn build_tile_request_for_tms(
     if !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64) {
         match bands {
             BandRequest::MultiBand { ref bands_1based }
-                if !u16_png
-                    && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
+                if !(u16_png
+                    || pq.pixel_selection.by_last_band()
+                        && matches!(bands_1based.len(), 2 | 4)) =>
             {
                 return Err(EngineError::BadRequest(
                     "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"

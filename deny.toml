@@ -1,0 +1,39 @@
+# cargo-deny configuration for RustSec advisory, license, and supply-chain checks.
+# Run locally with: `cargo deny check`
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail CI on known RustSec security vulnerabilities; warn on yanked crates.
+yanked = "warn"
+ignore = []
+
+[licenses]
+# Permissive SPDX licenses permitted across workspace dependencies.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "IJG",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn on transitive semver duplicates; internal workspace crates use path-only
+# dependencies without `publish = false`, so `allow-wildcard-paths` does not apply.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
