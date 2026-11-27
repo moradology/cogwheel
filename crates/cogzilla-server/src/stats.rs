@@ -5128,7 +5128,7 @@ async fn render_bbox_core(
                 }
                 BandRequest::Terrain {
                     band_1based,
-                    encoding,
+                    algorithm,
                 } => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
@@ -5141,7 +5141,7 @@ async fn render_bbox_core(
                             g_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                             b_plane.extend_from_slice(&f32::NAN.to_le_bytes());
                         } else {
-                            let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*encoding, elev);
+                            let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*algorithm, elev);
                             out.put_slice(&(r as f32).to_le_bytes());
                             g_plane.extend_from_slice(&(g as f32).to_le_bytes());
                             b_plane.extend_from_slice(&(b as f32).to_le_bytes());
@@ -5509,7 +5509,7 @@ async fn render_bbox_core(
                 }),
                 BandRequest::Terrain {
                     band_1based,
-                    encoding,
+                    algorithm,
                 } if custom_lut.is_none() && color_formula.is_none() => {
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
@@ -5521,7 +5521,7 @@ async fn render_bbox_core(
                             ifd_idx,
                             band0: b0,
                             src: &src,
-                            encoding: *encoding,
+                            algorithm: *algorithm,
                         },
                         &crate::gpu_backend::GpuBboxOutput::StyledTerrain {
                             resample,
@@ -5738,14 +5738,14 @@ async fn render_bbox_core(
             }
             BandRequest::Terrain {
                 band_1based,
-                encoding,
+                algorithm,
             } => {
                 let refs = get_band_refs(*band_1based, 0);
                 let src = make_src!(&refs);
                 coord_map.for_each_uv(w, h, |i, u, v| {
                     let val = sample(&src, u, v);
                     if !val.is_nan() {
-                        let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*encoding, val);
+                        let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*algorithm, val);
                         rgba[i * 4] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;

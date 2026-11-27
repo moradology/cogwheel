@@ -6,7 +6,7 @@ use bytes::Bytes;
 use cogzilla_io::{CogStore, IoError, OpenedCog};
 use cogzilla_kernel::{
     BandSource, ColormapName, DemAlgorithm, ExprProgram, OutputFormat, ResampleMode, RgbStyle,
-    SingleBandStyle, SpectralExpr, TerrainEncoding, empty_tile_bytes, encode_rgba_tile,
+    SingleBandStyle, SpectralExpr, empty_tile_bytes, encode_rgba_tile,
     render_bandmath1, render_bandmath2, render_bandmath3, render_dem_algorithm, render_expr_vm,
     render_rgb_bands, render_sar_rgb, render_single_band, render_terrain_tile,
 };
@@ -146,7 +146,7 @@ pub enum BandRequest {
     },
     Terrain {
         band_1based: u16,
-        encoding: TerrainEncoding,
+        algorithm: DemAlgorithm,
     },
     Dem {
         band_1based: u16,
@@ -1161,7 +1161,7 @@ impl TileEngine {
             }
             BandRequest::Terrain {
                 band_1based,
-                encoding,
+                algorithm,
             } => {
                 let band0 = band_1based.saturating_sub(1);
                 if band0 >= ifd.samples_per_pixel {
@@ -1219,7 +1219,7 @@ impl TileEngine {
                             ty0,
                             &plan,
                             &src,
-                            *encoding,
+                            *algorithm,
                             req.resample,
                             req.format,
                         )
@@ -1229,7 +1229,7 @@ impl TileEngine {
                         return Ok(bytes);
                     }
                 Ok(run_cpu_render(N, req.resample, || {
-                    render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
+                    render_terrain_tile::<N>(&plan, &src, *algorithm, req.resample, req.format)
                 }))
             }
             BandRequest::Dem {
@@ -2354,7 +2354,7 @@ impl TileEngine {
             }
             BandRequest::Terrain {
                 band_1based,
-                encoding,
+                algorithm,
             } => {
                 let src = make_src(*band_1based)?;
                 if let Some(gpu) = &self.gpu {
@@ -2368,7 +2368,7 @@ impl TileEngine {
                             ty0,
                             &plan,
                             &src,
-                            *encoding,
+                            *algorithm,
                             req.resample,
                             req.format,
                         )
@@ -2379,7 +2379,7 @@ impl TileEngine {
                     }
                 }
                 Ok(run_cpu_render(N, req.resample, || {
-                    render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
+                    render_terrain_tile::<N>(&plan, &src, *algorithm, req.resample, req.format)
                 }))
             }
             BandRequest::Dem {
@@ -3677,7 +3677,7 @@ mod tests {
         assert_eq!(
             TileEngine::value_bands(&BandRequest::Terrain {
                 band_1based: 1,
-                encoding: cogzilla_kernel::TerrainEncoding::Terrarium,
+                algorithm: cogzilla_kernel::DemAlgorithm::Terrarium,
             }),
             3
         );

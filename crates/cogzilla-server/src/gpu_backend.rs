@@ -27,7 +27,7 @@ use cogzilla_kernel::png_fast::{
 };
 use cogzilla_kernel::{
     BandSource, ColorFormula, ColormapName, CustomColormap, DemAlgorithm, ExprProgram,
-    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr, TerrainEncoding,
+    OutputFormat, ResampleMode, RgbStyle, SingleBandStyle, SpectralExpr,
     encode_rgba_tile,
 };
 use cogzilla_proj::CoordPlan;
@@ -600,7 +600,7 @@ pub enum GpuBboxBands<'a> {
         ifd_idx: usize,
         band0: u16,
         src: &'a BandSource<'a>,
-        encoding: TerrainEncoding,
+        algorithm: DemAlgorithm,
     },
     Spectral {
         cache_key: Option<MultiBandSlabKey>,
@@ -1478,7 +1478,7 @@ impl GpuBackend {
                     ifd_idx,
                     band0,
                     src,
-                    encoding,
+                    algorithm,
                 },
                 GpuBboxOutput::StyledTerrain {
                     resample,
@@ -1492,7 +1492,7 @@ impl GpuBackend {
                     *band0,
                     coords,
                     src,
-                    *encoding,
+                    *algorithm,
                     *resample,
                     *format,
                     *return_mask,
@@ -1817,14 +1817,14 @@ impl GpuBackend {
         band0: u16,
         coords: BboxCoordSource<'_>,
         src: &BandSource<'_>,
-        encoding: TerrainEncoding,
+        algorithm: DemAlgorithm,
         resample: ResampleMode,
         format: OutputFormat,
         active: usize,
     ) -> Option<(CoalescedJob, usize, usize)> {
         let gpu_mode = map_resample_on(resample, &coords)?;
-        let gpu_alg = if encoding.is_terrain_rgb_encoding() {
-            encoding
+        let gpu_alg = if algorithm.is_terrain_rgb_encoding() {
+            algorithm
         } else {
             return None;
         };
@@ -1879,14 +1879,14 @@ impl GpuBackend {
         band0: u16,
         coords: BboxCoordSource<'_>,
         src: &BandSource<'_>,
-        encoding: TerrainEncoding,
+        algorithm: DemAlgorithm,
         resample: ResampleMode,
         format: OutputFormat,
         return_mask: bool,
     ) -> Option<Bytes> {
         let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
-            cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
+            cog_id, ifd_idx, band0, coords, src, algorithm, resample, format, active,
         )?;
         self.submit_rgba(job, dst_w, dst_h, format, return_mask)
     }
@@ -1961,14 +1961,14 @@ impl GpuBackend {
         _ty0: u32,
         plan: &CoordPlan<N>,
         src: &BandSource<'_>,
-        encoding: TerrainEncoding,
+        algorithm: DemAlgorithm,
         resample: ResampleMode,
         format: OutputFormat,
     ) -> Option<Bytes> {
         let coords = BboxCoordSource::from_coord_plan(plan);
         let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
-            cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
+            cog_id, ifd_idx, band0, coords, src, algorithm, resample, format, active,
         )?;
         self.submit_rgba_async(job, dst_w, dst_h, format, true).await
     }

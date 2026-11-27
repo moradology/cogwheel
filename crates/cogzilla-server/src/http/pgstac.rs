@@ -7593,7 +7593,7 @@ mod tests {
         let count = Selected { bands: 1, values: vec![0.0, 255.0] };
         assert_eq!(rgb.rgba(&count, 2), [0, 0, 0, 255, 255, 255, 255, 255]);
 
-        let terrain = BandRequest::Terrain { band_1based: 1, encoding: cogzilla_kernel::TerrainEncoding::Terrarium };
+        let terrain = BandRequest::Terrain { band_1based: 1, algorithm: cogzilla_kernel::DemAlgorithm::Terrarium };
         assert!(Paint::of(&terrain).is_none());
     }
 
