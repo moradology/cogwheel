@@ -5943,6 +5943,11 @@ where
                 pgstac::ItemRoute::Stac(item, extent) => {
                     pgstac_item = Some(item);
                     pgstac_item_extent = extent;
+                    // An item is one image: titiler-pgstac's item routes have no
+                    // `pixel_selection`, and pass over any value of it.
+                    pq.keys.retain(|k| k != "pixel_selection");
+                    pq.errors.retain(|e| !e.starts_with("unsupported pixel_selection"));
+                    pq.pixel_selection = Selection::First;
                     // Band math on an item's point is applied to the `/stac` answer by
                     // `pgstac::item_fixup`, with TiTiler's names: `/stac` must not apply it first.
                     // An expression is over every band read, so the request's `bidx` does

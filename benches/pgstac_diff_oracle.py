@@ -727,6 +727,8 @@ def main() -> int:
         o.check("tileset list", "tilesets", f"/searches/{sid}/tiles")
         o.check("tileset list keeps the query", "tilesets", f"/searches/{sid_meta}/tiles?assets=visual&rescale=0,255")
         o.check("tileset list as a page", "page", f"/searches/{sid}/tiles?assets=visual&f=html")
+        o.check("tileset list in another format", "json", f"/searches/{sid}/tiles?f=png")
+        o.check("tileset in another format", "json", f"/searches/{sid}/tiles/WebMercatorQuad?assets=visual&f=npy")
         o.check("tileset as a page", "page", f"/searches/{sid}/tiles/WebMercatorQuad?assets=visual&f=html")
         o.check("tileset", "json", f"/searches/{sid}/tiles/WebMercatorQuad")
         o.check("tileset from search metadata", "json", f"/searches/{sid_meta}/tiles/WebMercatorQuad?assets=visual")
@@ -1412,6 +1414,7 @@ def main() -> int:
         o.check("item renders", "json", f"{it}/renders")
         o.check("item tileset list", "tilesets", f"{it}/tiles?assets=visual")
         o.check("item tileset list as a page", "page", f"{it}/tiles?assets=visual&f=html")
+        o.check("item tileset list in another format", "json", f"{it}/tiles?f=png")
         o.check("item tileset as a page", "page", f"{it}/tiles/WebMercatorQuad?assets=visual&f=html")
         o.check("item tileset", "json", f"{it}/tiles/WebMercatorQuad?assets=visual")
         o.check("item map viewer", "status", f"{it}/WebMercatorQuad/map.html?assets=visual")
@@ -1454,6 +1457,10 @@ def main() -> int:
                 known="a preview is read on the raster's own grid, which only the /stac routes do, and they do no band math on one asset; cogzilla answers 400")
         o.check("item point", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=visual")
         o.check("item point, two assets", "json", f"{it}/point/{ilon:.4f},{ilat:.4f}?assets=red&assets=nir")
+        o.check("item point, spaces around the numbers", "json", f"{it}/point/{ilon:.4f}%20,%20{ilat:.4f}?assets=red")
+        # An item is one image: its routes have no pixel_selection and pass over any value of it.
+        o.check("item tile, a pixel_selection", "status", f"{itile}.png?assets=visual&pixel_selection=mean")
+        o.check("item tile, a pixel_selection nobody has", "status", f"{itile}.png?assets=visual&pixel_selection=bogus")
         o.check("item point outside the item", "status", f"{it}/point/0,0?assets=visual",
                 known="titiler-pgstac answers 500 for a point outside the item; cogzilla answers 404")
         o.check("item statistics", "stats", f"{it}/statistics?assets=visual&max_size=128")
