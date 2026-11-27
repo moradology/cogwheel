@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod aimd;
+pub mod algorithms;
 pub mod catalog;
 pub mod engine;
 #[cfg(feature = "gpu")]
