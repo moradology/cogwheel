@@ -286,6 +286,10 @@ struct ParsedQuery {
     assets: Vec<String>,
     asset_bidx: Vec<(String, Vec<u16>)>,
     asset_exprs: Vec<(String, String)>,
+    /// The assets' own band math as it was folded into `expr_raw`, for typing an array as
+    /// numpy types it: the results of the assets stacked, `;` apart, and the request
+    /// expression over them. `None` when nothing was folded.
+    asset_math_stages: Option<(String, String)>,
     asset_as_band: bool,
     bidx: Vec<u16>,
     rescale: Vec<(f32, f32)>,
@@ -381,6 +385,7 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
         assets: Vec::new(),
         asset_bidx: Vec::new(),
         asset_exprs: Vec::new(),
+        asset_math_stages: None,
         asset_as_band: false,
         bidx: Vec::new(),
         rescale: Vec::new(),
@@ -2510,8 +2515,9 @@ fn array_in_its_type_rounded(
 #[derive(Clone)]
 enum ArrayAsked {
     /// The values in their type: the rule, the assets asked for (none on `/cog`), the band
-    /// math, and whether a mask was asked for.
-    Typed(array_type::ArrayRule, Vec<String>, Option<String>, bool),
+    /// math, whether a mask was asked for, and the assets' own band math and the request
+    /// expression over it, typed one after the other (`ParsedQuery::asset_math_stages`).
+    Typed(array_type::ArrayRule, Vec<String>, Option<String>, bool, Option<(String, String)>),
     /// The picture's bytes, for a `.npy` asked with a rescale, a colour map or a colour
     /// formula: the request, which says how they are painted.
     Shown(Box<ParsedQuery>),
@@ -2520,7 +2526,7 @@ enum ArrayAsked {
 /// What decides the array of a request whose path ends in `last`.
 fn array_asked(pq: &ParsedQuery, last: Option<&&str>) -> Option<ArrayAsked> {
     if let Some(rule) = array_type::ArrayRule::of(pq) {
-        return Some(ArrayAsked::Typed(rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask));
+        return Some(ArrayAsked::Typed(rule, pq.assets.clone(), pq.expr_raw.clone(), pq.return_mask, pq.asset_math_stages.clone()));
     }
     let npy = last.is_some_and(|last| last.ends_with(".npy")) || pq.format_param.as_deref() == Some("npy");
     let shown = npy && array_type::shown(pq);
@@ -2636,10 +2642,25 @@ fn apply_array_asked(
         return data;
     }
     match asked {
-        ArrayAsked::Typed(rule, _, expression, mask) => {
+        ArrayAsked::Typed(rule, _, expression, mask, stages) => {
             let reads: Vec<_> = cogs.iter().map(|cog| cog.index.full_res().sample_type).collect();
-            let expr = expression_override.or(expression.as_deref());
-            let kind = rule.kind(&reads, expr);
+            let kind = match &stages {
+                // numpy stacks the assets' results in one array, of the widest of their
+                // types, before the request expression is worked out over it.
+                // Whole arithmetic over a stack of numexpr's `int` keeps it, which a raster of
+                // int32 does not (`band_math_type`).
+                Some((results, request)) => rule.kind(&reads, Some(results)).map(|stacked| {
+                    use cogzilla_tiff::SampleType;
+                    let request: Vec<String> = request.split(';').map(str::to_string).collect();
+                    let whole = array_type::band_math_type(request.iter(), SampleType::Uint16) == SampleType::Int32;
+                    if stacked == SampleType::Int32 && whole {
+                        SampleType::Int32
+                    } else {
+                        array_type::band_math_type(request.iter(), stacked)
+                    }
+                }),
+                None => rule.kind(&reads, expression_override.or(expression.as_deref())),
+            };
             let rounding = kind.and_then(|kind| rule.rounding(kind));
             array_in_its_type_rounded(data, kind, mask, rounding)
         }
@@ -2680,7 +2701,7 @@ async fn stac_array_in_its_type(
         return data;
     };
     let (assets, expression) = match &asked {
-        ArrayAsked::Typed(_, assets, expression, _) => (assets.clone(), expression.clone()),
+        ArrayAsked::Typed(_, assets, expression, _, _) => (assets.clone(), expression.clone()),
         ArrayAsked::Shown(pq) => (pq.assets.clone(), pq.expr_raw.clone()),
     };
     let Ok((_, cogs, expression)) =
@@ -2704,7 +2725,7 @@ async fn mosaic_array_in_its_type(
     let Some(asked) = asked.filter(|_| may_be_f32_array(&data)) else {
         return data;
     };
-    if let ArrayAsked::Typed(_, _, _, mask) = &asked {
+    if let ArrayAsked::Typed(_, _, _, mask, _) = &asked {
         match selection {
             pixel_selection::Selection::Stdev => {
                 return array_in_its_type(data, Some(cogzilla_tiff::SampleType::Float32), *mask);
@@ -6649,6 +6670,7 @@ where
                         Err(message) => return Ok(pgstac::bad_request(message)),
                         Ok(Some((expression, _))) => {
                             item_asset_math = true;
+                            pq.asset_math_stages = pgstac::item_asset_math_stages(rest, &pgstac::query_pairs(&raw_query));
                             if let Some(names) = pgstac::asset_entry_names(&raw_query) {
                                 pq.assets = names;
                             }
