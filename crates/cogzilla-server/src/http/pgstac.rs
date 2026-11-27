@@ -4142,6 +4142,145 @@ fn stats_options(pairs: &[(String, String)]) -> Result<(StatsOptions, usize), Re
 }
 
 /// What one feature's statistics need besides the feature.
+/// One of rio-tiler's algorithms (titiler's `titiler.core.algorithm`) as it is applied to a
+/// mosaic's bands for statistics, a pixel without a value being NaN in every band. Across the
+/// bands, as numpy's masked arrays work them: `min`, `max`, `sum`, `mean`, `median`, and
+/// `std` and `var` with one degree of freedom less, over the values a pixel has.
+#[derive(Clone, Debug, PartialEq)]
+enum BandAlgorithm {
+    Min,
+    Max,
+    Sum,
+    Mean,
+    Median,
+    Std,
+    Var,
+    /// ITU-R 601-2 luma of the first three bands, in the bands' own type.
+    Grayscale,
+    /// 255 where the luma (or the one band) is above 127, else 0; titiler takes no threshold.
+    Bitonal,
+    /// To bytes, the way numpy's `astype("uint8")` wraps: after `ceil` or `floor`, or as they are.
+    Cast,
+    Ceil,
+    Floor,
+    /// Mapzen's Terrarium encoding of the first band.
+    Terrarium,
+    /// Mapbox's Terrain-RGB encoding of the first band.
+    TerrainRgb { interval: f64, baseval: f64 },
+}
+
+impl BandAlgorithm {
+    fn parse(name: &str, params: Option<&str>) -> Option<Self> {
+        let params: Value = params.and_then(|p| serde_json::from_str(p).ok()).unwrap_or(Value::Null);
+        let number = |key: &str, default: f64| params.get(key).and_then(Value::as_f64).unwrap_or(default);
+        Some(match name {
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "sum" => Self::Sum,
+            "mean" => Self::Mean,
+            "median" => Self::Median,
+            "std" => Self::Std,
+            "var" => Self::Var,
+            "grayscale" => Self::Grayscale,
+            "bitonal" => Self::Bitonal,
+            "cast" => Self::Cast,
+            "ceil" => Self::Ceil,
+            "floor" => Self::Floor,
+            "terrarium" => Self::Terrarium,
+            "terrainrgb" => Self::TerrainRgb { interval: number("interval", 0.1), baseval: number("baseval", -10000.0) },
+            _ => return None,
+        })
+    }
+
+    /// The bands after the algorithm, and their descriptions. `whole` says the bands hold
+    /// their rasters' whole numbers, which `grayscale` brings its result back to.
+    fn apply(&self, bands: Vec<Vec<f64>>, whole: bool) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
+        let n = bands.len();
+        let len = bands.first().map_or(0, Vec::len);
+        let across = |f: &dyn Fn(&mut Vec<f64>) -> f64| -> Vec<f64> {
+            let mut values = Vec::with_capacity(n);
+            (0..len)
+                .map(|i| {
+                    values.clear();
+                    values.extend(bands.iter().map(|b| b[i]).filter(|v| !v.is_nan()));
+                    if values.is_empty() { f64::NAN } else { f(&mut values) }
+                })
+                .collect()
+        };
+        let one = |plane: Vec<f64>, name: &str| Ok((vec![plane], vec![name.to_string()]));
+        let byte = |v: f64| if v.is_nan() { v } else { (v.trunc() as i64).rem_euclid(256) as f64 };
+        // numpy: `a[0] * 299 / 1000 + a[1] * 587 / 1000 + a[2] * 114 / 1000`.
+        let luma = |i: usize| bands[0][i] * 299.0 / 1000.0 + bands[1][i] * 587.0 / 1000.0 + bands[2][i] * 114.0 / 1000.0;
+        match self {
+            Self::Min => one(across(&|v| v.iter().copied().fold(f64::INFINITY, f64::min)), "min"),
+            Self::Max => one(across(&|v| v.iter().copied().fold(f64::NEG_INFINITY, f64::max)), "max"),
+            Self::Sum => one(across(&|v| v.iter().sum()), "sum"),
+            Self::Mean => one(across(&|v| v.iter().sum::<f64>() / v.len() as f64), "mean"),
+            Self::Median => one(
+                across(&|v| {
+                    v.sort_by(f64::total_cmp);
+                    let m = v.len() / 2;
+                    if v.len() % 2 == 1 { v[m] } else { (v[m - 1] + v[m]) / 2.0 }
+                }),
+                "median",
+            ),
+            Self::Std | Self::Var => {
+                let var = across(&|v| {
+                    if v.len() < 2 {
+                        return f64::NAN;
+                    }
+                    let mean = v.iter().sum::<f64>() / v.len() as f64;
+                    v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (v.len() - 1) as f64
+                });
+                match self {
+                    Self::Std => one(var.into_iter().map(f64::sqrt).collect(), "std"),
+                    _ => one(var, "var"),
+                }
+            }
+            Self::Grayscale => {
+                if n < 3 {
+                    return Err(format!("Cannot apply `grayscale` algorithm on image with {n} bands."));
+                }
+                one((0..len).map(|i| if whole { luma(i).trunc() } else { luma(i) }).collect(), "grayscale")
+            }
+            Self::Bitonal => {
+                let source: Vec<f64> = match n {
+                    3 => (0..len).map(luma).collect(),
+                    1 => bands[0].clone(),
+                    _ => return Err(format!("Cannot apply `bitonal` algorithm on image with {n} bands.")),
+                };
+                one(source.into_iter().map(|v| if v.is_nan() { v } else if v > 127.0 { 255.0 } else { 0.0 }).collect(), "bitonal")
+            }
+            Self::Cast | Self::Ceil | Self::Floor => {
+                let round = |v: f64| match self {
+                    Self::Ceil => v.ceil(),
+                    Self::Floor => v.floor(),
+                    _ => v,
+                };
+                let out = bands.into_iter().map(|b| b.into_iter().map(|v| byte(round(v))).collect()).collect();
+                Ok((out, Vec::new()))
+            }
+            Self::Terrarium => {
+                let data: Vec<f64> = bands[0].iter().map(|v| (v + 32768.0).clamp(0.0, 65535.0)).collect();
+                let r = data.iter().map(|d| byte(d / 256.0)).collect();
+                let g = data.iter().map(|d| byte(d % 256.0)).collect();
+                let b = data.iter().map(|d| byte((d * 256.0) % 256.0)).collect();
+                Ok((vec![r, g, b], ["terranium_r", "terranium_g", "terranium_b"].map(String::from).to_vec()))
+            }
+            Self::TerrainRgb { interval, baseval } => {
+                // numpy's `around` rounds half to even.
+                let data: Vec<f64> = bands[0].iter().map(|v| ((v - baseval) / interval).round_ties_even()).collect();
+                let (lo, hi) = data.iter().filter(|v| !v.is_nan()).fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), v| (l.min(*v), h.max(*v)));
+                if hi - lo > 256f64.powi(3) {
+                    return Err(format!("Data of {} larger than 256 ** 3", hi - lo));
+                }
+                let part = |shift: u32| data.iter().map(|d| if d.is_nan() { *d } else { f64::from(((*d as i32) >> shift) & 0xFF) }).collect();
+                Ok((vec![part(16), part(8), part(0)], ["terrain_r", "terrain_g", "terrain_b"].map(String::from).to_vec()))
+            }
+        }
+    }
+}
+
 struct StatsRequest<'a> {
     query: MosaicQuery,
     size: PartSize,
@@ -4155,6 +4294,8 @@ struct StatsRequest<'a> {
     mercator: bool,
     /// Whether the band math is `normalizedIndex`'s, whose values rio-tiler gives as float32.
     single: bool,
+    /// An algorithm applied to the mosaic's bands before they are counted.
+    algorithm: Option<BandAlgorithm>,
 }
 
 /// The statistics of one feature and the items they were read from, or `None` when the
@@ -4206,6 +4347,8 @@ async fn feature_statistics(
         let mut descriptions: Vec<String> = Vec::new();
         let mut program: Option<Program> = None;
         let mut program_bands = 0;
+        // Whether the mosaic holds its rasters' own whole numbers, which an algorithm keeps.
+        let mut whole = false;
         let mut used: Vec<String> = Vec::new();
         let (mut width, mut height, mut bounds) = (0usize, 0usize, bbox);
         // With a pixel selection other than `first`, every scene's bands go through this
@@ -4300,6 +4443,9 @@ async fn feature_statistics(
                     )));
                 }
                 canvas = vec![vec![f64::NAN; width * height]; descriptions.len()];
+                whole = !req.unscale
+                    && assets.iter().all(|a| a.expression.is_none())
+                    && !matches!(cogs[0].index.full_res().sample_type, SampleType::Float32 | SampleType::Float64);
                 if let Some(method) = req.query.selection {
                     // The last band decides and is left out: alone, it would leave nothing.
                     if method.by_last_band() && canvas.len() < 2 {
@@ -4381,6 +4527,17 @@ async fn feature_statistics(
             // `count` leaves one band, described as the first.
             canvas = selected.values.chunks(width * height).map(<[f64]>::to_vec).collect();
             descriptions.truncate(selected.bands);
+        }
+        if let Some(algorithm) = &req.algorithm {
+            // Band math over whole numbers that leaves whole numbers (numexpr's integer
+            // arithmetic) keeps the raster's type, which `grayscale` comes back to.
+            let whole = whole && (program.is_none() || canvas.iter().flatten().all(|v| v.is_nan() || v.fract() == 0.0));
+            let (bands, described) = algorithm.apply(canvas, whole).map_err(EngineError::BadRequest)?;
+            canvas = bands;
+            // `cast`, `ceil` and `floor` keep the bands' own descriptions.
+            if !described.is_empty() {
+                descriptions = described;
+            }
         }
 
         // The polygon on the image's grid: once for the mask, once finer for the coverage.
@@ -4482,13 +4639,24 @@ async fn mosaic_statistics(
         Err(r) => return r,
     };
     // `normalizedIndex` is rio-tiler's band math of the first two bands, written as it
-    // describes it; the other algorithms are not worked out on statistics yet.
+    // describes it; the other algorithms are applied to the mosaic's bands
+    // (`BandAlgorithm`), as titiler-pgstac's `post_process` applies them.
+    let mut algorithm = None;
     let index_math = match query_value(pairs, "algorithm").map(str::to_ascii_lowercase).as_deref() {
         None => None,
         Some("normalizedindex") if query_value(pairs, "expression").is_none() => Some("(b2 - b1) / (b2 + b1)"),
-        Some(_) => {
-            return detail(StatusCode::BAD_REQUEST, "parameter 'algorithm' is not supported on statistics routes yet, but for normalizedIndex without `expression`");
-        }
+        Some(name) => match BandAlgorithm::parse(name, query_value(pairs, "algorithm_params")) {
+            Some(a) => {
+                algorithm = Some(a);
+                None
+            }
+            None => {
+                return detail(
+                    StatusCode::BAD_REQUEST,
+                    format!("algorithm '{name}' is not supported on statistics routes yet (hillshade, slope, contours and normalizedIndex with `expression` are not)"),
+                );
+            }
+        },
     };
     let size = match part_size_from_query(pairs) {
         Ok(s) => s,
@@ -4518,6 +4686,7 @@ async fn mosaic_statistics(
         cover_scale,
         expression: index_math.or_else(|| query_value(pairs, "expression")),
         single: index_math.is_some(),
+        algorithm,
         unscale: pq.unscale,
         nodata: pq.nodata,
         mercator,
@@ -8019,6 +8188,40 @@ mod tests {
             let (algorithm, _, _) = asked(query, ext);
             assert!(algorithm.is_some(), "{query}");
         }
+    }
+
+    #[test]
+    fn algorithms_on_a_mosaic_s_bands() {
+        let nan = f64::NAN;
+        let bands = vec![vec![1.0, 10.0, nan], vec![2.0, nan, nan], vec![4.0, 20.0, nan]];
+        let run = |a: BandAlgorithm, whole| a.apply(bands.clone(), whole).unwrap();
+        let first = |a: BandAlgorithm| run(a, true).0.remove(0);
+        assert_eq!(first(BandAlgorithm::Min)[..2], [1.0, 10.0]);
+        assert_eq!(first(BandAlgorithm::Sum)[..2], [7.0, 30.0]);
+        assert_eq!(first(BandAlgorithm::Mean)[..2], [7.0 / 3.0, 15.0]);
+        // numpy's median of an even count is the mean of the two in the middle.
+        assert_eq!(first(BandAlgorithm::Median)[..2], [2.0, 15.0]);
+        // One degree of freedom less: 1, 2, 4 about 7/3.
+        let var = first(BandAlgorithm::Var);
+        assert!((var[0] - 7.0 / 3.0).abs() < 1e-12 && (var[1] - 50.0).abs() < 1e-12);
+        assert!(first(BandAlgorithm::Std)[2].is_nan());
+        // Luma, in the bands' own type: 0.299 + 1.174 + 0.456.
+        assert_eq!(first(BandAlgorithm::Grayscale)[0], 1.0);
+        assert!((run(BandAlgorithm::Grayscale, false).0[0][0] - 1.929).abs() < 1e-12);
+        assert!(BandAlgorithm::Grayscale.apply(vec![vec![1.0]], true).is_err());
+        assert_eq!(BandAlgorithm::Bitonal.apply(vec![vec![127.0, 128.0, nan]], true).unwrap().0[0][..2], [0.0, 255.0]);
+        // To bytes as `astype("uint8")` wraps, keeping the bands' descriptions.
+        let (cast, described) = BandAlgorithm::Cast.apply(vec![vec![300.0, -1.0, 255.9]], true).unwrap();
+        assert_eq!((cast[0].as_slice(), described.len()), (&[44.0, 255.0, 255.0][..], 0));
+        assert_eq!(BandAlgorithm::Ceil.apply(vec![vec![255.5]], false).unwrap().0[0], [0.0]);
+        // Terrain-RGB of 100 m: (100 + 10000) / 0.1 = 101000 = 0x018A88.
+        let (rgb, names) = BandAlgorithm::TerrainRgb { interval: 0.1, baseval: -10000.0 }.apply(vec![vec![100.0]], true).unwrap();
+        assert_eq!(rgb, [vec![1.0], vec![138.0], vec![136.0]]);
+        assert_eq!(names, ["terrain_r", "terrain_g", "terrain_b"]);
+        // Terrarium of 100 m: 32868 = 128 * 256 + 100.
+        assert_eq!(BandAlgorithm::Terrarium.apply(vec![vec![100.0]], true).unwrap().0, [vec![128.0], vec![100.0], vec![0.0]]);
+        assert_eq!(BandAlgorithm::parse("hillshade", None), None);
+        assert_eq!(BandAlgorithm::parse("terrainrgb", Some(r#"{"interval":1}"#)), Some(BandAlgorithm::TerrainRgb { interval: 1.0, baseval: -10000.0 }));
     }
 
     #[test]
