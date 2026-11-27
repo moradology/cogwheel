@@ -59,72 +59,19 @@ impl GpuTileBatcher {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-batch-tile-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/batch_tile.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::BATCH_TILE_WGSL.into()),
         });
 
+        use crate::wgpu_util::{bgl_storage_ro, bgl_storage_rw, bgl_uniform};
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cogzilla-batch-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                bgl_uniform(0),
+                bgl_storage_ro(1),
+                bgl_storage_ro(2),
+                bgl_storage_ro(3),
+                bgl_storage_ro(4),
+                bgl_storage_rw(5),
             ],
         });
 
@@ -432,8 +379,7 @@ impl GpuTileBatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::colormap::GpuColormapRenderer;
-    use crate::resample::GpuResampler;
+    use crate::colormap::pack_rgb_lut;
     use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
     use cogzilla_kernel::{BandSource, ColormapName, sample_cubic};
 
@@ -446,7 +392,6 @@ mod tests {
                 return;
             }
         };
-        let resampler = GpuResampler::new(&ctx);
         let mut batcher = GpuTileBatcher::new(&ctx);
 
         let src_w = 1024u32;
@@ -478,7 +423,7 @@ mod tests {
         };
         let blocks = [Some(&band)];
         let bs = BandSource::new(src_w, src_h, src_w, src_h, 0, 0, 1, 1, &blocks);
-        let gpu_slab = resampler.upload_slab(&src, src_w, src_h, src_w).unwrap();
+        let gpu_slab = GpuSlab::upload(&ctx.device, &src, src_w, src_h, src_w).unwrap();
 
         let tile_n = 256usize;
         let mut u_vecs = Vec::with_capacity(16);
@@ -501,7 +446,7 @@ mod tests {
             .collect();
 
         let lut = ColormapName::Viridis.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
         let rmin = 500.0f32;
         let rmax = 1500.0f32;
         let inv254 = 254.0 / (rmax - rmin);

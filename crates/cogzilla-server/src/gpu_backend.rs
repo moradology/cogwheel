@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use cogzilla_gpu::{
     CoalescedJob, CoalescedOutput, DispatchPolicy, DispatchRequest, GpuBandStats, GpuCoalescer,
-    GpuColorFormula, GpuColormapMode, GpuColormapRenderer, GpuContext, GpuDemAlgorithm,
-    GpuInstr, GpuJpegEncoder, GpuMosaicCompositor, GpuMultiBandCache, GpuOp,
-    GpuPixelOutput, GpuPixelSelection, GpuResampler, GpuSlab, GpuSlabCache, GpuStatsReducer,
-    GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
+    GpuColorFormula, GpuColormapMode, GpuContext, GpuDemAlgorithm, GpuInstr, GpuJpegEncoder,
+    GpuMosaicCompositor, GpuMultiBandCache, GpuOp, GpuPixelOutput, GpuPixelSelection, GpuSlab,
+    GpuSlabCache, GpuStatsReducer, GpuTileBatcher, GpuWeightedBandStats, GpuWeightedStatsReducer,
     MultiBandSlabKey, OwnedCoordPlan, PolicyOverride, SlabKey, TileCoordSlice, opcodes,
+    pack_rgb_lut,
 };
 use cogzilla_kernel::expr_vm::Op;
 use cogzilla_kernel::png_fast::{encode_indexed_png, filter_sub_u8_row};
@@ -54,7 +54,28 @@ pub enum BboxCoordSource<'a> {
     },
 }
 
-impl BboxCoordSource<'_> {
+impl<'a> BboxCoordSource<'a> {
+    fn from_coord_plan<const N: usize>(plan: &'a CoordPlan<N>) -> Self {
+        match plan {
+            CoordPlan::Separable1D { u, v, .. } => Self::Separable {
+                u: u.as_slice(),
+                v: v.as_slice(),
+            },
+            CoordPlan::Grid2D { grid_u, grid_v, .. } => Self::Grid2D {
+                dst_w: N,
+                dst_h: N,
+                grid_u,
+                grid_v,
+            },
+            CoordPlan::Exact2D { u, v, .. } => Self::Exact2D {
+                dst_w: N,
+                dst_h: N,
+                u_map: &u[..],
+                v_map: &v[..],
+            },
+        }
+    }
+
     fn dims_and_upload_bytes(&self) -> Option<(usize, usize, usize)> {
         match *self {
             Self::Separable { u, v } => Some((u.len(), v.len(), 0)),
@@ -102,7 +123,6 @@ pub struct GpuBackend {
     pub slab_cache: GpuSlabCache,
     pub multi_slab_cache: GpuMultiBandCache,
     pub coalescer: GpuCoalescer,
-    resampler: GpuResampler,
     mosaic: Mutex<GpuMosaicCompositor>,
     batcher: Mutex<GpuTileBatcher>,
     jpeg: Mutex<GpuJpegEncoder>,
@@ -132,6 +152,52 @@ fn map_resample(mode: ResampleMode) -> Option<GpuColormapMode> {
         ResampleMode::Bilinear => Some(GpuColormapMode::Bilinear),
         ResampleMode::Cubic => Some(GpuColormapMode::Cubic),
         ResampleMode::Lanczos => Some(GpuColormapMode::Lanczos3),
+        _ => None,
+    }
+}
+
+fn map_dem_algorithm(alg: DemAlgorithm) -> Option<GpuDemAlgorithm> {
+    match alg {
+        DemAlgorithm::Hillshade {
+            azimuth_deg,
+            altitude_deg,
+            z_factor,
+        } => Some(GpuDemAlgorithm::Hillshade {
+            azimuth_deg,
+            altitude_deg,
+            z_factor,
+        }),
+        DemAlgorithm::Slope { z_factor } => Some(GpuDemAlgorithm::Slope { z_factor }),
+        DemAlgorithm::Aspect => Some(GpuDemAlgorithm::Aspect),
+        DemAlgorithm::Contours { .. } => None,
+    }
+}
+
+fn multiband_policy_op(mode: GpuColormapMode) -> GpuOp {
+    match mode {
+        GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
+        GpuColormapMode::Cubic => GpuOp::DemHornCubic,
+        GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
+    }
+}
+
+fn is_rgba_format(format: OutputFormat) -> bool {
+    matches!(
+        format,
+        OutputFormat::Png
+            | OutputFormat::Webp { .. }
+            | OutputFormat::Jpeg { .. }
+            | OutputFormat::RawRgba
+    )
+}
+
+fn styled_pixel_output(format: OutputFormat, return_mask: bool) -> Option<GpuPixelOutput> {
+    match format {
+        OutputFormat::Png if return_mask => Some(GpuPixelOutput::IndexedU8),
+        OutputFormat::Png
+        | OutputFormat::Webp { .. }
+        | OutputFormat::Jpeg { .. }
+        | OutputFormat::RawRgba => Some(GpuPixelOutput::Rgba8),
         _ => None,
     }
 }
@@ -188,7 +254,8 @@ pub fn stitch_band_source_into(src: &BandSource<'_>, w: u32, h: u32, out: &mut [
     let strip_elems = th * w_us;
     for (gy, strip) in out[..w_us * h_us].chunks_mut(strip_elems).enumerate() {
         if gy >= src.grid_h as usize {
-            break;
+            strip.fill(f32::NAN);
+            continue;
         }
         stitch_band_row_strip(src, w_us, gy, strip);
     }
@@ -206,7 +273,8 @@ pub fn stitch_band_source_into_parallel(src: &BandSource<'_>, w: u32, h: u32, ou
         std::thread::scope(|s| {
             for (gy, strip) in out[..w_us * h_us].chunks_mut(strip_elems).enumerate() {
                 if gy >= src.grid_h as usize {
-                    break;
+                    strip.fill(f32::NAN);
+                    continue;
                 }
                 s.spawn(move || {
                     stitch_band_row_strip(src, w_us, gy, strip);
@@ -427,7 +495,6 @@ impl GpuBackend {
             override_mode = ?policy.override_mode,
             "cogzilla GPU backend initialized"
         );
-        let resampler = GpuResampler::new(&ctx);
         let coalesce_us = if ctx.info.unified_memory { 400 } else { 250 };
         let coalescer = GpuCoalescer::new(&ctx, 32, coalesce_us);
         let mosaic = Mutex::new(GpuMosaicCompositor::new(&ctx));
@@ -441,7 +508,6 @@ impl GpuBackend {
             slab_cache: GpuSlabCache::new(slab_cache_bytes),
             multi_slab_cache: GpuMultiBandCache::new(slab_cache_bytes),
             coalescer,
-            resampler,
             mosaic,
             batcher,
             jpeg,
@@ -467,12 +533,11 @@ impl GpuBackend {
                     let width = stride as u32;
                     if let Some(k) = key {
                         self.slab_cache
-                            .get_or_upload(k, slice, width, height, stride as u32, &self.resampler)
+                            .get_or_upload(k, slice, width, height, stride as u32, &self.ctx.device)
                             .ok()?
                     } else {
                         Arc::new(
-                            self.resampler
-                                .upload_slab(slice, width, height, stride as u32)
+                            GpuSlab::upload(&self.ctx.device, slice, width, height, stride as u32)
                                 .ok()?,
                         )
                     }
@@ -510,6 +575,110 @@ impl GpuBackend {
         let w = (src.grid_w * src.tile_w) as usize;
         let h = (src.grid_h * src.tile_h) as usize;
         w.saturating_mul(h).saturating_mul(std::mem::size_of::<f32>())
+    }
+
+    #[inline]
+    fn enter_in_flight(&self) -> (usize, InFlightGuard<'_>) {
+        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        (active, InFlightGuard(&self.in_flight))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gate_and_resolve_single_band(
+        &self,
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        src: &BandSource<'_>,
+        op: GpuOp,
+        dst_pixels: usize,
+        coord_upload_bytes: usize,
+        readback_bytes: usize,
+        active: usize,
+    ) -> Option<(Arc<GpuSlab>, u32, u32)> {
+        let key = source_slab_key(cog_id, ifd_idx, band0, src);
+        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
+        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels,
+            upload_bytes,
+            readback_bytes,
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 32,
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+        self.resolve_source_slab(key, warm_slab, src)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gate_and_resolve_multiband(
+        &self,
+        cache_key: Option<MultiBandSlabKey>,
+        srcs: &[BandSource<'_>],
+        op: GpuOp,
+        dst_pixels: usize,
+        coord_upload_bytes: usize,
+        readback_bytes: usize,
+        active: usize,
+    ) -> Option<(Arc<cogzilla_gpu::GpuMultiBandSlab>, u32, u32)> {
+        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
+        let band_upload_bytes: usize = if warm_slab.is_some() {
+            0
+        } else {
+            srcs.iter()
+                .map(|s| Self::estimate_upload_bytes(&None, s))
+                .sum()
+        };
+        let decision = self.policy.decide(&DispatchRequest {
+            op,
+            dst_pixels,
+            upload_bytes: band_upload_bytes + coord_upload_bytes,
+            readback_bytes,
+            batch_size: active.min(32),
+            in_flight: (active - 1) / 32,
+        });
+        if !decision.use_gpu {
+            return None;
+        }
+        self.resolve_multiband_slab(cache_key, warm_slab, srcs)
+    }
+
+    #[inline]
+    fn fused_stats_min_pixels(&self) -> usize {
+        if self.ctx.info.unified_memory {
+            512 * 1024
+        } else {
+            512 * 512
+        }
+    }
+
+    fn submit_fused_stats(
+        &self,
+        inner: CoalescedJob,
+        total_pixels: usize,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &[f64],
+    ) -> Option<GpuBandStats> {
+        let raw = self
+            .coalescer
+            .submit(CoalescedJob::WithStats {
+                inner: Box::new(inner),
+                nodata: None,
+                num_bins,
+                hist_range,
+            })
+            .ok()?;
+        Some(cogzilla_gpu::decode_stats_readback(
+            &raw,
+            total_pixels,
+            num_bins,
+            hist_range,
+            percentiles,
+        ))
     }
 
     async fn submit_coalesced_async(&self, job: CoalescedJob) -> Option<Vec<u8>> {
@@ -618,36 +787,23 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let out_kind = match style.format {
-            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
-            OutputFormat::Png
-            | OutputFormat::Webp { .. }
-            | OutputFormat::Jpeg { .. }
-            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-            _ => return None,
-        };
-
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
+        let out_kind = styled_pixel_output(style.format, return_mask)?;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
         };
-        let decision = self.policy.decide(&DispatchRequest {
-            op: gpu_mode.to_policy_op(),
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
+        let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
+            cog_id,
+            ifd_idx,
+            band0,
+            src,
+            gpu_mode.to_policy_op(),
+            dst_w * dst_h,
+            coord_upload_bytes,
             readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
+            active,
+        )?;
+        let lut_u32 = pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Colormap {
@@ -996,8 +1152,7 @@ impl GpuBackend {
         rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
     ) -> Option<Bytes> {
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
             cog_id, ifd_idx, band0, coords, src, style, rgb_lut, return_mask, active,
         )?;
@@ -1058,32 +1213,8 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let gpu_alg = match alg {
-            DemAlgorithm::Hillshade {
-                azimuth_deg,
-                altitude_deg,
-                z_factor,
-            } => GpuDemAlgorithm::Hillshade {
-                azimuth_deg,
-                altitude_deg,
-                z_factor,
-            },
-            DemAlgorithm::Slope { z_factor } => GpuDemAlgorithm::Slope { z_factor },
-            DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
-            DemAlgorithm::Contours { .. } => return None,
-        };
-        let out_kind = match style.format {
-            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
-            OutputFormat::Png
-            | OutputFormat::Webp { .. }
-            | OutputFormat::Jpeg { .. }
-            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-            _ => return None,
-        };
-
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
+        let gpu_alg = map_dem_algorithm(alg)?;
+        let out_kind = styled_pixel_output(style.format, return_mask)?;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
@@ -1092,20 +1223,18 @@ impl GpuBackend {
             GpuColormapMode::Lanczos3 => GpuOp::DemHornLanczos3,
             _ => GpuOp::DemHornCubic,
         };
-        let decision = self.policy.decide(&DispatchRequest {
+        let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
+            cog_id,
+            ifd_idx,
+            band0,
+            src,
             op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
+            dst_w * dst_h,
+            coord_upload_bytes,
             readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
+            active,
+        )?;
+        let lut_u32 = pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Terrain {
@@ -1174,8 +1303,7 @@ impl GpuBackend {
         rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
     ) -> Option<Bytes> {
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
             cog_id,
             ifd_idx,
@@ -1212,39 +1340,28 @@ impl GpuBackend {
             TerrainEncoding::TerrainRgb => GpuDemAlgorithm::TerrainRgb,
             TerrainEncoding::Contours { .. } => return None,
         };
-        if !matches!(
-            format,
-            OutputFormat::Png
-                | OutputFormat::Webp { .. }
-                | OutputFormat::Jpeg { .. }
-                | OutputFormat::RawRgba
-        ) {
+        if !is_rgba_format(format) {
             return None;
         }
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::ResampleLanczos3,
             _ => GpuOp::DemTerrainRgbCubic,
         };
-        let decision = self.policy.decide(&DispatchRequest {
+        let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
+            cog_id,
+            ifd_idx,
+            band0,
+            src,
             op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes: dst_w * dst_h * 4,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Terrain {
@@ -1279,8 +1396,7 @@ impl GpuBackend {
         format: OutputFormat,
         return_mask: bool,
     ) -> Option<Bytes> {
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
             cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
         )?;
@@ -1300,26 +1416,8 @@ impl GpuBackend {
         src: &BandSource<'_>,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let coords = BboxCoordSource::from_coord_plan(plan);
+        let (active, _guard) = self.enter_in_flight();
         let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_single_band(
             cog_id, ifd_idx, band0, coords, src, style, rgb_lut, true, active,
@@ -1343,26 +1441,8 @@ impl GpuBackend {
         pixel_size_m: f32,
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let coords = BboxCoordSource::from_coord_plan(plan);
+        let (active, _guard) = self.enter_in_flight();
         let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
             cog_id,
@@ -1397,26 +1477,8 @@ impl GpuBackend {
         resample: ResampleMode,
         format: OutputFormat,
     ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let coords = BboxCoordSource::from_coord_plan(plan);
+        let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
             cog_id, ifd_idx, band0, coords, src, encoding, resample, format, active,
         )?;
@@ -1614,45 +1676,21 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
-        let out_kind = match style.format {
-            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
-            OutputFormat::Png
-            | OutputFormat::Webp { .. }
-            | OutputFormat::Jpeg { .. }
-            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-            _ => return None,
-        };
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
+        let out_kind = styled_pixel_output(style.format, return_mask)?;
         let readback_bytes = match out_kind {
             GpuPixelOutput::IndexedU8 => dst_w * dst_h,
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
         };
-        let op = match gpu_mode {
-            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
-            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
-        };
-        let decision = self.policy.decide(&DispatchRequest {
-            op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            multiband_policy_op(gpu_mode),
+            dst_w * dst_h,
+            coord_upload_bytes,
             readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(rgb_lut);
+            active,
+        )?;
+        let lut_u32 = pack_rgb_lut(rgb_lut);
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Expr {
@@ -1683,27 +1721,9 @@ impl GpuBackend {
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
         let instrs = Self::compile_spectral_to_gpu(expr)?;
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
+        let coords = BboxCoordSource::from_coord_plan(plan);
         let cache_key = Self::multiband_key(cog_id, ifd_idx, bands_1based, srcs);
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
             cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
@@ -1778,27 +1798,9 @@ impl GpuBackend {
         style: &SingleBandStyle,
     ) -> Option<Bytes> {
         let instrs = Self::compile_expr_to_gpu(prog)?;
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
+        let coords = BboxCoordSource::from_coord_plan(plan);
         let cache_key = Self::multiband_key(cog_id, ifd_idx, &prog.used_bands, srcs);
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let rgb_lut = &style.colormap.lut().rgb;
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
             cache_key, coords, srcs, &instrs, style, rgb_lut, true, active,
@@ -1818,27 +1820,9 @@ impl GpuBackend {
         srcs: &[BandSource<'_>; 3],
         style: &RgbStyle,
     ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
+        let coords = BboxCoordSource::from_coord_plan(plan);
         let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) =
             self.prepare_bbox_rgb(cache_key, coords, srcs, style, None, active)?;
         self.submit_rgba_async(job, dst_w, dst_h, style.format, true)
@@ -1895,8 +1879,7 @@ impl GpuBackend {
         rgb_lut: &[[u8; 3]; 256],
         return_mask: bool,
     ) -> Option<Bytes> {
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_instrs(
             cache_key,
             coords,
@@ -1923,45 +1906,18 @@ impl GpuBackend {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
-        if dst_w == 0 || dst_h == 0 {
+        if dst_w == 0 || dst_h == 0 || !is_rgba_format(style.format) {
             return None;
         }
-        if !matches!(
-            style.format,
-            OutputFormat::Png
-                | OutputFormat::Webp { .. }
-                | OutputFormat::Jpeg { .. }
-                | OutputFormat::RawRgba
-        ) {
-            return None;
-        }
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
-        let readback_bytes = dst_w * dst_h * 4;
-        let op = match gpu_mode {
-            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
-            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
-        };
-        let decision = self.policy.decide(&DispatchRequest {
-            op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            multiband_policy_op(gpu_mode),
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::Rgb {
@@ -1990,8 +1946,7 @@ impl GpuBackend {
         color_formula: Option<&ColorFormula>,
         return_mask: bool,
     ) -> Option<Bytes> {
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) =
             self.prepare_bbox_rgb(cache_key, coords, srcs, style, color_formula, active)?;
         self.submit_rgba(job, dst_w, dst_h, style.format, return_mask)
@@ -2148,7 +2103,7 @@ impl GpuBackend {
         let _guard = InFlightGuard(&self.in_flight);
 
         let lut = colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
         let mut mosaic_guard = self.mosaic.lock().ok()?;
 
         // 1-pass fused Mosaic -> GPU JPEG FDCT: zero per-call VRAM alloc, zero RGBA8 readback,
@@ -2323,24 +2278,18 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-        let decision = self.policy.decide(&DispatchRequest {
-            op: gpu_mode.to_policy_op(),
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes: dst_w * dst_h * 4,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+        let (active, _guard) = self.enter_in_flight();
+        let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
+            cog_id,
+            ifd_idx,
+            band0,
+            src,
+            gpu_mode.to_policy_op(),
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         let raw = self
             .coalescer
@@ -2373,50 +2322,30 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
-        if dst_w == 0 || dst_h == 0 {
-            return None;
-        }
-        let min_px = if self.ctx.info.unified_memory {
-            512 * 1024
-        } else {
-            512 * 512
-        };
-        if dst_w.saturating_mul(dst_h) < min_px {
+        let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
+        if dst_w == 0 || dst_h == 0 || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels() {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
         let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let _ = coord_upload_bytes;
-        let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-
+        let (_active, _guard) = self.enter_in_flight();
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
-        let raw = self
-            .coalescer
-            .submit(CoalescedJob::WithStats {
-                inner: Box::new(CoalescedJob::Colormap {
-                    slab,
-                    plan,
-                    mode: gpu_mode,
-                    rescale_min: 0.0,
-                    rescale_max: 1.0,
-                    lut_u32: [0u32; 256],
-                    output: CoalescedOutput::RawF32,
-                }),
-                nodata: None,
-                num_bins,
-                hist_range,
-            })
-            .ok()?;
-        Some(cogzilla_gpu::decode_stats_readback(
-            &raw,
+        self.submit_fused_stats(
+            CoalescedJob::Colormap {
+                slab,
+                plan,
+                mode: gpu_mode,
+                rescale_min: 0.0,
+                rescale_max: 1.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            },
             dst_w * dst_h,
             num_bins,
             hist_range,
             percentiles,
-        ))
+        )
     }
 
     /// 1-pass fused GPU expression evaluation + band statistics/histogram/percentiles
@@ -2486,50 +2415,35 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample(resample)?;
-        let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
-        if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
-            return None;
-        }
-        let min_px = if self.ctx.info.unified_memory {
-            512 * 1024
-        } else {
-            512 * 512
-        };
-        if dst_w.saturating_mul(dst_h) < min_px {
+        let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
+        if dst_w == 0
+            || dst_h == 0
+            || srcs.is_empty()
+            || srcs.len() > 8
+            || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels()
+        {
             return None;
         }
         let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let _ = coord_upload_bytes;
-        let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-
+        let (_active, _guard) = self.enter_in_flight();
         let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
-        let raw = self
-            .coalescer
-            .submit(CoalescedJob::WithStats {
-                inner: Box::new(CoalescedJob::Expr {
-                    slab,
-                    plan,
-                    mode: gpu_mode,
-                    instrs,
-                    rescale_min: 0.0,
-                    rescale_max: 1.0,
-                    lut_u32: [0u32; 256],
-                    output: CoalescedOutput::RawF32,
-                }),
-                nodata: None,
-                num_bins,
-                hist_range,
-            })
-            .ok()?;
-        Some(cogzilla_gpu::decode_stats_readback(
-            &raw,
+        self.submit_fused_stats(
+            CoalescedJob::Expr {
+                slab,
+                plan,
+                mode: gpu_mode,
+                instrs,
+                rescale_min: 0.0,
+                rescale_max: 1.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            },
             dst_w * dst_h,
             num_bins,
             hist_range,
             percentiles,
-        ))
+        )
     }
 
     /// 1-pass fused GPU DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`) + band statistics/histogram/percentiles
@@ -2551,66 +2465,34 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample(resample)?;
-        let gpu_alg = match alg {
-            DemAlgorithm::Hillshade {
-                azimuth_deg,
-                altitude_deg,
-                z_factor,
-            } => GpuDemAlgorithm::Hillshade {
-                azimuth_deg,
-                altitude_deg,
-                z_factor,
-            },
-            DemAlgorithm::Slope { z_factor } => GpuDemAlgorithm::Slope { z_factor },
-            DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
-            DemAlgorithm::Contours { .. } => return None,
-        };
+        let gpu_alg = map_dem_algorithm(alg)?;
         let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
-        if dst_w == 0 || dst_h == 0 {
-            return None;
-        }
-        let min_px = if self.ctx.info.unified_memory {
-            512 * 1024
-        } else {
-            512 * 512
-        };
-        if dst_w.saturating_mul(dst_h) < min_px {
+        if dst_w == 0 || dst_h == 0 || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels() {
             return None;
         }
         let key = source_slab_key(cog_id, ifd_idx, band0, src);
         let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let _active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-
+        let (_active, _guard) = self.enter_in_flight();
         let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
-        let raw = self
-            .coalescer
-            .submit(CoalescedJob::WithStats {
-                inner: Box::new(CoalescedJob::Terrain {
-                    slab,
-                    plan,
-                    mode: gpu_mode,
-                    alg: gpu_alg,
-                    pixel_size_x_m,
-                    pixel_size_y_m,
-                    rescale_min: 0.0,
-                    rescale_max: 255.0,
-                    lut_u32: [0u32; 256],
-                    output: CoalescedOutput::RawF32,
-                }),
-                nodata: None,
-                num_bins,
-                hist_range,
-            })
-            .ok()?;
-        Some(cogzilla_gpu::decode_stats_readback(
-            &raw,
+        self.submit_fused_stats(
+            CoalescedJob::Terrain {
+                slab,
+                plan,
+                mode: gpu_mode,
+                alg: gpu_alg,
+                pixel_size_x_m,
+                pixel_size_y_m,
+                rescale_min: 0.0,
+                rescale_max: 255.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            },
             dst_w * dst_h,
             num_bins,
             hist_range,
             percentiles,
-        ))
+        )
     }
 
     /// Attempt GPU-accelerated raw `f32` DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`)
@@ -2629,46 +2511,27 @@ impl GpuBackend {
         resample: ResampleMode,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample(resample)?;
-        let gpu_alg = match alg {
-            DemAlgorithm::Hillshade {
-                azimuth_deg,
-                altitude_deg,
-                z_factor,
-            } => GpuDemAlgorithm::Hillshade {
-                azimuth_deg,
-                altitude_deg,
-                z_factor,
-            },
-            DemAlgorithm::Slope { z_factor } => GpuDemAlgorithm::Slope { z_factor },
-            DemAlgorithm::Aspect => GpuDemAlgorithm::Aspect,
-            DemAlgorithm::Contours { .. } => return None,
-        };
+        let gpu_alg = map_dem_algorithm(alg)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
-        let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let op = match gpu_mode {
             GpuColormapMode::Lanczos3 => GpuOp::DemHornLanczos3,
             _ => GpuOp::DemHornCubic,
         };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-        let decision = self.policy.decide(&DispatchRequest {
+        let (active, _guard) = self.enter_in_flight();
+        let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
+            cog_id,
+            ifd_idx,
+            band0,
+            src,
             op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes: dst_w * dst_h * 4,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        let (slab, base_col, base_row) = self.resolve_source_slab(key, warm_slab, src)?;
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         let raw = self
             .coalescer
@@ -2717,34 +2580,16 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 || srcs.is_empty() || srcs.len() > 8 {
             return None;
         }
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
-        let op = match gpu_mode {
-            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
-            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
-        };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-        let decision = self.policy.decide(&DispatchRequest {
-            op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes: dst_w * dst_h * 4,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let (active, _guard) = self.enter_in_flight();
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            multiband_policy_op(gpu_mode),
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         let raw = self
             .coalescer
@@ -2833,7 +2678,7 @@ impl GpuBackend {
             .collect();
 
         let lut = style.colormap.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
         let raw = self
             .batcher
             .lock()
@@ -2891,45 +2736,18 @@ impl GpuBackend {
         let gpu_mode = map_resample(style.resample)?;
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
-        if dst_w == 0 || dst_h == 0 {
+        if dst_w == 0 || dst_h == 0 || !is_rgba_format(style.format) {
             return None;
         }
-        if !matches!(
-            style.format,
-            OutputFormat::Png
-                | OutputFormat::Webp { .. }
-                | OutputFormat::Jpeg { .. }
-                | OutputFormat::RawRgba
-        ) {
-            return None;
-        }
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
-        let readback_bytes = dst_w * dst_h * 4;
-        let op = match gpu_mode {
-            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
-            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
-        };
-        let decision = self.policy.decide(&DispatchRequest {
-            op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            multiband_policy_op(gpu_mode),
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         Some((
             CoalescedJob::SarRgb {
@@ -2957,27 +2775,9 @@ impl GpuBackend {
         srcs: &[BandSource<'_>; 2],
         style: &RgbStyle,
     ) -> Option<Bytes> {
-        let coords = match plan {
-            CoordPlan::Separable1D { u, v, .. } => BboxCoordSource::Separable {
-                u: u.as_slice(),
-                v: v.as_slice(),
-            },
-            CoordPlan::Grid2D { grid_u, grid_v, .. } => BboxCoordSource::Grid2D {
-                dst_w: N,
-                dst_h: N,
-                grid_u,
-                grid_v,
-            },
-            CoordPlan::Exact2D { u, v, .. } => BboxCoordSource::Exact2D {
-                dst_w: N,
-                dst_h: N,
-                u_map: &u[..],
-                v_map: &v[..],
-            },
-        };
+        let coords = BboxCoordSource::from_coord_plan(plan);
         let cache_key = Self::multiband_key(cog_id, ifd_idx, &bands_1based, srcs);
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) =
             self.prepare_bbox_sar_rgb(cache_key, coords, srcs, style, None, active)?;
         self.submit_rgba_async(job, dst_w, dst_h, style.format, true)
@@ -2996,8 +2796,7 @@ impl GpuBackend {
         color_formula: Option<&ColorFormula>,
         return_mask: bool,
     ) -> Option<Bytes> {
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
+        let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) =
             self.prepare_bbox_sar_rgb(cache_key, coords, srcs, style, color_formula, active)?;
         self.submit_rgba(job, dst_w, dst_h, style.format, return_mask)
@@ -3054,47 +2853,19 @@ impl GpuBackend {
         let gpu_formula = Self::translate_color_formula(color_formula)?;
         let (instrs, lens) = Self::compile_expr_rgb_to_gpu(progs, unique_bands)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
-        if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {
+        if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() || !is_rgba_format(style.format) {
             return None;
         }
-        if !matches!(
-            style.format,
-            OutputFormat::Png
-                | OutputFormat::Webp { .. }
-                | OutputFormat::Jpeg { .. }
-                | OutputFormat::RawRgba
-        ) {
-            return None;
-        }
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
-        let readback_bytes = dst_w * dst_h * 4;
-        let op = match gpu_mode {
-            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
-            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
-        };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-        let decision = self.policy.decide(&DispatchRequest {
-            op,
-            dst_pixels: dst_w * dst_h,
-            upload_bytes,
-            readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let (active, _guard) = self.enter_in_flight();
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            multiband_policy_op(gpu_mode),
+            dst_w * dst_h,
+            coord_upload_bytes,
+            dst_w * dst_h * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         let job = CoalescedJob::ExprRgb {
             slab,
@@ -3125,30 +2896,16 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 || nb == 0 || nb > 8 {
             return None;
         }
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
-        let readback_bytes = dst_w * dst_h * nb * 4;
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-        let decision = self.policy.decide(&DispatchRequest {
-            op: gpu_mode.to_policy_op(),
-            dst_pixels: dst_w * dst_h * nb,
-            upload_bytes,
-            readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let (active, _guard) = self.enter_in_flight();
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            gpu_mode.to_policy_op(),
+            dst_w * dst_h * nb,
+            coord_upload_bytes,
+            dst_w * dst_h * nb * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         let raw = self
             .coalescer
@@ -3179,35 +2936,16 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 || srcs.len() != unique_bands.len() {
             return None;
         }
-        let warm_slab = cache_key.and_then(|k| self.multi_slab_cache.get(&k));
-        let band_upload_bytes: usize = if warm_slab.is_some() {
-            0
-        } else {
-            srcs.iter()
-                .map(|s| Self::estimate_upload_bytes(&None, s))
-                .sum()
-        };
-        let upload_bytes = band_upload_bytes + coord_upload_bytes;
-        let readback_bytes = dst_w * dst_h * 3 * 4;
-        let op = match gpu_mode {
-            GpuColormapMode::Lanczos3 => GpuOp::FusedColormapLanczos3,
-            GpuColormapMode::Cubic => GpuOp::DemHornCubic,
-            GpuColormapMode::Bilinear | GpuColormapMode::Nearest => GpuOp::FusedColormapBilinear,
-        };
-        let active = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        let _guard = InFlightGuard(&self.in_flight);
-        let decision = self.policy.decide(&DispatchRequest {
-            op,
-            dst_pixels: dst_w * dst_h * 3,
-            upload_bytes,
-            readback_bytes,
-            batch_size: active.min(32),
-            in_flight: (active - 1) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-        let (slab, base_col, base_row) = self.resolve_multiband_slab(cache_key, warm_slab, srcs)?;
+        let (active, _guard) = self.enter_in_flight();
+        let (slab, base_col, base_row) = self.gate_and_resolve_multiband(
+            cache_key,
+            srcs,
+            multiband_policy_op(gpu_mode),
+            dst_w * dst_h * 3,
+            coord_upload_bytes,
+            dst_w * dst_h * 3 * 4,
+            active,
+        )?;
         let plan = to_owned_plan(coords, base_col as f32, base_row as f32);
         let raw = self
             .coalescer

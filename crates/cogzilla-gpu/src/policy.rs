@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::context::GpuContext;
-use crate::resample::GpuResampler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyOverride {
@@ -56,17 +55,56 @@ pub struct GpuProfile {
 impl GpuProfile {
     /// Run a fast (<15 ms) startup micro-probe to measure dispatch floor and transfer bandwidth.
     pub fn calibrate(ctx: &GpuContext) -> Self {
-        let resampler = GpuResampler::new(ctx);
+        let noop_shader = ctx.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cogzilla-cal-noop-wgsl"),
+            source: wgpu::ShaderSource::Wgsl(
+                "@compute @workgroup_size(1, 1, 1) fn noop_dispatch() {}".into(),
+            ),
+        });
+        let noop_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("cogzilla-cal-noop-pl"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+        let noop_pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cogzilla-cal-noop-pipe"),
+                layout: Some(&noop_layout),
+                module: &noop_shader,
+                entry_point: Some("noop_dispatch"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let noop_dispatch_sync = || {
+            let mut encoder = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cogzilla-noop-enc"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cogzilla-noop-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&noop_pipeline);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            ctx.queue.submit(Some(encoder.finish()));
+            ctx.device.poll(wgpu::Maintain::Wait);
+        };
 
         // 1. Measure dispatch + poll(Wait) floor (take p20 of 7 samples so a noisy neighbor
         //    spiking the GPU during startup does not permanently inflate the dispatch floor).
         for _ in 0..2 {
-            resampler.noop_dispatch_sync();
+            noop_dispatch_sync();
         }
         let mut noop_samples = Vec::with_capacity(7);
         for _ in 0..7 {
             let t0 = Instant::now();
-            resampler.noop_dispatch_sync();
+            noop_dispatch_sync();
             noop_samples.push(t0.elapsed());
         }
         noop_samples.sort();

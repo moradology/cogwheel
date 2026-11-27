@@ -685,82 +685,29 @@ impl WorkerState {
 
         let cm_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-coal-cm-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/colormap.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::COLORMAP_WGSL.into()),
         });
         let tr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-coal-tr-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::TERRAIN_WGSL.into()),
         });
         let expr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-coal-expr-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/expr.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::EXPR_WGSL.into()),
         });
 
         // Both colormap.wgsl and terrain.wgsl share the exact same 6-binding layout:
         // 0: uniform params, 1: slab, 2: u_coords, 3: v_coords, 4: lut, 5: dst_words
+        use crate::wgpu_util::{bgl_storage_ro, bgl_storage_rw, bgl_uniform};
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cogzilla-coal-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                bgl_uniform(0),
+                bgl_storage_ro(1),
+                bgl_storage_ro(2),
+                bgl_storage_ro(3),
+                bgl_storage_ro(4),
+                bgl_storage_rw(5),
             ],
         });
 
@@ -794,76 +741,13 @@ impl WorkerState {
         let expr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cogzilla-coal-expr-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                bgl_uniform(0),
+                bgl_storage_ro(1),
+                bgl_storage_ro(2),
+                bgl_storage_ro(3),
+                bgl_storage_ro(4),
+                bgl_storage_ro(5),
+                bgl_storage_rw(6),
             ],
         });
         let expr_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -892,51 +776,15 @@ impl WorkerState {
 
         let jpeg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-coal-jpeg-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/jpeg_dct.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::JPEG_DCT_WGSL.into()),
         });
         let jpeg_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cogzilla-coal-jpeg-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                bgl_uniform(0),
+                bgl_storage_ro(1),
+                bgl_storage_ro(2),
+                bgl_storage_rw(3),
             ],
         });
         let jpeg_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -955,71 +803,17 @@ impl WorkerState {
 
         let stats_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-coal-stats-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/stats.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::STATS_WGSL.into()),
         });
         let stats_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cogzilla-coal-stats-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                bgl_uniform(0),
+                bgl_storage_ro(1),
+                bgl_storage_rw(2),
+                bgl_storage_rw(3),
+                bgl_storage_rw(4),
+                bgl_storage_rw(5),
             ],
         });
         let stats_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2802,9 +2596,7 @@ impl Drop for GpuCoalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::colormap::{GpuColormapRenderer, GpuCoordPlan};
-    use crate::resample::GpuResampler;
-    use crate::terrain::GpuTerrainRenderer;
+    use crate::colormap::pack_rgb_lut;
 
     #[test]
     fn heterogeneous_concurrent_burst_coalesces_and_matches_serial() {
@@ -2812,9 +2604,6 @@ mod tests {
             eprintln!("skipping GPU coalescer test (no adapter)");
             return;
         };
-        let resampler = GpuResampler::new(&ctx);
-        let mut cm_ref = GpuColormapRenderer::new(&ctx);
-        let mut tr_ref = GpuTerrainRenderer::new(&ctx);
 
         // Two distinct slabs (simulating 2 different COGs)
         let make_slab = |phase: f32| {
@@ -2828,7 +2617,7 @@ mod tests {
                         + 200.0 * (y as f32 * 0.05 - phase).cos();
                 }
             }
-            Arc::new(resampler.upload_slab(&data, w as u32, h as u32, w as u32).unwrap())
+            Arc::new(GpuSlab::upload(&ctx.device, &data, w as u32, h as u32, w as u32).unwrap())
         };
         let slab_a = make_slab(0.0);
         let slab_b = make_slab(1.3);
@@ -2837,49 +2626,58 @@ mod tests {
         let u: Vec<f32> = (0..n).map(|i| 8.0 + (i as f32 / n as f32) * 238.0).collect();
         let v: Vec<f32> = (0..n).map(|i| 8.0 + (i as f32 / n as f32) * 238.0).collect();
         let lut = cogzilla_kernel::ColormapName::Viridis.lut();
-        let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+        let lut_u32 = pack_rgb_lut(&lut.rgb);
 
+        let serial_coalescer = GpuCoalescer::new(&ctx, 1, 0);
         // Serial ground truth for 3 distinct job types
-        let ref_cm = cm_ref
-            .render_slab(
-                &slab_a,
-                &u,
-                &v,
-                GpuColormapMode::Lanczos3,
-                0.0,
-                1200.0,
-                &lut_u32,
-                GpuPixelOutput::IndexedU8,
-            )
-            .unwrap();
-        let ref_f32 = cm_ref
-            .render_slab_f32_with_plan(
-                &slab_b,
-                GpuCoordPlan::Separable1D {
-                    u_coords: &u,
-                    v_coords: &v,
+        let ref_cm = serial_coalescer
+            .submit(CoalescedJob::Colormap {
+                slab: Arc::clone(&slab_a),
+                plan: OwnedCoordPlan::Separable1D {
+                    u: u.clone(),
+                    v: v.clone(),
                 },
-                GpuColormapMode::Lanczos3,
-            )
+                mode: GpuColormapMode::Lanczos3,
+                rescale_min: 0.0,
+                rescale_max: 1200.0,
+                lut_u32,
+                output: CoalescedOutput::IndexedU8,
+            })
             .unwrap();
-        let ref_dem = tr_ref
-            .render_slab(
-                &slab_a,
-                &u,
-                &v,
-                GpuColormapMode::Lanczos3,
-                GpuDemAlgorithm::Hillshade {
+        let ref_f32 = serial_coalescer
+            .submit(CoalescedJob::Colormap {
+                slab: Arc::clone(&slab_b),
+                plan: OwnedCoordPlan::Separable1D {
+                    u: u.clone(),
+                    v: v.clone(),
+                },
+                mode: GpuColormapMode::Lanczos3,
+                rescale_min: 0.0,
+                rescale_max: 1.0,
+                lut_u32: [0u32; 256],
+                output: CoalescedOutput::RawF32,
+            })
+            .unwrap();
+        let ref_dem = serial_coalescer
+            .submit(CoalescedJob::Terrain {
+                slab: Arc::clone(&slab_a),
+                plan: OwnedCoordPlan::Separable1D {
+                    u: u.clone(),
+                    v: v.clone(),
+                },
+                mode: GpuColormapMode::Lanczos3,
+                alg: GpuDemAlgorithm::Hillshade {
                     azimuth_deg: 315.0,
                     altitude_deg: 45.0,
                     z_factor: 1.0,
                 },
-                30.0,
-                30.0,
-                0.0,
-                255.0,
-                &lut_u32,
-                GpuPixelOutput::Rgba8,
-            )
+                pixel_size_x_m: 30.0,
+                pixel_size_y_m: 30.0,
+                rescale_min: 0.0,
+                rescale_max: 255.0,
+                lut_u32,
+                output: CoalescedOutput::Rgba8,
+            })
             .unwrap();
 
         let coalescer = Arc::new(GpuCoalescer::new(&ctx, 32, 1000));
@@ -2956,10 +2754,6 @@ mod tests {
             eprintln!("skipping five_family_multiband_burst_matches_serial (no GPU adapter)");
             return;
         };
-        let resampler = crate::resample::GpuResampler::new(&ctx);
-        let mut cm_ref = crate::colormap::GpuColormapRenderer::new(&ctx);
-        let mut tr_ref = crate::terrain::GpuTerrainRenderer::new(&ctx);
-        let mut ex_ref = crate::expr::GpuExprRenderer::new(&ctx);
 
         let w = 128u32;
         let h = 128u32;
@@ -2973,15 +2767,19 @@ mod tests {
             .map(|i| 0.01 + (((i % w) ^ (i / w)) as f32 * 0.005))
             .collect();
 
-        let single_slab = Arc::new(resampler.upload_slab(&b0, w, h, w).unwrap());
+        let single_slab = Arc::new(GpuSlab::upload(&ctx.device, &b0, w, h, w).unwrap());
         let mb3_slab = Arc::new(
-            ex_ref
-                .upload_bands(&[b0.as_slice(), b1.as_slice(), b2.as_slice()], w, h, w)
-                .unwrap(),
+            GpuMultiBandSlab::upload_bands(
+                &ctx.device,
+                &[b0.as_slice(), b1.as_slice(), b2.as_slice()],
+                w,
+                h,
+                w,
+            )
+            .unwrap(),
         );
         let sar2_slab = Arc::new(
-            ex_ref
-                .upload_bands(&[b0.as_slice(), b1.as_slice()], w, h, w)
+            GpuMultiBandSlab::upload_bands(&ctx.device, &[b0.as_slice(), b1.as_slice()], w, h, w)
                 .unwrap(),
         );
 
@@ -2992,7 +2790,7 @@ mod tests {
         for i in 0..256 {
             lut_rgb[i] = [i as u8, (255 - i) as u8, ((i * 3) & 255) as u8];
         }
-        let lut_u32 = crate::colormap::GpuColormapRenderer::pack_rgb_lut(&lut_rgb);
+        let lut_u32 = pack_rgb_lut(&lut_rgb);
 
         // NDVI = (b0 - b1) / (b0 + b1)
         let ndvi_instrs = vec![
@@ -3006,73 +2804,71 @@ mod tests {
         ];
         let formula = GpuColorFormula::from_gamma_sigmoidal_sat(Some(1.2), Some((6.0, 0.5)), Some(1.3));
 
-        let ref_cm = cm_ref
-            .render_slab(
-                &single_slab,
-                &u,
-                &v,
-                GpuColormapMode::Lanczos3,
-                0.0,
-                2.0,
-                &lut_u32,
-                GpuPixelOutput::IndexedU8,
-            )
+        let serial = GpuCoalescer::new(&ctx, 1, 0);
+        let plan_ref = || OwnedCoordPlan::Separable1D {
+            u: u.clone(),
+            v: v.clone(),
+        };
+        let ref_cm = serial
+            .submit(CoalescedJob::Colormap {
+                slab: Arc::clone(&single_slab),
+                plan: plan_ref(),
+                mode: GpuColormapMode::Lanczos3,
+                rescale_min: 0.0,
+                rescale_max: 2.0,
+                lut_u32,
+                output: CoalescedOutput::IndexedU8,
+            })
             .unwrap();
-        let ref_dem = tr_ref
-            .render_slab(
-                &single_slab,
-                &u,
-                &v,
-                GpuColormapMode::Cubic,
-                GpuDemAlgorithm::Hillshade {
+        let ref_dem = serial
+            .submit(CoalescedJob::Terrain {
+                slab: Arc::clone(&single_slab),
+                plan: plan_ref(),
+                mode: GpuColormapMode::Cubic,
+                alg: GpuDemAlgorithm::Hillshade {
                     azimuth_deg: 315.0,
                     altitude_deg: 45.0,
                     z_factor: 1.0,
                 },
-                30.0,
-                30.0,
-                0.0,
-                255.0,
-                &lut_u32,
-                GpuPixelOutput::Rgba8,
-            )
+                pixel_size_x_m: 30.0,
+                pixel_size_y_m: 30.0,
+                rescale_min: 0.0,
+                rescale_max: 255.0,
+                lut_u32,
+                output: CoalescedOutput::Rgba8,
+            })
             .unwrap();
-        let ref_expr = ex_ref
-            .render_expr(
-                &mb3_slab,
-                &u,
-                &v,
-                GpuColormapMode::Lanczos3,
-                &ndvi_instrs,
-                -1.0,
-                1.0,
-                &lut_u32,
-                GpuPixelOutput::IndexedU8,
-            )
+        let ref_expr = serial
+            .submit(CoalescedJob::Expr {
+                slab: Arc::clone(&mb3_slab),
+                plan: plan_ref(),
+                mode: GpuColormapMode::Lanczos3,
+                instrs: ndvi_instrs.clone(),
+                rescale_min: -1.0,
+                rescale_max: 1.0,
+                lut_u32,
+                output: CoalescedOutput::IndexedU8,
+            })
             .unwrap();
-        let ref_rgb = ex_ref
-            .render_rgb_formula(
-                &mb3_slab,
-                &u,
-                &v,
-                GpuColormapMode::Lanczos3,
-                [0.0, 0.0, 0.0],
-                [2.0, 2.0, 2.0],
-                &formula,
-            )
+        let ref_rgb = serial
+            .submit(CoalescedJob::Rgb {
+                slab: Arc::clone(&mb3_slab),
+                plan: plan_ref(),
+                mode: GpuColormapMode::Lanczos3,
+                rescale_min: [0.0, 0.0, 0.0],
+                rescale_max: [2.0, 2.0, 2.0],
+                formula: formula.clone(),
+            })
             .unwrap();
-        let ref_sar = ex_ref
-            .render_sar_rgb_formula_with_plan(
-                &sar2_slab,
-                crate::colormap::GpuCoordPlan::Separable1D {
-                    u_coords: &u,
-                    v_coords: &v,
-                },
-                GpuColormapMode::Lanczos3,
-                [-25.0, -30.0, 0.0],
-                [0.0, -5.0, 15.0],
-                &formula,
-            )
+        let ref_sar = serial
+            .submit(CoalescedJob::SarRgb {
+                slab: Arc::clone(&sar2_slab),
+                plan: plan_ref(),
+                mode: GpuColormapMode::Lanczos3,
+                rescale_min: [-25.0, -30.0, 0.0],
+                rescale_max: [0.0, -5.0, 15.0],
+                formula: formula.clone(),
+            })
             .unwrap();
 
         let coalescer = Arc::new(GpuCoalescer::new(&ctx, 32, 2000));

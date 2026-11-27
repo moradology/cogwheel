@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::context::GpuError;
 use crate::expr::GpuMultiBandSlab;
-use crate::resample::{GpuResampler, GpuSlab};
+use crate::resample::GpuSlab;
 
 /// Cache key identifying a decoded raster block/slab resident on the GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,7 +130,7 @@ impl GpuSlabCache {
         );
     }
 
-    /// Look up `key`, or upload `data` via `resampler` on miss and cache the resulting `GpuSlab`.
+    /// Look up `key`, or upload `data` on miss and cache the resulting `GpuSlab`.
     pub fn get_or_upload(
         &self,
         key: SlabKey,
@@ -138,12 +138,12 @@ impl GpuSlabCache {
         width: u32,
         height: u32,
         stride: u32,
-        resampler: &GpuResampler,
+        device: &wgpu::Device,
     ) -> Result<Arc<GpuSlab>, GpuError> {
         if let Some(hit) = self.get(&key) {
             return Ok(hit);
         }
-        let slab = Arc::new(resampler.upload_slab(data, width, height, stride)?);
+        let slab = Arc::new(GpuSlab::upload(device, data, width, height, stride)?);
         self.insert(key, Arc::clone(&slab));
         Ok(slab)
     }
@@ -292,7 +292,6 @@ mod tests {
                 return;
             }
         };
-        let resampler = GpuResampler::new(&ctx);
         // Each 512x512 f32 slab is 1 MiB; cap at 2 MiB so 3rd insert evicts LRU.
         let cache = GpuSlabCache::new(2 * 1024 * 1024);
         let data = vec![1.0f32; 512 * 512];
@@ -301,11 +300,11 @@ mod tests {
         let k1 = SlabKey { dataset_id: 1, ifd_idx: 0, band: 0, tx: 1, ty: 0 };
         let k2 = SlabKey { dataset_id: 1, ifd_idx: 0, band: 0, tx: 2, ty: 0 };
 
-        let _ = cache.get_or_upload(k0, &data, 512, 512, 512, &resampler).unwrap();
-        let _ = cache.get_or_upload(k1, &data, 512, 512, 512, &resampler).unwrap();
+        let _ = cache.get_or_upload(k0, &data, 512, 512, 512, &ctx.device).unwrap();
+        let _ = cache.get_or_upload(k1, &data, 512, 512, 512, &ctx.device).unwrap();
         // Touch k0 so k1 becomes LRU
         assert!(cache.get(&k0).is_some());
-        let _ = cache.get_or_upload(k2, &data, 512, 512, 512, &resampler).unwrap();
+        let _ = cache.get_or_upload(k2, &data, 512, 512, 512, &ctx.device).unwrap();
 
         let st = cache.stats();
         assert_eq!(st.entries, 2);

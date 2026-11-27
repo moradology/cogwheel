@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
 use cogzilla_gpu::{
-    DispatchPolicy, DispatchRequest, GpuColormapMode, GpuColormapRenderer, GpuContext,
-    GpuPixelOutput, GpuResampler, GpuSlabCache, GpuTileBatcher, SlabKey, TileCoordSlice,
+    DispatchPolicy, DispatchRequest, GpuColormapMode, GpuContext, GpuPixelOutput, GpuSlabCache,
+    GpuTileBatcher, SlabKey, TileCoordSlice, pack_rgb_lut,
 };
 use cogzilla_kernel::{BandSource, ColormapName, ResampleMode, sample_cubic, sample_general};
 
@@ -72,7 +72,6 @@ fn main() {
         policy.profile.readback_gb_s
     );
 
-    let resampler = GpuResampler::new(&ctx);
     let cache = GpuSlabCache::new(256 * 1024 * 1024);
     let mut batcher = GpuTileBatcher::new(&ctx);
 
@@ -104,11 +103,11 @@ fn main() {
         ty: 0,
     };
     let gpu_slab = cache
-        .get_or_upload(key, &src, src_w, src_h, src_w, &resampler)
+        .get_or_upload(key, &src, src_w, src_h, src_w, &ctx.device)
         .unwrap();
 
     let lut = ColormapName::Viridis.lut();
-    let lut_u32 = GpuColormapRenderer::pack_rgb_lut(&lut.rgb);
+    let lut_u32 = pack_rgb_lut(&lut.rgb);
     let rmin = 800.0f32;
     let rmax = 1600.0f32;
 
