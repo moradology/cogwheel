@@ -30,20 +30,6 @@ struct GpuInstr {
 @group(0) @binding(3) var<storage, read> instrs: array<GpuInstr>;
 @group(0) @binding(4) var<storage, read_write> dst_expr: array<f32>;
 
-fn nan_f32() -> f32 {
-    return bitcast<f32>(0x7fc00000u);
-}
-
-fn is_nan_f32(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    return (bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u;
-}
-
-fn is_finite_f32(v: f32) -> bool {
-    let bits = bitcast<u32>(v);
-    return (bits & 0x7f800000u) != 0x7f800000u;
-}
-
 @compute @workgroup_size(256, 1, 1)
 fn weighted_expr_eval(
     @builtin(global_invocation_id) gid: vec3<u32>,

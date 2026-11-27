@@ -50,7 +50,7 @@ impl GpuPredictorDecoder {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cogzilla-predictor-wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/predictor.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::shaders::PREDICTOR_WGSL.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

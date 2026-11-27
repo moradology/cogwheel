@@ -9,9 +9,11 @@ pub mod mosaic;
 pub mod policy;
 pub mod predictor;
 pub mod resample;
+pub(crate) mod shaders;
 pub mod stats;
 pub mod terrain;
 pub mod weighted_stats;
+pub(crate) mod wgpu_util;
 
 pub use batch::{GpuTileBatcher, TileCoordSlice};
 pub use cache::{GpuCacheStats, GpuMultiBandCache, GpuSlabCache, MultiBandSlabKey, SlabKey};
