@@ -221,6 +221,32 @@ pub fn lookup_catalog_index(lower_name: &str) -> Option<u16> {
     COLORMAP_CATALOG_NAMES.binary_search(&lower_name).ok().map(|i| i as u16)
 }
 
+/// Compile-time lookup of a canonical lowercase name in `COLORMAP_CATALOG_NAMES`.
+/// Panics at compile time if the name is absent from the catalog.
+pub const fn lookup_catalog_index_const(lower_name: &str) -> u16 {
+    let target = lower_name.as_bytes();
+    let mut i = 0;
+    while i < COLORMAP_CATALOG_NAMES.len() {
+        let cand = COLORMAP_CATALOG_NAMES[i].as_bytes();
+        if cand.len() == target.len() {
+            let mut j = 0;
+            let mut eq = true;
+            while j < cand.len() {
+                if cand[j] != target[j] {
+                    eq = false;
+                    break;
+                }
+                j += 1;
+            }
+            if eq {
+                return i as u16;
+            }
+        }
+        i += 1;
+    }
+    panic!("colormap name missing from COLORMAP_CATALOG_NAMES")
+}
+
 pub fn catalog_lut(idx: u16) -> &'static ColormapLut {
     static ALL: OnceLock<Box<[ColormapLut]>> = OnceLock::new();
     let luts = ALL.get_or_init(|| {

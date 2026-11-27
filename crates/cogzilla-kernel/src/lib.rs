@@ -2,7 +2,6 @@ pub mod bandmath;
 pub mod color_formula;
 pub mod colormap;
 pub mod colormap_catalog;
-mod colormap_data;
 pub mod expr_vm;
 pub mod jpeg_fast;
 pub mod kernel;

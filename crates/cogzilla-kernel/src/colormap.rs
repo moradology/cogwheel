@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::colormap_data::*;
-
 /// Parse a TiTiler JSON color value: `[r, g, b]` / `[r, g, b, a]` or `"#rrggbb"` / `"#rrggbbaa"`.
 fn parse_json_rgba(v: &serde_json::Value) -> Option<[u8; 4]> {
     if let Some(arr) = v.as_array() {
@@ -363,39 +361,60 @@ impl ColormapLut {
     }
 }
 
+const fn identity_grayscale_rgb() -> [[u8; 3]; 256] {
+    let mut table = [[0u8; 3]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let v = i as u8;
+        table[i] = [v, v, v];
+        i += 1;
+    }
+    table
+}
+
+/// Spellings not present in `rio-tiler`'s 211-entry catalog that alias an existing catalog ramp.
+const ALIASES: &[(&str, &str)] = &[
+    ("grey", "gray"),
+    ("grayscale", "gray"),
+    ("ndvi", "rdylgn"),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColormapName {
+    /// Identity 0..=255 grayscale ramp used when a single-band raster is drawn without a
+    /// colormap (distinct from matplotlib's `gray` in the catalog, which rounds 24 entries by 1).
     Grayscale,
-    Viridis,
-    Magma,
-    Plasma,
-    Inferno,
-    Turbo,
-    Terrain,
-    Coolwarm,
-    Ndvi,
     /// Index into the full 211-entry `rio-tiler` colormap catalog (`COLORMAP_CATALOG_NAMES`).
     Catalog(u16),
 }
 
 impl ColormapName {
+    /// Named catalog constants so internal defaults and explicit `?colormap_name=` requests
+    /// resolve to the exact same `Catalog(idx)` entry and LUT bytes.
+    #[allow(non_upper_case_globals)]
+    pub const Viridis: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("viridis"));
+    #[allow(non_upper_case_globals)]
+    pub const Magma: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("magma"));
+    #[allow(non_upper_case_globals)]
+    pub const Plasma: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("plasma"));
+    #[allow(non_upper_case_globals)]
+    pub const Inferno: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("inferno"));
+    #[allow(non_upper_case_globals)]
+    pub const Turbo: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("turbo"));
+    #[allow(non_upper_case_globals)]
+    pub const Terrain: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("terrain"));
+    #[allow(non_upper_case_globals)]
+    pub const Coolwarm: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("coolwarm"));
+    #[allow(non_upper_case_globals)]
+    pub const Ndvi: Self = Self::Catalog(crate::colormap_catalog::lookup_catalog_index_const("rdylgn"));
+
     pub fn from_str_opt(s: &str) -> Option<Self> {
         let lower = s.to_ascii_lowercase();
-        if let Some(idx) = crate::colormap_catalog::lookup_catalog_index(&lower) {
-            return Some(Self::Catalog(idx));
-        }
-        match lower.as_str() {
-            "gray" | "grey" | "grayscale" => Some(Self::Grayscale),
-            "viridis" => Some(Self::Viridis),
-            "magma" => Some(Self::Magma),
-            "plasma" => Some(Self::Plasma),
-            "inferno" => Some(Self::Inferno),
-            "turbo" => Some(Self::Turbo),
-            "terrain" => Some(Self::Terrain),
-            "coolwarm" => Some(Self::Coolwarm),
-            "ndvi" | "rdylgn" => Some(Self::Ndvi),
-            _ => None,
-        }
+        let canonical = ALIASES
+            .iter()
+            .find_map(|&(alias, target)| (alias == lower).then_some(target))
+            .unwrap_or(lower.as_str());
+        crate::colormap_catalog::lookup_catalog_index(canonical).map(Self::Catalog)
     }
 
     pub fn lut(self) -> &'static ColormapLut {
@@ -403,39 +422,7 @@ impl ColormapName {
             Self::Catalog(idx) => crate::colormap_catalog::catalog_lut(idx),
             Self::Grayscale => {
                 static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(GRAYSCALE_RGB))
-            }
-            Self::Viridis => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(VIRIDIS_RGB))
-            }
-            Self::Magma => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(MAGMA_RGB))
-            }
-            Self::Plasma => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(PLASMA_RGB))
-            }
-            Self::Inferno => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(INFERNO_RGB))
-            }
-            Self::Turbo => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(TURBO_RGB))
-            }
-            Self::Terrain => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(TERRAIN_RGB))
-            }
-            Self::Coolwarm => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(COOLWARM_RGB))
-            }
-            Self::Ndvi => {
-                static LUT: OnceLock<ColormapLut> = OnceLock::new();
-                LUT.get_or_init(|| ColormapLut::from_rgb_table(NDVI_RGB))
+                LUT.get_or_init(|| ColormapLut::from_rgb_table(identity_grayscale_rgb()))
             }
         }
     }
@@ -456,6 +443,30 @@ mod tests {
         let named = ColormapName::from_str_opt("gray").expect("a colour map called gray");
         assert_ne!(named, ColormapName::Grayscale);
         assert_eq!(named.lut().rgb[33], [32; 3]);
+    }
+
+    #[test]
+    fn named_constants_and_aliases_resolve_to_single_catalog_table() {
+        for (name, constant) in [
+            ("viridis", ColormapName::Viridis),
+            ("magma", ColormapName::Magma),
+            ("plasma", ColormapName::Plasma),
+            ("inferno", ColormapName::Inferno),
+            ("turbo", ColormapName::Turbo),
+            ("terrain", ColormapName::Terrain),
+            ("coolwarm", ColormapName::Coolwarm),
+            ("rdylgn", ColormapName::Ndvi),
+            ("ndvi", ColormapName::Ndvi),
+        ] {
+            let parsed = ColormapName::from_str_opt(name).expect(name);
+            assert_eq!(parsed, constant, "{name} should resolve to identical Catalog variant");
+            assert_eq!(parsed.lut().rgb, constant.lut().rgb, "{name} LUT bytes");
+        }
+        // gray, grey, and grayscale are all aliases for matplotlib's `gray` in the catalog.
+        let gray = ColormapName::from_str_opt("gray").unwrap();
+        assert_eq!(ColormapName::from_str_opt("grey").unwrap(), gray);
+        assert_eq!(ColormapName::from_str_opt("grayscale").unwrap(), gray);
+        assert_eq!(ColormapName::from_str_opt("GRAYSCALE").unwrap(), gray);
     }
 
     #[test]
