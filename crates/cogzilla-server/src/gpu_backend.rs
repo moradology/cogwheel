@@ -583,6 +583,113 @@ impl MosaicCompositeResult {
     }
 }
 
+/// Band shape + resolved source planes for [`GpuBackend::try_render_bbox`].
+pub enum GpuBboxBands<'a> {
+    Single {
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        src: &'a BandSource<'a>,
+    },
+    Dem {
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        src: &'a BandSource<'a>,
+        algorithm: DemAlgorithm,
+        dx_m: f32,
+        dy_m: f32,
+    },
+    Terrain {
+        cog_id: u64,
+        ifd_idx: usize,
+        band0: u16,
+        src: &'a BandSource<'a>,
+        encoding: TerrainEncoding,
+    },
+    Spectral {
+        cache_key: Option<MultiBandSlabKey>,
+        srcs: &'a [BandSource<'a>],
+        expr: SpectralExpr,
+    },
+    Expr {
+        cache_key: Option<MultiBandSlabKey>,
+        srcs: &'a [BandSource<'a>],
+        prog: &'a ExprProgram,
+    },
+    Rgb {
+        cache_key: Option<MultiBandSlabKey>,
+        srcs: &'a [BandSource<'a>; 3],
+    },
+    SarRgb {
+        cache_key: Option<MultiBandSlabKey>,
+        srcs: &'a [BandSource<'a>; 2],
+    },
+    ExprRgb {
+        cache_key: Option<MultiBandSlabKey>,
+        unique_bands: &'a [u16],
+        srcs: &'a [BandSource<'a>],
+        progs: &'a [ExprProgram; 3],
+    },
+    MultiBand {
+        cache_key: Option<MultiBandSlabKey>,
+        srcs: &'a [BandSource<'a>],
+    },
+}
+
+/// Desired output mode for [`GpuBackend::try_render_bbox`].
+pub enum GpuBboxOutput<'a> {
+    /// Styled single-band / DEM / Spectral / Expr output via a resolved 256-entry RGB LUT.
+    StyledLut {
+        style: &'a SingleBandStyle,
+        rgb_lut: &'a [[u8; 3]; 256],
+        return_mask: bool,
+    },
+    /// Styled RGB / SAR-RGB / Expr-RGB output with optional color formula.
+    StyledRgb {
+        style: &'a RgbStyle,
+        color_formula: Option<&'a ColorFormula>,
+        return_mask: bool,
+    },
+    /// Styled Terrain (Terrarium / TerrainRGB / Contours) output.
+    StyledTerrain {
+        resample: ResampleMode,
+        format: OutputFormat,
+        return_mask: bool,
+    },
+    /// Raw `f32` plane(s) for `.npy`, `.tif`, `.f32`, or multi-scene mosaic fetches.
+    F32 { resample: ResampleMode },
+    /// 1-pass fused GPU resampling + band statistics / histogram / percentiles.
+    Stats {
+        resample: ResampleMode,
+        num_bins: usize,
+        hist_range: Option<(f64, f64)>,
+        percentiles: &'a [f64],
+    },
+}
+
+/// Output produced by [`GpuBackend::try_render_bbox`].
+pub enum GpuBboxResult {
+    Bytes(Bytes),
+    Stats(GpuBandStats),
+}
+
+impl GpuBboxResult {
+    pub fn into_bytes(self) -> Option<Bytes> {
+        match self {
+            Self::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn into_stats(self) -> Option<GpuBandStats> {
+        match self {
+            Self::Stats(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
 fn source_slab_key(cog_id: u64, ifd_idx: usize, band0: u16, src: &BandSource<'_>) -> Option<SlabKey> {
     if src.nodata_override.is_some()
         || src.scale_offset.is_some()
@@ -1219,10 +1326,379 @@ impl GpuBackend {
         }
     }
 
+    /// Unified GPU bbox/tile/crop render entry point across all band shapes and output modes.
+    ///
+    /// Replaces the 18 per-(band-shape × output-mode) `try_render_bbox_*` entry points with one
+    /// `(bands, out)` dispatch table. Every filled cell delegates to its specialized fused GPU
+    /// kernel; unfilled cells return `None` to fall back cleanly to the CPU path.
+    pub fn try_render_bbox(
+        &self,
+        coords: BboxCoordSource<'_>,
+        bands: &GpuBboxBands<'_>,
+        out: &GpuBboxOutput<'_>,
+    ) -> Option<GpuBboxResult> {
+        match (bands, out) {
+            (
+                GpuBboxBands::Single {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                },
+                GpuBboxOutput::StyledLut {
+                    style,
+                    rgb_lut,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_single_band_with_lut(
+                    *cog_id,
+                    *ifd_idx,
+                    *band0,
+                    coords,
+                    src,
+                    style,
+                    rgb_lut,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Single {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                },
+                GpuBboxOutput::F32 { resample },
+            ) => self
+                .try_render_bbox_single_band_f32(*cog_id, *ifd_idx, *band0, coords, src, *resample)
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Single {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                },
+                GpuBboxOutput::Stats {
+                    resample,
+                    num_bins,
+                    hist_range,
+                    percentiles,
+                },
+            ) => self
+                .try_render_bbox_single_band_stats(
+                    *cog_id,
+                    *ifd_idx,
+                    *band0,
+                    coords,
+                    src,
+                    *resample,
+                    *num_bins,
+                    *hist_range,
+                    percentiles,
+                )
+                .map(GpuBboxResult::Stats),
+            (
+                GpuBboxBands::Dem {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                    algorithm,
+                    dx_m,
+                    dy_m,
+                },
+                GpuBboxOutput::StyledLut {
+                    style,
+                    rgb_lut,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_dem_with_lut(
+                    *cog_id,
+                    *ifd_idx,
+                    *band0,
+                    coords,
+                    src,
+                    *algorithm,
+                    *dx_m,
+                    *dy_m,
+                    style,
+                    rgb_lut,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Dem {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                    algorithm,
+                    dx_m,
+                    dy_m,
+                },
+                GpuBboxOutput::F32 { resample },
+            ) => self
+                .try_render_bbox_dem_f32(
+                    *cog_id, *ifd_idx, *band0, coords, src, *algorithm, *dx_m, *dy_m, *resample,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Dem {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                    algorithm,
+                    dx_m,
+                    dy_m,
+                },
+                GpuBboxOutput::Stats {
+                    resample,
+                    num_bins,
+                    hist_range,
+                    percentiles,
+                },
+            ) => self
+                .try_render_bbox_dem_stats(
+                    *cog_id,
+                    *ifd_idx,
+                    *band0,
+                    coords,
+                    src,
+                    *algorithm,
+                    *dx_m,
+                    *dy_m,
+                    *resample,
+                    *num_bins,
+                    *hist_range,
+                    percentiles,
+                )
+                .map(GpuBboxResult::Stats),
+            (
+                GpuBboxBands::Terrain {
+                    cog_id,
+                    ifd_idx,
+                    band0,
+                    src,
+                    encoding,
+                },
+                GpuBboxOutput::StyledTerrain {
+                    resample,
+                    format,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_terrain(
+                    *cog_id,
+                    *ifd_idx,
+                    *band0,
+                    coords,
+                    src,
+                    *encoding,
+                    *resample,
+                    *format,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Spectral {
+                    cache_key,
+                    srcs,
+                    expr,
+                },
+                GpuBboxOutput::StyledLut {
+                    style,
+                    rgb_lut,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_spectral_with_lut(
+                    *cache_key,
+                    coords,
+                    srcs,
+                    *expr,
+                    style,
+                    rgb_lut,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Spectral {
+                    cache_key,
+                    srcs,
+                    expr,
+                },
+                GpuBboxOutput::F32 { resample },
+            ) => self
+                .try_render_bbox_spectral_f32(*cache_key, coords, srcs, *expr, *resample)
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Spectral {
+                    cache_key,
+                    srcs,
+                    expr,
+                },
+                GpuBboxOutput::Stats {
+                    resample,
+                    num_bins,
+                    hist_range,
+                    percentiles,
+                },
+            ) => self
+                .try_render_bbox_spectral_stats(
+                    *cache_key,
+                    coords,
+                    srcs,
+                    *expr,
+                    *resample,
+                    *num_bins,
+                    *hist_range,
+                    percentiles,
+                )
+                .map(GpuBboxResult::Stats),
+            (
+                GpuBboxBands::Expr {
+                    cache_key,
+                    srcs,
+                    prog,
+                },
+                GpuBboxOutput::StyledLut {
+                    style,
+                    rgb_lut,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_expr_with_lut(
+                    *cache_key,
+                    coords,
+                    srcs,
+                    prog,
+                    style,
+                    rgb_lut,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Expr {
+                    cache_key,
+                    srcs,
+                    prog,
+                },
+                GpuBboxOutput::F32 { resample },
+            ) => self
+                .try_render_bbox_expr_f32(*cache_key, coords, srcs, prog, *resample)
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::Expr {
+                    cache_key,
+                    srcs,
+                    prog,
+                },
+                GpuBboxOutput::Stats {
+                    resample,
+                    num_bins,
+                    hist_range,
+                    percentiles,
+                },
+            ) => self
+                .try_render_bbox_expr_stats(
+                    *cache_key,
+                    coords,
+                    srcs,
+                    prog,
+                    *resample,
+                    *num_bins,
+                    *hist_range,
+                    percentiles,
+                )
+                .map(GpuBboxResult::Stats),
+            (
+                GpuBboxBands::Rgb { cache_key, srcs },
+                GpuBboxOutput::StyledRgb {
+                    style,
+                    color_formula,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_rgb(*cache_key, coords, srcs, style, *color_formula, *return_mask)
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::SarRgb { cache_key, srcs },
+                GpuBboxOutput::StyledRgb {
+                    style,
+                    color_formula,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_sar_rgb(
+                    *cache_key,
+                    coords,
+                    srcs,
+                    style,
+                    *color_formula,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::ExprRgb {
+                    cache_key,
+                    unique_bands,
+                    srcs,
+                    progs,
+                },
+                GpuBboxOutput::StyledRgb {
+                    style,
+                    color_formula,
+                    return_mask,
+                },
+            ) => self
+                .try_render_bbox_expr_rgb(
+                    *cache_key,
+                    coords,
+                    unique_bands,
+                    srcs,
+                    progs,
+                    style,
+                    *color_formula,
+                    *return_mask,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::ExprRgb {
+                    cache_key,
+                    unique_bands,
+                    srcs,
+                    progs,
+                },
+                GpuBboxOutput::F32 { resample },
+            ) => self
+                .try_render_bbox_expr_rgb_f32(
+                    *cache_key,
+                    coords,
+                    unique_bands,
+                    srcs,
+                    progs,
+                    *resample,
+                )
+                .map(GpuBboxResult::Bytes),
+            (
+                GpuBboxBands::MultiBand { cache_key, srcs },
+                GpuBboxOutput::F32 { resample },
+            ) => self
+                .try_render_bbox_multiband_f32(*cache_key, coords, srcs, *resample)
+                .map(GpuBboxResult::Bytes),
+            // Unfilled combinations fall back cleanly to the CPU path.
+            _ => None,
+        }
+    }
+
     /// Single-band GPU render with an explicit 256-entry RGB LUT (supporting `CustomColormap`
     /// and zero-cost `ColorFormula` folding).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_single_band_with_lut(
+    fn try_render_bbox_single_band_with_lut(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -1306,7 +1782,7 @@ impl GpuBackend {
     /// DEM numpy-gradient GPU render with an explicit 256-entry RGB LUT (supporting `CustomColormap`
     /// and zero-cost `ColorFormula` folding).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_dem_with_lut(
+    fn try_render_bbox_dem_with_lut(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -1401,7 +1877,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated Terrarium / TerrainRGB rendering for `/cog/preview` & `/cog/bbox`
     /// (sync, for `spawn_blocking` callers).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_terrain(
+    fn try_render_bbox_terrain(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -1768,7 +2244,7 @@ impl GpuBackend {
 
     /// Built-in `SpectralExpr` GPU render with an explicit 256-entry RGB LUT.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_spectral_with_lut(
+    fn try_render_bbox_spectral_with_lut(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -1785,7 +2261,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated built-in `SpectralExpr` raw `f32` rendering for `.npy`, `.tif`,
     /// `.f32`, and multi-scene mosaic routes.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_spectral_f32(
+    fn try_render_bbox_spectral_f32(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -1842,7 +2318,7 @@ impl GpuBackend {
 
     /// Multi-band `ExprProgram` GPU render with an explicit 256-entry RGB LUT.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_expr_with_lut(
+    fn try_render_bbox_expr_with_lut(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -1925,7 +2401,7 @@ impl GpuBackend {
     /// Gamma/Sigmoidal LUT + CIE LCH Saturation) for arbitrary `BboxCoordSource`
     /// (`Separable`, `Grid2D`, or `Exact2D` for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_rgb(
+    fn try_render_bbox_rgb(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2238,7 +2714,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated raw `f32` single-band resampling for `.npy`, `.tif`, `.f32`,
     /// and multi-scene mosaic scene fetches across `Separable`, `Grid2D`, and `Exact2D`.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_single_band_f32(
+    fn try_render_bbox_single_band_f32(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -2283,7 +2759,7 @@ impl GpuBackend {
     /// 1-pass fused GPU single-band resampling + band statistics/histogram/percentiles
     /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_single_band_stats(
+    fn try_render_bbox_single_band_stats(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -2325,7 +2801,7 @@ impl GpuBackend {
     /// 1-pass fused GPU expression evaluation + band statistics/histogram/percentiles
     /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_expr_stats(
+    fn try_render_bbox_expr_stats(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2352,7 +2828,7 @@ impl GpuBackend {
     /// 1-pass fused GPU built-in spectral index (`SpectralExpr`) + band statistics/histogram/percentiles
     /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_spectral_stats(
+    fn try_render_bbox_spectral_stats(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2423,7 +2899,7 @@ impl GpuBackend {
     /// 1-pass fused GPU DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`) + band statistics/histogram/percentiles
     /// (`CoalescedJob::WithStats` — zero `f32` readback, zero re-upload, 12 KB readback).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_dem_stats(
+    fn try_render_bbox_dem_stats(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -2472,7 +2948,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated raw `f32` DEM Horn 3×3 (`Hillshade` / `Slope` / `Aspect`)
     /// evaluation for `.npy`, `.tif`, `.f32`, and mosaic routes.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_dem_f32(
+    fn try_render_bbox_dem_f32(
         &self,
         cog_id: u64,
         ifd_idx: usize,
@@ -2528,7 +3004,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated raw `f32` multi-band `ExprProgram` evaluation for `.npy`, `.tif`,
     /// `.f32`, and mosaic routes (reusing `multi_slab_cache`).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_expr_f32(
+    fn try_render_bbox_expr_f32(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2763,7 +3239,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated Dual-Pol SAR False-Color RGB (with optional fused `ColorFormula`
     /// and `GpuMultiBandCache`) for `/cog/preview`, `/cog/bbox`, `/cog/feature`, and tiles.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_sar_rgb(
+    fn try_render_bbox_sar_rgb(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2814,7 +3290,7 @@ impl GpuBackend {
     /// `ColorFormula` and `GpuMultiBandCache`) for `/cog/preview`, `/cog/bbox`, `/cog/crop`,
     /// and `/cog/feature`.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_expr_rgb(
+    fn try_render_bbox_expr_rgb(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2859,7 +3335,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated multi-band planar `(num_bands, dst_h, dst_w)` Float32 resampling
     /// for `.npy`, Float32 `.tif`, and `.f32` scientific ML tensor cubes (`1..=8` bands).
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_multiband_f32(
+    fn try_render_bbox_multiband_f32(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
@@ -2897,7 +3373,7 @@ impl GpuBackend {
     /// Attempt GPU-accelerated planar `(3, dst_h, dst_w)` Float32 evaluation for 3-expression
     /// `CustomExprRgb` `.npy` / Float32 `.tif` / `.f32` exports.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_render_bbox_expr_rgb_f32(
+    fn try_render_bbox_expr_rgb_f32(
         &self,
         cache_key: Option<MultiBandSlabKey>,
         coords: BboxCoordSource<'_>,
