@@ -19,6 +19,7 @@ use cogzilla_proj::CrsModel;
 use cogzilla_tiff::{Affine2D, PlanarConfig};
 
 use crate::engine::{EngineError, TileEngine};
+use crate::histogram::{HistDtype, sorted_bin_ranges};
 use crate::titiler::{PolygonMask, StatsOptions, compute_f32_band_stats};
 
 /// WGS84 ellipsoid constants.
@@ -1611,77 +1612,35 @@ pub fn compute_weighted_band_stats_with_geom(
             obj.insert("category_areas".into(), serde_json::Value::Object(cat_areas_obj));
         }
     } else {
-        // T4: numeric histogram always reports coverage counts summing to `count`.
-        let (h_lo, h_hi) = opts.histogram_range.unwrap_or((min_v, max_v));
-        let edges: Vec<f64> = if let Some(ref custom_edges) = opts.histogram_edges
-            && custom_edges.len() >= 2
-        {
-            custom_edges.clone()
+        // T4: numeric histogram always reports coverage counts summing to `count`, in numpy's
+        // bins (the values are sorted, so each bin is a run of them).
+        let dtype = opts.hist_dtype.unwrap_or_else(|| {
+            if all_unit {
+                HistDtype::infer(unit_keys.iter().map(|&k| sortable_u32_to_f32(k)))
+            } else if w_eq_c {
+                HistDtype::infer(cov_vals.iter().map(|&(k, _)| sortable_u32_to_f32(k)))
+            } else {
+                HistDtype::infer(weighted_vals.iter().map(|&(k, _, _)| sortable_u32_to_f32(k)))
+            }
+        });
+        let edges = opts.histogram_bin_edges(Some((min_v, max_v)), dtype);
+        let value = |k: u32| sortable_u32_to_f32(k) as f64;
+        let hist_w: Vec<f64> = if all_unit {
+            sorted_bin_ranges(&unit_keys, &edges, |&k| value(k))
+                .into_iter()
+                .map(|r| r.len() as f64)
+                .collect()
+        } else if w_eq_c {
+            sorted_bin_ranges(&cov_vals, &edges, |&(k, _)| value(k))
+                .into_iter()
+                .map(|r| cov_vals[r].iter().fold(0.0, |acc, &(_, c)| acc + c))
+                .collect()
         } else {
-            let nbins = opts.histogram_bins.clamp(1, 1000);
-            let degenerate = (h_hi - h_lo).abs() < 1e-12;
-            let span = if degenerate { 1.0 } else { h_hi - h_lo };
-            (0..=nbins)
-                .map(|k| {
-                    if k == nbins {
-                        if degenerate { h_lo + 1.0 } else { h_hi }
-                    } else {
-                        h_lo + span * (k as f64) / (nbins as f64)
-                    }
-                })
+            sorted_bin_ranges(&weighted_vals, &edges, |&(k, _, _)| value(k))
+                .into_iter()
+                .map(|r| weighted_vals[r].iter().fold(0.0, |acc, &(_, _, c)| acc + c))
                 .collect()
         };
-        let nbins = edges.len() - 1;
-        let mut hist_w = vec![0.0_f64; nbins];
-        if all_unit {
-            let mut start = unit_keys
-                .partition_point(|&k| (sortable_u32_to_f32(k) as f64) < edges[0]);
-            for bin in 0..nbins {
-                let end = if bin + 1 < nbins {
-                    let hi = edges[bin + 1];
-                    start
-                        + unit_keys[start..]
-                            .partition_point(|&k| (sortable_u32_to_f32(k) as f64) < hi)
-                } else {
-                    let hi = edges[nbins];
-                    start
-                        + unit_keys[start..]
-                            .partition_point(|&k| (sortable_u32_to_f32(k) as f64) <= hi)
-                };
-                hist_w[bin] = (end - start) as f64;
-                start = end;
-            }
-        } else if w_eq_c {
-            let mut bin = 0usize;
-            for &(k, c) in &cov_vals {
-                let vf = sortable_u32_to_f32(k) as f64;
-                if vf < edges[0] {
-                    continue;
-                }
-                if vf > edges[nbins] {
-                    break;
-                }
-                while bin + 1 < nbins && vf >= edges[bin + 1] {
-                    bin += 1;
-                }
-                hist_w[bin] += c;
-            }
-        } else {
-            let mut bin = 0usize;
-            for &(k, _, c) in &weighted_vals {
-                let vf = sortable_u32_to_f32(k) as f64;
-                if vf < edges[0] {
-                    continue;
-                }
-                if vf > edges[nbins] {
-                    break;
-                }
-                while bin + 1 < nbins && vf >= edges[bin + 1] {
-                    bin += 1;
-                }
-                hist_w[bin] += c;
-            }
-        }
         obj.insert("histogram".into(), serde_json::json!([hist_w, edges]));
     }
     obj.insert("valid_percent".into(), serde_json::json!(valid_percent));
@@ -2437,7 +2396,12 @@ pub async fn compute_native_exact_polygon_stats(
     // Compute exact coverage, ellipsoidal area model (or geodesic line lengths), and weighted statistics.
     let crs_owned = crs.clone();
     let p2c = ifd.pixel_to_crs;
-    let opts_owned = opts.clone();
+    let mut opts_owned = opts.clone();
+    // numpy builds the histogram's edges in the band's own type (or the expression's).
+    let band_dtype = HistDtype::for_sample_type(ifd.sample_type, unscale);
+    if opts_owned.expressions.is_none() {
+        opts_owned.hist_dtype.get_or_insert(band_dtype);
+    }
     let descs_owned = cog.index.band_descriptions.clone();
     let scales_owned = if stream_chunky && unscale {
         cog.index.scales.clone()
@@ -2587,6 +2551,12 @@ pub async fn compute_native_exact_polygon_stats(
                 }
             }
             for (ei, (desc, expr_px)) in expr_bufs.into_iter().enumerate() {
+                let expr_opts = StatsOptions {
+                    hist_dtype: opts_owned
+                        .hist_dtype
+                        .or(Some(HistDtype::for_expression(desc, band_dtype))),
+                    ..opts_owned.clone()
+                };
                 out.insert(
                     format!("b{}", ei + 1),
                     compute_weighted_band_stats_with_geom(
@@ -2600,7 +2570,7 @@ pub async fn compute_native_exact_polygon_stats(
                         line_len_m.as_deref(),
                         total_poly_area_px,
                         desc,
-                        &opts_owned,
+                        &expr_opts,
                     ),
                 );
             }
@@ -3111,6 +3081,14 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
     let p2c = ifd.pixel_to_crs;
     let opts_owned = opts.clone();
     let exprs_owned = exprs.to_vec();
+    // numexpr keeps float32 only when every asset is float32.
+    let band_dtype = if cogs.iter().all(|c| {
+        HistDtype::for_sample_type(c.index.ifds[ifd_idx].sample_type, unscale) == HistDtype::Float32
+    }) {
+        HistDtype::Float32
+    } else {
+        HistDtype::Float64
+    };
     #[cfg(feature = "gpu")]
     let gpu_opt = engine.gpu.as_ref().map(Arc::clone);
     #[cfg(feature = "gpu")]
@@ -3241,6 +3219,12 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
             }
         }
         for (ei, (desc, expr_px)) in expr_bufs.into_iter().enumerate() {
+            let expr_opts = StatsOptions {
+                hist_dtype: opts_owned
+                    .hist_dtype
+                    .or(Some(HistDtype::for_expression(desc, band_dtype))),
+                ..opts_owned.clone()
+            };
             out.insert(
                 format!("b{}", ei + 1),
                 compute_weighted_band_stats_with_geom(
@@ -3254,7 +3238,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
                     line_len_m.as_deref(),
                     total_poly_area_px,
                     desc,
-                    &opts_owned,
+                    &expr_opts,
                 ),
             );
         }

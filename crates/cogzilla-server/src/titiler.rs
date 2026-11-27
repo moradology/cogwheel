@@ -12,6 +12,8 @@ use cogzilla_kernel::{
 use cogzilla_tiff::PlanarConfig;
 
 use crate::engine::{BandRequest, EngineError, TileEngine};
+pub use crate::histogram::HistDtype;
+use crate::histogram::{AscendingBins, bin_of, sorted_bin_ranges};
 use crate::geotiff::{
     GeoTiffLayout, GeoTiffPhotometric, GeoTiffSample, GeoTiffSpec, write_geotiff,
 };
@@ -1629,6 +1631,22 @@ pub struct StatsOptions {
     pub height: Option<u32>,
     pub max_size_explicit: bool,
     pub area_weighted: bool,
+    /// The type numpy builds the histogram's bin edges in, for paths that only see `f32` values;
+    /// `None` infers it from the values (see [`HistDtype::infer`]).
+    pub hist_dtype: Option<HistDtype>,
+}
+
+impl StatsOptions {
+    /// numpy's histogram bin edges for this request over data spanning `min_max`.
+    pub fn histogram_bin_edges(&self, min_max: Option<(f64, f64)>, dtype: HistDtype) -> Vec<f64> {
+        crate::histogram::bin_edges(
+            self.histogram_bins.clamp(1, 1000),
+            self.histogram_edges.as_deref(),
+            self.histogram_range,
+            min_max,
+            dtype,
+        )
+    }
 }
 
 impl Default for StatsOptions {
@@ -1646,26 +1664,8 @@ impl Default for StatsOptions {
             height: None,
             max_size_explicit: false,
             area_weighted: true,
+            hist_dtype: None,
         }
-    }
-}
-
-/// Bin a value `v` into sorted `edges` (`edges.len() >= 2`) using NumPy `np.histogram` semantics:
-/// `[edges[i], edges[i+1])` for `i < n-1`, and `[edges[n-2], edges[n-1]]` inclusive on the last bin.
-#[inline]
-fn bin_into_edges(edges: &[f64], v: f64) -> Option<usize> {
-    let n_bins = edges.len().checked_sub(1)?;
-    if n_bins == 0 || v < edges[0] || v > edges[n_bins] {
-        return None;
-    }
-    if v == edges[n_bins] {
-        return Some(n_bins - 1);
-    }
-    let idx = edges.partition_point(|&e| e <= v);
-    if idx == 0 {
-        None
-    } else {
-        Some((idx - 1).min(n_bins - 1))
     }
 }
 
@@ -1708,7 +1708,7 @@ pub fn compute_f32_band_stats(
 ) -> serde_json::Value {
     let denom = pixels.len();
     let valid: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
-    BandStatsAcc::Floats(valid).finalize(denom, false, 1.0, 0.0, None, description, opts)
+    BandStatsAcc::Floats(valid).finalize(denom, false, 1.0, 0.0, None, description, opts, opts.hist_dtype)
 }
 
 /// GPU-accelerated variant of `compute_f32_band_stats`: when built with `--features gpu` and
@@ -1750,7 +1750,7 @@ fn gpu_band_stats_to_json(
 ) -> serde_json::Value {
     let masked_pixels = denom_pixels.saturating_sub(gs.valid_pixels);
     if gs.valid_pixels == 0 {
-        return empty_band_stats_json(masked_pixels, description, opts);
+        return empty_band_stats_json(masked_pixels, description, opts, opts.hist_dtype.unwrap_or(HistDtype::Float64));
     }
     let valid_percent = if denom_pixels > 0 {
         ((gs.valid_pixels as f64 / denom_pixels as f64) * 100.0 * 100.0).round() / 100.0
@@ -1809,6 +1809,7 @@ fn empty_band_stats_json(
     masked_px: usize,
     description: &str,
     opts: &StatsOptions,
+    dtype: HistDtype,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("min".into(), serde_json::Value::Null);
@@ -1827,7 +1828,14 @@ fn empty_band_stats_json(
     for &p in &opts.percentiles {
         obj.insert(percentile_key(p), serde_json::Value::Null);
     }
-    obj.insert("histogram".into(), serde_json::json!([[], []]));
+    if opts.categorical {
+        obj.insert("histogram".into(), serde_json::json!([[], []]));
+    } else {
+        // numpy.histogram of no values: zero counts over the range (0 .. 1 when none is given).
+        let edges = opts.histogram_bin_edges(None, dtype);
+        let counts = vec![0u64; edges.len() - 1];
+        obj.insert("histogram".into(), serde_json::json!([counts, edges]));
+    }
     if opts.categorical {
         obj.insert("categories".into(), serde_json::json!({}));
     }
@@ -1836,6 +1844,7 @@ fn empty_band_stats_json(
 }
 
 impl BandStatsAcc {
+    #[allow(clippy::too_many_arguments)]
     fn finalize_hist_with_opts(
         hist: &[u64],
         denom_pixels: usize,
@@ -1844,6 +1853,7 @@ impl BandStatsAcc {
         offset: f32,
         description: &str,
         opts: &StatsOptions,
+        dtype: HistDtype,
     ) -> serde_json::Value {
         let valid_px: usize = hist.iter().map(|&c| c as usize).sum();
         let masked_px = denom_pixels.saturating_sub(valid_px);
@@ -1853,7 +1863,7 @@ impl BandStatsAcc {
             0.0
         };
         if valid_px == 0 {
-            return empty_band_stats_json(masked_px, description, opts);
+            return empty_band_stats_json(masked_px, description, opts, dtype);
         }
         let reverse = unscale && scale < 0.0;
         let to_val = |k: usize| -> f32 {
@@ -1931,46 +1941,22 @@ impl BandStatsAcc {
 
         let mean = sum / (valid_px as f64);
         let mut var_sum = 0.0f64;
-        let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
-            && custom_edges.len() >= 2
-        {
-            let mut counts = vec![0u64; custom_edges.len() - 1];
-            for (k, &c) in hist.iter().enumerate() {
-                if c == 0 {
-                    continue;
-                }
-                let v = to_val(k) as f64;
-                let d = v - mean;
-                var_sum += d * d * (c as f64);
-                if let Some(bin) = bin_into_edges(custom_edges, v) {
-                    counts[bin] += c;
-                }
+        // Each distinct value goes to numpy's bin with its whole count.
+        let edges = opts.histogram_bin_edges(Some((min as f64, max as f64)), dtype);
+        let mut counts = vec![0u64; edges.len() - 1];
+        let mut ascending = AscendingBins::new(&edges);
+        for (k, &c) in hist.iter().enumerate() {
+            if c == 0 {
+                continue;
             }
-            (counts, custom_edges.clone())
-        } else {
-            let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
-            let span = (h_max - h_min).max(1e-12);
-            let n_bins = opts.histogram_bins.clamp(1, 1000);
-            let mut counts = vec![0u64; n_bins];
-            for (k, &c) in hist.iter().enumerate() {
-                if c == 0 {
-                    continue;
-                }
-                let v = to_val(k) as f64;
-                let d = v - mean;
-                var_sum += d * d * (c as f64);
-                if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
-                    let bin = (((v - h_min) / span) * (n_bins as f64))
-                        .floor()
-                        .clamp(0.0, (n_bins - 1) as f64) as usize;
-                    counts[bin] += c;
-                }
+            let v = to_val(k) as f64;
+            let d = v - mean;
+            var_sum += d * d * (c as f64);
+            let bin = if reverse { bin_of(&edges, v) } else { ascending.bin_of(v) };
+            if let Some(bin) = bin {
+                counts[bin] += c;
             }
-            let edges: Vec<f64> = (0..=n_bins)
-                .map(|i| h_min + span * (i as f64 / n_bins as f64))
-                .collect();
-            (counts, edges)
-        };
+        }
         let std = (var_sum / (valid_px as f64)).sqrt();
         let mut obj = serde_json::Map::new();
         obj.insert("min".into(), serde_json::json!(min));
@@ -2002,6 +1988,12 @@ impl BandStatsAcc {
         serde_json::Value::Object(obj)
     }
 
+    /// The band's statistics. `dtype` is the type numpy would build the histogram's edges in;
+    /// `None` takes it from the accumulator (integer bands, or float32 when unscaled) or, for
+    /// `f32` values of unknown source, infers it from the values.
+    #[allow(clippy::too_many_arguments)]
+    // Runs once per band: keep it out of the caller that holds the per-tile accumulation loops.
+    #[inline(never)]
     fn finalize(
         self,
         denom_pixels: usize,
@@ -2011,6 +2003,7 @@ impl BandStatsAcc {
         nodata_override: Option<f32>,
         description: &str,
         opts: &StatsOptions,
+        dtype: Option<HistDtype>,
     ) -> serde_json::Value {
         match self {
             Self::HistU8(mut hist) => {
@@ -2027,6 +2020,7 @@ impl BandStatsAcc {
                     offset,
                     description,
                     opts,
+                    dtype.unwrap_or(HistDtype::for_sample_type(cogzilla_tiff::SampleType::Uint16, unscale)),
                 )
             }
             Self::HistU16(mut hist) => {
@@ -2043,6 +2037,7 @@ impl BandStatsAcc {
                     offset,
                     description,
                     opts,
+                    dtype.unwrap_or(HistDtype::for_sample_type(cogzilla_tiff::SampleType::Uint16, unscale)),
                 )
             }
             Self::Floats(mut vals) => {
@@ -2054,7 +2049,8 @@ impl BandStatsAcc {
                     0.0
                 };
                 if valid_px == 0 {
-                    return empty_band_stats_json(masked_px, description, opts);
+                    let dtype = dtype.unwrap_or(HistDtype::Float64);
+                    return empty_band_stats_json(masked_px, description, opts, dtype);
                 }
                 vals.sort_unstable_by(|a, b| a.total_cmp(b));
                 let min = vals[0];
@@ -2114,40 +2110,17 @@ impl BandStatsAcc {
                 }
                 let mean = sum / (valid_px as f64);
                 let mut var_sum = 0.0f64;
-                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
-                    && custom_edges.len() >= 2
-                {
-                    let mut counts = vec![0u64; custom_edges.len() - 1];
-                    for &v in &vals {
-                        let vf = v as f64;
-                        let d = vf - mean;
-                        var_sum += d * d;
-                        if let Some(bin) = bin_into_edges(custom_edges, vf) {
-                            counts[bin] += 1;
-                        }
-                    }
-                    (counts, custom_edges.clone())
-                } else {
-                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min as f64, max as f64));
-                    let span = (h_max - h_min).max(1e-12);
-                    let n_bins = opts.histogram_bins.clamp(1, 1000);
-                    let mut counts = vec![0u64; n_bins];
-                    for &v in &vals {
-                        let vf = v as f64;
-                        let d = vf - mean;
-                        var_sum += d * d;
-                        if opts.histogram_range.is_none() || (vf >= h_min && vf <= h_max) {
-                            let bin = (((vf - h_min) / span) * (n_bins as f64))
-                                .floor()
-                                .clamp(0.0, (n_bins - 1) as f64) as usize;
-                            counts[bin] += 1;
-                        }
-                    }
-                    let edges: Vec<f64> = (0..=n_bins)
-                        .map(|i| h_min + span * (i as f64 / n_bins as f64))
-                        .collect();
-                    (counts, edges)
-                };
+                for &v in &vals {
+                    let d = v as f64 - mean;
+                    var_sum += d * d;
+                }
+                // The values are sorted: each bin is a run of them.
+                let dtype = dtype.unwrap_or_else(|| HistDtype::infer(vals.iter().copied()));
+                let edges = opts.histogram_bin_edges(Some((min as f64, max as f64)), dtype);
+                let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v as f64)
+                    .iter()
+                    .map(|r| r.len() as u64)
+                    .collect();
                 let std = (var_sum / (valid_px as f64)).sqrt();
 
                 let med_idx = valid_px / 2;
@@ -2192,7 +2165,8 @@ impl BandStatsAcc {
                     0.0
                 };
                 if valid_px == 0 {
-                    return empty_band_stats_json(masked_px, description, opts);
+                    let dtype = dtype.unwrap_or(HistDtype::Float64);
+                    return empty_band_stats_json(masked_px, description, opts, dtype);
                 }
                 vals.sort_unstable_by(|a, b| a.total_cmp(b));
                 let min = vals[0];
@@ -2261,61 +2235,15 @@ impl BandStatsAcc {
                 let inv_var_scale = 1.0 / var_scale;
                 let mean_scaled = mean * inv_var_scale;
                 let mut var_sum = 0.0f64;
-                let (counts, edges) = if let Some(ref custom_edges) = opts.histogram_edges
-                    && custom_edges.len() >= 2
-                {
-                    let mut counts = vec![0u64; custom_edges.len() - 1];
-                    for &v in &vals {
-                        let d = v * inv_var_scale - mean_scaled;
-                        var_sum += d * d;
-                        if let Some(bin) = bin_into_edges(custom_edges, v) {
-                            counts[bin] += 1;
-                        }
-                    }
-                    (counts, custom_edges.clone())
-                } else {
-                    let (h_min, h_max) = opts.histogram_range.unwrap_or((min, max));
-                    let n_bins = opts.histogram_bins.clamp(1, 1000);
-                    let mut counts = vec![0u64; n_bins];
-                    let raw_span = h_max - h_min;
-                    let step = if raw_span.is_finite() {
-                        raw_span.max(1e-12) / (n_bins as f64)
-                    } else {
-                        (h_max / (n_bins as f64)) - (h_min / (n_bins as f64))
-                    };
-                    for &v in &vals {
-                        let d = v * inv_var_scale - mean_scaled;
-                        var_sum += d * d;
-                        if opts.histogram_range.is_none() || (v >= h_min && v <= h_max) {
-                            let bin = if step.is_finite() && step > 0.0 {
-                                let off = if (v - h_min).is_finite() {
-                                    (v - h_min) / step
-                                } else {
-                                    (v / step) - (h_min / step)
-                                };
-                                off.floor().clamp(0.0, (n_bins - 1) as f64) as usize
-                            } else {
-                                0
-                            };
-                            counts[bin] += 1;
-                        }
-                    }
-                    let edges: Vec<f64> = (0..=n_bins)
-                        .map(|i| {
-                            if i == 0 {
-                                h_min
-                            } else if i == n_bins {
-                                h_max
-                            } else if raw_span.is_finite() {
-                                h_min + step * (i as f64)
-                            } else {
-                                let t = (i as f64) / (n_bins as f64);
-                                h_min * (1.0 - t) + h_max * t
-                            }
-                        })
-                        .collect();
-                    (counts, edges)
-                };
+                for &v in &vals {
+                    let d = v * inv_var_scale - mean_scaled;
+                    var_sum += d * d;
+                }
+                let edges = opts.histogram_bin_edges(Some((min, max)), dtype.unwrap_or(HistDtype::Float64));
+                let counts: Vec<u64> = sorted_bin_ranges(&vals, &edges, |&v| v)
+                    .iter()
+                    .map(|r| r.len() as u64)
+                    .collect();
                 let std = (var_sum / n_f).sqrt() * var_scale;
 
                 let med_idx = valid_px / 2;
@@ -3109,6 +3037,7 @@ fn compute_statistics_cpu(
             nodata_override,
             &bname,
             opts,
+            Some(HistDtype::for_sample_type(ifd.sample_type, unscale)),
         );
         out.insert(bname, val);
     }
@@ -3505,7 +3434,10 @@ fn compute_expression_statistics_cpu(
             continue;
         }
         let acc = BandStatsAcc::Floats(vals);
-        let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts);
+        let dtype = opts.hist_dtype.unwrap_or_else(|| {
+            HistDtype::for_expression(expr_str, HistDtype::for_sample_type(ifd.sample_type, unscale))
+        });
+        let val = acc.finalize(denom_pixels, false, 1.0, 0.0, None, expr_str, opts, Some(dtype));
         out.insert(format!("b{}", i + 1), val);
     }
     serde_json::Value::Object(out)
@@ -4067,6 +3999,13 @@ pub async fn compute_statistics_with_options(
                     rescale: (0.0, 1.0),
                     colormap: ColormapName::Grayscale,
                 };
+                let expr_opts = StatsOptions {
+                    hist_dtype: opts.hist_dtype.or(Some(HistDtype::for_expression(
+                        desc,
+                        HistDtype::for_sample_type(full.sample_type, unscale),
+                    ))),
+                    ..opts.clone()
+                };
                 let stat = match render_wgs84_bbox_stats(
                     engine,
                     &cogs,
@@ -4079,13 +4018,13 @@ pub async fn compute_statistics_with_options(
                     nodata_override,
                     unscale,
                     desc,
-                    opts,
+                    &expr_opts,
                 )
                 .await
                 {
                     Ok(v) => v,
                     Err(EngineError::NotFound(_)) => {
-                        compute_f32_band_stats_with_engine(engine, &[], desc, opts)
+                        compute_f32_band_stats_with_engine(engine, &[], desc, &expr_opts)
                     }
                     Err(e) => return Err(e),
                 };
@@ -4099,6 +4038,13 @@ pub async fn compute_statistics_with_options(
             _ => (1..=count)
                 .filter(|&b| Some((b - 1) as usize) != alpha_idx)
                 .collect(),
+        };
+        // Plain bands: numpy builds the histogram's edges in the band's own type.
+        let band_opts = StatsOptions {
+            hist_dtype: opts
+                .hist_dtype
+                .or(Some(HistDtype::for_sample_type(full.sample_type, unscale))),
+            ..opts.clone()
         };
         for chunk in sel_bands.chunks(15) {
             if chunk.len() == 1 {
@@ -4128,13 +4074,13 @@ pub async fn compute_statistics_with_options(
                     nodata_override,
                     unscale,
                     &desc,
-                    opts,
+                    &band_opts,
                 )
                 .await
                 {
                     Ok(v) => v,
                     Err(EngineError::NotFound(_)) => {
-                        compute_f32_band_stats_with_engine(engine, &[], &desc, opts)
+                        compute_f32_band_stats_with_engine(engine, &[], &desc, &band_opts)
                     }
                     Err(e) => return Err(e),
                 };
@@ -4185,7 +4131,7 @@ pub async fn compute_statistics_with_options(
                 out.insert(
                     format!("b{b1}"),
                     patch_valid_percent(compute_f32_band_stats_with_engine(
-                        engine, &pixels, &desc, opts,
+                        engine, &pixels, &desc, &band_opts,
                     )),
                 );
             }
