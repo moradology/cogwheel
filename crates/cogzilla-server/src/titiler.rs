@@ -5785,10 +5785,10 @@ pub async fn render_exact_f64_array(
         } else {
             (1, 1)
         };
-        let c0 = (min_u.floor() as i32 - mx).clamp(0, ifd.width as i32 - 1) as u32;
-        let c1 = (max_u.ceil() as i32 + mx).clamp(0, ifd.width as i32 - 1) as u32;
-        let r0 = (min_v.floor() as i32 - my).clamp(0, ifd.height as i32 - 1) as u32;
-        let r1 = (max_v.ceil() as i32 + my).clamp(0, ifd.height as i32 - 1) as u32;
+        let c0 = (min_u.floor() as i32).saturating_sub(mx).clamp(0, ifd.width as i32 - 1) as u32;
+        let c1 = (max_u.ceil() as i32).saturating_add(mx).clamp(0, ifd.width as i32 - 1) as u32;
+        let r0 = (min_v.floor() as i32).saturating_sub(my).clamp(0, ifd.height as i32 - 1) as u32;
+        let r1 = (max_v.ceil() as i32).saturating_add(my).clamp(0, ifd.height as i32 - 1) as u32;
         let tx0 = c0 / ifd.tile_width;
         let tx1 = c1 / ifd.tile_width;
         let ty0 = r0 / ifd.tile_height;

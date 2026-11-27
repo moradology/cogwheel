@@ -1578,7 +1578,7 @@ struct AxisTapTable {
 }
 
 impl AxisTapTable {
-    fn build(mode: ResampleMode, coords: &[f32], scale: f32) -> Self {
+    fn build(mode: ResampleMode, coords: &[f32], scale: f32, lim: i32) -> Self {
         let s = widened_scale(mode, scale);
         let bound = ((2.0 * conv_kernel_radius(mode) * s).ceil() as usize + 1).min(WIDE_MAX_TAPS);
         let mut start = Vec::with_capacity(coords.len());
@@ -1586,8 +1586,13 @@ impl AxisTapTable {
         let mut packed = vec![0.0f32; coords.len() * bound];
         let mut tmp = [0.0f32; WIDE_MAX_TAPS];
         let mut most = 0usize;
+        let max_c = lim as f32 - 0.5;
         for (k, &c) in coords.iter().enumerate() {
-            let (st, n) = if c.is_finite() { widened_axis_taps(mode, c, s, &mut tmp[..bound]) } else { (0, 0) };
+            let (st, n) = if c.is_finite() && c >= -0.5 && c <= max_c {
+                widened_axis_taps(mode, c, s, &mut tmp[..bound])
+            } else {
+                (0, 0)
+            };
             let sum: f32 = tmp[..n].iter().sum();
             let inv = if sum.abs() > 1e-12 { 1.0 / sum } else { 0.0 };
             for i in 0..n {
@@ -1721,8 +1726,8 @@ pub fn widened_plane_separable(
     let (w, h) = (us.len(), vs.len());
     let mut out = vec![f32::NAN; w * h];
     let in_range = |c: f32, lim: i32| c.is_finite() && c >= -0.5 && c <= lim as f32 - 0.5;
-    let cols = AxisTapTable::build(mode, us, scale_x);
-    let rows = AxisTapTable::build(mode, vs, scale_y);
+    let cols = AxisTapTable::build(mode, us, scale_x, src.ifd_w);
+    let rows = AxisTapTable::build(mode, vs, scale_y, src.ifd_h);
     let (Some((c_lo, c_hi)), Some(_)) = (cols.span(), rows.span()) else {
         return out;
     };
@@ -8749,6 +8754,33 @@ mod widened_kernel_tests {
                 sample_bilinear::<false>(&src, u, v)
             );
             assert_eq!(sample_general_scaled(&src, u, v, 1.02, 0.7, ResampleMode::Cubic), sample_cubic(&src, u, v));
+        }
+    }
+
+    #[test]
+    fn widened_plane_separable_ignores_far_out_of_range_coords_with_nodata() {
+        // Out-of-range coordinates (e.g. low-zoom tile over a small COG) must not inflate the
+        // separable tap span or overflow i32 when no_nodata is false.
+        let b = f32_band(16, 16, |x, _| if x == 0 { f32::NAN } else { 7.0 });
+        let blks = [Some(&b)];
+        let mut src = BandSource::new(16, 16, 16, 16, 0, 0, 1, 1, &blks);
+        src.no_nodata = false;
+        let us = [-1e9f32, -500_000.0, 4.5, 1e9];
+        let vs = [-1e9f32, 4.5, 1e9];
+        for mode in [ResampleMode::Bilinear, ResampleMode::Cubic, ResampleMode::CubicSpline, ResampleMode::Lanczos] {
+            let plane = widened_plane_separable(&us, &vs, &src, mode, 2.0, 2.0);
+            assert_eq!(plane.len(), us.len() * vs.len());
+            for (py, &v) in vs.iter().enumerate() {
+                for (px, &u) in us.iter().enumerate() {
+                    let got = plane[py * us.len() + px];
+                    let want = sample_kernel_widened(&src, u, v, 2.0, 2.0, mode);
+                    if want.is_nan() {
+                        assert!(got.is_nan(), "{mode:?} ({px},{py}): expected NaN, got {got}");
+                    } else {
+                        assert!((got - want).abs() < 1e-4, "{mode:?} ({px},{py}): {got} vs {want}");
+                    }
+                }
+            }
         }
     }
 }
