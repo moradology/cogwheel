@@ -2374,6 +2374,50 @@ fn geotiff_render_format(
     }
 }
 
+/// Return true when an unrescaled `Uint16` `.png` request should emit a 16-bit PNG
+/// matching TiTiler / GDAL's PNG driver instead of downscaling to 8-bit.
+fn wants_u16_png(
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    bands: &BandRequest,
+    sample_type: cogzilla_tiff::SampleType,
+) -> bool {
+    fmt == OutputFormat::Png
+        && ct == "image/png"
+        && sample_type == cogzilla_tiff::SampleType::Uint16
+        && !pq.unscale
+        && pq.rescale.is_empty()
+        && !pq.colormap_explicit
+        && pq.custom_colormap_json.is_none()
+        && pq.color_formula.is_none()
+        && pq.algorithm.is_none()
+        && pq.expr_raw.is_none()
+        && !source_cog.is_some_and(|c| has_embedded_palette(pq, c, bands))
+        && matches!(
+            bands,
+            BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
+        )
+        && (TileEngine::value_bands(bands) + usize::from(pq.return_mask)) <= 4
+}
+
+fn render_output_format(
+    fmt: OutputFormat,
+    ct: &str,
+    pq: &ParsedQuery,
+    source_cog: Option<&cogzilla_io::OpenedCog>,
+    bands: &BandRequest,
+    sample_type: cogzilla_tiff::SampleType,
+    allow_f64: bool,
+) -> OutputFormat {
+    if wants_u16_png(fmt, ct, pq, source_cog, bands, sample_type) {
+        OutputFormat::RawF32
+    } else {
+        geotiff_render_format(fmt, ct, pq, source_cog, bands, sample_type, allow_f64)
+    }
+}
+
 fn wrap_geotiff_fmt(
     data: Bytes,
     ct: &'static str,
@@ -2406,6 +2450,21 @@ fn wrap_geotiff_fmt(
             encode_geotiff_f32(w, h, &data, bbox, epsg, return_mask)
         } else {
             encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
+        }
+    } else if ct == "image/png" && matches!(fmt, OutputFormat::RawF32) {
+        let n_px = (w as usize).saturating_mul(h as usize).max(1);
+        let n_bands = data.len() / (n_px * 4);
+        if n_bands >= 1
+            && data.len() == n_bands * n_px * 4
+            && (n_bands + usize::from(return_mask)) <= 4
+        {
+            let vals: Vec<f32> = data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            pgstac::png_of_16_bits(&vals, n_bands, w as usize, h as usize, return_mask)
+        } else {
+            data
         }
     } else {
         data
@@ -9169,7 +9228,7 @@ where
                 let st = widest_sample_type(&cogs);
                 let mut bands =
                     build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -9409,6 +9468,8 @@ where
                         let auto_fmt = ext.is_none() && pq_stac.format_param.is_none();
                         if auto_fmt {
                             treq.format = OutputFormat::RawRgba;
+                        } else if wants_u16_png(treq.format, ct, &pq_stac, Some(&cogs[0]), &treq.bands, st) {
+                            treq.format = OutputFormat::RawF32;
                         }
                         if let Some(ref cf_str) = pq_stac.color_formula {
                             ColorFormula::parse(cf_str).map_err(EngineError::BadRequest)?;
@@ -9692,7 +9753,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(
+                    render_output_format(
                         fmt,
                         ct,
                         &pq_stac,
@@ -9776,7 +9837,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -9862,7 +9923,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(
+                    render_output_format(
                         fmt,
                         ct,
                         &pq_stac,
@@ -9952,7 +10013,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -10036,7 +10097,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq_stac, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(
+                let fmt = render_output_format(
                     fmt,
                     ct,
                     &pq_stac,
@@ -10099,7 +10160,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(
+                    render_output_format(
                         fmt,
                         ct,
                         &pq_stac,
@@ -10693,6 +10754,8 @@ where
                         let auto_fmt = ext.is_none() && pq.format_param.is_none();
                         if auto_fmt {
                             treq.format = OutputFormat::RawRgba;
+                        } else if wants_u16_png(treq.format, ct, &pq, Some(&cogs[0]), &treq.bands, st) {
+                            treq.format = OutputFormat::RawF32;
                         }
                         if let Some(ref cf_str) = pq.color_formula {
                             ColorFormula::parse(cf_str).map_err(EngineError::BadRequest)?;
@@ -11153,7 +11216,7 @@ where
                 let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -11310,7 +11373,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
+                    render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11409,7 +11472,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -11497,7 +11560,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
+                    render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11575,7 +11638,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -11653,7 +11716,7 @@ where
                 let fmt = if auto_fmt {
                     OutputFormat::RawRgba
                 } else {
-                    geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
+                    render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1)
                 };
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
@@ -11709,7 +11772,7 @@ where
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
                 let st = widest_sample_type(&cogs);
                 let mut bands = build_band_request_for_output(&pq, db, st, fmt, ct)?;
-                let fmt = geotiff_render_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
+                let fmt = render_output_format(fmt, ct, &pq, Some(&cogs[0]), &bands, st, cogs.len() == 1);
                 if pq.unscale {
                     apply_unscale_cogs(&mut bands, &cogs);
                 }
@@ -12305,6 +12368,29 @@ mod tests {
         assert_ne!(unmasked, png, "return_mask=false leaves the mask out");
         let jpeg = encode_rgba_output(2, 2, &rgba, OutputFormat::Jpeg { quality: 75 }, true);
         assert_eq!(jpeg[..2], [0xff, 0xd8]);
+    }
+
+    #[test]
+    fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
+        let pq_plain = parse_query(None);
+        let pq_rescaled = parse_query(Some("rescale=0,1000"));
+        let pq_cmap = parse_query(Some("colormap_name=viridis"));
+        let single = BandRequest::Single { band_1based: 1, rescale: (0.0, 65535.0), colormap: ColormapName::Grayscale };
+        assert!(wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_tiff::SampleType::Uint16));
+        assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_tiff::SampleType::Uint8));
+        assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_rescaled, None, &single, cogzilla_tiff::SampleType::Uint16));
+        assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_cmap, None, &single, cogzilla_tiff::SampleType::Uint16));
+
+        // 2x1 single-band f32 buffer with overshoot (-1.0, 70000.0) -> clamped to (0, 65535) in 16-bit Grey+Alpha PNG.
+        let mut raw = Vec::new();
+        for v in [-1.0f32, 70000.0f32] {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let png = wrap_geotiff_fmt(Bytes::from(raw), "image/png", OutputFormat::RawF32, 2, 1, [0.0; 4], 4326, true);
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        // IHDR: byte 24 is bit depth (16), byte 25 is colour type (4 = Greyscale+Alpha).
+        assert_eq!(png[24], 16, "expected 16-bit PNG");
+        assert_eq!(png[25], 4, "expected Greyscale+Alpha colour type");
     }
 
     #[test]
