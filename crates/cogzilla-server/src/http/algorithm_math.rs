@@ -78,9 +78,17 @@ pub(super) fn band_math(
             let scale = if alg == "var" { n / (n - 1.0) } else { (n / (n - 1.0)).sqrt() };
             format!("{alg}({}) * {scale}", list(", "))
         }
-        "var" | "std" => format!("{alg}({})", list(", ")),
+        // One sample has no spread under `ddof=1`: numpy's NaN, which TiTiler masks.
+        "var" | "std" => format!("(b{0} - b{0}) / 0", bands[0]),
+        // TiTiler fails (a `500`) on fewer than three bands; its words, as a `400`.
+        "grayscale" if rgb.is_none() => {
+            return Err(format!("Cannot apply `grayscale` algorithm on image with {} bands.", bands.len()));
+        }
+        "bitonal" if bands.len() == 2 => {
+            return Err("Cannot apply `bitonal` algorithm on image with 2 bands.".into());
+        }
         "grayscale" => match (rgb, whole) {
-            (None, _) => format!("b{}", bands[0]),
+            (None, _) => unreachable!("fewer than three bands is refused above"),
             (Some(rgb), None) => luma(rgb),
             // In whole numbers the sum is exact and one division rounds it once, as close to
             // numpy's float64 as single precision comes; then truncated toward zero.
@@ -146,7 +154,11 @@ mod tests {
         assert_eq!(eval(&gray(Some(T::Uint8)), &[101.0, 200.0, 50.0]), 153.0);
         assert_eq!(eval(&gray(Some(T::Int16)), &[-101.0, -200.0, -50.0]), -153.0);
         assert!((eval(&gray(None), &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
-        assert_eq!(band_math("grayscale", &[2], Some(T::Uint8), None, 127.0).unwrap(), "b2");
+        // TiTiler's words for what it fails on, and one sample's spread masked.
+        assert_eq!(band_math("grayscale", &[2], Some(T::Uint8), None, 127.0).unwrap_err(), "Cannot apply `grayscale` algorithm on image with 1 bands.");
+        assert_eq!(band_math("bitonal", &[1, 2], None, None, 127.0).unwrap_err(), "Cannot apply `bitonal` algorithm on image with 2 bands.");
+        assert!(eval(&band_math("std", &[1], None, None, 127.0).unwrap(), &[5.0]).is_nan());
+        assert!(eval(&band_math("var", &[1], None, None, 127.0).unwrap(), &[5.0]).is_nan());
     }
 
     #[test]
