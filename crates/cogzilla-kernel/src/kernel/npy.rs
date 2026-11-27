@@ -103,13 +103,13 @@ fn write_npy_typed_planes(
     }
 }
 
-/// Convert `f32` to IEEE-754 binary16 bits (clamping infinities to `±65504.0`).
+/// Convert `f32` to IEEE-754 binary16 bits (preserving `NaN` as canonical quiet NaN `0x7E00`
+/// and clamping infinities to `±65504.0`).
 fn f32_to_f16_bits(v: f32) -> u16 {
-    let clamped = if v.is_nan() {
-        0.0
-    } else {
-        v.clamp(-65504.0, 65504.0)
-    };
+    if v.is_nan() {
+        return 0x7E00;
+    }
+    let clamped = v.clamp(-65504.0, 65504.0);
     let bits = clamped.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
@@ -252,9 +252,10 @@ pub fn encode_npy_typed_f64(
     let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
     let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
     out.extend_from_slice(&hdr);
-    let absent = absent.unwrap_or(match kind {
-        SampleType::Float32 | SampleType::Float64 => f64::NAN,
-        _ => 0.0,
+    let absent = absent.unwrap_or(if kind.value_range().is_none() {
+        f64::NAN
+    } else {
+        0.0
     });
     let data = &values[..(bands * pixels).min(values.len())];
     let vals = data.iter().map(|&v| if v.is_nan() { absent } else { v });
@@ -313,4 +314,45 @@ pub fn wrap_raw_f32_as_npy_with_mask(
         out.put_slice(if any_valid { &valid_le } else { &zero_le });
     }
     out.freeze()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn npy_body(bytes: &[u8]) -> &[u8] {
+        assert_eq!(&bytes[..8], b"\x93NUMPY\x01\x00");
+        let hdr_len = usize::from(u16::from_le_bytes([bytes[8], bytes[9]]));
+        &bytes[10 + hdr_len..]
+    }
+
+    #[test]
+    fn float_dtypes_write_nan_for_absent_pixels_in_npy() {
+        // Float16: absent pixel -> canonical binary16 quiet NaN (0x7E00); finite 1.0 -> 0x3C00.
+        let f16_npy = encode_npy_typed_f64(&[1.0, f64::NAN], 1, 1, 2, SampleType::Float16, None, false);
+        let body = npy_body(&f16_npy);
+        assert_eq!(body.len(), 4);
+        assert_eq!(u16::from_le_bytes([body[0], body[1]]), 0x3C00);
+        let nan_bits = u16::from_le_bytes([body[2], body[3]]);
+        assert_eq!(nan_bits & 0x7C00, 0x7C00, "Float16 absent pixel must have NaN exponent");
+        assert_ne!(nan_bits & 0x03FF, 0, "Float16 absent pixel must have non-zero mantissa (NaN, not Inf)");
+
+        // Float32: absent pixel -> NaN.
+        let f32_npy = encode_npy_typed_f64(&[1.0, f64::NAN], 1, 1, 2, SampleType::Float32, None, false);
+        let body = npy_body(&f32_npy);
+        assert_eq!(f32::from_le_bytes(body[0..4].try_into().unwrap()), 1.0);
+        assert!(f32::from_le_bytes(body[4..8].try_into().unwrap()).is_nan());
+
+        // Float64: absent pixel -> NaN.
+        let f64_npy = encode_npy_typed_f64(&[1.0, f64::NAN], 1, 1, 2, SampleType::Float64, None, false);
+        let body = npy_body(&f64_npy);
+        assert_eq!(f64::from_le_bytes(body[0..8].try_into().unwrap()), 1.0);
+        assert!(f64::from_le_bytes(body[8..16].try_into().unwrap()).is_nan());
+
+        // Integer/Bool dtypes: absent pixel -> 0.
+        let u8_npy = encode_npy_typed_f64(&[7.0, f64::NAN], 1, 1, 2, SampleType::Uint8, None, false);
+        assert_eq!(npy_body(&u8_npy), &[7u8, 0u8]);
+        let bool_npy = encode_npy_typed_f64(&[1.0, f64::NAN], 1, 1, 2, SampleType::Bool, None, false);
+        assert_eq!(npy_body(&bool_npy), &[1u8, 0u8]);
+    }
 }
