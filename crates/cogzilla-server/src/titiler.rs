@@ -1853,17 +1853,23 @@ fn compute_statistics_cpu(
                     )
                     .with_nodata_override(nodata_override)
                     .with_scale_offset(sc, off);
-                    let gs = gpu_ref.try_render_bbox_single_band_stats(
-                        cog.id,
-                        ifd_idx,
-                        b as u16,
-                        coords,
-                        &src,
-                        ResampleMode::Nearest,
-                        hist_bins,
-                        opts.histogram_range,
-                        &opts.percentiles,
-                    )?;
+                    let gs = gpu_ref
+                        .try_render_bbox(
+                            coords,
+                            &crate::gpu_backend::GpuBboxBands::Single {
+                                cog_id: cog.id,
+                                ifd_idx,
+                                band0: b as u16,
+                                src: &src,
+                            },
+                            &crate::gpu_backend::GpuBboxOutput::Stats {
+                                resample: ResampleMode::Nearest,
+                                num_bins: hist_bins,
+                                hist_range: opts.histogram_range,
+                                percentiles: &opts.percentiles,
+                            },
+                        )
+                        .and_then(crate::gpu_backend::GpuBboxResult::into_stats)?;
                     let bname = format!("b{}", b + 1);
                     let dtype = HistDtype::for_sample_type(ifd.sample_type, unscale);
                     let json = gpu_band_stats_to_json(&gs, total_pixels, &bname, opts, dtype, None);
@@ -2334,16 +2340,22 @@ fn compute_expression_statistics_cpu(
                     &prog.used_bands,
                     &srcs,
                 );
-                let gs = gpu_ref.try_render_bbox_expr_stats(
-                    cache_key,
-                    coords,
-                    &srcs,
-                    prog,
-                    ResampleMode::Nearest,
-                    hist_bins,
-                    opts.histogram_range,
-                    &opts.percentiles,
-                )?;
+                let gs = gpu_ref
+                    .try_render_bbox(
+                        coords,
+                        &crate::gpu_backend::GpuBboxBands::Expr {
+                            cache_key,
+                            srcs: &srcs,
+                            prog,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::Stats {
+                            resample: ResampleMode::Nearest,
+                            num_bins: hist_bins,
+                            hist_range: opts.histogram_range,
+                            percentiles: &opts.percentiles,
+                        },
+                    )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_stats)?;
                 Some((
                     format!("b{}", i + 1),
                     gpu_band_stats_to_json(
@@ -7187,7 +7199,14 @@ async fn render_bbox_core(
                     && !sopts.categorical
                     && sopts.histogram_edges.is_none()
                 {
+                    use crate::gpu_backend::{GpuBboxBands, GpuBboxOutput, GpuBboxResult};
                     let hist_bins = sopts.histogram_bins.clamp(1, 1000);
+                    let stats_out = GpuBboxOutput::Stats {
+                        resample,
+                        num_bins: hist_bins,
+                        hist_range: sopts.histogram_range,
+                        percentiles: &sopts.percentiles,
+                    };
                     let dispatch_spectral_stats = |expr, b1s: &[u16]| {
                         let ref_vecs: Vec<_> = b1s
                             .iter()
@@ -7195,33 +7214,33 @@ async fn render_bbox_core(
                             .map(|(slot, &b)| get_band_refs(b, slot))
                             .collect();
                         let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                        gpu.try_render_bbox_spectral_stats(
-                            mb_key(b1s, &srcs),
+                        gpu.try_render_bbox(
                             coords,
-                            &srcs,
-                            expr,
-                            resample,
-                            hist_bins,
-                            sopts.histogram_range,
-                            &sopts.percentiles,
+                            &GpuBboxBands::Spectral {
+                                cache_key: mb_key(b1s, &srcs),
+                                srcs: &srcs,
+                                expr,
+                            },
+                            &stats_out,
                         )
+                        .and_then(GpuBboxResult::into_stats)
                     };
                     let gpu_stats: Option<cogzilla_gpu::GpuBandStats> = match bands {
                         BandRequest::Single { band_1based, .. } => {
                             let refs = get_band_refs(*band_1based, 0);
                             let src = make_src!(&refs);
                             let (cid, b0) = single_band_key(*band_1based);
-                            gpu.try_render_bbox_single_band_stats(
-                                cid,
-                                ifd_idx,
-                                b0,
+                            gpu.try_render_bbox(
                                 coords,
-                                &src,
-                                resample,
-                                hist_bins,
-                                sopts.histogram_range,
-                                &sopts.percentiles,
+                                &GpuBboxBands::Single {
+                                    cog_id: cid,
+                                    ifd_idx,
+                                    band0: b0,
+                                    src: &src,
+                                },
+                                &stats_out,
                             )
+                            .and_then(GpuBboxResult::into_stats)
                         }
                         BandRequest::CustomExpr { prog, .. } => {
                             let ref_vecs: Vec<_> = prog
@@ -7230,16 +7249,16 @@ async fn render_bbox_core(
                                 .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
                                 .collect();
                             let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                            gpu.try_render_bbox_expr_stats(
-                                mb_key(&prog.used_bands, &srcs),
+                            gpu.try_render_bbox(
                                 coords,
-                                &srcs,
-                                prog,
-                                resample,
-                                hist_bins,
-                                sopts.histogram_range,
-                                &sopts.percentiles,
+                                &GpuBboxBands::Expr {
+                                    cache_key: mb_key(&prog.used_bands, &srcs),
+                                    srcs: &srcs,
+                                    prog,
+                                },
+                                &stats_out,
                             )
+                            .and_then(GpuBboxResult::into_stats)
                         }
                         BandRequest::Dem {
                             band_1based,
@@ -7250,20 +7269,20 @@ async fn render_bbox_core(
                             let src = make_src!(&refs);
                             let (dx_m, dy_m) = dem_dxy();
                             let (cid, b0) = single_band_key(*band_1based);
-                            gpu.try_render_bbox_dem_stats(
-                                cid,
-                                ifd_idx,
-                                b0,
+                            gpu.try_render_bbox(
                                 coords,
-                                &src,
-                                *algorithm,
-                                dx_m,
-                                dy_m,
-                                resample,
-                                hist_bins,
-                                sopts.histogram_range,
-                                &sopts.percentiles,
+                                &GpuBboxBands::Dem {
+                                    cog_id: cid,
+                                    ifd_idx,
+                                    band0: b0,
+                                    src: &src,
+                                    algorithm: *algorithm,
+                                    dx_m,
+                                    dy_m,
+                                },
+                                &stats_out,
                             )
+                            .and_then(GpuBboxResult::into_stats)
                         }
                         BandRequest::Spectral1 {
                             expr, band_1based, ..
@@ -7290,6 +7309,7 @@ async fn render_bbox_core(
                         ));
                     }
                 }
+                let f32_out = crate::gpu_backend::GpuBboxOutput::F32 { resample };
                 let dispatch_spectral_f32 = |expr, b1s: &[u16]| {
                     let ref_vecs: Vec<_> = b1s
                         .iter()
@@ -7297,27 +7317,33 @@ async fn render_bbox_core(
                         .map(|(slot, &b)| get_band_refs(b, slot))
                         .collect();
                     let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                    gpu.try_render_bbox_spectral_f32(
-                        mb_key(b1s, &srcs),
+                    gpu.try_render_bbox(
                         coords,
-                        &srcs,
-                        expr,
-                        resample,
+                        &crate::gpu_backend::GpuBboxBands::Spectral {
+                            cache_key: mb_key(b1s, &srcs),
+                            srcs: &srcs,
+                            expr,
+                        },
+                        &f32_out,
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 };
                 let gpu_raw: Option<Bytes> = match bands {
                     BandRequest::Single { band_1based, .. } => {
                         let refs = get_band_refs(*band_1based, 0);
                         let src = make_src!(&refs);
                         let (cid, b0) = single_band_key(*band_1based);
-                        gpu.try_render_bbox_single_band_f32(
-                            cid,
-                            ifd_idx,
-                            b0,
+                        gpu.try_render_bbox(
                             coords,
-                            &src,
-                            resample,
+                            &crate::gpu_backend::GpuBboxBands::Single {
+                                cog_id: cid,
+                                ifd_idx,
+                                band0: b0,
+                                src: &src,
+                            },
+                            &f32_out,
                         )
+                        .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                     }
                     BandRequest::Dem {
                         band_1based,
@@ -7328,17 +7354,20 @@ async fn render_bbox_core(
                         let src = make_src!(&refs);
                         let (dx_m, dy_m) = dem_dxy();
                         let (cid, b0) = single_band_key(*band_1based);
-                        gpu.try_render_bbox_dem_f32(
-                            cid,
-                            ifd_idx,
-                            b0,
+                        gpu.try_render_bbox(
                             coords,
-                            &src,
-                            *algorithm,
-                            dx_m,
-                            dy_m,
-                            resample,
+                            &crate::gpu_backend::GpuBboxBands::Dem {
+                                cog_id: cid,
+                                ifd_idx,
+                                band0: b0,
+                                src: &src,
+                                algorithm: *algorithm,
+                                dx_m,
+                                dy_m,
+                            },
+                            &f32_out,
                         )
+                        .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                     }
                     BandRequest::CustomExpr { prog, .. } => {
                         let ref_vecs: Vec<_> = prog
@@ -7347,13 +7376,16 @@ async fn render_bbox_core(
                             .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
                             .collect();
                         let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                        gpu.try_render_bbox_expr_f32(
-                            mb_key(&prog.used_bands, &srcs),
+                        gpu.try_render_bbox(
                             coords,
-                            &srcs,
-                            prog,
-                            resample,
+                            &crate::gpu_backend::GpuBboxBands::Expr {
+                                cache_key: mb_key(&prog.used_bands, &srcs),
+                                srcs: &srcs,
+                                prog,
+                            },
+                            &f32_out,
                         )
+                        .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                     }
                     BandRequest::Spectral1 {
                         expr, band_1based, ..
@@ -7369,12 +7401,15 @@ async fn render_bbox_core(
                         let r1 = get_band_refs(bands_1based[1], 1);
                         let r2 = get_band_refs(bands_1based[2], 2);
                         let srcs = [make_src!(&r0), make_src!(&r1), make_src!(&r2)];
-                        gpu.try_render_bbox_multiband_f32(
-                            mb_key(bands_1based, &srcs),
+                        gpu.try_render_bbox(
                             coords,
-                            &srcs,
-                            resample,
+                            &crate::gpu_backend::GpuBboxBands::MultiBand {
+                                cache_key: mb_key(bands_1based, &srcs),
+                                srcs: &srcs,
+                            },
+                            &f32_out,
                         )
+                        .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                     }
                     BandRequest::MultiBand { bands_1based } => {
                         if bands_1based.is_empty() || bands_1based.len() > 8 {
@@ -7386,12 +7421,15 @@ async fn render_bbox_core(
                                 .map(|(slot, &b)| get_band_refs(b, slot))
                                 .collect();
                             let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                            gpu.try_render_bbox_multiband_f32(
-                                mb_key(bands_1based, &srcs),
+                            gpu.try_render_bbox(
                                 coords,
-                                &srcs,
-                                resample,
+                                &crate::gpu_backend::GpuBboxBands::MultiBand {
+                                    cache_key: mb_key(bands_1based, &srcs),
+                                    srcs: &srcs,
+                                },
+                                &f32_out,
                             )
+                            .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                         }
                     }
                     BandRequest::CustomExprRgb { progs, .. } => {
@@ -7411,14 +7449,17 @@ async fn render_bbox_core(
                                 .map(|&b| get_band_refs(b, b.saturating_sub(1) as usize))
                                 .collect();
                             let srcs: Vec<_> = ref_vecs.iter().map(|r| make_src!(r)).collect();
-                            gpu.try_render_bbox_expr_rgb_f32(
-                                mb_key(&unique_bands, &srcs),
+                            gpu.try_render_bbox(
                                 coords,
-                                &unique_bands,
-                                &srcs,
-                                progs,
-                                resample,
+                                &crate::gpu_backend::GpuBboxBands::ExprRgb {
+                                    cache_key: mb_key(&unique_bands, &srcs),
+                                    unique_bands: &unique_bands,
+                                    srcs: &srcs,
+                                    progs,
+                                },
+                                &f32_out,
                             )
+                            .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                         }
                     }
                     _ => None,
@@ -7775,15 +7816,20 @@ async fn render_bbox_core(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_spectral_with_lut(
-                        mb_key(b1s, &srcs),
+                    gpu.try_render_bbox(
                         coords,
-                        &srcs,
-                        expr,
-                        &style,
-                        &rgb_lut,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::Spectral {
+                            cache_key: mb_key(b1s, &srcs),
+                            srcs: &srcs,
+                            expr,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledLut {
+                            style: &style,
+                            rgb_lut: &rgb_lut,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 })
             };
             let gpu_out: Option<Bytes> = match bands {
@@ -7807,16 +7853,21 @@ async fn render_bbox_core(
                         format,
                     };
                     let (cid, b0) = single_band_key(*band_1based);
-                    gpu.try_render_bbox_single_band_with_lut(
-                        cid,
-                        ifd_idx,
-                        b0,
+                    gpu.try_render_bbox(
                         coords,
-                        &src,
-                        &style,
-                        &rgb_lut,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::Single {
+                            cog_id: cid,
+                            ifd_idx,
+                            band0: b0,
+                            src: &src,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledLut {
+                            style: &style,
+                            rgb_lut: &rgb_lut,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 }),
                 BandRequest::Dem {
                     band_1based,
@@ -7840,19 +7891,24 @@ async fn render_bbox_core(
                         format,
                     };
                     let (cid, b0) = single_band_key(*band_1based);
-                    gpu.try_render_bbox_dem_with_lut(
-                        cid,
-                        ifd_idx,
-                        b0,
+                    gpu.try_render_bbox(
                         coords,
-                        &src,
-                        *algorithm,
-                        dx_m,
-                        dy_m,
-                        &style,
-                        &rgb_lut,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::Dem {
+                            cog_id: cid,
+                            ifd_idx,
+                            band0: b0,
+                            src: &src,
+                            algorithm: *algorithm,
+                            dx_m,
+                            dy_m,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledLut {
+                            style: &style,
+                            rgb_lut: &rgb_lut,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 }),
                 BandRequest::Terrain {
                     band_1based,
@@ -7861,17 +7917,22 @@ async fn render_bbox_core(
                     let refs = get_band_refs(*band_1based, 0);
                     let src = make_src!(&refs);
                     let (cid, b0) = single_band_key(*band_1based);
-                    gpu.try_render_bbox_terrain(
-                        cid,
-                        ifd_idx,
-                        b0,
+                    gpu.try_render_bbox(
                         coords,
-                        &src,
-                        *encoding,
-                        resample,
-                        format,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::Terrain {
+                            cog_id: cid,
+                            ifd_idx,
+                            band0: b0,
+                            src: &src,
+                            encoding: *encoding,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledTerrain {
+                            resample,
+                            format,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 }
                 BandRequest::CustomExpr {
                     prog,
@@ -7896,15 +7957,20 @@ async fn render_bbox_core(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_expr_with_lut(
-                        mb_key(&prog.used_bands, &srcs),
+                    gpu.try_render_bbox(
                         coords,
-                        &srcs,
-                        prog,
-                        &style,
-                        &rgb_lut,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::Expr {
+                            cache_key: mb_key(&prog.used_bands, &srcs),
+                            srcs: &srcs,
+                            prog,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledLut {
+                            style: &style,
+                            rgb_lut: &rgb_lut,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 }),
                 BandRequest::CustomExprRgb {
                     progs,
@@ -7933,16 +7999,21 @@ async fn render_bbox_core(
                             resample,
                             format,
                         };
-                        gpu.try_render_bbox_expr_rgb(
-                            mb_key(&unique_bands, &srcs),
+                        gpu.try_render_bbox(
                             coords,
-                            &unique_bands,
-                            &srcs,
-                            progs,
-                            &style,
-                            color_formula,
-                            return_mask,
+                            &crate::gpu_backend::GpuBboxBands::ExprRgb {
+                                cache_key: mb_key(&unique_bands, &srcs),
+                                unique_bands: &unique_bands,
+                                srcs: &srcs,
+                                progs,
+                            },
+                            &crate::gpu_backend::GpuBboxOutput::StyledRgb {
+                                style: &style,
+                                color_formula,
+                                return_mask,
+                            },
                         )
+                        .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                     }
                 }
                 BandRequest::Rgb {
@@ -7960,14 +8031,19 @@ async fn render_bbox_core(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_rgb(
-                        mb_key(bands_1based, &srcs),
+                    gpu.try_render_bbox(
                         coords,
-                        &srcs,
-                        &style,
-                        color_formula,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::Rgb {
+                            cache_key: mb_key(bands_1based, &srcs),
+                            srcs: &srcs,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledRgb {
+                            style: &style,
+                            color_formula,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 }
                 BandRequest::SarRgb {
                     bands_1based,
@@ -7983,14 +8059,19 @@ async fn render_bbox_core(
                         resample,
                         format,
                     };
-                    gpu.try_render_bbox_sar_rgb(
-                        mb_key(bands_1based, &srcs),
+                    gpu.try_render_bbox(
                         coords,
-                        &srcs,
-                        &style,
-                        color_formula,
-                        return_mask,
+                        &crate::gpu_backend::GpuBboxBands::SarRgb {
+                            cache_key: mb_key(bands_1based, &srcs),
+                            srcs: &srcs,
+                        },
+                        &crate::gpu_backend::GpuBboxOutput::StyledRgb {
+                            style: &style,
+                            color_formula,
+                            return_mask,
+                        },
                     )
+                    .and_then(crate::gpu_backend::GpuBboxResult::into_bytes)
                 }
                 BandRequest::Spectral1 {
                     expr,
