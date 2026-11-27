@@ -78,12 +78,11 @@ impl<'a> BandSource<'a> {
 
     #[inline(always)]
     pub fn with_nodata_override(mut self, nodata: Option<f32>) -> Self {
-        if let Some(nd) = nodata {
-            if !nd.is_nan() {
+        if let Some(nd) = nodata
+            && !nd.is_nan() {
                 self.nodata_override = Some(nd);
                 self.no_nodata = false;
             }
-        }
         self
     }
 
@@ -129,16 +128,14 @@ impl<'a> BandSource<'a> {
             }
             _ => f32::NAN,
         };
-        if let Some(nd) = self.nodata_override {
-            if v == nd {
+        if let Some(nd) = self.nodata_override
+            && v == nd {
                 return f32::NAN;
             }
-        }
-        if let Some((sc, off)) = self.scale_offset {
-            if !v.is_nan() {
+        if let Some((sc, off)) = self.scale_offset
+            && !v.is_nan() {
                 return v * sc + off;
             }
-        }
         v
     }
 
@@ -432,13 +429,12 @@ impl<'a> BandSource<'a> {
             let gy = ty.wrapping_sub(self.ty0);
             if gx < self.grid_w && gy < self.grid_h {
                 let bidx = (gy * self.grid_w + gx) as usize;
-                if let Some(blk) = unsafe { *self.blocks.get_unchecked(bidx) } {
-                    if ly + 1 < blk.height && lx + 1 < blk.width {
+                if let Some(blk) = unsafe { *self.blocks.get_unchecked(bidx) }
+                    && ly + 1 < blk.height && lx + 1 < blk.width {
                         let tw = self.tile_w as usize;
                         let p00 = (ly as usize) * tw + (lx as usize);
                         return Some((bidx, p00, p00 + tw));
                     }
-                }
             }
         }
         None
@@ -461,12 +457,11 @@ impl<'a> BandSource<'a> {
         let gy = ty.wrapping_sub(self.ty0);
         if gx < self.grid_w && gy < self.grid_h {
             let bidx = (gy * self.grid_w + gx) as usize;
-            if let Some(blk) = unsafe { *self.blocks.get_unchecked(bidx) } {
-                if ly < blk.height && lx < blk.width {
+            if let Some(blk) = unsafe { *self.blocks.get_unchecked(bidx) }
+                && ly < blk.height && lx < blk.width {
                     let pidx = (ly as usize) * (self.tile_w as usize) + (lx as usize);
                     return Some((bidx, pidx));
                 }
-            }
         }
         None
     }

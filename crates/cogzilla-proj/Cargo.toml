@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 cogzilla-tiff = { path = "../cogzilla-tiff" }
 thiserror.workspace = true
+
+[lints]
+workspace = true

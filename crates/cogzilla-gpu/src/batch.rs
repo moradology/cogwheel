@@ -380,7 +380,7 @@ mod tests {
         for y in 0..src_h {
             for x in 0..src_w {
                 let idx = (y * src_w + x) as usize;
-                if x >= 300 && x < 340 && y >= 250 && y < 290 {
+                if (300..340).contains(&x) && (250..290).contains(&y) {
                     src[idx] = f32::NAN;
                 } else {
                     src[idx] = 1000.0 + 500.0 * (x as f32 * 0.015).sin() * (y as f32 * 0.019).cos();

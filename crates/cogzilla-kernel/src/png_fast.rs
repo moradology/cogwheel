@@ -99,9 +99,8 @@ fn filter_sub_row<const BPP: usize, const SHIFT: i32>(src: &[u8], dst_filtered: 
 
     #[allow(unreachable_code)]
     {
-        for i in 0..BPP.min(len) {
-            out[i] = src[i];
-        }
+        let head = BPP.min(len);
+        out[..head].copy_from_slice(&src[..head]);
         for i in BPP..len {
             out[i] = src[i].wrapping_sub(src[i - BPP]);
         }

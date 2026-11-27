@@ -118,13 +118,15 @@ impl GpuContext {
         let info = GpuAdapterInfo::from_wgpu(chosen_idx, &adapter.get_info());
         let adapter_limits = adapter.limits();
 
-        // Request generous storage buffer limits (up to 256 MiB per binding if supported)
+        // Request generous storage buffer limits (up to 512 MiB per binding if supported)
         // so 4096x4096+ f32 slabs and outputs fit comfortably.
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffer_binding_size = adapter_limits
-            .max_storage_buffer_binding_size
-            .min(512 * 1024 * 1024);
-        limits.max_buffer_size = adapter_limits.max_buffer_size.min(512 * 1024 * 1024);
+        let limits = wgpu::Limits {
+            max_storage_buffer_binding_size: adapter_limits
+                .max_storage_buffer_binding_size
+                .min(512 * 1024 * 1024),
+            max_buffer_size: adapter_limits.max_buffer_size.min(512 * 1024 * 1024),
+            ..wgpu::Limits::default()
+        };
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {

@@ -6054,8 +6054,8 @@ async fn parity_nn1_r2_raster_layers_and_f2_sample_types() {
     let u64_path = tmp.join("u64.tif");
     write_test_geotiff(&u1_path, 1, 1, &[0xAAu8; 32], false);
     write_test_geotiff(&u4_path, 4, 1, &[0x3Cu8; 128], false);
-    let i64_bytes: Vec<u8> = std::iter::repeat((-500i64).to_le_bytes()).take(256).flatten().collect();
-    let u64_bytes: Vec<u8> = std::iter::repeat(900u64.to_le_bytes()).take(256).flatten().collect();
+    let i64_bytes: Vec<u8> = std::iter::repeat_n((-500i64).to_le_bytes(), 256).flatten().collect();
+    let u64_bytes: Vec<u8> = std::iter::repeat_n(900u64.to_le_bytes(), 256).flatten().collect();
     write_test_geotiff(&i64_path, 64, 2, &i64_bytes, false);
     write_test_geotiff(&u64_path, 64, 1, &u64_bytes, false);
 
@@ -6538,7 +6538,7 @@ async fn encoded_query_keys_and_grey_mosaic_tiles() {
     assert!(matches!(mapped[25], 2 | 3 | 6), "a colour map is colour: {}", mapped[25]);
     let jpg = get(tile("").replace(".png", ".jpg")).await;
     // The frame header's component count: one for grey.
-    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0 | 0xC1 | 0xC2)).unwrap();
+    let sof = jpg.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0..=0xC2)).unwrap();
     assert_eq!(jpg[sof + 9], 1, "a grey JPEG");
 }
 

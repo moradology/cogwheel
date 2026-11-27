@@ -411,7 +411,7 @@ fn parse_limits(pairs: &[(String, String)]) -> Result<SearchLimits, Resp> {
                 return Err(invalid_param(
                     "query",
                     name,
-                    &format!("Input should be less than or equal to {max_allowed}"),
+                    format!("Input should be less than or equal to {max_allowed}"),
                 ));
             }
             // Zero is no limit given, as in titiler-pgstac: the default stands.
@@ -1326,7 +1326,7 @@ fn wmts(ctx: &Ctx<'_>, base: &str, source: WmtsSource<'_>, pairs: &[(String, Str
         .into_iter()
         .map(|(name, qs)| {
             // The tile size is the service's to choose, not the layer's.
-            let qs: Vec<&str> = qs.split('&').filter(|kv| !kv.split_once('=').is_some_and(|(k, _)| super::query_key(k) == "tilesize")).collect();
+            let qs: Vec<&str> = qs.split('&').filter(|kv| kv.split_once('=').is_none_or(|(k, _)| super::query_key(k) != "tilesize")).collect();
             (name, qs.join("&"), (source.minzoom, source.maxzoom))
         })
         .collect();
@@ -4437,7 +4437,7 @@ impl BandAlgorithm {
     fn apply(&self, bands: Vec<Vec<f64>>, whole: bool, width: usize, pixel: (f64, f64)) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
         let n = bands.len();
         let len = bands.first().map_or(0, Vec::len);
-        let height = if width == 0 { 0 } else { len / width };
+        let height = len.checked_div(width).unwrap_or(0);
         let across = |f: &dyn Fn(&mut Vec<f64>) -> f64| -> Vec<f64> {
             let mut values = Vec::with_capacity(n);
             (0..len)
@@ -4553,7 +4553,7 @@ impl BandAlgorithm {
                     return Err("Source data must be 1 band".into());
                 }
                 let lut = &ColormapName::from_str_opt("terrain").ok_or("no terrain colour map")?.lut().rgb;
-                let mut out = vec![Vec::with_capacity(len); 3];
+                let mut out: Vec<Vec<f64>> = (0..3).map(|_| Vec::with_capacity(len)).collect();
                 for v in &bands[0] {
                     let rgb = if v.is_nan() {
                         [f64::NAN; 3]
@@ -4962,7 +4962,7 @@ fn float32_bins(opts: &StatsOptions, band: &[f64]) -> StatsOptions {
                 .iter()
                 .filter(|v| v.is_finite())
                 .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v as f32), hi.max(v as f32)));
-            if !(lo < hi) {
+            if lo >= hi || lo.is_nan() || hi.is_nan() {
                 return out;
             }
             let step = (hi - lo) / count as f32;
@@ -5166,7 +5166,7 @@ async fn point_values(
     let (lon, lat) = if pq.coord_crs_3857 {
         mercator_to_lonlat_deg(x, y)
     } else {
-        if let Err(r) = check_coord_crs(&pq, pairs) {
+        if let Err(r) = check_coord_crs(pq, pairs) {
             return r;
         }
         (x, y)
@@ -5856,11 +5856,11 @@ async fn tile(
             };
             let pq: &ParsedQuery = &pq;
             let (mut treq, content_type) = build_tile_request(
-                Some(&engine),
+                Some(engine),
                 tile,
                 scale,
                 Some(explicit.as_str()),
-                &pq,
+                pq,
                 default_bands,
                 full.sample_type,
                 false,
@@ -5916,7 +5916,7 @@ async fn tile(
                 && formula.is_none()
                 && pq.algorithm.is_none()
                 && full.extra_samples.is_empty()
-                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+                && !super::has_embedded_palette(pq, &first, &treq.bands)
             {
                 let bands = TileEngine::value_bands(&treq.bands);
                 treq.format = OutputFormat::RawF32;
@@ -5966,7 +5966,7 @@ async fn tile(
             let exact = formula.is_some()
                 && !raw_array
                 && one_grey_band(&treq.bands)
-                && !super::has_embedded_palette(&pq, &first, &treq.bands);
+                && !super::has_embedded_palette(pq, &first, &treq.bands);
             let mut rgba = if let (None, true) = (selection, exact) {
                 let paint = Paint::of(&treq.bands).ok_or_else(|| EngineError::BadRequest("not a band of values".into()))?;
                 treq.format = OutputFormat::RawF32;
@@ -5991,7 +5991,7 @@ async fn tile(
                     && pq.expr_raw.is_none()
                     && pq.algorithm.is_none()
                     && full.extra_samples.is_empty()
-                    && !super::has_embedded_palette(&pq, &first, &treq.bands);
+                    && !super::has_embedded_palette(pq, &first, &treq.bands);
                 if raw_array && !array {
                     return Err(EngineError::BadRequest(
                         "raw array formats are not supported with pixel_selection other than 'first' yet".into(),
@@ -6081,7 +6081,7 @@ async fn tile(
             // So is one band drawn in grey, whichever scene it came from: a raster with a
             // palette of its own is one band too, and is not grey.
             let one_grey = matches!(Paint::of(&treq.bands), Some(Paint::Gray { colormap: ColormapName::Grayscale, .. }))
-                && !super::has_embedded_palette(&pq, &first, &treq.bands)
+                && !super::has_embedded_palette(pq, &first, &treq.bands)
                 && rgba.chunks_exact(4).all(|p| p[3] == 0 || (p[0] == p[1] && p[1] == p[2]));
             let grey = (one_grey || selection.is_some_and(|method| method == Selection::Count || TileEngine::value_bands(&treq.bands) == 1))
                 && !pq.colormap_explicit;
@@ -6573,7 +6573,7 @@ pub(super) fn item_placed(resp: Resp, sub: &[&str], raw_query: &str) -> Resp {
             }
             // A buffered tile reaches past its bounds by an amount that depends on its
             // size: it goes without the headers sooner than with the wrong ones.
-            if asked("buffer").is_some_and(|b| b.parse::<f64>().map_or(true, |b| b != 0.0)) {
+            if asked("buffer").is_some_and(|b| b.parse::<f64>() != Ok(0.0)) {
                 return respelled(resp);
             }
             let (west, south, east, north) = tile_bounds_3857(TileCoord { z, x, y });

@@ -43,3 +43,6 @@ required-features = ["gpu"]
 libdeflater.workspace = true
 tokio-postgres.workspace = true
 zune-jpeg.workspace = true
+
+[lints]
+workspace = true

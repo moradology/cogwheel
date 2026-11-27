@@ -187,8 +187,10 @@ unsafe fn bilinear_row_flat_neon<const N: usize>(
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for flat single-block `Separable1D + CleanFastPath`.
 /// Uses 64-bit adjacent-pair loads + shuffle instead of microcoded `vgatherdps` (much faster on
 /// AMD Zen 4 / EPYC as well as Intel).
+// SAFETY: Caller checks AVX2+FMA and guarantees `x_idx`/`x_idx+1` are in-bounds of `r0`/`r1`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_row_flat_avx2<const N: usize>(
     u_coords: &[f32; N],
     base_col: u32,
@@ -435,8 +437,10 @@ unsafe fn bilinear_row_typed_neon<T: Copy, F: Fn(T) -> f32, const N: usize>(
 }
 
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for single-block `U16`/`U8` (`Separable1D + CleanFastPath`).
+// SAFETY: Caller checks AVX2+FMA and guarantees `x_idx`/`x_idx+1` are in-bounds of `r0`/`r1`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_row_typed_avx2<T: Copy, F: Fn(T) -> f32, const N: usize>(
     u_coords: &[f32; N],
     base_col: u32,
@@ -1802,8 +1806,8 @@ fn widened_plane_separable_with_tables(
                     let hs_row = &mut hs[slot * w..(slot + 1) * w];
                     if clean {
                         match cols.stride {
-                            4 => h_pass_fixed::<4>(seg, gc0, &cols, &col_ok, hs_row),
-                            8 => h_pass_fixed::<8>(seg, gc0, &cols, &col_ok, hs_row),
+                            4 => h_pass_fixed::<4>(seg, gc0, cols, &col_ok, hs_row),
+                            8 => h_pass_fixed::<8>(seg, gc0, cols, &col_ok, hs_row),
                             _ => {
                                 for px in 0..w {
                                     if col_ok[px] {
@@ -1821,8 +1825,8 @@ fn widened_plane_separable_with_tables(
                     } else {
                         let hw_row = &mut hw[slot * w..(slot + 1) * w];
                         match cols.stride {
-                            4 => h_pass_fixed_nan::<4>(seg, gc0, &cols, &col_ok, hs_row, hw_row),
-                            8 => h_pass_fixed_nan::<8>(seg, gc0, &cols, &col_ok, hs_row, hw_row),
+                            4 => h_pass_fixed_nan::<4>(seg, gc0, cols, &col_ok, hs_row, hw_row),
+                            8 => h_pass_fixed_nan::<8>(seg, gc0, cols, &col_ok, hs_row, hw_row),
                             _ => {
                                 for px in 0..w {
                                     if col_ok[px] {
@@ -3000,8 +3004,8 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
 
     // Ultra-hot Nearest path: Separable1D + Nearest + CleanFastPath + Single-Block (F32/U16/U8)!
     // Hoists `[usize; N]` X-indices once outside `for py in 0..N` for direct flat slice indexing.
-    if !BILINEAR && CLEAN {
-        if let (CoordPlan::Separable1D { u, v, .. }, Some(blk)) =
+    if !BILINEAR && CLEAN
+        && let (CoordPlan::Separable1D { u, v, .. }, Some(blk)) =
             (plan, SingleBlockRef::from_source(src))
         {
             let x_idx = blk.precompute_nearest_x(u);
@@ -3182,11 +3186,10 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                 }
             }
         }
-    }
 
     // Ultra-hot SIMD path: Separable1D + Bilinear + CleanFastPath + Single-Block (F32/U16/U8)!
-    if BILINEAR && CLEAN {
-        if let (CoordPlan::Separable1D { u, v, .. }, Some(blk)) =
+    if BILINEAR && CLEAN
+        && let (CoordPlan::Separable1D { u, v, .. }, Some(blk)) =
             (plan, SingleBlockRef::from_source(src))
         {
             match style.format {
@@ -3274,7 +3277,6 @@ fn render_single_specialized<const N: usize, const BILINEAR: bool, const CLEAN: 
                 }
             }
         }
-    }
 
     match style.format {
         OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
@@ -3694,8 +3696,10 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     }
 }
 
+// SAFETY: Caller checks AVX2+FMA and guarantees `x_idx`/`x_idx+1` are in-bounds of each band's row slices.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -> f32>(
     u_row: &[f32; N],
     v_row: &[f32; N],
@@ -3817,8 +3821,8 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
         srcs[0].single_block_rgb_u8(),
         srcs[1].single_block_rgb_u8(),
         srcs[2].single_block_rgb_u8(),
-    ) {
-        if std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
+    )
+        && std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
             && std::ptr::eq(rgb0.as_ptr(), rgb2.as_ptr())
             && srcs[0].same_grid_as(&srcs[1])
             && srcs[0].same_grid_as(&srcs[2])
@@ -3854,15 +3858,14 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
             }
             return;
         }
-    }
 
     // Fast path 1a: single-block planar U8 across all 3 bands.
     if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
         srcs[0].single_block_u8(),
         srcs[1].single_block_u8(),
         srcs[2].single_block_u8(),
-    ) {
-        if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+    )
+        && bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
             let mut u_row = [0.0f32; N];
             let mut v_row = [0.0f32; N];
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
@@ -3894,15 +3897,14 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
             }
             return;
         }
-    }
 
     // Fast path 1b: single-block planar U16 across all 3 bands (Sentinel-2 / Landsat).
     if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
         srcs[0].single_block_u16(),
         srcs[1].single_block_u16(),
         srcs[2].single_block_u16(),
-    ) {
-        if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+    )
+        && bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
             let mut u_row = [0.0f32; N];
             let mut v_row = [0.0f32; N];
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
@@ -3922,15 +3924,14 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
             }
             return;
         }
-    }
 
     // Fast path 1c: single-block planar F32 across all 3 bands.
     if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
         srcs[0].single_block_flat(),
         srcs[1].single_block_flat(),
         srcs[2].single_block_flat(),
-    ) {
-        if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+    )
+        && bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
             let mut u_row = [0.0f32; N];
             let mut v_row = [0.0f32; N];
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
@@ -3950,7 +3951,6 @@ fn sample_rgb_nearest_row_clean<const N: usize>(
             }
             return;
         }
-    }
 
     // Fast path 2: multi-block aligned grid across all 3 bands.
     if srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
@@ -4158,8 +4158,10 @@ unsafe fn bilinear_row_rgb_u8_separable_neon<const N: usize>(
 }
 
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for interleaved `RgbU8Channel` on `Separable1D`.
+// SAFETY: Caller checks AVX2+FMA and guarantees `x_off3` offsets are in-bounds of `r0`/`r1`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
     u_coords: &[f32; N],
     bc: f32,
@@ -4286,8 +4288,8 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
         srcs[0].single_block_rgb_u8(),
         srcs[1].single_block_rgb_u8(),
         srcs[2].single_block_rgb_u8(),
-    ) {
-        if std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
+    )
+        && std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
             && std::ptr::eq(rgb0.as_ptr(), rgb2.as_ptr())
             && srcs[0].same_grid_as(&srcs[1])
             && srcs[0].same_grid_as(&srcs[2])
@@ -4399,15 +4401,14 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
             }
             return;
         }
-    }
 
     // Fast path 1: all 3 bands live in a single clean block with matching native storage
     if let (Some((r, bc, br, st)), Some((g, _, _, _)), Some((b, _, _, _))) = (
         srcs[0].single_block_u8(),
         srcs[1].single_block_u8(),
         srcs[2].single_block_u8(),
-    ) {
-        if srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
+    )
+        && srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
             let mut u_row = [0.0f32; N];
             let mut v_row = [0.0f32; N];
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
@@ -4416,13 +4417,12 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
             );
             return;
         }
-    }
     if let (Some((r, bc, br, st)), Some((g, _, _, _)), Some((b, _, _, _))) = (
         srcs[0].single_block_u16(),
         srcs[1].single_block_u16(),
         srcs[2].single_block_u16(),
-    ) {
-        if srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
+    )
+        && srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
             let mut u_row = [0.0f32; N];
             let mut v_row = [0.0f32; N];
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
@@ -4431,13 +4431,12 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
             );
             return;
         }
-    }
     if let (Some((r, bc, br, st)), Some((g, _, _, _)), Some((b, _, _, _))) = (
         srcs[0].single_block_flat(),
         srcs[1].single_block_flat(),
         srcs[2].single_block_flat(),
-    ) {
-        if srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
+    )
+        && srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
             let mut u_row = [0.0f32; N];
             let mut v_row = [0.0f32; N];
             fill_uv_row(plan, py, &mut u_row, &mut v_row);
@@ -4446,7 +4445,6 @@ fn sample_rgb_bilinear_row_clean<const N: usize>(
             );
             return;
         }
-    }
 
     // Fast path 2: multi-block aligned grid — compute floor/frac + (bidx, p00, p01) ONCE per pixel
     if srcs[0].same_grid_as(&srcs[1]) && srcs[0].same_grid_as(&srcs[2]) {
@@ -4634,8 +4632,8 @@ impl<'a, const N: usize> CleanRgbNearestPlan<'a, N> {
             srcs[0].single_block_rgb_u8(),
             srcs[1].single_block_rgb_u8(),
             srcs[2].single_block_rgb_u8(),
-        ) {
-            if std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
+        )
+            && std::ptr::eq(rgb0.as_ptr(), rgb1.as_ptr())
                 && std::ptr::eq(rgb0.as_ptr(), rgb2.as_ptr())
                 && srcs[0].same_grid_as(&srcs[1])
                 && srcs[0].same_grid_as(&srcs[2])
@@ -4659,13 +4657,12 @@ impl<'a, const N: usize> CleanRgbNearestPlan<'a, N> {
                     identity,
                 };
             }
-        }
         if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
             srcs[0].single_block_u8(),
             srcs[1].single_block_u8(),
             srcs[2].single_block_u8(),
-        ) {
-            if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+        )
+            && bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
                 let bc_f = bc as f32;
                 let max_x = (st as i32 - 1).max(0);
                 let min_len = r.len().min(g.len()).min(b.len());
@@ -4686,13 +4683,12 @@ impl<'a, const N: usize> CleanRgbNearestPlan<'a, N> {
                     identity,
                 };
             }
-        }
         if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
             srcs[0].single_block_u16(),
             srcs[1].single_block_u16(),
             srcs[2].single_block_u16(),
-        ) {
-            if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+        )
+            && bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
                 let bc_f = bc as f32;
                 let max_x = (st as i32 - 1).max(0);
                 let min_len = r.len().min(g.len()).min(b.len());
@@ -4712,13 +4708,12 @@ impl<'a, const N: usize> CleanRgbNearestPlan<'a, N> {
                     x_idx,
                 };
             }
-        }
         if let (Some((r, bc, br, st)), Some((g, bc1, br1, st1)), Some((b, bc2, br2, st2))) = (
             srcs[0].single_block_flat(),
             srcs[1].single_block_flat(),
             srcs[2].single_block_flat(),
-        ) {
-            if bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
+        )
+            && bc == bc1 && br == br1 && st == st1 && bc == bc2 && br == br2 && st == st2 {
                 let bc_f = bc as f32;
                 let max_x = (st as i32 - 1).max(0);
                 let min_len = r.len().min(g.len()).min(b.len());
@@ -4738,7 +4733,6 @@ impl<'a, const N: usize> CleanRgbNearestPlan<'a, N> {
                     x_idx,
                 };
             }
-        }
         Self::Generic
     }
 
@@ -6461,9 +6455,10 @@ fn eval_hillshade_row_clean<const N: usize>(
     }
 }
 
+// SAFETY: Caller checks AVX2+FMA and guarantees 3x3 stencil rows (`top`, `mid`, `bot`) have `>= N + 2` elements.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn eval_hillshade_row_clean_avx2<const N: usize>(
     r0: *const f32,
     r1: *const f32,
@@ -6724,8 +6719,8 @@ pub fn render_dem_algorithm<const N: usize>(
                     sc.row_buf.resize(N, 0);
                 }
                 let mut has_nodata = false;
-                if halo_clean {
-                    if let DemAlgorithm::Hillshade {
+                if halo_clean
+                    && let DemAlgorithm::Hillshade {
                         azimuth_deg,
                         altitude_deg,
                         z_factor,
@@ -6764,7 +6759,6 @@ pub fn render_dem_algorithm<const N: usize>(
                             &sc.img_buf[..total],
                         );
                     }
-                }
                 let is_opaque_dem = clean && !matches!(alg, DemAlgorithm::Aspect);
                 let is_gray = matches!(style.colormap, crate::colormap::ColormapName::Grayscale);
                 if is_gray && !is_opaque_dem {
