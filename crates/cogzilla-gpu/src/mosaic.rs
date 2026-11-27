@@ -8,12 +8,84 @@ use crate::context::{GpuContext, GpuError};
 pub use cogzilla_raster::GpuPixelSelection;
 
 /// GPU-resident stack of `1..=32` aligned scene planes (`width * height` `f32` each).
+/// For 3-band RGB stacks created by [`GpuMosaicCompositor::upload_rgb_scenes`], the buffer holds
+/// `3 * num_scenes` planes laid out band-major (`R`, then `G`, then `B`).
 pub struct GpuSceneStack {
     pub(crate) buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
     pub plane_stride: u32,
     pub num_scenes: u32,
+}
+
+/// Scene upload mode for [`GpuMosaicCompositor::composite`].
+pub enum MosaicUpload<'a> {
+    /// Already-resident single-band scene stack.
+    Staged(&'a GpuSceneStack),
+    /// Single-band scene planes uploaded directly into the persistent `scene_buf`.
+    Direct {
+        planes: &'a [&'a [f32]],
+        width: u32,
+        height: u32,
+    },
+    /// Already-resident per-band scene stacks (for [`MosaicOutput::F32Bands`]).
+    StagedBands(&'a [&'a GpuSceneStack]),
+    /// Multi-band scene planes uploaded directly into the persistent `scene_buf`
+    /// (for [`MosaicOutput::F32Bands`]).
+    DirectBands {
+        bands: &'a [Vec<&'a [f32]>],
+        width: u32,
+        height: u32,
+    },
+    /// Already-resident 3-band RGB scene stack from [`GpuMosaicCompositor::upload_rgb_scenes`].
+    StagedRgb(&'a GpuSceneStack),
+    /// 3-band RGB scene planes uploaded directly into the persistent `scene_buf`.
+    DirectRgb {
+        planes: &'a [&'a [&'a [f32]]; 3],
+        width: u32,
+        height: u32,
+    },
+}
+
+/// Desired output shape for [`GpuMosaicCompositor::composite`].
+pub enum MosaicOutput<'a> {
+    /// Single-band raw `f32` composite (`width * height`).
+    F32,
+    /// Multi-band raw `f32` composites in a single batched submission.
+    F32Bands,
+    /// Single-band composite fused with rescale + colormap into `Rgba8` or `IndexedU8`.
+    Styled {
+        lut: &'a [u32; 256],
+        out: GpuPixelOutput,
+        rescale: (f32, f32),
+    },
+    /// Single-band composite fused with rescale + colormap -> 1-pass GPU 4:2:0 JPEG.
+    StyledJpeg {
+        lut: &'a [u32; 256],
+        jpeg: &'a mut crate::GpuJpegEncoder,
+        quality: u8,
+        rescale: (f32, f32),
+    },
+    /// 3-band RGB composite fused with per-channel rescale -> RGBA8.
+    RgbStyled {
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+    },
+    /// 3-band RGB composite fused with per-channel rescale -> 1-pass GPU 4:2:0 JPEG.
+    RgbStyledJpeg {
+        jpeg: &'a mut crate::GpuJpegEncoder,
+        quality: u8,
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+    },
+}
+
+/// Output produced by [`GpuMosaicCompositor::composite`].
+#[derive(Debug)]
+pub enum MosaicCompositeResult {
+    F32(Vec<f32>),
+    F32Bands(Vec<Vec<f32>>),
+    Bytes(Vec<u8>),
 }
 
 #[repr(C)]
@@ -366,118 +438,460 @@ impl GpuMosaicCompositor {
         })
     }
 
-    /// Reduce `stack` via `method` into raw `f32` pixels (`width * height`).
-    pub fn composite_f32(
-        &mut self,
-        stack: &GpuSceneStack,
-        method: GpuPixelSelection,
-    ) -> Result<Vec<f32>, GpuError> {
-        let pixels = (stack.width as usize) * (stack.height as usize);
-        self.ensure_out_cap(pixels);
-        let params = MosaicParams::raw(
-            stack.width,
-            stack.height,
-            stack.plane_stride,
-            stack.num_scenes,
-            method,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let raw = self.run_pipeline_binding(
-            stack.buffer.as_entire_buffer_binding(),
-            &self.f32_pipeline,
-            stack.width.div_ceil(16),
-            stack.height.div_ceil(16),
-            pixels * 4,
-        )?;
-        Ok(bytemuck::cast_slice(&raw).to_vec())
-    }
-
-    /// Reduce multiple bands (`stacks`, all sharing the same `width × height` and `num_scenes`)
-    /// via `method` in **1 `CommandEncoder` → 1 `queue.submit()` → 1 `map_async()`**, amortizing
-    /// GPU submission overhead across all bands (e.g. 3-band RGB or 4-band multispectral medians).
-    pub fn composite_f32_bands(
-        &mut self,
-        stacks: &[&GpuSceneStack],
-        method: GpuPixelSelection,
-    ) -> Result<Vec<Vec<f32>>, GpuError> {
-        if stacks.is_empty() {
-            return Ok(Vec::new());
-        }
-        if stacks.len() == 1 {
-            return Ok(vec![self.composite_f32(stacks[0], method)?]);
-        }
-        let first = stacks[0];
-        for (idx, s) in stacks.iter().enumerate().skip(1) {
-            if s.width != first.width
-                || s.height != first.height
-                || s.plane_stride != first.plane_stride
-                || s.num_scenes != first.num_scenes
-            {
-                return Err(GpuError::InvalidDimensions(format!(
-                    "band {idx} stack mismatch: {}x{}x{} vs {}x{}x{}",
-                    s.width, s.height, s.num_scenes, first.width, first.height, first.num_scenes
-                )));
+    /// Upload 3 bands × `1..=32` scene planes (`width * height` `f32` each) into a contiguous
+    /// GPU stack laid out band-major (`R`, `G`, `B`) for [`MosaicUpload::StagedRgb`].
+    pub fn upload_rgb_scenes(
+        &self,
+        rgb_planes: &[&[&[f32]]; 3],
+        width: u32,
+        height: u32,
+    ) -> Result<GpuSceneStack, GpuError> {
+        let (plane_stride, plane_bytes, band_bytes, total_bytes, num_scenes) =
+            self.validate_rgb_scene_planes(rgb_planes, width, height)?;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cogzilla-rgb-scene-stack"),
+            size: total_bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = buffer.slice(..).get_mapped_range_mut();
+            for (c, planes) in rgb_planes.iter().enumerate() {
+                let band_base = c * band_bytes;
+                for (s, p) in planes.iter().enumerate() {
+                    let off = band_base + s * plane_bytes;
+                    mapped[off..off + plane_bytes]
+                        .copy_from_slice(bytemuck::cast_slice(&p[..plane_stride]));
+                }
             }
         }
-        let pixels = (first.width as usize) * (first.height as usize);
-        let total_words = pixels
-            .checked_mul(stacks.len())
-            .ok_or_else(|| GpuError::InvalidDimensions("batched mosaic words overflow".into()))?;
-        self.ensure_out_cap(total_words);
-        let params = MosaicParams::raw(
-            first.width,
-            first.height,
-            first.plane_stride,
-            first.num_scenes,
-            method,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let bindings: Vec<wgpu::BufferBinding<'_>> = stacks
-            .iter()
-            .map(|s| s.buffer.as_entire_buffer_binding())
-            .collect();
-        self.run_f32_bands_bindings(&bindings, first.width, first.height, pixels)
+        buffer.unmap();
+        Ok(GpuSceneStack {
+            buffer,
+            width,
+            height,
+            plane_stride: plane_stride as u32,
+            num_scenes: num_scenes as u32,
+        })
     }
 
-    /// 1-pass fused GPU multi-scene pixel selection + rescale + colormap → GPU 4:2:0 JPEG FDCT
-    /// in **1 `CommandEncoder` → 1 `queue.submit()` → 1 `map_async()`**, with zero RGBA8 readback
-    /// and zero CPU→GPU JPEG re-upload.
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_styled_jpeg(
+    /// Unified mosaic composite entry point over all upload modes (`Staged` / `Direct`) and
+    /// output shapes (`F32`, `F32Bands`, `Styled`, `StyledJpeg`, `RgbStyled`, `RgbStyledJpeg`).
+    pub fn composite(
         &mut self,
-        stack: &GpuSceneStack,
-        method: GpuPixelSelection,
-        rescale_min: f32,
-        rescale_max: f32,
-        lut_rgba_u32: &[u32; 256],
-        jpeg: &mut crate::GpuJpegEncoder,
-        quality: u8,
-    ) -> Result<Vec<u8>, GpuError> {
-        let total_words = (stack.width as usize) * (stack.height as usize);
-        self.ensure_out_cap(total_words);
-        let params = MosaicParams::styled(
-            stack.width,
-            stack.height,
-            stack.plane_stride,
-            stack.num_scenes,
-            method,
-            rescale_min,
-            rescale_max,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue
-            .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
-        self.run_jpeg_binding(
-            stack.buffer.as_entire_buffer_binding(),
-            &self.rgba8_pipeline,
-            stack.width,
-            stack.height,
-            jpeg,
-            quality,
-        )
+        upload: MosaicUpload<'_>,
+        selection: GpuPixelSelection,
+        output: MosaicOutput<'_>,
+    ) -> Result<MosaicCompositeResult, GpuError> {
+        match output {
+            MosaicOutput::F32 => {
+                let (width, height, plane_stride, num_scenes, direct_bytes) =
+                    self.resolve_single_upload(&upload)?;
+                let pixels = plane_stride as usize;
+                self.ensure_out_cap(pixels);
+                let params = MosaicParams::raw(width, height, plane_stride, num_scenes, selection);
+                self.queue
+                    .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+                let binding = self.single_binding(&upload, direct_bytes);
+                let raw = self.run_pipeline_binding(
+                    binding,
+                    &self.f32_pipeline,
+                    width.div_ceil(16),
+                    height.div_ceil(16),
+                    pixels * 4,
+                )?;
+                Ok(MosaicCompositeResult::F32(bytemuck::cast_slice(&raw).to_vec()))
+            }
+            MosaicOutput::F32Bands => self.composite_bands_impl(upload, selection),
+            MosaicOutput::Styled { lut, out, rescale } => {
+                let (width, height, plane_stride, num_scenes, direct_bytes) =
+                    self.resolve_single_upload(&upload)?;
+                self.prepare_styled(
+                    width,
+                    height,
+                    plane_stride,
+                    num_scenes,
+                    selection,
+                    rescale.0,
+                    rescale.1,
+                    lut,
+                    out,
+                );
+                let binding = self.single_binding(&upload, direct_bytes);
+                let bytes = self.run_styled_binding(binding, width, height, out)?;
+                Ok(MosaicCompositeResult::Bytes(bytes))
+            }
+            MosaicOutput::StyledJpeg {
+                lut,
+                jpeg,
+                quality,
+                rescale,
+            } => {
+                let (width, height, plane_stride, num_scenes, direct_bytes) =
+                    self.resolve_single_upload(&upload)?;
+                self.ensure_out_cap(plane_stride as usize);
+                let params = MosaicParams::styled(
+                    width,
+                    height,
+                    plane_stride,
+                    num_scenes,
+                    selection,
+                    rescale.0,
+                    rescale.1,
+                );
+                self.queue
+                    .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+                self.queue
+                    .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut));
+                let binding = self.single_binding(&upload, direct_bytes);
+                let bytes = self.run_jpeg_binding(
+                    binding,
+                    &self.rgba8_pipeline,
+                    width,
+                    height,
+                    jpeg,
+                    quality,
+                )?;
+                Ok(MosaicCompositeResult::Bytes(bytes))
+            }
+            MosaicOutput::RgbStyled {
+                rescale_min,
+                rescale_max,
+            } => {
+                let (width, height, plane_stride, num_scenes, direct_bytes) =
+                    self.resolve_rgb_upload(&upload)?;
+                let pixels = plane_stride as usize;
+                self.ensure_out_cap(pixels);
+                let params = MosaicParams::rgb(
+                    width,
+                    height,
+                    plane_stride,
+                    num_scenes,
+                    selection,
+                    rescale_min,
+                    rescale_max,
+                );
+                self.queue
+                    .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+                let binding = self.rgb_binding(&upload, direct_bytes);
+                let bytes = self.run_pipeline_binding(
+                    binding,
+                    &self.rgb_rgba8_pipeline,
+                    width.div_ceil(16),
+                    height.div_ceil(16),
+                    pixels * 4,
+                )?;
+                Ok(MosaicCompositeResult::Bytes(bytes))
+            }
+            MosaicOutput::RgbStyledJpeg {
+                jpeg,
+                quality,
+                rescale_min,
+                rescale_max,
+            } => {
+                let (width, height, plane_stride, num_scenes, direct_bytes) =
+                    self.resolve_rgb_upload(&upload)?;
+                self.ensure_out_cap(plane_stride as usize);
+                let params = MosaicParams::rgb(
+                    width,
+                    height,
+                    plane_stride,
+                    num_scenes,
+                    selection,
+                    rescale_min,
+                    rescale_max,
+                );
+                self.queue
+                    .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+                let binding = self.rgb_binding(&upload, direct_bytes);
+                let bytes = self.run_jpeg_binding(
+                    binding,
+                    &self.rgb_rgba8_pipeline,
+                    width,
+                    height,
+                    jpeg,
+                    quality,
+                )?;
+                Ok(MosaicCompositeResult::Bytes(bytes))
+            }
+        }
+    }
+
+    fn resolve_single_upload(
+        &mut self,
+        upload: &MosaicUpload<'_>,
+    ) -> Result<(u32, u32, u32, u32, Option<u64>), GpuError> {
+        match upload {
+            MosaicUpload::Staged(stack) => Ok((
+                stack.width,
+                stack.height,
+                stack.plane_stride,
+                stack.num_scenes,
+                None,
+            )),
+            MosaicUpload::Direct {
+                planes,
+                width,
+                height,
+            } => {
+                let (plane_stride, stack_bytes) =
+                    self.write_scene_planes(planes, *width, *height)?;
+                Ok((
+                    *width,
+                    *height,
+                    plane_stride as u32,
+                    planes.len() as u32,
+                    Some(stack_bytes),
+                ))
+            }
+            _ => Err(GpuError::InvalidDimensions(
+                "single-band mosaic output requires MosaicUpload::Staged or MosaicUpload::Direct"
+                    .into(),
+            )),
+        }
+    }
+
+    fn single_binding<'a>(
+        &'a self,
+        upload: &'a MosaicUpload<'a>,
+        direct_bytes: Option<u64>,
+    ) -> wgpu::BufferBinding<'a> {
+        match upload {
+            MosaicUpload::Staged(stack) => stack.buffer.as_entire_buffer_binding(),
+            MosaicUpload::Direct { .. } => wgpu::BufferBinding {
+                buffer: &self.scene_buf,
+                offset: 0,
+                size: direct_bytes.and_then(std::num::NonZeroU64::new),
+            },
+            _ => unreachable!("resolve_single_upload rejected non-single upload"),
+        }
+    }
+
+    fn resolve_rgb_upload(
+        &mut self,
+        upload: &MosaicUpload<'_>,
+    ) -> Result<(u32, u32, u32, u32, Option<u64>), GpuError> {
+        match upload {
+            MosaicUpload::StagedRgb(stack) => Ok((
+                stack.width,
+                stack.height,
+                stack.plane_stride,
+                stack.num_scenes,
+                None,
+            )),
+            MosaicUpload::DirectRgb {
+                planes,
+                width,
+                height,
+            } => {
+                let (plane_stride, num_scenes, total_bytes) =
+                    self.write_rgb_scene_planes(planes, *width, *height)?;
+                Ok((
+                    *width,
+                    *height,
+                    plane_stride as u32,
+                    num_scenes as u32,
+                    Some(total_bytes),
+                ))
+            }
+            _ => Err(GpuError::InvalidDimensions(
+                "RGB mosaic output requires MosaicUpload::StagedRgb or MosaicUpload::DirectRgb"
+                    .into(),
+            )),
+        }
+    }
+
+    fn rgb_binding<'a>(
+        &'a self,
+        upload: &'a MosaicUpload<'a>,
+        direct_bytes: Option<u64>,
+    ) -> wgpu::BufferBinding<'a> {
+        match upload {
+            MosaicUpload::StagedRgb(stack) => stack.buffer.as_entire_buffer_binding(),
+            MosaicUpload::DirectRgb { .. } => wgpu::BufferBinding {
+                buffer: &self.scene_buf,
+                offset: 0,
+                size: direct_bytes.and_then(std::num::NonZeroU64::new),
+            },
+            _ => unreachable!("resolve_rgb_upload rejected non-RGB upload"),
+        }
+    }
+
+    fn composite_bands_impl(
+        &mut self,
+        upload: MosaicUpload<'_>,
+        selection: GpuPixelSelection,
+    ) -> Result<MosaicCompositeResult, GpuError> {
+        match upload {
+            MosaicUpload::StagedBands(stacks) => {
+                if stacks.is_empty() {
+                    return Ok(MosaicCompositeResult::F32Bands(Vec::new()));
+                }
+                if stacks.len() == 1 {
+                    let MosaicCompositeResult::F32(single) = self.composite(
+                        MosaicUpload::Staged(stacks[0]),
+                        selection,
+                        MosaicOutput::F32,
+                    )?
+                    else {
+                        unreachable!();
+                    };
+                    return Ok(MosaicCompositeResult::F32Bands(vec![single]));
+                }
+                let first = stacks[0];
+                for (idx, s) in stacks.iter().enumerate().skip(1) {
+                    if s.width != first.width
+                        || s.height != first.height
+                        || s.plane_stride != first.plane_stride
+                        || s.num_scenes != first.num_scenes
+                    {
+                        return Err(GpuError::InvalidDimensions(format!(
+                            "band {idx} stack mismatch: {}x{}x{} vs {}x{}x{}",
+                            s.width,
+                            s.height,
+                            s.num_scenes,
+                            first.width,
+                            first.height,
+                            first.num_scenes
+                        )));
+                    }
+                }
+                let pixels = (first.width as usize) * (first.height as usize);
+                let total_words = pixels.checked_mul(stacks.len()).ok_or_else(|| {
+                    GpuError::InvalidDimensions("batched mosaic words overflow".into())
+                })?;
+                self.ensure_out_cap(total_words);
+                let params = MosaicParams::raw(
+                    first.width,
+                    first.height,
+                    first.plane_stride,
+                    first.num_scenes,
+                    selection,
+                );
+                self.queue
+                    .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+                let bindings: Vec<wgpu::BufferBinding<'_>> = stacks
+                    .iter()
+                    .map(|s| s.buffer.as_entire_buffer_binding())
+                    .collect();
+                let bands =
+                    self.run_f32_bands_bindings(&bindings, first.width, first.height, pixels)?;
+                Ok(MosaicCompositeResult::F32Bands(bands))
+            }
+            MosaicUpload::DirectBands {
+                bands: band_planes,
+                width,
+                height,
+            } => {
+                if band_planes.is_empty() {
+                    return Ok(MosaicCompositeResult::F32Bands(Vec::new()));
+                }
+                if band_planes.len() == 1 {
+                    let MosaicCompositeResult::F32(single) = self.composite(
+                        MosaicUpload::Direct {
+                            planes: &band_planes[0],
+                            width,
+                            height,
+                        },
+                        selection,
+                        MosaicOutput::F32,
+                    )?
+                    else {
+                        unreachable!();
+                    };
+                    return Ok(MosaicCompositeResult::F32Bands(vec![single]));
+                }
+                let num_scenes = band_planes[0].len();
+                if num_scenes == 0 || num_scenes > 32 || width == 0 || height == 0 {
+                    return Err(GpuError::InvalidDimensions(format!(
+                        "invalid batched scene stack: scenes={num_scenes}, {width}x{height}"
+                    )));
+                }
+                let plane_stride = (width as usize)
+                    .checked_mul(height as usize)
+                    .ok_or_else(|| GpuError::InvalidDimensions("plane_stride overflow".into()))?;
+                for (b, planes) in band_planes.iter().enumerate() {
+                    if planes.len() != num_scenes {
+                        return Err(GpuError::InvalidDimensions(format!(
+                            "band {b} scene count {} != {num_scenes}",
+                            planes.len()
+                        )));
+                    }
+                    for (s, p) in planes.iter().enumerate() {
+                        if p.len() < plane_stride {
+                            return Err(GpuError::InvalidDimensions(format!(
+                                "band {b} scene {s} len {} < {plane_stride}",
+                                p.len()
+                            )));
+                        }
+                    }
+                }
+                let plane_bytes = plane_stride
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| GpuError::InvalidDimensions("plane_bytes overflow".into()))?;
+                let raw_band_bytes = plane_bytes
+                    .checked_mul(num_scenes)
+                    .ok_or_else(|| GpuError::InvalidDimensions("raw_band_bytes overflow".into()))?
+                    as u64;
+                let align = self.min_storage_align;
+                let aligned_band_stride = raw_band_bytes.div_ceil(align) * align;
+                let total_scene_bytes = (aligned_band_stride as usize)
+                    .checked_mul(band_planes.len())
+                    .ok_or_else(|| {
+                        GpuError::InvalidDimensions("batched scene bytes overflow".into())
+                    })?;
+                if (total_scene_bytes as u64) > self.max_scene_bytes {
+                    return Err(GpuError::InvalidDimensions(format!(
+                        "batched scene stack {total_scene_bytes} B exceeds adapter limit {} B",
+                        self.max_scene_bytes
+                    )));
+                }
+                self.ensure_scene_cap(total_scene_bytes);
+
+                for (b, planes) in band_planes.iter().enumerate() {
+                    let band_base = (b as u64) * aligned_band_stride;
+                    for (s, p) in planes.iter().enumerate() {
+                        self.queue.write_buffer(
+                            &self.scene_buf,
+                            band_base + (s * plane_bytes) as u64,
+                            bytemuck::cast_slice(&p[..plane_stride]),
+                        );
+                    }
+                }
+
+                let total_out_words = plane_stride
+                    .checked_mul(band_planes.len())
+                    .ok_or_else(|| {
+                        GpuError::InvalidDimensions("batched out words overflow".into())
+                    })?;
+                self.ensure_out_cap(total_out_words);
+
+                let params = MosaicParams::raw(
+                    width,
+                    height,
+                    plane_stride as u32,
+                    num_scenes as u32,
+                    selection,
+                );
+                self.queue
+                    .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+
+                let bindings: Vec<wgpu::BufferBinding<'_>> = (0..band_planes.len())
+                    .map(|b| wgpu::BufferBinding {
+                        buffer: &self.scene_buf,
+                        offset: (b as u64) * aligned_band_stride,
+                        size: std::num::NonZeroU64::new(raw_band_bytes),
+                    })
+                    .collect();
+                let bands =
+                    self.run_f32_bands_bindings(&bindings, width, height, plane_stride)?;
+                Ok(MosaicCompositeResult::F32Bands(bands))
+            }
+            _ => Err(GpuError::InvalidDimensions(
+                "F32Bands mosaic output requires MosaicUpload::StagedBands or MosaicUpload::DirectBands"
+                    .into(),
+            )),
+        }
     }
 
     fn write_scene_planes(
@@ -499,227 +913,12 @@ impl GpuMosaicCompositor {
         Ok((plane_stride, total_bytes as u64))
     }
 
-    /// Reduce `planes` directly via the persistent `scene_buf` (zero per-call VRAM allocation).
-    pub fn composite_f32_direct(
-        &mut self,
-        planes: &[&[f32]],
-        width: u32,
-        height: u32,
-        method: GpuPixelSelection,
-    ) -> Result<Vec<f32>, GpuError> {
-        let (plane_stride, stack_bytes) = self.write_scene_planes(planes, width, height)?;
-        self.ensure_out_cap(plane_stride);
-        let params = MosaicParams::raw(
-            width,
-            height,
-            plane_stride as u32,
-            planes.len() as u32,
-            method,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        let raw = self.run_pipeline_binding(
-            wgpu::BufferBinding {
-                buffer: &self.scene_buf,
-                offset: 0,
-                size: std::num::NonZeroU64::new(stack_bytes),
-            },
-            &self.f32_pipeline,
-            width.div_ceil(16),
-            height.div_ceil(16),
-            plane_stride * 4,
-        )?;
-        Ok(bytemuck::cast_slice(&raw).to_vec())
-    }
-
-    /// Reduce `band_planes` (`B` bands × `S` scenes) in **1 `CommandEncoder` → 1 `queue.submit()`
-    /// → 1 `map_async()`** using the persistent `scene_buf` (zero per-call VRAM allocation).
-    pub fn composite_f32_bands_direct(
-        &mut self,
-        band_planes: &[Vec<&[f32]>],
-        width: u32,
-        height: u32,
-        method: GpuPixelSelection,
-    ) -> Result<Vec<Vec<f32>>, GpuError> {
-        if band_planes.is_empty() {
-            return Ok(Vec::new());
-        }
-        if band_planes.len() == 1 {
-            return Ok(vec![self.composite_f32_direct(
-                &band_planes[0],
-                width,
-                height,
-                method,
-            )?]);
-        }
-        let num_scenes = band_planes[0].len();
-        if num_scenes == 0 || num_scenes > 32 || width == 0 || height == 0 {
-            return Err(GpuError::InvalidDimensions(format!(
-                "invalid batched scene stack: scenes={num_scenes}, {width}x{height}"
-            )));
-        }
-        let plane_stride = (width as usize)
-            .checked_mul(height as usize)
-            .ok_or_else(|| GpuError::InvalidDimensions("plane_stride overflow".into()))?;
-        for (b, planes) in band_planes.iter().enumerate() {
-            if planes.len() != num_scenes {
-                return Err(GpuError::InvalidDimensions(format!(
-                    "band {b} scene count {} != {num_scenes}",
-                    planes.len()
-                )));
-            }
-            for (s, p) in planes.iter().enumerate() {
-                if p.len() < plane_stride {
-                    return Err(GpuError::InvalidDimensions(format!(
-                        "band {b} scene {s} len {} < {plane_stride}",
-                        p.len()
-                    )));
-                }
-            }
-        }
-        let plane_bytes = plane_stride
-            .checked_mul(std::mem::size_of::<f32>())
-            .ok_or_else(|| GpuError::InvalidDimensions("plane_bytes overflow".into()))?;
-        let raw_band_bytes = plane_bytes
-            .checked_mul(num_scenes)
-            .ok_or_else(|| GpuError::InvalidDimensions("raw_band_bytes overflow".into()))?
-            as u64;
-        let align = self.min_storage_align;
-        let aligned_band_stride = raw_band_bytes.div_ceil(align) * align;
-        let total_scene_bytes = (aligned_band_stride as usize)
-            .checked_mul(band_planes.len())
-            .ok_or_else(|| GpuError::InvalidDimensions("batched scene bytes overflow".into()))?;
-        if (total_scene_bytes as u64) > self.max_scene_bytes {
-            return Err(GpuError::InvalidDimensions(format!(
-                "batched scene stack {total_scene_bytes} B exceeds adapter limit {} B",
-                self.max_scene_bytes
-            )));
-        }
-        self.ensure_scene_cap(total_scene_bytes);
-
-        for (b, planes) in band_planes.iter().enumerate() {
-            let band_base = (b as u64) * aligned_band_stride;
-            for (s, p) in planes.iter().enumerate() {
-                self.queue.write_buffer(
-                    &self.scene_buf,
-                    band_base + (s * plane_bytes) as u64,
-                    bytemuck::cast_slice(&p[..plane_stride]),
-                );
-            }
-        }
-
-        let total_out_words = plane_stride
-            .checked_mul(band_planes.len())
-            .ok_or_else(|| GpuError::InvalidDimensions("batched out words overflow".into()))?;
-        self.ensure_out_cap(total_out_words);
-
-        let params = MosaicParams::raw(
-            width,
-            height,
-            plane_stride as u32,
-            num_scenes as u32,
-            method,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-
-        let bindings: Vec<wgpu::BufferBinding<'_>> = (0..band_planes.len())
-            .map(|b| wgpu::BufferBinding {
-                buffer: &self.scene_buf,
-                offset: (b as u64) * aligned_band_stride,
-                size: std::num::NonZeroU64::new(raw_band_bytes),
-            })
-            .collect();
-        self.run_f32_bands_bindings(&bindings, width, height, plane_stride)
-    }
-
-    /// Reduce `planes` fused with rescale + colormap directly via persistent `scene_buf`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_styled_direct(
-        &mut self,
-        planes: &[&[f32]],
-        width: u32,
-        height: u32,
-        method: GpuPixelSelection,
-        rescale_min: f32,
-        rescale_max: f32,
-        lut_rgba_u32: &[u32; 256],
-        output: GpuPixelOutput,
-    ) -> Result<Vec<u8>, GpuError> {
-        let (plane_stride, stack_bytes) = self.write_scene_planes(planes, width, height)?;
-        self.prepare_styled(
-            width,
-            height,
-            plane_stride as u32,
-            planes.len() as u32,
-            method,
-            rescale_min,
-            rescale_max,
-            lut_rgba_u32,
-            output,
-        );
-        self.run_styled_binding(
-            wgpu::BufferBinding {
-                buffer: &self.scene_buf,
-                offset: 0,
-                size: std::num::NonZeroU64::new(stack_bytes),
-            },
-            width,
-            height,
-            output,
-        )
-    }
-
-    /// 1-pass fused Mosaic -> GPU JPEG directly via persistent `scene_buf` (zero per-call VRAM
-    /// allocation, zero RGBA8 readback, zero CPU JPEG encode).
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_styled_jpeg_direct(
-        &mut self,
-        planes: &[&[f32]],
-        width: u32,
-        height: u32,
-        method: GpuPixelSelection,
-        rescale_min: f32,
-        rescale_max: f32,
-        lut_rgba_u32: &[u32; 256],
-        jpeg: &mut crate::GpuJpegEncoder,
-        quality: u8,
-    ) -> Result<Vec<u8>, GpuError> {
-        let (plane_stride, stack_bytes) = self.write_scene_planes(planes, width, height)?;
-        self.ensure_out_cap(plane_stride);
-        let params = MosaicParams::styled(
-            width,
-            height,
-            plane_stride as u32,
-            planes.len() as u32,
-            method,
-            rescale_min,
-            rescale_max,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.queue
-            .write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(lut_rgba_u32));
-        self.run_jpeg_binding(
-            wgpu::BufferBinding {
-                buffer: &self.scene_buf,
-                offset: 0,
-                size: std::num::NonZeroU64::new(stack_bytes),
-            },
-            &self.rgba8_pipeline,
-            width,
-            height,
-            jpeg,
-            quality,
-        )
-    }
-
-    fn write_rgb_scene_planes(
-        &mut self,
+    fn validate_rgb_scene_planes(
+        &self,
         rgb_planes: &[&[&[f32]]; 3],
         width: u32,
         height: u32,
-    ) -> Result<(usize, usize, u64), GpuError> {
+    ) -> Result<(usize, usize, usize, usize, usize), GpuError> {
         let num_scenes = rgb_planes[0].len();
         if num_scenes == 0
             || num_scenes > 32
@@ -763,6 +962,17 @@ impl GpuMosaicCompositor {
                 self.max_scene_bytes
             )));
         }
+        Ok((plane_stride, plane_bytes, band_bytes, total_bytes, num_scenes))
+    }
+
+    fn write_rgb_scene_planes(
+        &mut self,
+        rgb_planes: &[&[&[f32]]; 3],
+        width: u32,
+        height: u32,
+    ) -> Result<(usize, usize, u64), GpuError> {
+        let (plane_stride, plane_bytes, band_bytes, total_bytes, num_scenes) =
+            self.validate_rgb_scene_planes(rgb_planes, width, height)?;
         self.ensure_scene_cap(total_bytes);
         for (c, planes) in rgb_planes.iter().enumerate() {
             let band_base = (c * band_bytes) as u64;
@@ -775,118 +985,6 @@ impl GpuMosaicCompositor {
             }
         }
         Ok((plane_stride, num_scenes, total_bytes as u64))
-    }
-
-    /// 1-pass fused 3-band RGB multi-scene pixel selection + per-channel rescale -> RGBA8
-    /// directly via persistent `scene_buf` (3× smaller readback than 3×f32, zero CPU rescale).
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_rgb_styled_direct(
-        &mut self,
-        rgb_planes: &[&[&[f32]]; 3],
-        width: u32,
-        height: u32,
-        method: GpuPixelSelection,
-        rescale_min: [f32; 3],
-        rescale_max: [f32; 3],
-    ) -> Result<Vec<u8>, GpuError> {
-        let (plane_stride, num_scenes, total_bytes) =
-            self.write_rgb_scene_planes(rgb_planes, width, height)?;
-        self.ensure_out_cap(plane_stride);
-        let params = MosaicParams::rgb(
-            width,
-            height,
-            plane_stride as u32,
-            num_scenes as u32,
-            method,
-            rescale_min,
-            rescale_max,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.run_pipeline_binding(
-            wgpu::BufferBinding {
-                buffer: &self.scene_buf,
-                offset: 0,
-                size: std::num::NonZeroU64::new(total_bytes),
-            },
-            &self.rgb_rgba8_pipeline,
-            width.div_ceil(16),
-            height.div_ceil(16),
-            plane_stride * 4,
-        )
-    }
-
-    /// 1-pass fused 3-band RGB multi-scene pixel selection + per-channel rescale -> GPU JPEG
-    /// in **1 `CommandEncoder` → 1 `queue.submit()` → 1 `map_async()`** (zero f32 readback,
-    /// zero RGBA8 readback, zero CPU rescale, zero CPU JPEG encode).
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_rgb_styled_jpeg_direct(
-        &mut self,
-        rgb_planes: &[&[&[f32]]; 3],
-        width: u32,
-        height: u32,
-        method: GpuPixelSelection,
-        rescale_min: [f32; 3],
-        rescale_max: [f32; 3],
-        jpeg: &mut crate::GpuJpegEncoder,
-        quality: u8,
-    ) -> Result<Vec<u8>, GpuError> {
-        let (plane_stride, num_scenes, total_bytes) =
-            self.write_rgb_scene_planes(rgb_planes, width, height)?;
-        self.ensure_out_cap(plane_stride);
-        let params = MosaicParams::rgb(
-            width,
-            height,
-            plane_stride as u32,
-            num_scenes as u32,
-            method,
-            rescale_min,
-            rescale_max,
-        );
-        self.queue
-            .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-        self.run_jpeg_binding(
-            wgpu::BufferBinding {
-                buffer: &self.scene_buf,
-                offset: 0,
-                size: std::num::NonZeroU64::new(total_bytes),
-            },
-            &self.rgb_rgba8_pipeline,
-            width,
-            height,
-            jpeg,
-            quality,
-        )
-    }
-
-    /// Reduce `stack` via `method` fused with rescale + colormap into `Rgba8` or `IndexedU8`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_styled(
-        &mut self,
-        stack: &GpuSceneStack,
-        method: GpuPixelSelection,
-        rescale_min: f32,
-        rescale_max: f32,
-        lut_rgba_u32: &[u32; 256],
-        output: GpuPixelOutput,
-    ) -> Result<Vec<u8>, GpuError> {
-        self.prepare_styled(
-            stack.width,
-            stack.height,
-            stack.plane_stride,
-            stack.num_scenes,
-            method,
-            rescale_min,
-            rescale_max,
-            lut_rgba_u32,
-            output,
-        );
-        self.run_styled_binding(
-            stack.buffer.as_entire_buffer_binding(),
-            stack.width,
-            stack.height,
-            output,
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1188,12 +1286,39 @@ mod tests {
             GpuPixelSelection::Stdev,
             GpuPixelSelection::Count,
         ] {
-            let gpu_out = comp.composite_f32(&stack, method).unwrap();
+            let MosaicCompositeResult::F32(staged_out) = comp
+                .composite(MosaicUpload::Staged(&stack), method, MosaicOutput::F32)
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            let MosaicCompositeResult::F32(direct_out) = comp
+                .composite(
+                    MosaicUpload::Direct {
+                        planes: &refs,
+                        width: w,
+                        height: h,
+                    },
+                    method,
+                    MosaicOutput::F32,
+                )
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            assert_eq!(staged_out.len(), direct_out.len());
+            for i in 0..n {
+                assert_eq!(
+                    staged_out[i].to_bits(),
+                    direct_out[i].to_bits(),
+                    "{method:?} px {i}: Staged vs Direct bit mismatch"
+                );
+            }
             let mut max_err = 0.0f32;
             let mut mask_err = 0usize;
             for i in 0..n {
                 let c = cpu_select(&planes, i, method);
-                let g = gpu_out[i];
+                let g = staged_out[i];
                 if c.is_nan() != g.is_nan() {
                     mask_err += 1;
                 } else if !c.is_nan() {
@@ -1246,62 +1371,160 @@ mod tests {
         let s0 = comp.upload_scenes(&r0, w, h).unwrap();
         let s1 = comp.upload_scenes(&r1, w, h).unwrap();
         let s2 = comp.upload_scenes(&r2, w, h).unwrap();
+        let direct_bands: Vec<Vec<&[f32]>> = vec![r0.clone(), r1.clone(), r2.clone()];
 
         for &method in &[
             GpuPixelSelection::Median,
             GpuPixelSelection::Mean,
             GpuPixelSelection::Stdev,
         ] {
-            let batched = comp.composite_f32_bands(&[&s0, &s1, &s2], method).unwrap();
-            assert_eq!(batched.len(), 3);
-            for (b_idx, (stack, got)) in [&s0, &s1, &s2].into_iter().zip(&batched).enumerate() {
-                let single = comp.composite_f32(stack, method).unwrap();
-                assert_eq!(got.len(), single.len());
+            let MosaicCompositeResult::F32Bands(staged_batched) = comp
+                .composite(
+                    MosaicUpload::StagedBands(&[&s0, &s1, &s2]),
+                    method,
+                    MosaicOutput::F32Bands,
+                )
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            let MosaicCompositeResult::F32Bands(direct_batched) = comp
+                .composite(
+                    MosaicUpload::DirectBands {
+                        bands: &direct_bands,
+                        width: w,
+                        height: h,
+                    },
+                    method,
+                    MosaicOutput::F32Bands,
+                )
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            assert_eq!(staged_batched.len(), 3);
+            assert_eq!(direct_batched.len(), 3);
+            for (b_idx, ((stack, got_staged), got_direct)) in [&s0, &s1, &s2]
+                .into_iter()
+                .zip(&staged_batched)
+                .zip(&direct_batched)
+                .enumerate()
+            {
+                let MosaicCompositeResult::F32(single) = comp
+                    .composite(MosaicUpload::Staged(stack), method, MosaicOutput::F32)
+                    .unwrap()
+                else {
+                    unreachable!();
+                };
+                assert_eq!(got_staged.len(), single.len());
+                assert_eq!(got_direct.len(), single.len());
                 for i in 0..n {
                     assert_eq!(
-                        got[i].to_bits(),
+                        got_staged[i].to_bits(),
                         single[i].to_bits(),
-                        "{method:?} band {b_idx} px {i} mismatch"
+                        "{method:?} band {b_idx} px {i} staged mismatch"
+                    );
+                    assert_eq!(
+                        got_direct[i].to_bits(),
+                        single[i].to_bits(),
+                        "{method:?} band {b_idx} px {i} direct mismatch"
                     );
                 }
             }
         }
 
-        // 1-pass fused Mosaic -> GPU JPEG must be bit-identical to 2-pass RGBA8 -> GPU JPEG.
+        // 1-pass fused Mosaic -> GPU JPEG and Styled (Rgba8 + IndexedU8) must be bit-identical
+        // across Staged and Direct uploads, and fused JPEG must match 2-pass RGBA8 -> GPU JPEG.
         let mut lut = [0u32; 256];
         for (i, slot) in lut.iter_mut().enumerate() {
             let v = i as u32;
             *slot = v | ((255 - v) << 8) | (((v * 3) & 0xff) << 16) | (0xff << 24);
         }
-        let fused_jpg = comp
-            .composite_styled_jpeg(
-                &s0,
+        let MosaicCompositeResult::Bytes(staged_jpg) = comp
+            .composite(
+                MosaicUpload::Staged(&s0),
                 GpuPixelSelection::Median,
-                40.0,
-                240.0,
-                &lut,
-                &mut jpeg,
-                85,
+                MosaicOutput::StyledJpeg {
+                    lut: &lut,
+                    jpeg: &mut jpeg,
+                    quality: 85,
+                    rescale: (40.0, 240.0),
+                },
             )
-            .unwrap();
-        assert!(fused_jpg.starts_with(&[0xff, 0xd8]));
-        assert!(fused_jpg.ends_with(&[0xff, 0xd9]));
-
-        let rgba = comp
-            .composite_styled(
-                &s0,
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let MosaicCompositeResult::Bytes(direct_jpg) = comp
+            .composite(
+                MosaicUpload::Direct {
+                    planes: &r0,
+                    width: w,
+                    height: h,
+                },
                 GpuPixelSelection::Median,
-                40.0,
-                240.0,
-                &lut,
-                GpuPixelOutput::Rgba8,
+                MosaicOutput::StyledJpeg {
+                    lut: &lut,
+                    jpeg: &mut jpeg,
+                    quality: 85,
+                    rescale: (40.0, 240.0),
+                },
             )
-            .unwrap();
-        let ref_jpg = jpeg.encode_rgba8(&rgba, w, h, 85).unwrap();
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert!(staged_jpg.starts_with(&[0xff, 0xd8]) && staged_jpg.ends_with(&[0xff, 0xd9]));
         assert_eq!(
-            fused_jpg, ref_jpg,
-            "1-pass fused Mosaic->GPU JPEG must be bit-exact vs 2-pass RGBA8->GPU JPEG"
+            staged_jpg, direct_jpg,
+            "StyledJpeg must be bit-exact between Staged and Direct"
         );
+
+        for out_kind in [GpuPixelOutput::Rgba8, GpuPixelOutput::IndexedU8] {
+            let MosaicCompositeResult::Bytes(staged_styled) = comp
+                .composite(
+                    MosaicUpload::Staged(&s0),
+                    GpuPixelSelection::Median,
+                    MosaicOutput::Styled {
+                        lut: &lut,
+                        out: out_kind,
+                        rescale: (40.0, 240.0),
+                    },
+                )
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            let MosaicCompositeResult::Bytes(direct_styled) = comp
+                .composite(
+                    MosaicUpload::Direct {
+                        planes: &r0,
+                        width: w,
+                        height: h,
+                    },
+                    GpuPixelSelection::Median,
+                    MosaicOutput::Styled {
+                        lut: &lut,
+                        out: out_kind,
+                        rescale: (40.0, 240.0),
+                    },
+                )
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                staged_styled, direct_styled,
+                "Styled ({out_kind:?}) must be bit-exact between Staged and Direct"
+            );
+            if out_kind == GpuPixelOutput::Rgba8 {
+                let ref_jpg = jpeg.encode_rgba8(&staged_styled, w, h, 85).unwrap();
+                assert_eq!(
+                    staged_jpg, ref_jpg,
+                    "1-pass fused Mosaic->GPU JPEG must be bit-exact vs 2-pass RGBA8->GPU JPEG"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1343,12 +1566,41 @@ mod tests {
         let g_refs: Vec<&[f32]> = g_band.iter().map(Vec::as_slice).collect();
         let b_refs: Vec<&[f32]> = b_band.iter().map(Vec::as_slice).collect();
         let rgb_planes: [&[&[f32]]; 3] = [&r_refs, &g_refs, &b_refs];
+        let rgb_stack = comp.upload_rgb_scenes(&rgb_planes, w, h).unwrap();
 
         let rmin = [0.0f32, 10.0, 20.0];
         let rmax = [300.0f32, 310.0, 320.0];
-        let rgba = comp
-            .composite_rgb_styled_direct(&rgb_planes, w, h, GpuPixelSelection::Median, rmin, rmax)
-            .unwrap();
+        let MosaicCompositeResult::Bytes(rgba) = comp
+            .composite(
+                MosaicUpload::DirectRgb {
+                    planes: &rgb_planes,
+                    width: w,
+                    height: h,
+                },
+                GpuPixelSelection::Median,
+                MosaicOutput::RgbStyled {
+                    rescale_min: rmin,
+                    rescale_max: rmax,
+                },
+            )
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let MosaicCompositeResult::Bytes(staged_rgba) = comp
+            .composite(
+                MosaicUpload::StagedRgb(&rgb_stack),
+                GpuPixelSelection::Median,
+                MosaicOutput::RgbStyled {
+                    rescale_min: rmin,
+                    rescale_max: rmax,
+                },
+            )
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(rgba, staged_rgba, "RgbStyled must be bit-exact between DirectRgb and StagedRgb");
         assert_eq!(rgba.len(), n * 4);
 
         let inv = [
@@ -1382,23 +1634,83 @@ mod tests {
         assert_eq!(mask_err, 0, "RGB mosaic nodata mask mismatch");
         assert!(max_diff <= 1, "RGB mosaic max channel diff {max_diff} > 1");
 
-        let fused_jpg = comp
-            .composite_rgb_styled_jpeg_direct(
-                &rgb_planes,
-                w,
-                h,
+        let MosaicCompositeResult::Bytes(fused_jpg) = comp
+            .composite(
+                MosaicUpload::DirectRgb {
+                    planes: &rgb_planes,
+                    width: w,
+                    height: h,
+                },
                 GpuPixelSelection::Median,
-                rmin,
-                rmax,
-                &mut jpeg,
-                85,
+                MosaicOutput::RgbStyledJpeg {
+                    jpeg: &mut jpeg,
+                    quality: 85,
+                    rescale_min: rmin,
+                    rescale_max: rmax,
+                },
             )
-            .unwrap();
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        let MosaicCompositeResult::Bytes(staged_jpg) = comp
+            .composite(
+                MosaicUpload::StagedRgb(&rgb_stack),
+                GpuPixelSelection::Median,
+                MosaicOutput::RgbStyledJpeg {
+                    jpeg: &mut jpeg,
+                    quality: 85,
+                    rescale_min: rmin,
+                    rescale_max: rmax,
+                },
+            )
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            fused_jpg, staged_jpg,
+            "RgbStyledJpeg must be bit-exact between DirectRgb and StagedRgb"
+        );
         assert!(fused_jpg.starts_with(&[0xff, 0xd8]) && fused_jpg.ends_with(&[0xff, 0xd9]));
         let ref_jpg = jpeg.encode_rgba8(&rgba, w, h, 85).unwrap();
         assert_eq!(
             fused_jpg, ref_jpg,
             "1-pass fused RGB Mosaic->GPU JPEG must be bit-exact vs 2-pass RGBA8->GPU JPEG"
+        );
+    }
+
+    #[test]
+    fn pixel_selection_codes_match_mosaic_wgsl() {
+        let mut wgsl_codes: Vec<u32> = Vec::new();
+        let needle = "params.method == ";
+        let mut rest = crate::shaders::MOSAIC_WGSL;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                wgsl_codes.push(digits.parse().expect("valid u32 method literal"));
+            }
+        }
+        wgsl_codes.sort_unstable();
+        wgsl_codes.dedup();
+
+        let rust_codes: Vec<u32> = [
+            GpuPixelSelection::First,
+            GpuPixelSelection::Highest,
+            GpuPixelSelection::Lowest,
+            GpuPixelSelection::Mean,
+            GpuPixelSelection::Median,
+            GpuPixelSelection::Stdev,
+            GpuPixelSelection::Count,
+        ]
+        .into_iter()
+        .map(GpuPixelSelection::as_u32)
+        .collect();
+
+        assert_eq!(
+            wgsl_codes, rust_codes,
+            "mosaic.wgsl params.method branches must match GpuPixelSelection::as_u32() exactly"
         );
     }
 }

@@ -22,7 +22,10 @@ pub use colormap::{GpuColormapMode, GpuPixelOutput, pack_rgb_lut};
 pub use context::{GpuAdapterInfo, GpuContext, GpuError, GpuOptions};
 pub use expr::{GpuColorFormula, GpuInstr, GpuMultiBandSlab};
 pub use jpeg::{GpuJpegEncoder, huffman_encode_coeffs};
-pub use mosaic::{GpuMosaicCompositor, GpuPixelSelection, GpuSceneStack};
+pub use mosaic::{
+    GpuMosaicCompositor, GpuPixelSelection, GpuSceneStack, MosaicCompositeResult, MosaicOutput,
+    MosaicUpload,
+};
 pub use policy::{
     DispatchDecision, DispatchPolicy, DispatchReason, DispatchRequest, GpuOp, GpuProfile,
     PolicyOverride,

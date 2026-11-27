@@ -132,15 +132,19 @@ fn select_pixel_at(base_off: u32, px_idx: u32) -> f32 {
         return sqrt(max(m2 / f32(count), 0.0));
     }
 
-    // method == 6u: Count
-    var count: u32 = 0u;
-    for (var s: u32 = 0u; s < n; s = s + 1u) {
-        let v = scene_planes[base_off + s * params.plane_stride + px_idx];
-        if (is_finite_f32(v)) {
-            count += 1u;
+    if (params.method == 6u) {
+        // Count
+        var count: u32 = 0u;
+        for (var s: u32 = 0u; s < n; s = s + 1u) {
+            let v = scene_planes[base_off + s * params.plane_stride + px_idx];
+            if (is_finite_f32(v)) {
+                count += 1u;
+            }
         }
+        return select(nan_f32(), f32(count), count > 0u);
     }
-    return select(nan_f32(), f32(count), count > 0u);
+
+    return nan_f32();
 }
 
 fn select_pixel(px_idx: u32) -> f32 {
