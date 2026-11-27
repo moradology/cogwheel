@@ -5663,32 +5663,16 @@ async fn load_mosaicjson(
 }
 
 const MAX_POST_BODY_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_MAX_STATISTICS_FEATURES: usize = 10_000;
-const MAX_STATISTICS_FEATURES_ENV: &str = "COGZILLA_MAX_STATISTICS_FEATURES";
-const DEFAULT_BODY_TIMEOUT_SECS: u64 = 30;
-const BODY_TIMEOUT_SECS_ENV: &str = "COGZILLA_BODY_TIMEOUT_SECS";
 
 /// Maximum features accepted in a `POST /*/statistics` `FeatureCollection` (`0` = unlimited,
 /// still bounded by `MAX_POST_BODY_BYTES` and per-feature window/block caps).
 fn max_statistics_features() -> usize {
-    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var(MAX_STATISTICS_FEATURES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_STATISTICS_FEATURES)
-    })
+    crate::config::Config::global().max_statistics_features
 }
 
 /// Timeout in seconds for reading a POST request body (`0` disables the timeout).
 fn body_timeout_secs() -> u64 {
-    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *SECS.get_or_init(|| {
-        std::env::var(BODY_TIMEOUT_SECS_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_BODY_TIMEOUT_SECS)
-    })
+    crate::config::Config::global().body_timeout_secs
 }
 
 fn check_feature_collection_len(len: usize) -> Result<(), EngineError> {
@@ -11941,19 +11925,7 @@ fn pgstac_cacheable(mut resp: Response<Full<Bytes>>, method: &Method) -> Respons
 }
 
 fn cache_control_header() -> &'static HeaderValue {
-    static VAL: std::sync::OnceLock<HeaderValue> = std::sync::OnceLock::new();
-    VAL.get_or_init(|| {
-        let secs: u64 = std::env::var("COGZILLA_CACHE_CONTROL_MAX_AGE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(3600);
-        let s = if secs == 0 {
-            "no-cache".to_string()
-        } else {
-            format!("public, max-age={secs}")
-        };
-        HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600"))
-    })
+    crate::config::Config::global().cache_control_header()
 }
 
 fn etag_matches(if_none_match: &str, etag: &str) -> bool {
@@ -13019,8 +12991,8 @@ mod tests {
         // BB1: default FeatureCollection limit allows thousands of features (not capped at 64)
         assert!(check_feature_collection_len(200).is_ok());
         assert!(check_feature_collection_len(1_000).is_ok());
-        assert!(check_feature_collection_len(DEFAULT_MAX_STATISTICS_FEATURES).is_ok());
-        assert!(check_feature_collection_len(DEFAULT_MAX_STATISTICS_FEATURES + 1).is_err());
+        assert!(check_feature_collection_len(crate::config::DEFAULT_MAX_STATISTICS_FEATURES).is_ok());
+        assert!(check_feature_collection_len(crate::config::DEFAULT_MAX_STATISTICS_FEATURES + 1).is_err());
 
         // BB2: oversized POST body returns 413 Content Too Large with exact message
         let big = Bytes::from(vec![b'a'; MAX_POST_BODY_BYTES + 1]);

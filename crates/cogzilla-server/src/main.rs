@@ -40,6 +40,10 @@ struct Args {
     /// Pre-registered spatial mosaic catalogs as `name=/path/to/catalog.json` (STAC FeatureCollection or JSON array)
     #[arg(long = "mosaic")]
     mosaics: Vec<String>,
+
+    /// Print effective environment configuration (and any parse warnings) and exit
+    #[arg(long)]
+    print_config: bool,
 }
 
 #[tokio::main]
@@ -52,6 +56,18 @@ async fn main() {
         .init();
 
     let args = Args::parse();
+    if args.print_config {
+        let (cfg, warnings) = cogzilla_server::Config::from_env();
+        for (var, val) in cfg.effective_entries() {
+            println!("{var}={val}");
+        }
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
+        return;
+    }
+    // Parse and validate environment configuration once at startup so invalid values log early.
+    let _ = cogzilla_server::Config::global();
     let engine = TileEngine::boot(EngineBootConfig {
         cache_mb: args.cache_mb,
         tile_cache_mb: args.tile_cache_mb,

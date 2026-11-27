@@ -354,12 +354,29 @@ fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
 
 impl CogStore {
     pub fn new(cache_max_bytes: usize) -> Self {
-        let max_open_uris = std::env::var("COGZILLA_MAX_OPEN_URIS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_MAX_OPEN_URIS);
+        let max_open_uris = match std::env::var("COGZILLA_MAX_OPEN_URIS") {
+            Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    eprintln!(
+                        "cogzilla-io: warning: COGZILLA_MAX_OPEN_URIS={raw:?} ignored (expected positive integer; using default {DEFAULT_MAX_OPEN_URIS})"
+                    );
+                    DEFAULT_MAX_OPEN_URIS
+                }
+            },
+            _ => DEFAULT_MAX_OPEN_URIS,
+        };
         Self::with_limits(cache_max_bytes, max_open_uris, Arc::new(AimdLimiter::from_env()))
+    }
+
+    /// Configured maximum number of cached open URIs (`COGZILLA_MAX_OPEN_URIS`, default 4096).
+    pub fn max_open_uris(&self) -> usize {
+        self.max_open_uris
+    }
+
+    /// Configured remote cache revalidation TTL (`COGZILLA_CACHE_TTL_SECS`, default 5s).
+    pub fn remote_cache_ttl(&self) -> Duration {
+        self.remote_cache_ttl
     }
 
     pub fn with_limits(
@@ -409,11 +426,18 @@ impl CogStore {
             .map(|n| n.get())
             .unwrap_or(4)
             .max(1);
-        let remote_cache_ttl = std::env::var("COGZILLA_CACHE_TTL_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(DEFAULT_REMOTE_CACHE_TTL_SECS));
+        let remote_cache_ttl = match std::env::var("COGZILLA_CACHE_TTL_SECS") {
+            Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
+                Ok(secs) => Duration::from_secs(secs),
+                Err(_) => {
+                    eprintln!(
+                        "cogzilla-io: warning: COGZILLA_CACHE_TTL_SECS={raw:?} ignored (expected non-negative integer; using default {DEFAULT_REMOTE_CACHE_TTL_SECS})"
+                    );
+                    Duration::from_secs(DEFAULT_REMOTE_CACHE_TTL_SECS)
+                }
+            },
+            _ => Duration::from_secs(DEFAULT_REMOTE_CACHE_TTL_SECS),
+        };
         Self {
             next_id: AtomicU64::new(1),
             datasets_by_name: DashMap::with_hasher(ahash::RandomState::new()),
