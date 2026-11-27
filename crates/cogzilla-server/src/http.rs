@@ -5520,7 +5520,7 @@ fn is_compressible_content_type(ct: &str) -> bool {
 
 pub async fn handle_request<B>(
     engine: Arc<TileEngine>,
-    req: Request<B>,
+    mut req: Request<B>,
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     B: hyper::body::Body,
@@ -5551,6 +5551,10 @@ where
     let as_page = (offers_page
         && html::wants_html(req.uri().query().unwrap_or(""), accept_hdr))
     .then(|| (req.uri().path().to_string(), req.uri().query().unwrap_or("").to_string()));
+    // Prevent a cached JSON ETag in `If-None-Match` from short-circuiting an HTML page request to 304.
+    if as_page.is_some() {
+        req.headers_mut().remove(IF_NONE_MATCH);
+    }
     let mut resp = handle_request_inner(engine.clone(), req, is_head).await?;
     if resp.headers_mut().remove("x-cogzilla-retry").is_some()
         && let Some((m, u, h)) = retry_head
@@ -5584,7 +5588,7 @@ where
             Err(_) => Response::from_parts(parts, Full::new(raw)),
         };
     }
-    if offers_page && resp.status().is_success() {
+    if offers_page && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED) {
         html::append_vary_accept(resp.headers_mut());
     }
     let dur_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -10211,9 +10215,18 @@ where
                                 }
                             }
                             "datetime" if !dec.is_empty() => q_datetime = Some(dec),
-                            "with_proj" => with_proj = !dec.eq_ignore_ascii_case("false") && dec != "0",
-                            "with_raster" => with_raster = !dec.eq_ignore_ascii_case("false") && dec != "0",
-                            "with_eo" => with_eo = !dec.eq_ignore_ascii_case("false") && dec != "0",
+                            "with_proj" => match parse_bool_param(v) {
+                                Some(b) => with_proj = b,
+                                None => return Err(EngineError::BadRequest(format!("invalid with_proj={dec}: expected boolean"))),
+                            },
+                            "with_raster" => match parse_bool_param(v) {
+                                Some(b) => with_raster = b,
+                                None => return Err(EngineError::BadRequest(format!("invalid with_raster={dec}: expected boolean"))),
+                            },
+                            "with_eo" => match parse_bool_param(v) {
+                                Some(b) => with_eo = b,
+                                None => return Err(EngineError::BadRequest(format!("invalid with_eo={dec}: expected boolean"))),
+                            },
                             _ => {}
                         }
                     }
