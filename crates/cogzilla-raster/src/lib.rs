@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Shared raster vocabulary across all cogzilla crates (`SampleType`, `Affine2D`, and `DemAlgorithm`).
 //!
 //! Kept format-agnostic with zero dependencies so TIFF, Zarr, kernel, codec, projection,
@@ -358,5 +360,105 @@ mod tests {
         let (col, row) = inv.forward(x, y);
         assert!((col - 12.5).abs() < 1e-9);
         assert!((row - 34.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_type_row_bytes_and_needs_f64() {
+        // Sub-byte TIFF types pad each row to a byte boundary.
+        assert_eq!(SampleType::Uint1.row_bytes(0, 1), Some(0));
+        assert_eq!(SampleType::Uint1.row_bytes(1, 1), Some(1));
+        assert_eq!(SampleType::Uint1.row_bytes(8, 1), Some(1));
+        assert_eq!(SampleType::Uint1.row_bytes(9, 1), Some(2));
+        assert_eq!(SampleType::Uint4.row_bytes(1, 1), Some(1));
+        assert_eq!(SampleType::Uint4.row_bytes(2, 1), Some(1));
+        assert_eq!(SampleType::Uint4.row_bytes(3, 1), Some(2));
+        assert_eq!(SampleType::Uint4.row_bytes(3, 3), Some(5));
+        assert_eq!(SampleType::Uint16.row_bytes(256, 3), Some(256 * 3 * 2));
+        assert_eq!(SampleType::Float64.row_bytes(10, 2), Some(160));
+        // Overflow returns None rather than wrapping.
+        assert_eq!(SampleType::Uint8.row_bytes(usize::MAX, 2), None);
+        assert_eq!(SampleType::Float64.row_bytes(usize::MAX / 4, 1), None);
+
+        // Exactly the 5 wide dtypes require f64 precision.
+        assert!(SampleType::Uint32.needs_f64());
+        assert!(SampleType::Int32.needs_f64());
+        assert!(SampleType::Uint64.needs_f64());
+        assert!(SampleType::Int64.needs_f64());
+        assert!(SampleType::Float64.needs_f64());
+        for narrow in [
+            SampleType::Bool,
+            SampleType::Uint1,
+            SampleType::Uint4,
+            SampleType::Uint8,
+            SampleType::Int8,
+            SampleType::Uint16,
+            SampleType::Int16,
+            SampleType::Float16,
+            SampleType::Float32,
+        ] {
+            assert!(!narrow.needs_f64(), "{narrow:?} should not require f64");
+        }
+        assert_eq!(SampleType::from_numpy_name("complex64"), None);
+        assert_eq!(SampleType::from_numpy_name(""), None);
+    }
+
+    #[test]
+    fn affine2d_handles_rotated_singular_and_non_finite() {
+        let rotated = Affine2D {
+            a: 3.0,
+            b: 4.0,
+            c: 100.0,
+            d: -4.0,
+            e: 3.0,
+            f: -200.0,
+        };
+        assert!(!rotated.is_axis_aligned());
+        let inv = rotated.invert().unwrap();
+        let (x, y) = rotated.forward(7.25, -11.5);
+        let (col, row) = inv.forward(x, y);
+        assert!((col - 7.25).abs() < 1e-12);
+        assert!((row - (-11.5)).abs() < 1e-12);
+
+        // Singular (zero determinant) and non-finite matrices return None.
+        let singular = Affine2D { a: 2.0, b: 4.0, c: 0.0, d: 1.0, e: 2.0, f: 0.0 };
+        assert_eq!(singular.invert(), None);
+        let nan_aff = Affine2D { a: f64::NAN, b: 0.0, c: 0.0, d: 0.0, e: 1.0, f: 0.0 };
+        assert_eq!(nan_aff.invert(), None);
+        let inf_aff = Affine2D { a: 1.0, b: 0.0, c: f64::INFINITY, d: 0.0, e: 1.0, f: 0.0 };
+        assert_eq!(inf_aff.invert(), None);
+    }
+
+    #[test]
+    fn dem_algorithm_and_pixel_selection_wire_codes() {
+        assert_eq!(
+            DemAlgorithm::Hillshade { azimuth_deg: 315.0, altitude_deg: 45.0, z_factor: 1.0 }.gpu_mode(),
+            Some(0)
+        );
+        assert_eq!(DemAlgorithm::Slope { z_factor: 1.0 }.gpu_mode(), Some(1));
+        assert_eq!(DemAlgorithm::Aspect.gpu_mode(), Some(2));
+        assert_eq!(DemAlgorithm::Terrarium.gpu_mode(), Some(3));
+        assert_eq!(DemAlgorithm::TerrainRgb.gpu_mode(), Some(4));
+        assert_eq!(
+            DemAlgorithm::Contours { increment: 10.0, thickness: 1, minz: 0.0, maxz: 100.0 }.gpu_mode(),
+            None
+        );
+
+        assert!(DemAlgorithm::Terrarium.is_terrain_rgb_encoding());
+        assert!(DemAlgorithm::TerrainRgb.is_terrain_rgb_encoding());
+        assert!(!DemAlgorithm::Aspect.is_terrain_rgb_encoding());
+        assert!(!DemAlgorithm::Slope { z_factor: 1.0 }.is_terrain_rgb_encoding());
+
+        let selections = [
+            GpuPixelSelection::First,
+            GpuPixelSelection::Highest,
+            GpuPixelSelection::Lowest,
+            GpuPixelSelection::Mean,
+            GpuPixelSelection::Median,
+            GpuPixelSelection::Stdev,
+            GpuPixelSelection::Count,
+        ];
+        for (i, sel) in selections.into_iter().enumerate() {
+            assert_eq!(sel.as_u32(), i as u32);
+        }
     }
 }
