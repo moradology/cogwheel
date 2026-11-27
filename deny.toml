@@ -27,9 +27,10 @@ confidence-threshold = 0.8
 
 [bans]
 # Transitive crates occasionally pull two semver lines (e.g., hashbrown, getrandom);
-# forbid wildcard version requirements and unknown sources.
+# forbid wildcard crates.io version requirements while allowing local workspace path deps.
 multiple-versions = "allow"
 wildcards = "deny"
+allow-wildcard-paths = true
 highlight = "all"
 
 [sources]
