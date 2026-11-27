@@ -338,6 +338,14 @@ struct ParsedQuery {
     errors: Vec<String>,
 }
 
+fn parse_bool_param(v: &str) -> Option<bool> {
+    match percent_decode(v).trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "t" | "y" => Some(true),
+        "false" | "0" | "no" | "off" | "f" | "n" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_query(q: Option<&str>) -> ParsedQuery {
     let mut pq = ParsedQuery {
         urls: Vec::new(),
@@ -503,10 +511,9 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected asset_bidx=name|1,2,3");
                 }
             }
-            "asset_as_band" => match percent_decode(v).to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" => pq.asset_as_band = true,
-                "false" | "0" | "no" => pq.asset_as_band = false,
-                _ => bad("expected boolean"),
+            "asset_as_band" => match parse_bool_param(v) {
+                Some(b) => pq.asset_as_band = b,
+                None => bad("expected boolean"),
             },
             "format" | "f" => pq.format_param = Some(percent_decode(v).to_ascii_lowercase()),
             "bbox" => {
@@ -693,21 +700,26 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected a number, nan, inf, or -inf");
                 }
             }
-            "unscale" => {
-                pq.unscale = v.eq_ignore_ascii_case("true") || v == "1";
-            }
-            "strict" => {
-                pq.strict = v.eq_ignore_ascii_case("true") || v == "1";
-            }
-            "return_mask" => {
-                pq.return_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
-            }
-            "shape_mask" => {
-                pq.shape_mask = !(v.eq_ignore_ascii_case("false") || v == "0");
-            }
-            "area_weighted" => {
-                pq.area_weighted = !(v.eq_ignore_ascii_case("false") || v == "0");
-            }
+            "unscale" => match parse_bool_param(v) {
+                Some(b) => pq.unscale = b,
+                None => bad("expected boolean"),
+            },
+            "strict" => match parse_bool_param(v) {
+                Some(b) => pq.strict = b,
+                None => bad("expected boolean"),
+            },
+            "return_mask" => match parse_bool_param(v) {
+                Some(b) => pq.return_mask = b,
+                None => bad("expected boolean"),
+            },
+            "shape_mask" => match parse_bool_param(v) {
+                Some(b) => pq.shape_mask = b,
+                None => bad("expected boolean"),
+            },
+            "area_weighted" => match parse_bool_param(v) {
+                Some(b) => pq.area_weighted = b,
+                None => bad("expected boolean"),
+            },
             "cover_scale" | "all_touched" => {
                 // Exact analytical coverage weighting needs no supersampling or binary all_touched toggle;
                 // accepted and ignored for TiTiler/rasterio client compatibility.
@@ -894,9 +906,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                 "vertical" => pq.orientation_vertical = true,
                 _ => bad("expected horizontal or vertical"),
             },
-            "use_epsg" => {
-                pq.use_epsg = v.eq_ignore_ascii_case("true") || v == "1";
-            }
+            "use_epsg" => match parse_bool_param(v) {
+                Some(b) => pq.use_epsg = b,
+                None => bad("expected boolean"),
+            },
             "p" => {
                 let dec = percent_decode(v);
                 for tok in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -956,9 +969,10 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected histogram_range=min,max with min < max");
                 }
             }
-            "categorical" => {
-                pq.categorical = v.eq_ignore_ascii_case("true") || v == "1";
-            }
+            "categorical" => match parse_bool_param(v) {
+                Some(b) => pq.categorical = b,
+                None => bad("expected boolean"),
+            },
             "c" => {
                 let dec = percent_decode(v);
                 for tok in dec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -12522,5 +12536,20 @@ mod tests {
         assert!(resp.headers().get(CONTENT_TYPE).unwrap().to_str().unwrap().starts_with("application/json"));
         let vary = resp.headers().get(hyper::header::VARY).unwrap().to_str().unwrap().to_ascii_lowercase();
         assert!(vary.contains("accept"), "missing Vary: Accept on */*: {vary}");
+
+        // Strict boolean query parameter validation (rejects bogus booleans with 422).
+        for q in [
+            "return_mask=bogus",
+            "unscale=maybe",
+            "strict=nope",
+            "categorical=2",
+            "area_weighted=invalid",
+            "use_epsg=nah",
+            "asset_as_band=wat",
+        ] {
+            let pq = parse_query(Some(q));
+            assert!(!pq.errors.is_empty(), "expected validation error for {q}");
+        }
+        assert!(parse_query(Some("return_mask=false&unscale=1&categorical=yes")).errors.is_empty());
     }
 }
