@@ -176,6 +176,18 @@ impl CrsModel {
         matches!(self.unshifted(), Self::Geographic)
     }
 
+    /// Returns `true` for degree-based CRSes (currently identical to [`Self::is_geographic`]).
+    #[inline]
+    pub fn is_degree_based(&self) -> bool {
+        self.is_geographic()
+    }
+
+    /// Returns `true` for Web Mercator (`EPSG:3857`), including any datum-shifted wrapper.
+    #[inline]
+    pub fn is_web_mercator(&self) -> bool {
+        matches!(self.unshifted(), Self::Epsg3857)
+    }
+
     /// Unwrap any outer `DatumShifted` wrapper to inspect the underlying projection model.
     #[inline]
     fn unshifted(&self) -> &Self {

@@ -6,7 +6,7 @@
 //! - Half-cell-center affine derivation (handling ascending & descending Y by sign)
 //! - `0..360` longitude normalization to `-180..180` reusing `cogzilla_proj::normalize_geographic_lon`
 
-use cogzilla_proj::{CrsModel, normalize_geographic_lon};
+use cogzilla_proj::normalize_geographic_lon;
 use cogzilla_tiff::Affine2D;
 use serde_json::Value;
 
@@ -150,7 +150,7 @@ fn derive_regular_geo_with_dtypes(
     // - Global grids spanning across 180° keep their true `0..360` pixel-to-CRS affine so
     //   `cogzilla_proj::CoordPlan` wraps western-hemisphere longitudes without column shifting,
     //   while reporting WGS84 bounds via `CrsModel::wgs84_bounds`.
-    if matches!(crs.model, CrsModel::Geographic) {
+    if crs.model.is_geographic() {
         let x_min = x_vals.first().copied().unwrap_or(0.0).min(x_vals.last().copied().unwrap_or(0.0));
         let x_max = x_vals.first().copied().unwrap_or(0.0).max(x_vals.last().copied().unwrap_or(0.0));
         if x_min >= -1e-6 && x_max > 180.0 && x_max <= 360.0 + dx.abs() {
@@ -474,7 +474,7 @@ mod tests {
 
     fn geo_crs() -> ZarrCrs {
         ZarrCrs {
-            model: CrsModel::Geographic,
+            model: cogzilla_proj::CrsModel::Geographic,
             epsg: Some(4326),
             description: "EPSG:4326".into(),
         }

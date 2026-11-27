@@ -242,7 +242,7 @@ fn resolve_input_bbox(
             bbox[1], bbox[3]
         )));
     }
-    let is_geo = matches!(coord_crs, None | Some(cogzilla_proj::CrsModel::Geographic));
+    let is_geo = coord_crs.is_none_or(cogzilla_proj::CrsModel::is_geographic);
     if is_geo {
         // Symmetric ±2-turn longitude normalisation (matching point routes) before RFC 7946 §5.2
         // antimeridian unwrap: shift both bounds by the same whole multiple of 360° if needed.

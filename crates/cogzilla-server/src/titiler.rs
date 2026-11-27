@@ -2993,9 +2993,7 @@ pub fn native_bbox_dims_in_crs(
                     return scale_dims_to_cap(dx / w_res, dy / h_res);
                 }
             }
-            let mut ddx = if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
-                && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
-            {
+            let mut ddx = if src_crs.is_geographic() && dst_crs.is_web_mercator() {
                 // Preserve full unwrapped span for 0..360° global geographic rasters -> 3857.
                 (sx1 - sx0) * (20_037_508.342_789_244 / 180.0)
             } else {
