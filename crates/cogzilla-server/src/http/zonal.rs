@@ -152,10 +152,17 @@ pub(super) fn shape_cover_counts(shape: &GridShape, width: usize, height: usize,
         }
         let out_row = (row / scale) * width;
         for &(a, b) in &spans {
-            for cx in a / scale..=b / scale {
-                let lo = a.max(cx * scale);
-                let hi = b.min(cx * scale + scale - 1);
-                counts[out_row + cx] += (hi - lo + 1) as u32;
+            // The pixels at the span's two ends take the sub-cells they hold of it; every
+            // pixel between takes a whole row of them, in one pass the compiler vectorises.
+            let (first, last) = (a / scale, b / scale);
+            if first == last {
+                counts[out_row + first] += (b - a + 1) as u32;
+                continue;
+            }
+            counts[out_row + first] += (first * scale + scale - a) as u32;
+            counts[out_row + last] += (b - last * scale + 1) as u32;
+            for count in &mut counts[out_row + first + 1..out_row + last] {
+                *count += scale as u32;
             }
         }
         // Cells a ring, line or point burns that the fill did not already take.
@@ -340,6 +347,42 @@ fn round2(v: f64) -> f64 {
 
 /// One band's statistics in TiTiler's shape. `values` are the band's pixels, a pixel that
 /// is not finite being masked; `coverage` is the fraction of each pixel under the polygon.
+/// The widest range of whole numbers [`sort_by_value`] counts its way through.
+const MAX_COUNTED_RANGE: f64 = (1 << 20) as f64;
+
+/// `pairs` in order of value, those of equal value in the order they came, as a stable sort
+/// leaves them: the sums worked out in that order are the same whichever way it is reached.
+/// Whole numbers over a short range (a raster's own, mostly) are counted into place; the
+/// rest are compared.
+fn sort_by_value(pairs: &mut Vec<(f64, f32)>) {
+    let (mut lo, mut hi, mut whole) = (f64::INFINITY, f64::NEG_INFINITY, true);
+    for &(v, _) in pairs.iter() {
+        lo = lo.min(v);
+        hi = hi.max(v);
+        // -0 comes before 0 in a sort, but is the same number to a count.
+        whole &= v.fract() == 0.0 && v.to_bits() != (-0.0f64).to_bits();
+    }
+    if !whole || pairs.len() < 1024 || !(hi - lo < MAX_COUNTED_RANGE) {
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        return;
+    }
+    let slot = |v: f64| (v - lo) as usize;
+    let mut starts = vec![0usize; slot(hi) + 2];
+    for &(v, _) in pairs.iter() {
+        starts[slot(v) + 1] += 1;
+    }
+    for i in 1..starts.len() {
+        starts[i] += starts[i - 1];
+    }
+    let mut sorted = vec![(0.0, 0.0); pairs.len()];
+    for &pair in pairs.iter() {
+        let at = &mut starts[slot(pair.0)];
+        sorted[*at] = pair;
+        *at += 1;
+    }
+    *pairs = sorted;
+}
+
 pub(super) fn band_statistics(
     values: &[f64],
     coverage: &[f32],
@@ -352,7 +395,7 @@ pub(super) fn band_statistics(
         .filter(|(v, _)| v.is_finite())
         .map(|(v, w)| (*v, *w))
         .collect();
-    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    sort_by_value(&mut pairs);
     let sorted: Vec<f64> = pairs.iter().map(|p| p.0).collect();
     let valid = pairs.len();
     let covered = coverage.iter().filter(|c| **c != 0.0).count();
@@ -464,6 +507,31 @@ pub(super) fn band_statistics(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn values_are_counted_into_the_order_a_stable_sort_gives() {
+        let mut state = 7u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for (spread, offset) in [(256u64, 0.0), (65_536, -32_768.0), (3, 1e6)] {
+            let pairs: Vec<(f64, f32)> = (0..5000).map(|i| ((next() % spread) as f64 + offset, i as f32)).collect();
+            let (mut counted, mut compared) = (pairs.clone(), pairs);
+            sort_by_value(&mut counted);
+            compared.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(counted, compared, "a spread of {spread}");
+        }
+        // Fractions, -0 and a range too wide are compared.
+        for odd in [0.5, -0.0, 1e12] {
+            let mut pairs: Vec<(f64, f32)> = (0..2000).map(|i| (f64::from(i % 7), i as f32)).collect();
+            pairs.push((odd, 9.0));
+            let mut compared = pairs.clone();
+            sort_by_value(&mut pairs);
+            compared.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(pairs, compared, "{odd}");
+        }
+    }
     use super::*;
 
     fn grid(counts: &[u32], width: usize) -> Vec<String> {

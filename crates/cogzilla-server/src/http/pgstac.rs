@@ -4499,8 +4499,7 @@ async fn feature_statistics(
         return Err(detail(StatusCode::BAD_REQUEST, "the feature reaches past the edge of Web Mercator, 85.05 degrees north or south"));
     }
     let mercator = req.mercator;
-    let items = pg
-        .items_for_pixels(&search_box, hash, req.query.limits, &names, sampled, lookup)
+    let items = pixel_items(ctx, pg, &search_box, hash, req.query.limits, &names, sampled, lookup)
         .await
         .map_err(|e| db_error(&e))?;
     if items.is_empty() {
@@ -4926,7 +4925,10 @@ async fn mosaic_statistics(
                 properties.insert(k.clone(), v.clone());
             }
         }
-        properties.insert("used_assets".into(), json!(used));
+        // An item's statistics are of the item: titiler-pgstac lists no items there.
+        if ctx.only.is_none() {
+            properties.insert("used_assets".into(), json!(used));
+        }
         let mut one = serde_json::Map::new();
         one.insert("type".into(), json!("Feature"));
         one.insert("geometry".into(), posted.get(nth).unwrap_or(&feature["geometry"]).clone());
@@ -6505,6 +6507,7 @@ pub(super) async fn item_route(
     item_id: &str,
     rest: &[&str],
     pq: &ParsedQuery,
+    body: Option<Bytes>,
 ) -> ItemRoute {
     use ItemRoute::Done;
     let Some(pg) = ctx.engine.pgstac() else {
@@ -6673,8 +6676,10 @@ pub(super) async fn item_route(
     }
     // Band math on one asset, and bands chosen on each of several, are things the search
     // routes draw and the `/stac` ones do not: a tile or a box of this item with either
-    // is drawn by the search routes, from this item alone.
-    if get && item_picture_by_asset(rest, &pairs) {
+    // is drawn by the search routes, from this item alone. So are the statistics of a
+    // posted feature, which titiler-pgstac works out for an item as for a mosaic of it.
+    let posted_statistics = *method == Method::POST && rest == ["statistics"];
+    if (get && item_picture_by_asset(rest, &pairs)) || posted_statistics {
         let assets: std::collections::BTreeMap<String, Value> = doc["assets"]
             .as_object()
             .map(|a| a.iter().filter(|(name, _)| readable.contains(name)).map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -6722,7 +6727,7 @@ pub(super) async fn item_route(
         // over there: the search routes are not shown it.
         let query = without_search_options(ctx.raw_query);
         let (own, pairs) = (super::parse_query((!query.is_empty()).then_some(query.as_str())), query_pairs(&query));
-        return Done(mosaic_route(&ctx, pg, &base, &rec, rest, None, own, &pairs).await);
+        return Done(mosaic_route(&ctx, pg, &base, &rec, rest, body.as_ref(), own, &pairs).await);
     }
     ItemRoute::Stac(item, extent)
 }

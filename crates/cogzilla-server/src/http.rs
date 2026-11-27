@@ -5969,7 +5969,19 @@ where
                 if_none_match: if_none_match.as_deref(),
                 only: None,
             };
-            match pgstac::item_route(&ctx, &method, c, i, rest, &pq).await {
+            // A feature posted for an item's statistics is read here: those are worked out by
+            // the search routes, from the item alone, and never reach `/stac`.
+            if method == Method::POST && rest == ["statistics"] {
+                let body = match read_limited_body(req.into_body()).await {
+                    Ok(body) => body,
+                    Err(e) => return Ok(pgstac::engine_error(&e)),
+                };
+                return Ok(match pgstac::item_route(&ctx, &method, c, i, rest, &pq, Some(body)).await {
+                    pgstac::ItemRoute::Done(resp) => resp,
+                    pgstac::ItemRoute::Stac(..) => pgstac::bad_request("an item's statistics of a posted feature are worked out from the item alone".into()),
+                });
+            }
+            match pgstac::item_route(&ctx, &method, c, i, rest, &pq, None).await {
                 pgstac::ItemRoute::Done(resp) => return Ok(pgstac_cacheable(resp, &method)),
                 pgstac::ItemRoute::Stac(item, extent) => {
                     pgstac_item = Some(item);
@@ -8067,15 +8079,9 @@ where
             (Method::POST, ["statistics"]) => async {
                 let item = stac_source.load(&engine).await?;
                 let body_bytes = read_limited_body(req.into_body()).await?;
+                // (An item's posted statistics are the search routes', and never come here.)
                 let (names, cogs, rewritten_expr) =
                     resolve_stac_assets(&engine, &item, &pq.assets, pq.expr_raw.as_deref()).await?;
-                if stac_prefix != "stac"
-                    && let Some(expression) = pq.expr_raw.as_deref()
-                {
-                    let bands: Vec<usize> = cogs.iter().map(|c| usize::from(c.index.full_res().samples_per_pixel)).collect();
-                    let selected = !pq.bidx.is_empty() || pq.assets.iter().any(|a| stac_asset_selected_bands(&pq, a).is_some());
-                    pgstac::check_item_statistics_expression(expression, &bands, pq.asset_as_band, selected)?;
-                }
                 let mut geojson: serde_json::Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
 
