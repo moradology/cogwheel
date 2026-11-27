@@ -191,11 +191,22 @@ const MAX_EXPR_BANDS: usize = 16;
 
 impl ExprProgram {
     pub fn compile(input: &str) -> Result<Self, String> {
-        const MAX_EXPR_CHARS: usize = 4096;
-        const MAX_EXPR_OPS: usize = 256;
-        if input.len() > MAX_EXPR_CHARS {
+        Self::compile_with_limit(input, Self::MAX_OPS)
+    }
+
+    /// The ops an expression may compile to ([`Self::compile`]).
+    pub const MAX_OPS: usize = 256;
+
+    /// [`Self::compile`] with room for `max_ops` ops: for band math made of expressions that
+    /// were each held to [`Self::MAX_OPS`] (an algorithm worked over an expression's
+    /// outputs). A program longer than the GPU's takes is evaluated on the CPU.
+    pub fn compile_with_limit(input: &str, max_ops: usize) -> Result<Self, String> {
+        let max_ops = max_ops.max(Self::MAX_OPS);
+        // Characters in proportion to the ops allowed: 4096 for an expression as written.
+        let max_expr_chars = 16 * max_ops;
+        if input.len() > max_expr_chars {
             return Err(format!(
-                "expression length ({}) exceeds limit ({MAX_EXPR_CHARS})",
+                "expression length ({}) exceeds limit ({max_expr_chars})",
                 input.len()
             ));
         }
@@ -211,9 +222,9 @@ impl ExprProgram {
         if p.pos < p.tokens.len() {
             return Err(format!("unexpected trailing token at position {}", p.pos));
         }
-        if p.ops.len() > MAX_EXPR_OPS {
+        if p.ops.len() > max_ops {
             return Err(format!(
-                "expression has {} ops (max {MAX_EXPR_OPS})",
+                "expression has {} ops (max {max_ops})",
                 p.ops.len()
             ));
         }

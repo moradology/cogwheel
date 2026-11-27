@@ -6248,9 +6248,11 @@ pub(super) fn item_fixup(
         // An algorithm over the band math describes its outputs from those descriptions.
         let described = match (described, query_value(&pairs, "algorithm")) {
             (Some(described), Some(alg)) => {
-                let parts: Vec<(String, String)> = described.iter().map(|d| (d.clone(), d.clone())).collect();
+                // Only the descriptions are wanted: each output stands as its own band.
+                let parts: Vec<(String, String)> =
+                    described.iter().enumerate().map(|(i, d)| (d.clone(), format!("b{}", i + 1))).collect();
                 match super::algorithm_math::over_results(alg, None, None, 0.0, &parts) {
-                    Ok(Some(outputs)) => Some(outputs.into_iter().map(|(desc, _)| desc).collect()),
+                    Ok(Some(composed)) => Some(composed.outputs.into_iter().map(|(desc, _)| desc).collect()),
                     _ => Some(described),
                 }
             }

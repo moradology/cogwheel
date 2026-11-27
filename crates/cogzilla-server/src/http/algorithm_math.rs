@@ -103,6 +103,18 @@ pub(super) fn band_math(
     })
 }
 
+/// What an algorithm worked over band math gives ([`over_results`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Composed {
+    /// Each output's description and band math.
+    pub(super) outputs: Vec<(String, String)>,
+    /// The ops the outputs may compile to: as many as the band math they are made of took,
+    /// twice over where the algorithm reads an output twice (`normalizedIndex`).
+    pub(super) max_ops: usize,
+    /// The type TiTiler's algorithm writes its outputs in, when the band math's is known.
+    pub(super) kind: Option<SampleType>,
+}
+
 /// Band math and TiTiler's one-output algorithm `alg` together, as rio-tiler works them: the
 /// expression's outputs first, then the algorithm over them as its bands (a post-process of
 /// what was read). `parts` are each output's description and band math, and what comes back
@@ -111,39 +123,45 @@ pub(super) fn band_math(
 /// the descriptions, and the rest are one output named after the algorithm. `None` for an
 /// algorithm that is not band math (a terrain or DEM algorithm draws from the bands).
 ///
-/// `read` is the type of the bands the band math is over, when it is known: the outputs are
-/// then typed as numexpr types them, and whole numbers are what `grayscale` truncates back
-/// to and what needs no rounding.
+/// Every part is checked as band math of its own first, whether the algorithm reads it or
+/// not (`normalizedIndex` reads two). `typed` is the type of the parts' values, when it is
+/// known (as numexpr types them, after any asset's own band math): whole numbers are what
+/// `grayscale` truncates back to and what needs no rounding.
 pub(super) fn over_results(
     alg: &str,
-    read: Option<(SampleType, bool)>,
+    typed: Option<SampleType>,
     cast_dtype: Option<&str>,
     threshold: f32,
     parts: &[(String, String)],
-) -> Result<Option<Vec<(String, String)>>, super::EngineError> {
+) -> Result<Option<Composed>, super::EngineError> {
     let alg = alg.to_ascii_lowercase();
-    let texts: Vec<String> = parts.iter().map(|(_, text)| text.clone()).collect();
     if parts.is_empty() {
         return Ok(None);
     }
-    let whole = read.and_then(|(read, unscale)| {
-        let read = if unscale { SampleType::Float32 } else { read };
-        whole_numbers(super::array_type::band_math_type(texts.iter(), read), false)
-    });
-    if matches!(alg.as_str(), "cast" | "ceil" | "floor") {
-        let one = integer_band(&alg, 1, whole, cast_dtype).0;
-        return parts
-            .iter()
-            .map(|(desc, text)| Ok((desc.clone(), super::compose_over_results(&one, std::slice::from_ref(text))?)))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some);
-    }
-    if !matches!(
-        alg.as_str(),
-        "normalizedindex" | "min" | "max" | "sum" | "mean" | "median" | "var" | "std" | "grayscale" | "bitonal"
-    ) {
+    let one_output =
+        matches!(alg.as_str(), "normalizedindex" | "min" | "max" | "sum" | "mean" | "median" | "var" | "std" | "grayscale" | "bitonal");
+    if !one_output && !matches!(alg.as_str(), "cast" | "ceil" | "floor") {
         return Ok(None);
     }
+    let mut ops = 0usize;
+    for (_, text) in parts {
+        ops += cogzilla_kernel::ExprProgram::compile(text).map_err(super::EngineError::BadRequest)?.ops.len();
+    }
+    let max_ops = 2 * ops + 64;
+    let whole = typed.and_then(|kind| whole_numbers(kind, false));
+    let kind = typed.and_then(|kind| {
+        let cast = if alg == "cast" { super::array_type::cast_type(cast_dtype) } else { None };
+        crate::algorithms::lookup_algorithm(&alg)?.out_dtype.resolve(cast, kind)
+    });
+    if !one_output {
+        let one = integer_band(&alg, 1, whole, cast_dtype).0;
+        let outputs = parts
+            .iter()
+            .map(|(desc, text)| Ok((desc.clone(), super::compose_over_results(&one, std::slice::from_ref(text))?)))
+            .collect::<Result<Vec<_>, super::EngineError>>()?;
+        return Ok(Some(Composed { outputs, max_ops, kind }));
+    }
+    let texts: Vec<String> = parts.iter().map(|(_, text)| text.clone()).collect();
     let bands: Vec<u16> = (1..=parts.len().min(usize::from(u16::MAX)) as u16).collect();
     let expr = band_math(&alg, &bands, whole, cast_dtype, threshold).map_err(super::EngineError::BadRequest)?;
     let desc = if alg == "normalizedindex" {
@@ -151,7 +169,7 @@ pub(super) fn over_results(
     } else {
         alg.clone()
     };
-    Ok(Some(vec![(desc, super::compose_over_results(&expr, &texts)?)]))
+    Ok(Some(Composed { outputs: vec![(desc, super::compose_over_results(&expr, &texts)?)], max_ops, kind }))
 }
 
 #[cfg(test)]
@@ -159,10 +177,14 @@ mod tests {
     use super::*;
     use cogzilla_kernel::ExprProgram;
 
+    fn eval(expr: &str, values: &[f32]) -> f32 {
+        ExprProgram::compile_with_limit(expr, 1024).unwrap().eval(values)
+    }
+
     #[test]
     fn an_algorithm_works_over_band_math_results() {
         let parts = |exprs: &[&str]| exprs.iter().map(|e| (e.to_string(), e.to_string())).collect::<Vec<_>>();
-        let over = |alg: &str, exprs: &[&str]| over_results(alg, None, None, 127.0, &parts(exprs)).unwrap().unwrap();
+        let over = |alg: &str, exprs: &[&str]| over_results(alg, None, None, 127.0, &parts(exprs)).unwrap().unwrap().outputs;
         // floor(77 / 2) == 38, each output kept with its description.
         let floor = over("floor", &["b1/2", "b1*300"]);
         assert_eq!(floor.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(), ["b1/2", "b1*300"]);
@@ -180,16 +202,23 @@ mod tests {
         assert!(over_results("hillshade", None, None, 127.0, &parts(&["b1"])).unwrap().is_none());
         assert!(over_results("floor", None, None, 127.0, &[]).unwrap().is_none());
         assert!(over_results("normalizedIndex", None, None, 127.0, &parts(&["b1"])).is_err());
+        // A part the algorithm does not read is still band math to be checked.
+        assert!(over_results("normalizedIndex", None, None, 127.0, &parts(&["b1", "b2", "bogus("])).is_err());
         // Over whole numbers, `grayscale` truncates back to them, as TiTiler casts to the
         // type it was given; over fractions it does not.
-        let gray = |read| over_results("grayscale", read, None, 127.0, &parts(&["b1", "b2", "b3"])).unwrap().unwrap();
-        assert_eq!(eval(&gray(Some((SampleType::Uint8, false)))[0].1, &[101.0, 200.0, 50.0]), 153.0);
-        assert!((eval(&gray(Some((SampleType::Uint8, true)))[0].1, &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
-        assert!((eval(&gray(None)[0].1, &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
-    }
-
-    fn eval(expr: &str, values: &[f32]) -> f32 {
-        ExprProgram::compile(expr).unwrap().eval(values)
+        let gray = |typed| over_results("grayscale", typed, None, 127.0, &parts(&["b1", "b2", "b3"])).unwrap().unwrap();
+        assert_eq!(eval(&gray(Some(SampleType::Uint8)).outputs[0].1, &[101.0, 200.0, 50.0]), 153.0);
+        assert!((eval(&gray(Some(SampleType::Float64)).outputs[0].1, &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
+        assert!((eval(&gray(None).outputs[0].1, &[101.0, 200.0, 50.0]) - 153.299).abs() < 1e-3);
+        // The algorithm's own type: normalizedIndex over uint16 band math is float32.
+        let typed = over_results("normalizedIndex", Some(SampleType::Uint16), None, 127.0, &parts(&["b1", "b2"])).unwrap().unwrap();
+        assert_eq!(typed.kind, Some(SampleType::Float32));
+        // Room for an output read twice: two parts of 65 ops each make 263 under normalizedIndex.
+        let long = format!("b1{}", "+1".repeat(32));
+        let long2 = long.replace("b1", "b2");
+        let ndi = over_results("normalizedIndex", None, None, 127.0, &parts(&[&long, &long2])).unwrap().unwrap();
+        let program = ExprProgram::compile_with_limit(&ndi.outputs[0].1, ndi.max_ops).unwrap();
+        assert!(program.ops.len() > ExprProgram::MAX_OPS);
     }
 
     #[test]

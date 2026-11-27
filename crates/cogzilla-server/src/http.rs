@@ -1332,18 +1332,24 @@ fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::Sampl
         return Ok(None);
     }
     let parts: Vec<(String, String)> = expression_parts(expr).map(|p| (p.to_string(), p.to_string())).collect();
-    let Some(outputs) = algorithm_math::over_results(alg, read.map(|r| (r, pq.unscale)), pq.cast_dtype.as_deref(), pq.threshold, &parts)? else {
+    let typed = band_math_output_type(pq, &parts, read);
+    let Some(composed_math) = algorithm_math::over_results(alg, typed, pq.cast_dtype.as_deref(), pq.threshold, &parts)? else {
         return Ok(None);
     };
+    // The range a picture of the algorithm spans when none is asked, as without band math,
+    // from the type of the band math's outputs.
     let lower = alg.to_ascii_lowercase();
+    let source = default_rescale_for_dtype(typed.unwrap_or(cogzilla_tiff::SampleType::Float32), true);
     let range = match lower.as_str() {
         "cast" | "ceil" | "floor" => algorithm_math::integer_band(&lower, 1, None, pq.cast_dtype.as_deref()).1,
         "normalizedindex" => Some((-1.0, 1.0)),
         "bitonal" => Some((0.0, 255.0)),
-        _ => None,
+        "sum" => Some((source.0, source.1 * parts.len() as f32)),
+        _ => Some(source),
     };
     let mut composed = pq.clone();
-    composed.expr_raw = Some(outputs.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join(";"));
+    composed.expr_raw = Some(composed_math.outputs.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join(";"));
+    composed.expr_op_budget = composed_math.max_ops;
     composed.algorithm = None;
     if composed.rescale.is_empty()
         && let Some(range) = range
@@ -1351,6 +1357,19 @@ fn algorithm_over_expression(pq: &ParsedQuery, read: Option<cogzilla_tiff::Sampl
         composed.rescale = vec![range];
     }
     Ok(Some(composed))
+}
+
+/// The type of band math's outputs as numpy types them: as folded from the assets' own band
+/// math (`ParsedQuery::band_math_type`), or the expression over bands read as `read`.
+fn band_math_output_type(
+    pq: &ParsedQuery,
+    parts: &[(String, String)],
+    read: Option<cogzilla_tiff::SampleType>,
+) -> Option<cogzilla_tiff::SampleType> {
+    pq.band_math_type.or_else(|| {
+        let read = if pq.unscale { cogzilla_tiff::SampleType::Float32 } else { read? };
+        Some(array_type::band_math_type(parts.iter().map(|(_, text)| text), read))
+    })
 }
 
 fn build_band_request(
@@ -1570,9 +1589,8 @@ fn build_band_request(
                     "colormap cannot be applied to 3-band RGB output".into(),
                 ));
             }
-            let p0 = ExprProgram::compile(parts[0]).map_err(EngineError::BadRequest)?;
-            let p1 = ExprProgram::compile(parts[1]).map_err(EngineError::BadRequest)?;
-            let p2 = ExprProgram::compile(parts[2]).map_err(EngineError::BadRequest)?;
+            let compile = |p: &str| ExprProgram::compile_with_limit(p, pq.expr_op_budget).map_err(EngineError::BadRequest);
+            let (p0, p1, p2) = (compile(parts[0])?, compile(parts[1])?, compile(parts[2])?);
             let (rmin, rmax) = match pq.rescale.len() {
                 0 => {
                     let (lo, hi) = default_rescale_for_dtype(sample_type, false);
@@ -1608,7 +1626,7 @@ fn build_band_request(
             }
             let mut progs = Vec::with_capacity(parts.len());
             for p in &parts {
-                progs.push(ExprProgram::compile(p).map_err(EngineError::BadRequest)?);
+                progs.push(ExprProgram::compile_with_limit(p, pq.expr_op_budget).map_err(EngineError::BadRequest)?);
             }
             return Ok(BandRequest::CustomExprMulti { progs });
         }
@@ -1618,7 +1636,7 @@ fn build_band_request(
                 pq.rescale.len()
             )));
         }
-        let prog = ExprProgram::compile(parts[0]).map_err(EngineError::BadRequest)?;
+        let prog = ExprProgram::compile_with_limit(parts[0], pq.expr_op_budget).map_err(EngineError::BadRequest)?;
         let rescale = pq.rescale.first().copied().unwrap_or((-1.0, 1.0));
         return Ok(BandRequest::CustomExpr {
             prog,
@@ -2267,25 +2285,31 @@ fn reads_type(cogs: &[Arc<cogzilla_io::OpenedCog>]) -> cogzilla_tiff::SampleType
 
 /// The statistics' band math, each output's description and expression compiled, with the
 /// request's band-math `algorithm` worked over the outputs ([`algorithm_math::over_results`]).
+///
+/// Also gives the histogram's edge type when an algorithm was worked over the band math: that
+/// of the algorithm's output (float32 for `normalizedIndex`), not one read from the text.
 fn compile_stats_parts(
     pq: &ParsedQuery,
     parts: Vec<(String, String)>,
     read: Option<cogzilla_tiff::SampleType>,
-) -> Result<Vec<(String, ExprProgram)>, EngineError> {
+) -> Result<(Vec<(String, ExprProgram)>, Option<crate::histogram::HistDtype>), EngineError> {
     if parts.len() > 16 {
         return Err(EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
     }
-    let parts = match pq.algorithm.as_deref() {
-        Some(alg) => {
-            let read = read.map(|r| (r, pq.unscale));
-            algorithm_math::over_results(alg, read, pq.cast_dtype.as_deref(), pq.threshold, &parts)?.unwrap_or(parts)
-        }
-        None => parts,
+    let typed = band_math_output_type(pq, &parts, read);
+    let composed = match pq.algorithm.as_deref() {
+        Some(alg) => algorithm_math::over_results(alg, typed, pq.cast_dtype.as_deref(), pq.threshold, &parts)?,
+        None => None,
     };
-    parts
+    let (parts, max_ops, hist) = match composed {
+        Some(c) => (c.outputs, c.max_ops, c.kind.map(|kind| crate::histogram::HistDtype::for_sample_type(kind, false))),
+        None => (parts, ExprProgram::MAX_OPS, None),
+    };
+    let compiled = parts
         .into_iter()
-        .map(|(desc, text)| Ok((desc, ExprProgram::compile(&text).map_err(EngineError::BadRequest)?)))
-        .collect()
+        .map(|(desc, text)| Ok((desc, ExprProgram::compile_with_limit(&text, max_ops).map_err(EngineError::BadRequest)?)))
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok((compiled, hist))
 }
 
 fn build_stats_options(pq: &ParsedQuery, allow_expr: bool) -> Result<StatsOptions, EngineError> {
@@ -2323,9 +2347,12 @@ fn build_stats_options_with_bands(
         && let Some(raw) = pq.expr_raw.as_deref()
     {
         let parts: Vec<(String, String)> = expression_parts(raw).map(|p| (p.to_string(), p.to_string())).collect();
-        let compiled = compile_stats_parts(pq, parts, read)?;
+        let (compiled, hist) = compile_stats_parts(pq, parts, read)?;
         if !compiled.is_empty() {
             opts.expressions = Some(compiled);
+        }
+        if hist.is_some() {
+            opts.hist_dtype = hist;
         }
     } else if allow_expr
         && let Some(alg_raw) = pq.algorithm.as_deref()
@@ -3195,6 +3222,14 @@ fn expand_stac_asset_bidx(
             )));
         }
         picked.push(bands);
+    }
+    // The type of the folded band math's results, as numpy types them stage by stage: each
+    // asset's own over its raster, stacked, then the request's (what an algorithm is given).
+    if options.iter().any(|(own, _)| own.is_some()) {
+        let reads: Vec<cogzilla_tiff::SampleType> = cogs.iter().map(|c| c.index.full_res().sample_type).collect();
+        let own: Vec<Option<String>> = options.iter().map(|(own, _)| own.clone()).collect();
+        let request = pq.expr_raw.clone().unwrap_or_default();
+        pq.band_math_type = array_type::ArrayRule::Math { unscale: pq.unscale }.staged_kind(&reads, &own, &request);
     }
     if names.len() == 1 {
         match &options[0] {
@@ -7164,6 +7199,7 @@ where
                     return Ok((Bytes::from(serde_json::Value::Object(map).to_string()), "application/json"));
                 }
                 let mut expr_progs: Option<Vec<(String, ExprProgram)>> = None;
+                let mut expr_hist = None;
                 if let Some(ref expr_str) = rewritten_expr {
                     let parts: Vec<&str> = expr_str
                         .split(';')
@@ -7188,7 +7224,9 @@ where
                         .enumerate()
                         .map(|(idx, part)| (raw_parts.get(idx).copied().unwrap_or(part).to_string(), part.to_string()))
                         .collect();
-                    expr_progs = Some(compile_stats_parts(&pq, described, Some(reads_type(&cogs)))?);
+                    let (compiled, hist) = compile_stats_parts(&pq, described, Some(reads_type(&cogs)))?;
+                    expr_progs = Some(compiled);
+                    expr_hist = hist;
                 } else if pq.algorithm.is_some() {
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
@@ -7205,7 +7243,10 @@ where
                     let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
                     let (out_w, out_h) = resolve_query_dims(def_w, def_h, pq.width, pq.height);
-                    let stats_opts = build_stats_options(&pq, false)?;
+                    let mut stats_opts = build_stats_options(&pq, false)?;
+                    if expr_hist.is_some() {
+                        stats_opts.hist_dtype = expr_hist;
+                    }
                     let mut map = serde_json::Map::new();
                     for (idx, (desc, prog)) in compiled.into_iter().enumerate() {
                         let mut bands = BandRequest::CustomExpr {
@@ -7317,9 +7358,12 @@ where
                     crate::algorithms::lookup_algorithm(a)
                         .is_some_and(|d| d.kind == crate::algorithms::AlgorithmKind::Dem)
                 });
+                let mut post_hist = None;
                 let post_expr_progs: Option<Vec<(String, ExprProgram)>> = if let Some(ref expr_str) = rewritten_expr {
                     let parts = expression_parts(expr_str).map(|p| (p.to_string(), p.to_string())).collect();
-                    Some(compile_stats_parts(&pq, parts, Some(reads_type(&cogs)))?)
+                    let (compiled, hist) = compile_stats_parts(&pq, parts, Some(reads_type(&cogs)))?;
+                    post_hist = hist;
+                    Some(compiled)
                 } else if pq.algorithm.is_some() && !is_dem_alg {
                     let db = if cogs.len() > 1 {
                         cogs.len() as u16
@@ -7330,7 +7374,10 @@ where
                 } else {
                     None
                 };
-                let stats_opts_post = build_stats_options(&pq, false)?;
+                let mut stats_opts_post = build_stats_options(&pq, false)?;
+                if post_hist.is_some() {
+                    stats_opts_post.hist_dtype = post_hist;
+                }
                 let eng_stac = engine.clone();
                 let pq_stac = pq.clone();
                 let compute_stac_merged_stats = move |mask: Arc<PolygonMask>, poly_bbox: [f64; 4]| {
