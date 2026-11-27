@@ -937,17 +937,9 @@ impl CogStore {
             };
 
             let open_res: Result<Arc<OpenedCog>, IoError> = async {
-                let is_cloud_scheme = uri.starts_with("s3://")
-                    || uri.starts_with("/vsis3/")
-                    || uri.starts_with("gs://")
-                    || uri.starts_with("/vsigs/")
-                    || uri.starts_with("az://")
-                    || uri.starts_with("abfs://")
-                    || uri.starts_with("abfss://")
-                    || uri.starts_with("/vsiaz/");
                 let source = CogSource::open_remote_limited(
                     uri,
-                    if is_cloud_scheme {
+                    if is_cloud_scheme(uri) {
                         self.cloud_client.clone()
                     } else {
                         self.client.clone()
@@ -2696,17 +2688,9 @@ impl CogStore {
         end: u64,
     ) -> Result<bytes::Bytes, IoError> {
         crate::allowlist::check_uri_allowed(uri)?;
-        let is_cloud_scheme = uri.starts_with("s3://")
-            || uri.starts_with("/vsis3/")
-            || uri.starts_with("gs://")
-            || uri.starts_with("/vsigs/")
-            || uri.starts_with("az://")
-            || uri.starts_with("abfs://")
-            || uri.starts_with("abfss://")
-            || uri.starts_with("/vsiaz/");
         let source = CogSource::open_remote_limited(
             uri,
-            if is_cloud_scheme {
+            if is_cloud_scheme(uri) {
                 self.cloud_client.clone()
             } else {
                 self.client.clone()
@@ -2794,4 +2778,15 @@ impl CogStore {
             Err(e) => Err(IoError::Fs(e)),
         }
     }
+}
+
+fn is_cloud_scheme(uri: &str) -> bool {
+    uri.starts_with("s3://")
+        || uri.starts_with("/vsis3/")
+        || uri.starts_with("gs://")
+        || uri.starts_with("/vsigs/")
+        || uri.starts_with("az://")
+        || uri.starts_with("abfs://")
+        || uri.starts_with("abfss://")
+        || uri.starts_with("/vsiaz/")
 }

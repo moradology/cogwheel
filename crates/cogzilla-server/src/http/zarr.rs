@@ -108,7 +108,11 @@ fn zarr_hierarchy_cache() -> &'static DashMap<String, CachedZarrStore> {
     CACHE.get_or_init(DashMap::new)
 }
 
-fn zarr_http_chunk_cache() -> &'static DashMap<String, Vec<u8>> {
+const MAX_ZARR_REMOTE_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024;
+static ZARR_REMOTE_CHUNK_CACHE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn zarr_remote_chunk_cache() -> &'static DashMap<String, Vec<u8>> {
     static CACHE: OnceLock<DashMap<String, Vec<u8>>> = OnceLock::new();
     CACHE.get_or_init(DashMap::new)
 }
@@ -116,7 +120,8 @@ fn zarr_http_chunk_cache() -> &'static DashMap<String, Vec<u8>> {
 /// Flush all cached Zarr store hierarchies and remote chunks (called by `POST /admin/clear-cache`, #387).
 pub(crate) fn clear_zarr_cache() {
     zarr_hierarchy_cache().clear();
-    zarr_http_chunk_cache().clear();
+    zarr_remote_chunk_cache().clear();
+    ZARR_REMOTE_CHUNK_CACHE_BYTES.store(0, Ordering::Relaxed);
 }
 
 fn zarr_cache_ttl() -> Duration {
@@ -359,7 +364,7 @@ impl ZarrStore for ServerZarrStore {
                 let io = Arc::clone(io);
                 let key_owned = key.to_string();
                 Box::pin(async move {
-                    if let Some(cached) = zarr_http_chunk_cache().get(&uri) {
+                    if let Some(cached) = zarr_remote_chunk_cache().get(&uri) {
                         return Ok(Some(cached.value().clone()));
                     }
                     match io
@@ -368,12 +373,17 @@ impl ZarrStore for ServerZarrStore {
                     {
                         Ok(bytes) => {
                             let vec = bytes.to_vec();
-                            if vec.len() <= 16 * 1024 * 1024 {
-                                let cache = zarr_http_chunk_cache();
-                                if cache.len() >= 64 {
+                            let len = vec.len();
+                            if len <= 16 * 1024 * 1024 {
+                                let cache = zarr_remote_chunk_cache();
+                                let prev = ZARR_REMOTE_CHUNK_CACHE_BYTES.load(Ordering::Relaxed);
+                                if prev.saturating_add(len) > MAX_ZARR_REMOTE_CHUNK_CACHE_BYTES {
                                     cache.clear();
+                                    ZARR_REMOTE_CHUNK_CACHE_BYTES.store(0, Ordering::Relaxed);
                                 }
-                                cache.insert(uri, vec.clone());
+                                if cache.insert(uri, vec.clone()).is_none() {
+                                    ZARR_REMOTE_CHUNK_CACHE_BYTES.fetch_add(len, Ordering::Relaxed);
+                                }
                             }
                             Ok(Some(vec))
                         }
@@ -635,8 +645,10 @@ pub(crate) async fn handle_zarr_request(
     post_body: Option<Bytes>,
 ) -> Response<Full<Bytes>> {
     let io = &engine.store;
+    let is_head = method == Method::HEAD;
+    let dispatch_method = if is_head { Method::GET } else { method };
     let q = ZarrQuery::parse(raw_query);
-    let result = match (method, sub) {
+    let result = match (dispatch_method, sub) {
         // Metadata & introspection family (#372)
         (Method::GET, ["info"]) => handle_info(io, &q, false).await,
         (Method::GET, ["info.geojson"]) => handle_info(io, &q, true).await,
@@ -740,10 +752,29 @@ pub(crate) async fn handle_zarr_request(
         }
     };
 
-    match result {
+    let mut resp = match result {
         Ok(resp) => resp,
         Err(err) => zarr_error_to_response(&err),
+    };
+    if resp.status() == StatusCode::NOT_MODIFIED {
+        engine
+            .stats
+            .http_304_not_modified
+            .fetch_add(1, Ordering::Relaxed);
     }
+    if is_head {
+        use hyper::body::Body as _;
+        if let Some(len) = resp.body().size_hint().exact()
+            && !resp.headers().contains_key(hyper::header::CONTENT_LENGTH)
+        {
+            resp.headers_mut().insert(
+                hyper::header::CONTENT_LENGTH,
+                HeaderValue::from(len),
+            );
+        }
+        *resp.body_mut() = Full::new(Bytes::new());
+    }
+    resp
 }
 
 fn parse_dims_ext(seg: &str) -> Result<((u32, u32), Option<&str>), ZarrError> {
@@ -1580,6 +1611,7 @@ async fn handle_tile(
 
     // Fast warm-tile cache hit (keyed by store validator so mutated stores never serve stale tiles).
     if let Some(cached) = engine.tile_cache.get(&tile_cache_key) {
+        engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
         return Ok(binary_ok_with_etag(
             cached.bytes.clone(),
             content_type,
@@ -1648,10 +1680,12 @@ async fn handle_tile(
             render_single_band::<256>(&plan, &src, &style)
         };
         engine.tile_cache.insert(tile_cache_key, body.clone(), content_type);
+        engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
         return Ok(binary_ok_with_etag(body, content_type, &etag_key, if_none_match));
     }
 
     // General tile size (e.g. 512x512, @2x, custom tilesize): sample through `sample_general`
+    engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
     render_zarr_rect(
         &store,
         &sel_var,
