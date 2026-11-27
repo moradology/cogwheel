@@ -3230,17 +3230,23 @@ fn expand_stac_asset_bidx(
                 pq.bidx.clear();
             }
             // Band math over the bands chosen reads them in their order: `bN` is the Nth
-            // chosen (an asset's name, written for its own band, is left to it).
-            (None, Some(sel)) if pq.bidx.is_empty() => match pq.expr_raw.as_deref() {
-                Some(expr) if !named => {
+            // chosen, whatever top-level `bidx` came with it (an asset's name, written for its
+            // own band, reads that band).
+            (None, Some(sel)) => match original.as_deref() {
+                Some(expr) if pq.expr_raw.is_some() => {
                     let mut beyond = None;
-                    let parts: Vec<String> = expression_parts(expr)
+                    let positional: Vec<String> = expression_parts(expr)
                         .map(|part| {
-                            substitute_band_tokens(part, |k| match sel.get(k.wrapping_sub(1)) {
-                                Some(b) => Some(format!("b{b}")),
-                                None => {
-                                    beyond.get_or_insert(k);
-                                    None
+                            substitute_band_tokens(part, |k| {
+                                if read_names && names.contains(&format!("b{k}")) {
+                                    return None;
+                                }
+                                match sel.get(k.wrapping_sub(1)) {
+                                    Some(b) => Some(format!("b{b}")),
+                                    None => {
+                                        beyond.get_or_insert(k);
+                                        None
+                                    }
                                 }
                             })
                         })
@@ -3252,9 +3258,15 @@ fn expand_stac_asset_bidx(
                             sel.len()
                         )));
                     }
-                    pq.expr_raw = Some(parts.join(";"));
+                    let positional = positional.join(";");
+                    pq.expr_raw = Some(if named {
+                        crate::stac::rewrite_stac_expr_to(&positional, names, |_, _, band| Ok(band.unwrap_or(1)))?
+                    } else {
+                        positional
+                    });
                 }
-                _ => pq.bidx = sel.clone(),
+                _ if pq.bidx.is_empty() => pq.bidx = sel.clone(),
+                _ => {}
             },
             _ => {}
         }

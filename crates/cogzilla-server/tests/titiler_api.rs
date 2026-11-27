@@ -6734,6 +6734,9 @@ async fn stac_stacks_every_band_of_several_assets() {
         means("&assets=a%7Cbidx%3D2,1&expression=b1;b2*2").await,
         described(&[(5.0, "a_b2"), (6.0, "a_b1*2")])
     );
+    // Whatever top-level `bidx` came with it; and an asset's name reads its own band.
+    assert_eq!(means("&assets=a%7Cbidx%3D2&bidx=1&expression=b1").await, described(&[(5.0, "a_b2")]));
+    assert_eq!(means("&assets=a%7Cbidx%3D2,1&expression=a_b2%2Bb1").await, described(&[(10.0, "a_b2+a_b2")]));
     let past = client.get(format!("{base}/stac/statistics?url={url}&assets=a%7Cbidx%3D2&expression=b2")).send().await.unwrap();
     assert_eq!(past.status().as_u16(), 400);
     // An asset named like a band (`b2`) stays as written.
