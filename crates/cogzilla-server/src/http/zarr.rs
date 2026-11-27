@@ -2035,7 +2035,7 @@ async fn handle_bbox(
         crs: format!("EPSG:{dst_epsg}"),
         detail: e.to_string(),
     })?;
-    if matches!(dst_crs, CrsModel::Geographic) && minx > maxx {
+    if dst_crs.is_geographic() && minx > maxx {
         maxx += 360.0;
     }
     if minx >= maxx || miny >= maxy {
@@ -2213,7 +2213,7 @@ async fn compute_zarr_feature_stats(
     })?;
 
     // Densify polygon rings directly into Zarr native pixel space
-    let is_geo = matches!(geo.crs.model, CrsModel::Geographic);
+    let is_geo = geo.crs.model.is_geographic();
     let mut px_polys: Vec<Vec<Vec<(f64, f64)>>> = Vec::new();
     let mut min_c = f64::INFINITY;
     let mut max_c = f64::NEG_INFINITY;

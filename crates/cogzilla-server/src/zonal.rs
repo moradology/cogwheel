@@ -242,27 +242,26 @@ impl PixelAreaModel {
         }
         // Fast exact O(win_h) closed-form authalic band area for axis-aligned Geographic & EPSG:3857.
         if p2c.is_axis_aligned() {
-            match crs {
-                CrsModel::Geographic => {
-                    let dlon = p2c.a.abs();
-                    let mut rows = Vec::with_capacity(win_h);
-                    let mut min_a = f64::INFINITY;
-                    let mut max_a = 0.0_f64;
-                    for dy in 0..win_h {
-                        let r = (r0 + dy) as f64;
-                        let (_, lat0) = p2c.forward(c0 as f64, r);
-                        let (_, lat1) = p2c.forward(c0 as f64, r + 1.0);
-                        let a = wgs84_geographic_cell_area_m2(0.0, dlon, lat0, lat1);
-                        min_a = min_a.min(a);
-                        max_a = max_a.max(a);
-                        rows.push(a);
-                    }
-                    if max_a > 0.0 && (max_a - min_a) / max_a < 1e-6 {
-                        return Self::Constant(0.5 * (min_a + max_a));
-                    }
-                    return Self::PerRow(rows);
+            if crs.is_geographic() {
+                let dlon = p2c.a.abs();
+                let mut rows = Vec::with_capacity(win_h);
+                let mut min_a = f64::INFINITY;
+                let mut max_a = 0.0_f64;
+                for dy in 0..win_h {
+                    let r = (r0 + dy) as f64;
+                    let (_, lat0) = p2c.forward(c0 as f64, r);
+                    let (_, lat1) = p2c.forward(c0 as f64, r + 1.0);
+                    let a = wgs84_geographic_cell_area_m2(0.0, dlon, lat0, lat1);
+                    min_a = min_a.min(a);
+                    max_a = max_a.max(a);
+                    rows.push(a);
                 }
-                CrsModel::Epsg3857 => {
+                if max_a > 0.0 && (max_a - min_a) / max_a < 1e-6 {
+                    return Self::Constant(0.5 * (min_a + max_a));
+                }
+                return Self::PerRow(rows);
+            }
+            if crs.is_web_mercator() {
                     let (mx0, _) = p2c.forward(c0 as f64, r0 as f64);
                     let (mx1, _) = p2c.forward((c0 + 1) as f64, r0 as f64);
                     let (lon0, _) = cogzilla_proj::mercator_to_lonlat_deg(mx0, 0.0);
@@ -286,8 +285,6 @@ impl PixelAreaModel {
                         return Self::Constant(0.5 * (min_a + max_a));
                     }
                     return Self::PerRow(rows);
-                }
-                _ => {}
             }
         }
 
@@ -471,12 +468,17 @@ pub fn densify_ring_lonlat_to_pixel(
     if ring.len() < 2 {
         return Vec::new();
     }
+    let is_wgs84_geo = matches!(crs, CrsModel::Geographic);
     let map_pt = |lon: f64, lat: f64| -> (f64, f64) {
-        let adj_lon = lon + lon_shift_deg;
-        let (sx, sy) = if is_geo_dataset {
-            (adj_lon, lat)
+        let (sx, sy) = if is_wgs84_geo {
+            (lon + lon_shift_deg, lat)
+        } else if is_geo_dataset {
+            // Datum-shifted geographic CRS (e.g. NAD27/OSGB36/Amersfoort/CH1903): apply the
+            // Helmert shift first, then lon_shift_deg so atan2 does not wrap it back to [-180, 180].
+            let (gx, gy) = crs.from_lonlat_deg(lon, lat);
+            (gx + lon_shift_deg, gy)
         } else {
-            crs.from_lonlat_deg(adj_lon, lat)
+            crs.from_lonlat_deg(lon + lon_shift_deg, lat)
         };
         let (col, row) = if let Some(poly) = gcp_poly {
             poly.crs_to_pixel(sx, sy)
@@ -2107,11 +2109,15 @@ fn project_mask_to_ifd(
         }
     }
 
+    let is_wgs84_geo = matches!(crs, CrsModel::Geographic);
     let mut pts_px = Vec::with_capacity(pm.points.len());
     for &(lon, lat) in &pm.points {
         let adj_lon = geo_point_lon_shift(lon, ifd, is_geo);
-        let (sx, sy) = if is_geo {
+        let (sx, sy) = if is_wgs84_geo {
             (adj_lon, lat)
+        } else if is_geo {
+            let (gx, gy) = crs.from_lonlat_deg(lon, lat);
+            (gx + (adj_lon - lon), gy)
         } else {
             crs.from_lonlat_deg(adj_lon, lat)
         };
@@ -2226,7 +2232,7 @@ pub async fn compute_native_exact_polygon_stats(
     };
 
     let total_verts = pm.vertex_count();
-    let is_geo_dataset = matches!(crs, CrsModel::Geographic);
+    let is_geo_dataset = crs.is_geographic();
     let densify_lonlat = !is_geo_dataset && !pm.coord_crs_projected;
 
     // Start on full-resolution IFD 0; only step down to an overview if explicit max_size > 0 requests it.
@@ -2836,7 +2842,7 @@ pub async fn compute_native_exact_multi_cog_expr_stats(
         ));
     }
 
-    let is_geo = matches!(crs, CrsModel::Geographic);
+    let is_geo = crs.is_geographic();
     let densify_lonlat = !is_geo && !pm.coord_crs_projected;
     let total_verts = pm.vertex_count();
     let geom_kind = geom_kind_for_mask(pm);
@@ -3523,7 +3529,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
         serde_json::Value::Object(out)
     };
 
-    let is_geo = matches!(crs, CrsModel::Geographic);
+    let is_geo = crs.is_geographic();
     let densify_lonlat = !is_geo && !pm.coord_crs_projected;
     let total_verts = pm.vertex_count();
 

@@ -520,10 +520,9 @@ impl TmsDef {
         let span_x = (m.cell_size * (m.tile_width as f64)).max(1e-12);
         let span_y = (m.cell_size * (m.tile_height as f64)).max(1e-12);
         let (c0, c1) = if crosses_am
-            && matches!(
-                dst_crs,
-                CrsModel::Geographic | CrsModel::Epsg3857 | CrsModel::WorldMercator
-            )
+            && (dst_crs.is_geographic()
+                || dst_crs.is_web_mercator()
+                || matches!(dst_crs, CrsModel::WorldMercator))
         {
             (0, max_c)
         } else {

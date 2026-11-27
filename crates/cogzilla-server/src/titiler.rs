@@ -2972,8 +2972,8 @@ pub fn native_bbox_dims_in_crs(
         let (lon0, mut lat0) = src_crs.to_lonlat_deg(sx0, sy0);
         let (lon1, mut lat1) = src_crs.to_lonlat_deg(sx1, sy1);
         let mut eff_h = ifd.height as f64;
-        if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
-            && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
+        if src_crs.is_geographic()
+            && dst_crs.is_web_mercator()
             && (lat0.abs() > 85.06 || lat1.abs() > 85.06)
         {
             let orig_span = (lat1 - lat0).abs().max(1e-9);
@@ -2995,9 +2995,7 @@ pub fn native_bbox_dims_in_crs(
                     return scale_dims_to_cap(dx / w_res, dy / h_res);
                 }
             }
-            let mut ddx = if matches!(src_crs, cogzilla_proj::CrsModel::Geographic)
-                && matches!(dst_crs, cogzilla_proj::CrsModel::Epsg3857)
-            {
+            let mut ddx = if src_crs.is_geographic() && dst_crs.is_web_mercator() {
                 // Preserve full unwrapped span for 0..360° global geographic rasters -> 3857.
                 (sx1 - sx0) * (20_037_508.342_789_244 / 180.0)
             } else {
@@ -5087,7 +5085,7 @@ async fn render_bbox_core(
             let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
             let (mut rcx_raw, rcy_raw) =
                 dst_crs.from_lonlat_deg(0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]));
-            if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic)
+            if dst_crs.is_geographic()
                 && rcx_raw < bbox[0]
                 && rcx_raw + 360.0 <= bbox[2]
             {

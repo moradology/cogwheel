@@ -212,7 +212,7 @@ pub(super) fn normalize_render_bbox(
             bbox[0], bbox[1], bbox[2], bbox[3]
         )));
     }
-    if matches!(dst_crs, cogzilla_proj::CrsModel::Geographic) && bbox[0] > bbox[2] {
+    if dst_crs.is_geographic() && bbox[0] > bbox[2] {
         bbox[2] += 360.0;
     }
     if bbox[0] >= bbox[2] {
@@ -342,14 +342,14 @@ pub(super) fn bbox_to_wgs84(
     // Polar-centered projected bboxes (e.g. EPSG:3413 / EPSG:3031) contain a pole in their interior:
     // if either pole projects inside [x0..=x1, y0..=y1], span full [-180, 180] and extend to ±90°.
     // Exclude cylindrical / pseudocylindrical projections where poles are horizontal lines (not points).
-    let is_line_pole = matches!(
-        crs,
-        cogzilla_proj::CrsModel::Geographic
-            | cogzilla_proj::CrsModel::Epsg3857
-            | cogzilla_proj::CrsModel::WorldMercator
-            | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
-            | cogzilla_proj::CrsModel::EqualEarth(_)
-    );
+    let is_line_pole = crs.is_geographic()
+        || crs.is_web_mercator()
+        || matches!(
+            crs,
+            cogzilla_proj::CrsModel::WorldMercator
+                | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
+                | cogzilla_proj::CrsModel::EqualEarth(_)
+        );
     if !is_line_pole {
         let (bx0, bx1) = (x0.min(x1), x0.max(x1));
         let (by0, by1) = (y0.min(y1), y0.max(y1));
@@ -620,12 +620,9 @@ pub(super) fn tile_intersects_cog(
                     // For axis-aligned Mercator/Geographic/CEA rasters without nonlinear GCPs, the WGS84 box IS exact.
                     if full.gcp_poly.is_none()
                         && full.pixel_to_crs.is_axis_aligned()
-                        && matches!(
-                            crs,
-                            cogzilla_proj::CrsModel::Epsg3857
-                                | cogzilla_proj::CrsModel::Geographic
-                                | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
-                        )
+                        && (crs.is_web_mercator()
+                            || crs.is_geographic()
+                            || matches!(crs, cogzilla_proj::CrsModel::CylindricalEqualArea(_)))
                     {
                         return Ok(true);
                     }
@@ -636,12 +633,9 @@ pub(super) fn tile_intersects_cog(
                     }
                     if full.gcp_poly.is_none()
                         && full.pixel_to_crs.is_axis_aligned()
-                        && matches!(
-                            crs,
-                            cogzilla_proj::CrsModel::Epsg3857
-                                | cogzilla_proj::CrsModel::Geographic
-                                | cogzilla_proj::CrsModel::CylindricalEqualArea(_)
-                        )
+                        && (crs.is_web_mercator()
+                            || crs.is_geographic()
+                            || matches!(crs, cogzilla_proj::CrsModel::CylindricalEqualArea(_)))
                     {
                         return Ok(true);
                     }
@@ -670,4 +664,86 @@ pub(super) fn tile_intersects_cog(
         &cogzilla_proj::CrsModel::Epsg3857,
         tb,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cogzilla_proj::CrsModel;
+
+    #[test]
+    fn datum_shifted_geographic_epsg_codes_behave_as_geographic() {
+        // NAD27 (4267), OSGB36 (4277), Amersfoort (4289), CH1903 (4149), CH1903+ (4150).
+        for epsg in [4326u16, 4267, 4277, 4289, 4149, 4150] {
+            let crs = CrsModel::from_epsg(epsg).unwrap_or_else(|e| panic!("EPSG:{epsg}: {e}"));
+            assert!(crs.is_geographic(), "EPSG:{epsg} must be geographic");
+            assert!(crs.is_degree_based(), "EPSG:{epsg} must be degree-based");
+            assert!(!crs.is_web_mercator(), "EPSG:{epsg} must not be web mercator");
+
+            // Antimeridian bbox unwrap: 170..-170 -> 170..190 (previously 400 on 4267/4277/4289/4149/4150).
+            let unwrapped = super::super::resolve_input_bbox([170.0, 0.0, -170.0, 10.0], Some(&crs))
+                .unwrap_or_else(|e| panic!("EPSG:{epsg} antimeridian resolve_input_bbox failed: {e}"));
+            assert_eq!(unwrapped, [170.0, 0.0, 190.0, 10.0], "EPSG:{epsg} antimeridian unwrap");
+
+            // ±2-turn longitude normalization.
+            let norm = super::super::resolve_input_bbox([530.0, 0.0, 550.0, 10.0], Some(&crs))
+                .unwrap_or_else(|e| panic!("EPSG:{epsg} longitude norm failed: {e}"));
+            assert_eq!(norm, [170.0, 0.0, 190.0, 10.0], "EPSG:{epsg} lon normalization");
+
+            // normalize_render_bbox antimeridian unwrap.
+            let rendered = normalize_render_bbox([170.0, 0.0, -170.0, 10.0], &crs)
+                .unwrap_or_else(|e| panic!("EPSG:{epsg} normalize_render_bbox failed: {e}"));
+            assert_eq!(rendered, [170.0, 0.0, 190.0, 10.0], "EPSG:{epsg} render bbox unwrap");
+
+            // Point coordinate transformation succeeds (and preserves datum shift for non-WGS84).
+            let (lon, lat) = coord_to_lonlat(-100.0, 40.0, Some(&crs))
+                .unwrap_or_else(|e| panic!("EPSG:{epsg} coord_to_lonlat failed: {e}"));
+            assert!((lon - (-100.0)).abs() < 0.05 && (lat - 40.0).abs() < 0.05, "EPSG:{epsg}: ({lon}, {lat})");
+            if epsg != 4326 {
+                assert!(
+                    (lon - (-100.0)).abs() > 1e-5 || (lat - 40.0).abs() > 1e-5,
+                    "EPSG:{epsg} must preserve non-zero datum shift, got ({lon}, {lat})"
+                );
+            }
+        }
+
+        // Zonal densify_ring_lonlat_to_pixel must preserve Helmert datum shift on datum-shifted geographic CRSes.
+        let nad27 = CrsModel::from_epsg(4267).unwrap();
+        let identity = cogzilla_tiff::Affine2D {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.0,
+            e: 1.0,
+            f: 0.0,
+        };
+        let ring = vec![(-100.0, 40.0), (-99.0, 40.0), (-99.0, 41.0), (-100.0, 40.0)];
+        let shifted = crate::zonal::densify_ring_lonlat_to_pixel(
+            &ring,
+            &nad27,
+            &identity,
+            None,
+            nad27.is_geographic(),
+            false,
+            0.0,
+            ring.len(),
+        );
+        let (sx, sy) = shifted[0];
+        let (exp_x, exp_y) = nad27.from_lonlat_deg(-100.0, 40.0);
+        assert!(
+            (sx - exp_x).abs() < 1e-9 && (sy - exp_y).abs() < 1e-9,
+            "NAD27 zonal ring must apply Helmert shift: got ({sx}, {sy}), expected ({exp_x}, {exp_y})"
+        );
+        assert!(
+            (sx - (-100.0)).abs() > 1e-5 || (sy - 40.0).abs() > 1e-5,
+            "NAD27 zonal ring shift must be non-zero"
+        );
+
+        // Projected CRSes (e.g. EPSG:3857) must still reject minx >= maxx.
+        let merc = CrsModel::from_epsg(3857).unwrap();
+        assert!(!merc.is_geographic());
+        assert!(merc.is_web_mercator());
+        assert!(super::super::resolve_input_bbox([170.0, 0.0, -170.0, 10.0], Some(&merc)).is_err());
+        assert!(normalize_render_bbox([170.0, 0.0, -170.0, 10.0], &merc).is_err());
+    }
 }
