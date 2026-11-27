@@ -2452,20 +2452,29 @@ fn wrap_geotiff_fmt(
             encode_geotiff_rgba(w, h, &data, bbox, epsg, return_mask)
         }
     } else if ct == "image/png" && matches!(fmt, OutputFormat::RawF32) {
-        let n_px = (w as usize).saturating_mul(h as usize).max(1);
-        let n_bands = data.len() / (n_px * 4);
-        if n_bands >= 1
-            && data.len() == n_bands * n_px * 4
-            && (n_bands + usize::from(return_mask)) <= 4
+        if let Some(n_px) = (w as usize).checked_mul(h as usize).filter(|&n| n > 0)
+            && let Some(row_bytes) = n_px.checked_mul(4)
         {
-            let vals: Vec<f32> = data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            pgstac::png_of_16_bits(&vals, n_bands, w as usize, h as usize, return_mask)
-        } else {
-            data
+            let n_bands = data.len() / row_bytes;
+            if n_bands >= 1
+                && data.len() == n_bands * row_bytes
+                && (n_bands + usize::from(return_mask)) <= 4
+            {
+                let vals: Vec<f32> = data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                return pgstac::png_of_16_bits(&vals, n_bands, w as usize, h as usize, return_mask);
+            }
         }
+        debug_assert!(
+            false,
+            "wrap_geotiff_fmt: unexpected RawF32 buffer length {} for {}x{} 16-bit PNG",
+            data.len(),
+            w,
+            h
+        );
+        pgstac::png_of_16_bits(&[], 1, w.max(1) as usize, h.max(1) as usize, return_mask)
     } else {
         data
     }
@@ -3760,10 +3769,13 @@ fn build_tile_request_for_tms(
         maybe_upgrade_multiband_default(bands, format, content_type, pq, eff_default_bands)
     };
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
+    let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
+    let u16_png = !auto_fmt && wants_u16_png(format, content_type, pq, source_cog, &bands, sample_type);
     if !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64) {
         match bands {
             BandRequest::MultiBand { ref bands_1based }
-                if !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
+                if !u16_png
+                    && !(pq.pixel_selection.by_last_band() && matches!(bands_1based.len(), 2 | 4)) =>
             {
                 return Err(EngineError::BadRequest(
                     "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
@@ -12381,16 +12393,56 @@ mod tests {
         assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_rescaled, None, &single, cogzilla_tiff::SampleType::Uint16));
         assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_cmap, None, &single, cogzilla_tiff::SampleType::Uint16));
 
-        // 2x1 single-band f32 buffer with overshoot (-1.0, 70000.0) -> clamped to (0, 65535) in 16-bit Grey+Alpha PNG.
+        // 4x1 single-band f32 buffer testing clamp (-1.0 -> 0, 70000.0 -> 65535),
+        // rounding (123.6 -> 124), and NaN (0, alpha=0) in 16-bit Grey+Alpha PNG.
         let mut raw = Vec::new();
-        for v in [-1.0f32, 70000.0f32] {
+        for v in [-1.0f32, 123.6, 70000.0, f32::NAN] {
             raw.extend_from_slice(&v.to_le_bytes());
         }
-        let png = wrap_geotiff_fmt(Bytes::from(raw), "image/png", OutputFormat::RawF32, 2, 1, [0.0; 4], 4326, true);
+        let png = wrap_geotiff_fmt(Bytes::from(raw), "image/png", OutputFormat::RawF32, 4, 1, [0.0; 4], 4326, true);
         assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
         // IHDR: byte 24 is bit depth (16), byte 25 is colour type (4 = Greyscale+Alpha).
         assert_eq!(png[24], 16, "expected 16-bit PNG");
         assert_eq!(png[25], 4, "expected Greyscale+Alpha colour type");
+        // Extract and inflate IDAT payload to verify decoded 16-bit BE samples & alpha.
+        let mut idat = Vec::new();
+        let mut pos = 8usize;
+        while pos + 12 <= png.len() {
+            let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
+            let chunk_type = &png[pos + 4..pos + 8];
+            if chunk_type == b"IDAT" {
+                idat.extend_from_slice(&png[pos + 8..pos + 8 + len]);
+            }
+            pos += 12 + len;
+        }
+        let mut scanline = vec![0u8; 17];
+        let n = libdeflater::Decompressor::new()
+            .zlib_decompress(&idat, &mut scanline)
+            .expect("valid zlib IDAT");
+        // Filter byte (0) + 4 pixels * (u16 value + u16 alpha) = 1 + 16 = 17 bytes.
+        assert_eq!(n, 17);
+        assert_eq!(scanline[0], 0);
+        let decoded: Vec<(u16, u16)> = scanline[1..]
+            .chunks_exact(4)
+            .map(|c| (u16::from_be_bytes([c[0], c[1]]), u16::from_be_bytes([c[2], c[3]])))
+            .collect();
+        assert_eq!(decoded, vec![(0, 65535), (124, 65535), (65535, 65535), (0, 0)]);
+
+        // 2-band Uint16 `.png` tile request is accepted by build_tile_request_for_tms.
+        let pq_2b = parse_query(Some("bidx=1&bidx=2"));
+        let res = build_tile_request_for_tms(
+            None,
+            TileCoord { z: 0, x: 0, y: 0 },
+            None,
+            Some("png"),
+            &pq_2b,
+            2,
+            cogzilla_tiff::SampleType::Uint16,
+            "WebMercatorQuad",
+            None,
+            false,
+        );
+        assert!(res.is_ok(), "2-band Uint16 .png tile should be accepted: {:?}", res.err());
     }
 
     #[test]
