@@ -428,6 +428,18 @@ pub(crate) fn rewrite_stac_expr_to(
     names: &[String],
     target: impl Fn(usize, &str, Option<usize>) -> Result<usize, EngineError>,
 ) -> Result<String, EngineError> {
+    rewrite_stac_expr_with(expr, names, target, |_| Ok(None))
+}
+
+/// [`rewrite_stac_expr_to`], with each `bN` that is not an asset's name given by `positional`
+/// in the same pass (`None` leaves it as it is): names are matched first, longest first, so
+/// a band token inside a name (`SR-B5`) or a name like a band (`b2`) is read as the name.
+pub(crate) fn rewrite_stac_expr_with(
+    expr: &str,
+    names: &[String],
+    target: impl Fn(usize, &str, Option<usize>) -> Result<usize, EngineError>,
+    mut positional: impl FnMut(usize) -> Result<Option<usize>, EngineError>,
+) -> Result<String, EngineError> {
     let mut ordered: Vec<(usize, &str)> = names
         .iter()
         .enumerate()
@@ -486,6 +498,26 @@ pub(crate) fn rewrite_stac_expr_to(
                 i += consumed;
                 continue;
             }
+
+            // 3. Any other identifier is passed over whole; a `bN` is given by `positional`.
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let ident = &expr[i..j];
+            let band = ident
+                .strip_prefix(['b', 'B'])
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<usize>().ok());
+            match band.map(&mut positional).transpose()?.flatten() {
+                Some(to) => {
+                    out.push('b');
+                    out.push_str(&to.to_string());
+                }
+                None => out.push_str(ident),
+            }
+            i = j;
+            continue;
         }
         let ch = expr[i..].chars().next().unwrap();
         out.push(ch);
@@ -759,6 +791,23 @@ mod tests {
             resolve_href("file:///allowed/items/item.json", "B04.tif"),
             "/allowed/items/B04.tif"
         );
+    }
+
+    #[test]
+    fn names_are_read_whole_before_the_bands_beside_them() {
+        let pick = [2usize, 1];
+        let remap = |expr: &str, names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            rewrite_stac_expr_with(expr, &names, |_, _, band| Ok(band.unwrap_or(pick[0])), |k| Ok(pick.get(k - 1).copied()))
+                .unwrap()
+        };
+        // A band token inside a hyphenated name is the name's.
+        assert_eq!(remap("SR-B5+b1", &["SR-B5"]), "b2+b2");
+        // A name like a band, and its own band, are the name's; the `bN` beside it is positional.
+        assert_eq!(remap("b2_b2+b1", &["b2"]), "b2+b2");
+        assert_eq!(remap("b2+b2", &["b2"]), "b2+b2");
+        // Without names every `bN` is positional, and other words are left whole.
+        assert_eq!(remap("b2*where(b1>0,b1,0)", &[]), "b1*where(b2>0,b2,0)");
     }
 
     #[test]

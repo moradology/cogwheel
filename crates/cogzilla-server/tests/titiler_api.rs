@@ -6652,7 +6652,7 @@ async fn stac_stacks_every_band_of_several_assets() {
         "type": "Feature", "stac_version": "1.0.0", "id": "two", "bbox": bounds,
         "geometry": {"type": "Polygon", "coordinates": [[[10.0, 40.0], [10.64, 40.0], [10.64, 40.64], [10.0, 40.64], [10.0, 40.0]]]},
         "properties": {"datetime": "2024-01-01T00:00:00Z"},
-        "assets": {"a": asset(&a), "b": asset(&b), "b2": asset(&b)},
+        "assets": {"a": asset(&a), "b": asset(&b), "b2": asset(&b), "SR-B5": asset(&a)},
     });
     let item_path = tmp.join("item.json");
     std::fs::write(&item_path, item.to_string()).unwrap();
@@ -6737,6 +6737,9 @@ async fn stac_stacks_every_band_of_several_assets() {
     // Whatever top-level `bidx` came with it; and an asset's name reads its own band.
     assert_eq!(means("&assets=a%7Cbidx%3D2&bidx=1&expression=b1").await, described(&[(5.0, "a_b2")]));
     assert_eq!(means("&assets=a%7Cbidx%3D2,1&expression=a_b2%2Bb1").await, described(&[(10.0, "a_b2+a_b2")]));
+    // A name is read whole first: a band token inside it, or a name like a band, is the name's.
+    assert_eq!(means("&assets=SR-B5%7Cbidx%3D2,1&expression=SR-B5%2Bb1").await[0].0, 10.0);
+    assert_eq!(means("&assets=b2%7Cbidx%3D2,1&expression=b2_b2%2Bb1").await[0].0, 26.0);
     let past = client.get(format!("{base}/stac/statistics?url={url}&assets=a%7Cbidx%3D2&expression=b2")).send().await.unwrap();
     assert_eq!(past.status().as_u16(), 400);
     // An asset named like a band (`b2`) stays as written.
