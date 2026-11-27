@@ -198,56 +198,30 @@ fn convert_endian_to_native(buf: &mut [u8], elem_size: usize, stored: Endianness
 }
 
 fn decompress_gzip(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
-    cogzilla_codec::with_codec_scratch(|scratch| {
-        let dst = scratch.resize_zeroed(expected);
-        let n = cogzilla_codec::inflate_into(src, dst, cogzilla_codec::DeflateWrapper::Gzip)
-            .map_err(|e| ZarrError::Codec {
-                codec: "gzip".into(),
-                chunk_key: chunk_key.into(),
-                detail: e.to_string(),
-            })?;
-        Ok(dst[..n].to_vec())
-    })
-}
-
-pub(crate) fn decompress_zlib_raw(
-    src: &[u8],
-    expected: usize,
-    chunk_key: &str,
-) -> Result<Vec<u8>, ZarrError> {
-    decompress_zlib(src, expected, chunk_key)
-}
-
-pub(crate) fn decompress_zstd_raw(
-    src: &[u8],
-    expected: usize,
-    chunk_key: &str,
-) -> Result<Vec<u8>, ZarrError> {
-    decompress_zstd(src, expected, chunk_key)
+    cogzilla_codec::inflate_to_vec(src, expected, cogzilla_codec::DeflateWrapper::Gzip).map_err(
+        |e| ZarrError::Codec {
+            codec: "gzip".into(),
+            chunk_key: chunk_key.into(),
+            detail: e.to_string(),
+        },
+    )
 }
 
 fn decompress_zlib(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
-    cogzilla_codec::with_codec_scratch(|scratch| {
-        let dst = scratch.resize_zeroed(expected);
-        let n = cogzilla_codec::inflate_into(src, dst, cogzilla_codec::DeflateWrapper::Zlib)
-            .map_err(|e| ZarrError::Codec {
-                codec: "zlib".into(),
-                chunk_key: chunk_key.into(),
-                detail: e.to_string(),
-            })?;
-        Ok(dst[..n].to_vec())
-    })
+    cogzilla_codec::inflate_to_vec(src, expected, cogzilla_codec::DeflateWrapper::Zlib).map_err(
+        |e| ZarrError::Codec {
+            codec: "zlib".into(),
+            chunk_key: chunk_key.into(),
+            detail: e.to_string(),
+        },
+    )
 }
 
 fn decompress_zstd(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
-    cogzilla_codec::with_codec_scratch(|scratch| {
-        let dst = scratch.resize_zeroed(expected);
-        let n = cogzilla_codec::zstd_into(src, dst).map_err(|e| ZarrError::Codec {
-            codec: "zstd".into(),
-            chunk_key: chunk_key.into(),
-            detail: e.to_string(),
-        })?;
-        Ok(dst[..n].to_vec())
+    cogzilla_codec::zstd_to_vec(src, expected).map_err(|e| ZarrError::Codec {
+        codec: "zstd".into(),
+        chunk_key: chunk_key.into(),
+        detail: e.to_string(),
     })
 }
 

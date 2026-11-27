@@ -177,6 +177,8 @@ pub enum CodecError {
     Deflate(String),
     #[error("zstd decompression failed: code {0}")]
     Zstd(usize),
+    #[error("zstd decompression failed: {0}")]
+    ZstdHeader(&'static str),
     #[error("LZW decompression failed: {0}")]
     Lzw(&'static str),
     #[error("JPEG decompression failed: {0}")]
@@ -259,24 +261,35 @@ impl CodecScratch<'_> {
 /// Borrow a thread-local reusable byte scratch buffer without per-chunk heap allocation.
 ///
 /// Safe to combine with [`inflate_into`] and [`zstd_into`] inside `f` (uses a separate
-/// thread-local cell from the codec context state).
+/// thread-local cell from the codec context state). Clears the buffer on entry and exit,
+/// shrinks oversized (>4 MiB) buffers back to 1 MiB on drop, and falls back to a local
+/// `Vec` if called re-entrantly.
 pub fn with_codec_scratch<R>(f: impl FnOnce(&mut CodecScratch<'_>) -> R) -> R {
+    struct ExternalScratchGuard<'a>(&'a mut Vec<u8>);
+    impl Drop for ExternalScratchGuard<'_> {
+        fn drop(&mut self) {
+            self.0.clear();
+            if self.0.capacity() > 4 * 1024 * 1024 {
+                *self.0 = Vec::with_capacity(512 * 512 * 4);
+            }
+        }
+    }
     EXTERNAL_SCRATCH.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        let mut scratch = CodecScratch { buf: &mut buf };
-        f(&mut scratch)
+        if let Ok(mut buf) = cell.try_borrow_mut() {
+            buf.clear();
+            let guard = ExternalScratchGuard(&mut buf);
+            let mut scratch = CodecScratch { buf: guard.0 };
+            f(&mut scratch)
+        } else {
+            let mut local = Vec::new();
+            let mut scratch = CodecScratch { buf: &mut local };
+            f(&mut scratch)
+        }
     })
 }
 
-/// Decompress a gzip, zlib, or raw-deflate payload directly into `dst`, reusing the
-/// thread-local `libdeflater::Decompressor`.
-///
-/// Enforces the caller's exact `dst.len()` bound without growing or over-allocating.
-pub fn inflate_into(
-    src: &[u8],
-    dst: &mut [u8],
-    wrapper: DeflateWrapper,
-) -> Result<usize, CodecError> {
+/// Validate minimal framing headers for gzip/zlib before allocating output buffers.
+pub fn validate_deflate_header(src: &[u8], wrapper: DeflateWrapper) -> Result<(), CodecError> {
     match wrapper {
         DeflateWrapper::Gzip => {
             if src.len() < 18 || src[0] != 0x1f || src[1] != 0x8b {
@@ -292,6 +305,39 @@ pub fn inflate_into(
         }
         DeflateWrapper::Raw => {}
     }
+    Ok(())
+}
+
+/// Validate Zstd frame header and declared content size against `max_out` before allocating.
+pub fn validate_zstd_header(src: &[u8], max_out: usize) -> Result<(), CodecError> {
+    if src.len() < 4 {
+        return Err(CodecError::ZstdHeader("truncated zstd frame"));
+    }
+    // SAFETY: `src.as_ptr()` is valid for `src.len()` readable bytes.
+    let content_size =
+        unsafe { zstd_sys::ZSTD_getFrameContentSize(src.as_ptr().cast(), src.len()) };
+    if content_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
+        return Err(CodecError::ZstdHeader("corrupt zstd frame header"));
+    }
+    if content_size != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64 && content_size > max_out as u64 {
+        return Err(CodecError::SizeMismatch {
+            expected: max_out,
+            got: usize::try_from(content_size).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
+/// Decompress a gzip, zlib, or raw-deflate payload directly into `dst`, reusing the
+/// thread-local `libdeflater::Decompressor`.
+///
+/// Enforces the caller's exact `dst.len()` bound without growing or over-allocating.
+pub fn inflate_into(
+    src: &[u8],
+    dst: &mut [u8],
+    wrapper: DeflateWrapper,
+) -> Result<usize, CodecError> {
+    validate_deflate_header(src, wrapper)?;
     CODEC_STATE.with(|cell| {
         let mut state = cell.borrow_mut();
         let res = match wrapper {
@@ -303,27 +349,26 @@ pub fn inflate_into(
     })
 }
 
+/// Validate header, allocate at most `expected` bytes, and decompress gzip/zlib/raw-deflate
+/// into an owned `Vec<u8>` without an intermediate scratch copy.
+pub fn inflate_to_vec(
+    src: &[u8],
+    expected: usize,
+    wrapper: DeflateWrapper,
+) -> Result<Vec<u8>, CodecError> {
+    validate_deflate_header(src, wrapper)?;
+    let mut dst = vec![0u8; expected];
+    let n = inflate_into(src, &mut dst, wrapper)?;
+    dst.truncate(n);
+    Ok(dst)
+}
+
 /// Decompress a Zstd frame directly into `dst`, reusing the thread-local `ZSTD_DCtx`.
 ///
 /// Validates `ZSTD_getFrameContentSize` against `dst.len()` before decompressing so hostile
 /// frames declaring more bytes than the expected chunk size fail immediately.
 pub fn zstd_into(src: &[u8], dst: &mut [u8]) -> Result<usize, CodecError> {
-    if src.len() < 4 {
-        return Err(CodecError::Deflate("truncated zstd frame".into()));
-    }
-    // SAFETY: `src.as_ptr()` is valid for `src.len()` readable bytes.
-    let content_size =
-        unsafe { zstd_sys::ZSTD_getFrameContentSize(src.as_ptr().cast(), src.len()) };
-    if content_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as u64 {
-        return Err(CodecError::Deflate("corrupt zstd frame header".into()));
-    }
-    if content_size != zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as u64 && content_size > dst.len() as u64
-    {
-        return Err(CodecError::SizeMismatch {
-            expected: dst.len(),
-            got: content_size as usize,
-        });
-    }
+    validate_zstd_header(src, dst.len())?;
     CODEC_STATE.with(|cell| {
         let state = cell.borrow_mut();
         // SAFETY: `state.zstd_dctx` is a valid thread-local `ZSTD_DCtx`, `dst` is writable
@@ -343,6 +388,16 @@ pub fn zstd_into(src: &[u8], dst: &mut [u8]) -> Result<usize, CodecError> {
         }
         Ok(rc)
     })
+}
+
+/// Validate Zstd header/content-size, allocate at most `expected` bytes, and decompress into an
+/// owned `Vec<u8>` without an intermediate scratch copy.
+pub fn zstd_to_vec(src: &[u8], expected: usize) -> Result<Vec<u8>, CodecError> {
+    validate_zstd_header(src, expected)?;
+    let mut dst = vec![0u8; expected];
+    let n = zstd_into(src, &mut dst)?;
+    dst.truncate(n);
+    Ok(dst)
 }
 
 /// Hard upper bound on a single decoded TIFF tile/strip (128 MiB) to prevent integer wrap
@@ -1912,6 +1967,40 @@ mod tests {
             ));
             assert!(inflate_into(&gz, tiny, DeflateWrapper::Gzip).is_err());
             assert!(inflate_into(&zl, tiny, DeflateWrapper::Zlib).is_err());
+
+            // Truncated/corrupt zstd headers report ZstdHeader, not Deflate.
+            assert!(matches!(
+                zstd_into(&[0, 1], tiny),
+                Err(CodecError::ZstdHeader(_))
+            ));
+            assert!(matches!(
+                zstd_into(&[0, 0, 0, 0], tiny),
+                Err(CodecError::ZstdHeader(_))
+            ));
+
+            // Re-entrant with_codec_scratch falls back safely without panicking.
+            with_codec_scratch(|inner| {
+                let d = inner.resize_zeroed(payload.len());
+                assert_eq!(zstd_into(&zs, d).unwrap(), payload.len());
+            });
         });
+
+        // Oversized (>4 MiB) scratch allocation is shrunk back to 1 MiB on drop, and cleared on entry.
+        with_codec_scratch(|scratch| {
+            let _ = scratch.resize_zeroed(5 * 1024 * 1024);
+        });
+        with_codec_scratch(|scratch| {
+            assert!(scratch.as_vec_mut().is_empty());
+            assert!(scratch.as_vec_mut().capacity() <= 4 * 1024 * 1024);
+        });
+
+        // Direct owned-vec helpers roundtrip and reject hostile headers before allocating.
+        assert_eq!(inflate_to_vec(&gz, payload.len(), DeflateWrapper::Gzip).unwrap(), payload);
+        assert_eq!(inflate_to_vec(&zl, payload.len(), DeflateWrapper::Zlib).unwrap(), payload);
+        assert_eq!(zstd_to_vec(&zs, payload.len()).unwrap(), payload);
+        assert!(matches!(
+            zstd_to_vec(&[0, 1], 128 * 1024 * 1024),
+            Err(CodecError::ZstdHeader(_))
+        ));
     }
 }
