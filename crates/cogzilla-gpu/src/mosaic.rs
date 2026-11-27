@@ -777,7 +777,10 @@ impl GpuMosaicCompositor {
         let plane_bytes = plane_stride
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| GpuError::InvalidDimensions("plane_bytes overflow".into()))?;
-        let raw_band_bytes = (plane_bytes * num_scenes) as u64;
+        let raw_band_bytes = plane_bytes
+            .checked_mul(num_scenes)
+            .ok_or_else(|| GpuError::InvalidDimensions("raw_band_bytes overflow".into()))?
+            as u64;
         let align = self.min_storage_align;
         let aligned_band_stride = raw_band_bytes.div_ceil(align) * align;
         let total_scene_bytes = (aligned_band_stride as usize)
