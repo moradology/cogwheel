@@ -1106,11 +1106,13 @@ impl WorkerState {
                         | DemAlgorithm::Contours { .. } => (0.0, 0.0, 1.0, 1.0),
                     };
                     let is_terrain_rgb = alg.is_terrain_rgb_encoding();
-                    let eff_output = if is_terrain_rgb {
-                        CoalescedOutput::Rgba8
-                    } else {
-                        output
-                    };
+                    if is_terrain_rgb && output != CoalescedOutput::Rgba8 {
+                        reply(Err(GpuError::InvalidDimensions(
+                            "terrain RGB encoding requires CoalescedOutput::Rgba8".into(),
+                        )));
+                        continue;
+                    }
+                    let eff_output = output;
                     let words_per_row = match eff_output {
                         CoalescedOutput::Rgba8 | CoalescedOutput::RawF32 => dst_w,
                         CoalescedOutput::IndexedU8 => dst_w.div_ceil(4),

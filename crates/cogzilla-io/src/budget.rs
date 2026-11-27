@@ -154,7 +154,7 @@ impl ByteBudget {
                     // Pass 2: if concurrent reads touched every candidate and we are still over cap,
                     // evict the oldest entries from the snapshot regardless of recent hits so
                     // memory/disk stays strictly bounded under thundering herds.
-                    if self.current.load(Ordering::Acquire) > self.max {
+                    if dropped < target_drop && self.current.load(Ordering::Acquire) > self.max {
                         for key in skipped {
                             if self.current.load(Ordering::Acquire) <= self.max {
                                 break;

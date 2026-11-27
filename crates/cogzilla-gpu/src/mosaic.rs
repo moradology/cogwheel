@@ -16,6 +16,7 @@ pub struct GpuSceneStack {
     pub height: u32,
     pub plane_stride: u32,
     pub num_scenes: u32,
+    pub num_bands: u32,
 }
 
 /// Scene upload mode for [`GpuMosaicCompositor::composite`].
@@ -435,6 +436,7 @@ impl GpuMosaicCompositor {
             height,
             plane_stride: plane_stride as u32,
             num_scenes: planes.len() as u32,
+            num_bands: 1,
         })
     }
 
@@ -472,6 +474,7 @@ impl GpuMosaicCompositor {
             height,
             plane_stride: plane_stride as u32,
             num_scenes: num_scenes as u32,
+            num_bands: 3,
         })
     }
 
@@ -672,13 +675,20 @@ impl GpuMosaicCompositor {
         upload: &MosaicUpload<'_>,
     ) -> Result<(u32, u32, u32, u32, Option<u64>), GpuError> {
         match upload {
-            MosaicUpload::StagedRgb(stack) => Ok((
-                stack.width,
-                stack.height,
-                stack.plane_stride,
-                stack.num_scenes,
-                None,
-            )),
+            MosaicUpload::StagedRgb(stack) => {
+                if stack.num_bands != 3 {
+                    return Err(GpuError::InvalidDimensions(
+                        "MosaicUpload::StagedRgb requires a 3-band GpuSceneStack".into(),
+                    ));
+                }
+                Ok((
+                    stack.width,
+                    stack.height,
+                    stack.plane_stride,
+                    stack.num_scenes,
+                    None,
+                ))
+            }
             MosaicUpload::DirectRgb {
                 planes,
                 width,

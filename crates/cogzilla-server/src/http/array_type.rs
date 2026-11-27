@@ -23,8 +23,8 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
         T::Uint64 | T::Int64 | T::Float64 => 64,
     };
     if float(a) || float(b) {
-        // float32 holds whole numbers of 16 bits and no more.
-        let narrow = |t| if float(t) { bits(t) == 32 } else { bits(t) <= 16 };
+        // float32 holds whole numbers of 16 bits and no more (and Float16 promotes to Float32).
+        let narrow = |t| if float(t) { bits(t) <= 32 } else { bits(t) <= 16 };
         return if narrow(a) && narrow(b) { T::Float32 } else { T::Float64 };
     }
     let sized = |kinds: [SampleType; 4], width: u32| kinds[match width { 8 => 0, 16 => 1, 32 => 2, _ => 3 }];
@@ -149,7 +149,7 @@ pub(crate) fn astype(kind: SampleType, v: f64) -> f64 {
 fn round_into(kind: SampleType) -> fn(f64) -> f64 {
     use SampleType as T;
     match kind {
-        T::Uint1 => |v: f64| v.round().clamp(0.0, 1.0),
+        T::Bool | T::Uint1 => |v: f64| v.round().clamp(0.0, 1.0),
         T::Uint4 => |v: f64| v.round().clamp(0.0, 15.0),
         T::Uint8 => |v: f64| v.round().clamp(0.0, 255.0),
         T::Int8 => |v: f64| v.round().clamp(-128.0, 127.0),
