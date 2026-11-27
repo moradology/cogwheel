@@ -3241,7 +3241,18 @@ fn expand_stac_asset_bidx(
                     let remapped = crate::stac::rewrite_stac_expr_with(
                         expr,
                         read,
-                        |_, _, band| Ok(band.unwrap_or_else(|| sel.first().map_or(1, |&b| usize::from(b)))),
+                        |_, name, band| match band {
+                            Some(k) => {
+                                if sel.iter().any(|&b| usize::from(b) == k) {
+                                    Ok(k)
+                                } else {
+                                    Err(EngineError::BadRequest(format!(
+                                        "band {k} of asset '{name}' is not read"
+                                    )))
+                                }
+                            }
+                            None => Ok(sel.first().map_or(1, |&b| usize::from(b))),
+                        },
                         |k| match sel.get(k.wrapping_sub(1)) {
                             Some(&b) => Ok(Some(usize::from(b))),
                             None => Err(EngineError::BadRequest(format!(
@@ -3395,19 +3406,54 @@ fn stac_stats_band_math(
         return Err(EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
     }
     let descriptions: Vec<String> = match pq.expr_raw.as_deref() {
-        Some(request) => expression_parts(request)
-            .map(|part| {
-                substitute_band_tokens(part, |k| {
-                    // On `/stac` an asset may be named like a band; it is read as the asset,
-                    // and stays as written.
-                    let token = format!("b{k}");
-                    if on_stac && names.contains(&token) {
-                        return None;
+        Some(request) => {
+            let mut sorted_names: Vec<&str> = names.iter().map(String::as_str).collect();
+            sorted_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
+            expression_parts(request)
+                .map(|part| {
+                    if on_stac && !sorted_names.is_empty() {
+                        // Preserve verbatim asset names (including uppercase `B02` and
+                        // hyphenated `SR-B1`) before substituting positional `bN`.
+                        let bytes = part.as_bytes();
+                        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+                        let mut out = String::with_capacity(part.len());
+                        let mut seg_start = 0usize;
+                        let mut i = 0usize;
+                        while i < bytes.len() {
+                            let at_start = i == 0 || !is_ident(bytes[i - 1]);
+                            let matched = if at_start {
+                                sorted_names.iter().copied().find(|name| {
+                                    part[i..].starts_with(name)
+                                        && !bytes
+                                            .get(i + name.len())
+                                            .is_some_and(|&c| is_ident(c))
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(name) = matched {
+                                out.push_str(&substitute_band_tokens(&part[seg_start..i], |k| {
+                                    stack_names.get(k.wrapping_sub(1)).cloned()
+                                }));
+                                out.push_str(name);
+                                i += name.len();
+                                seg_start = i;
+                            } else {
+                                i += part[i..].chars().next().map_or(1, char::len_utf8);
+                            }
+                        }
+                        out.push_str(&substitute_band_tokens(&part[seg_start..], |k| {
+                            stack_names.get(k.wrapping_sub(1)).cloned()
+                        }));
+                        out
+                    } else {
+                        substitute_band_tokens(part, |k| {
+                            stack_names.get(k.wrapping_sub(1)).cloned()
+                        })
                     }
-                    stack_names.get(k.wrapping_sub(1)).cloned()
                 })
-            })
-            .collect(),
+                .collect()
+        }
         None => stack_names,
     };
     let described = parts

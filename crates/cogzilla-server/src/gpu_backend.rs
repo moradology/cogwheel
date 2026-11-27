@@ -1733,6 +1733,9 @@ impl GpuBackend {
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
+        if alg.is_terrain_rgb_encoding() {
+            return None;
+        }
         let gpu_alg = alg.gpu_mode().map(|_| alg)?;
         let out_kind = styled_pixel_output(style.format, return_mask)?;
         let readback_bytes = match out_kind {
@@ -2946,6 +2949,9 @@ impl GpuBackend {
         percentiles: &[f64],
     ) -> Option<GpuBandStats> {
         let gpu_mode = map_resample_on(resample, &coords)?;
+        if alg.is_terrain_rgb_encoding() {
+            return None;
+        }
         let gpu_alg = alg.gpu_mode().map(|_| alg)?;
         let (dst_w, dst_h, _) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 || dst_w.saturating_mul(dst_h) < self.fused_stats_min_pixels() {
@@ -2992,6 +2998,9 @@ impl GpuBackend {
         resample: ResampleMode,
     ) -> Option<Bytes> {
         let gpu_mode = map_resample_on(resample, &coords)?;
+        if alg.is_terrain_rgb_encoding() {
+            return None;
+        }
         let gpu_alg = alg.gpu_mode().map(|_| alg)?;
         let (dst_w, dst_h, coord_upload_bytes) = coords.dims_and_upload_bytes()?;
         if dst_w == 0 || dst_h == 0 {

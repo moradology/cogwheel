@@ -34,7 +34,9 @@ pub fn encode_terrain_pixel(algorithm: DemAlgorithm, elev_m: f32) -> [u8; 3] {
             minz,
             maxz,
         } => encode_contours_rgb(elev_m, increment, thickness, minz, maxz),
-        _ => [0, 0, 0],
+        DemAlgorithm::Hillshade { .. } | DemAlgorithm::Slope { .. } | DemAlgorithm::Aspect => {
+            [0, 0, 0]
+        }
     }
 }
 
