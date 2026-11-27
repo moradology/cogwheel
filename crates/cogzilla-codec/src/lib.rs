@@ -413,9 +413,9 @@ const MAX_DECODED_TILE_BYTES: usize = 128 * 1024 * 1024;
 #[inline(always)]
 pub const fn decoded_bytes_per_sample(st: SampleType) -> usize {
     match st {
-        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => 1,
+        SampleType::Bool | SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => 1,
         SampleType::Uint16 => 2,
-        SampleType::Int8 | SampleType::Int16 | SampleType::Float32 => 4,
+        SampleType::Int8 | SampleType::Int16 | SampleType::Float16 | SampleType::Float32 => 4,
         SampleType::Uint32
         | SampleType::Int32
         | SampleType::Uint64
