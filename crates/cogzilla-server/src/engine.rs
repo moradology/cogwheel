@@ -358,10 +358,25 @@ fn tile_fetch_range_for_plan<const N: usize>(
             | ResampleMode::Q3
             | ResampleMode::Sum
     );
+    let widened = if is_footprint || resample == ResampleMode::Nearest {
+        None
+    } else {
+        let (sx, sy) = cogzilla_kernel::coord_plan_scale(plan);
+        cogzilla_kernel::kernel_widens(resample, sx, sy).then_some((sx, sy))
+    };
     let (pad_lo_x, pad_hi_x, pad_lo_y, pad_hi_y) = if is_footprint {
         let (sx, sy) = cogzilla_kernel::coord_plan_scale(plan);
         let hx = (0.5 * sx).ceil().max(1.0) as i32;
         let hy = (0.5 * sy).ceil().max(1.0) as i32;
+        if is_dem {
+            (hx + 2, hx + 3, hy + 2, hy + 3)
+        } else {
+            (hx, hx + 1, hy, hy + 1)
+        }
+    } else if let Some((sx, sy)) = widened {
+        // GDAL-style widened kernel: the support grows to `radius * scale` source pixels.
+        let hx = cogzilla_kernel::widened_kernel_radius(resample, sx).ceil().max(1.0) as i32;
+        let hy = cogzilla_kernel::widened_kernel_radius(resample, sy).ceil().max(1.0) as i32;
         if is_dem {
             (hx + 2, hx + 3, hy + 2, hy + 3)
         } else {

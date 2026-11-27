@@ -471,6 +471,114 @@ impl<'a> BandSource<'a> {
         None
     }
 
+    /// The block holding the whole `w x h` pixel rectangle at `(x0, y0)` when it is in bounds and
+    /// inside one decoded block: `(band, index_of_(x0, y0), row_stride)`. Raw block values: the
+    /// caller applies `nodata_override` / `scale_offset` (or checks `no_nodata`).
+    #[inline(always)]
+    pub fn rect_in_block(&self, x0: i32, y0: i32, w: u32, h: u32) -> Option<(&'a DecodedBand, usize, usize)> {
+        if w == 0
+            || h == 0
+            || x0 < 0
+            || y0 < 0
+            || x0 as i64 + w as i64 > self.ifd_w as i64
+            || y0 as i64 + h as i64 > self.ifd_h as i64
+        {
+            return None;
+        }
+        let (ux, uy) = (x0 as u32, y0 as u32);
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (ux >> s, ux & self.mask_x),
+            None => (ux / self.tile_w, ux % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (uy >> s, uy & self.mask_y),
+            None => (uy / self.tile_h, uy % self.tile_h),
+        };
+        if lx + w > self.tile_w || ly + h > self.tile_h {
+            return None;
+        }
+        let gx = tx.wrapping_sub(self.tx0);
+        let gy = ty.wrapping_sub(self.ty0);
+        if gx >= self.grid_w || gy >= self.grid_h {
+            return None;
+        }
+        let blk = unsafe { *self.blocks.get_unchecked((gy * self.grid_w + gx) as usize) }?;
+        if lx + w > blk.width || ly + h > blk.height {
+            return None;
+        }
+        let tw = self.tile_w as usize;
+        Some((blk, ly as usize * tw + lx as usize, tw))
+    }
+
+    /// Fill `out[i]` with pixel `(col0 + i, row)`, `NaN` outside the raster or the fetched blocks
+    /// and for nodata (same values as [`Self::sample_checked`], read a block run at a time).
+    pub fn read_row_segment(&self, row: i32, col0: i32, out: &mut [f32]) {
+        if row < 0 || row >= self.ifd_h {
+            out.fill(f32::NAN);
+            return;
+        }
+        let uy = row as u32;
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (uy >> s, uy & self.mask_y),
+            None => (uy / self.tile_h, uy % self.tile_h),
+        };
+        let gy = ty.wrapping_sub(self.ty0);
+        let mut i = 0usize;
+        while i < out.len() {
+            let col = col0 + i as i32;
+            if col < 0 || col >= self.ifd_w {
+                out[i] = f32::NAN;
+                i += 1;
+                continue;
+            }
+            let ux = col as u32;
+            let (tx, lx) = match self.shift_x {
+                Some(s) => (ux >> s, ux & self.mask_x),
+                None => (ux / self.tile_w, ux % self.tile_w),
+            };
+            let run = (out.len() - i)
+                .min((self.tile_w - lx) as usize)
+                .min((self.ifd_w - col) as usize);
+            let dst = &mut out[i..i + run];
+            let gx = tx.wrapping_sub(self.tx0);
+            let blk = if gx < self.grid_w && gy < self.grid_h {
+                unsafe { *self.blocks.get_unchecked((gy * self.grid_w + gx) as usize) }
+            } else {
+                None
+            };
+            match blk {
+                Some(b) if ly < b.height => {
+                    let base = ly as usize * self.tile_w as usize + lx as usize;
+                    let valid = (b.width.saturating_sub(lx) as usize).min(run);
+                    match b.data.as_f32_slice() {
+                        Some(sl) if self.nodata_override.is_none() && self.scale_offset.is_none() => {
+                            dst[..valid].copy_from_slice(&sl[base..base + valid]);
+                        }
+                        _ => {
+                            for (k, d) in dst[..valid].iter_mut().enumerate() {
+                                let mut v = unsafe { b.data.get_f32_unchecked(base + k) };
+                                if let Some(nd) = self.nodata_override
+                                    && v == nd
+                                {
+                                    v = f32::NAN;
+                                }
+                                if let Some((sc, off)) = self.scale_offset
+                                    && !v.is_nan()
+                                {
+                                    v = v * sc + off;
+                                }
+                                *d = v;
+                            }
+                        }
+                    }
+                    dst[valid..].fill(f32::NAN);
+                }
+                _ => dst.fill(f32::NAN),
+            }
+            i += run;
+        }
+    }
+
     /// Fast pointer to the top-left `(x0 - 1, y0 - 1)` of a 4×4 Catmull-Rom cubic neighborhood
     /// when all 16 pixels live strictly inside a single clean (`no_nodata`) `f32` block.
     #[inline(always)]
