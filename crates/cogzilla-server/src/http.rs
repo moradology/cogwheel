@@ -9835,7 +9835,15 @@ where
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"zarr") {
         let sub = &segs[1..];
-        let resp = zarr::handle_zarr_request(&engine, method, sub, &raw_query).await;
+        let resp = Box::pin(zarr::handle_zarr_request(
+            &engine,
+            method,
+            sub,
+            &raw_query,
+            &host,
+            if_none_match.as_deref(),
+        ))
+        .await;
         return Ok(resp);
     }
 

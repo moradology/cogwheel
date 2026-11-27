@@ -7,20 +7,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use cogzilla_kernel::{
+    ColormapName, OutputFormat, ResampleMode, SingleBandStyle, render_single_band, sample_general,
+    wrap_raw_f32_as_npy_with_mask,
+};
+use cogzilla_proj::{CoordPlan, CrsModel, TileCoord, normalize_geographic_lon};
 use cogzilla_zarr::hierarchy::BoxFuture;
 use cogzilla_zarr::{
-    ArrayMeta, CfTimeUnits, DataType, FsStore, OpenMode, ShardingConfig, ZarrError, ZarrHierarchy,
-    ZarrStore, ZarrVersion, parse_sel_params, read_coord_1d, resolve_geo, resolve_sel_indices,
+    ArrayMeta, CfTimeUnits, DataType, FsStore, OpenMode, ShardingConfig, ZarrCaps, ZarrError,
+    ZarrGeo, ZarrHierarchy, ZarrStore, ZarrVersion, parse_sel_params,
+    read_chunk_window_for_band_with_caps, read_coord_1d, resolve_geo, resolve_sel_indices,
     select_variable,
 };
 use http_body_util::Full;
-use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
+use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderValue};
 use hyper::{Method, Response, StatusCode};
 use serde_json::{Value, json};
 
 use crate::engine::TileEngine;
+use crate::titiler::{
+    StatsOptions, build_map_html, compute_f32_band_stats, encode_geotiff_f32, encode_rgba_output,
+};
+use crate::tms::{TmsDef, lookup_tms};
 use super::html::append_vary_accept;
-use super::percent_decode;
+use super::{parse_u8_like, parse_u32_like, parse_y_scale_ext, percent_decode};
 
 /// Unified failure -> HTTP status table for every `/zarr/*` route (#388).
 ///
@@ -338,14 +348,26 @@ struct ZarrQuery {
     variable: Option<String>,
     group: Option<String>,
     sel: Vec<String>,
+    bidx: Option<u64>,
     decode_times: bool,
     show_times: bool,
+    rescale: Option<(f32, f32)>,
+    colormap_name: Option<String>,
+    resampling: Option<String>,
+    nodata: Option<f32>,
+    unscale: bool,
+    return_mask: bool,
+    max_size: Option<u32>,
+    tilesize: Option<u32>,
+    format: Option<String>,
+    coord_crs: Option<u16>,
 }
 
 impl ZarrQuery {
     fn parse(raw_query: &str) -> Self {
         let mut q = Self {
             decode_times: true,
+            return_mask: true,
             ..Default::default()
         };
         for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
@@ -356,6 +378,13 @@ impl ZarrQuery {
                 "variable" => q.variable = Some(val),
                 "group" => q.group = Some(val),
                 "sel" => q.sel.push(val),
+                "bidx" => {
+                    if let Ok(b) = val.parse::<u64>()
+                        && b >= 1
+                    {
+                        q.bidx = Some(b - 1);
+                    }
+                }
                 "decode_times" => {
                     q.decode_times = !matches!(
                         val.to_ascii_lowercase().as_str(),
@@ -368,11 +397,139 @@ impl ZarrQuery {
                         "true" | "1" | "yes"
                     );
                 }
+                "rescale" => {
+                    if let Some((a, b)) = val.split_once(',')
+                        && let (Ok(lo), Ok(hi)) = (a.trim().parse::<f32>(), b.trim().parse::<f32>())
+                        && lo.is_finite()
+                        && hi.is_finite()
+                    {
+                        q.rescale = Some((lo, hi));
+                    }
+                }
+                "colormap_name" => q.colormap_name = Some(val),
+                "resampling" | "reproject" => q.resampling = Some(val),
+                "nodata" => {
+                    if let Ok(nd) = val.parse::<f32>() {
+                        q.nodata = Some(nd);
+                    }
+                }
+                "unscale" => {
+                    q.unscale = matches!(
+                        val.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes"
+                    );
+                }
+                "return_mask" => {
+                    q.return_mask = !matches!(
+                        val.to_ascii_lowercase().as_str(),
+                        "false" | "0" | "no"
+                    );
+                }
+                "max_size" => {
+                    if let Ok(ms) = val.parse::<u32>() {
+                        q.max_size = Some(ms);
+                    }
+                }
+                "tilesize" => {
+                    if let Ok(ts) = val.parse::<u32>() {
+                        q.tilesize = Some(ts);
+                    }
+                }
+                "format" | "f" => q.format = Some(val),
+                "coord_crs" => {
+                    let up = val.trim().to_ascii_uppercase();
+                    if let Some(rest) = up.strip_prefix("EPSG:")
+                        && let Ok(code) = rest.parse::<u16>()
+                    {
+                        q.coord_crs = Some(code);
+                    }
+                }
                 _ => {}
             }
         }
         q
     }
+
+    fn resample_mode(&self) -> ResampleMode {
+        match self.resampling.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("bilinear") => ResampleMode::Bilinear,
+            Some("cubic") => ResampleMode::Cubic,
+            Some("cubic_spline") => ResampleMode::CubicSpline,
+            Some("lanczos") => ResampleMode::Lanczos,
+            Some("average") => ResampleMode::Average,
+            Some("mode") => ResampleMode::Mode,
+            Some("max") => ResampleMode::Max,
+            Some("min") => ResampleMode::Min,
+            Some("med") => ResampleMode::Med,
+            _ => ResampleMode::Nearest,
+        }
+    }
+
+    fn colormap(&self) -> ColormapName {
+        self.colormap_name
+            .as_deref()
+            .and_then(ColormapName::from_str_opt)
+            .unwrap_or(ColormapName::Grayscale)
+    }
+}
+
+fn parse_output_format(ext: Option<&str>, q_fmt: Option<&str>) -> (OutputFormat, &'static str) {
+    let raw = ext.or(q_fmt).unwrap_or("png").to_ascii_lowercase();
+    match raw.as_str() {
+        "jpg" | "jpeg" => (OutputFormat::Jpeg { quality: 85 }, "image/jpeg"),
+        "webp" => (OutputFormat::Webp { quality: Some(80.0) }, "image/webp"),
+        "npy" => (OutputFormat::Npy, "application/x-binary"),
+        "tif" | "tiff" => (OutputFormat::RawF32, "image/tiff; application=geotiff"),
+        _ => (OutputFormat::Png, "image/png"),
+    }
+}
+
+fn compute_zarr_etag(key: &str, body: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    body.len().hash(&mut h);
+    let sample = body.len().min(512);
+    body[..sample].hash(&mut h);
+    format!("\"{:016x}\"", h.finish())
+}
+
+fn binary_ok_with_etag(
+    body: Bytes,
+    content_type: &'static str,
+    etag_key: &str,
+    if_none_match: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let etag = compute_zarr_etag(etag_key, &body);
+    if let Some(inm) = if_none_match {
+        let matched = inm.trim() == "*"
+            || inm
+                .split(',')
+                .any(|t| t.trim().trim_start_matches("W/") == etag);
+        if matched {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(ETAG, HeaderValue::from_str(&etag).unwrap())
+                .header(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=3600"),
+                )
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static(content_type))
+        .header(ETAG, HeaderValue::from_str(&etag).unwrap())
+        .header(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600"),
+        )
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+        .body(Full::new(body))
+        .unwrap()
 }
 
 /// Main dispatcher for all `/zarr/*` routes.
@@ -381,9 +538,12 @@ pub(crate) async fn handle_zarr_request(
     method: Method,
     sub: &[&str],
     raw_query: &str,
+    host: &str,
+    if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
     let q = ZarrQuery::parse(raw_query);
     let result = match (method, sub) {
+        // Metadata & introspection family (#372)
         (Method::GET, ["info"]) => handle_info(&q, false).await,
         (Method::GET, ["info.geojson"]) => handle_info(&q, true).await,
         (Method::GET, ["bounds"]) => handle_bounds(&q).await,
@@ -396,6 +556,55 @@ pub(crate) async fn handle_zarr_request(
         (Method::GET, ["dataset", "coordinates", name]) => {
             handle_dataset_coordinate(&q, &percent_decode(name)).await
         }
+
+        // Raster family (#373): OGC Tilesets, TileJSON, Map HTML, WMTS, Tiles, Point, Preview, BBox, GET Statistics
+        (Method::GET, ["tiles"]) => handle_tileset_list(&q, host, raw_query).await,
+        (Method::GET, ["tiles", tms]) => handle_tileset(&q, tms, host, raw_query).await,
+        (Method::GET, ["tilejson.json"]) => {
+            handle_tilejson(&q, "WebMercatorQuad", host, raw_query).await
+        }
+        (Method::GET, [tms, "tilejson.json"]) => handle_tilejson(&q, tms, host, raw_query).await,
+        (Method::GET, ["map.html"]) => handle_map_html("WebMercatorQuad", host, raw_query),
+        (Method::GET, [tms, "map.html"]) => handle_map_html(tms, host, raw_query),
+        (Method::GET, ["WMTSCapabilities.xml"]) => {
+            handle_wmts(&q, "WebMercatorQuad", host, raw_query).await
+        }
+        (Method::GET, [tms, "WMTSCapabilities.xml"]) => handle_wmts(&q, tms, host, raw_query).await,
+        (Method::GET, ["tiles", tms, zs, xs, ys]) => {
+            handle_tile(&q, tms, zs, xs, ys, raw_query, if_none_match).await
+        }
+        (Method::GET, ["tiles", zs, xs, ys]) => {
+            handle_tile(&q, "WebMercatorQuad", zs, xs, ys, raw_query, if_none_match).await
+        }
+        (Method::GET, ["point", coords]) => handle_point(&q, &percent_decode(coords)).await,
+        (Method::GET, ["preview"]) => handle_preview(&q, None, None, raw_query, if_none_match).await,
+        (Method::GET, [seg]) if seg.starts_with("preview.") => {
+            let ext = seg.strip_prefix("preview.");
+            handle_preview(&q, None, ext, raw_query, if_none_match).await
+        }
+        (Method::GET, ["preview", dims_seg]) => match parse_dims_ext(dims_seg) {
+            Ok((dims, ext)) => handle_preview(&q, Some(dims), ext, raw_query, if_none_match).await,
+            Err(e) => Err(e),
+        },
+        (Method::GET, ["bbox", bbox_seg]) => {
+            let (bbox_str, ext) = split_bbox_ext(&percent_decode(bbox_seg));
+            handle_bbox(&q, &bbox_str, None, ext.as_deref(), raw_query, if_none_match).await
+        }
+        (Method::GET, ["bbox", bbox_seg, dims_seg]) => match parse_dims_ext(dims_seg) {
+            Ok((dims, ext)) => {
+                handle_bbox(
+                    &q,
+                    &percent_decode(bbox_seg),
+                    Some(dims),
+                    ext,
+                    raw_query,
+                    if_none_match,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        },
+        (Method::GET, ["statistics"]) => handle_get_statistics(&q).await,
         _ => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -412,6 +621,40 @@ pub(crate) async fn handle_zarr_request(
         Ok(resp) => resp,
         Err(err) => zarr_error_to_response(&err),
     }
+}
+
+fn parse_dims_ext(seg: &str) -> Result<((u32, u32), Option<&str>), ZarrError> {
+    let (dims_part, ext) = match seg.rfind('.') {
+        Some(pos) => (&seg[..pos], Some(&seg[pos + 1..])),
+        None => (seg, None),
+    };
+    let Some((ws, hs)) = dims_part.split_once('x').or_else(|| dims_part.split_once('X')) else {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("invalid dimensions segment {seg:?} (expected WxH)"),
+        });
+    };
+    let (Ok(w), Ok(h)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("invalid width/height in {seg:?}"),
+        });
+    };
+    if w == 0 || h == 0 || w > 2048 || h > 2048 {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("dimensions {w}x{h} out of allowed range 1..=2048"),
+        });
+    }
+    Ok(((w, h), ext))
+}
+
+fn split_bbox_ext(seg: &str) -> (String, Option<String>) {
+    // e.g. "-123,37,-121.5,38.5.png" -> ("-123,37,-121.5,38.5", Some("png"))
+    if let Some(pos) = seg.rfind('.') {
+        let after = &seg[pos + 1..];
+        if !after.is_empty() && after.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return (seg[..pos].to_string(), Some(after.to_string()));
+        }
+    }
+    (seg.to_string(), None)
 }
 
 async fn open_store_and_hierarchy(q: &ZarrQuery) -> Result<(ServerZarrStore, ZarrHierarchy), ZarrError> {
@@ -703,6 +946,907 @@ async fn handle_dataset_coordinate(
         "data": data_val,
     });
     Ok(json_ok(&body, "application/json"))
+}
+
+// ============================================================================
+// Raster route family (#373) — all pixels flow through BandSource + cogzilla-kernel
+// ============================================================================
+
+async fn resolve_band_index(
+    store: &ServerZarrStore,
+    group: &cogzilla_zarr::GroupView<'_>,
+    sel_var: &cogzilla_zarr::SelectedVariable<'_>,
+    q: &ZarrQuery,
+) -> Result<Option<u64>, ZarrError> {
+    if sel_var.meta.rank() == 2 {
+        return Ok(None);
+    }
+    if !q.sel.is_empty() {
+        let specs = parse_sel_params(&q.sel)?;
+        for spec in &specs {
+            if sel_var.dims.extra_name.as_deref() == Some(spec.dim.as_str())
+                && let Some(coord_meta) = group.array(&spec.dim)
+            {
+                let vals = read_coord_1d(store, &group.child_prefix(&spec.dim), coord_meta).await?;
+                let cf = if q.decode_times {
+                    CfTimeUnits::from_meta(coord_meta)?
+                } else {
+                    None
+                };
+                let idxs = resolve_sel_indices(spec, &vals, cf.as_ref())?;
+                return Ok(idxs.first().map(|&i| i as u64));
+            }
+        }
+    }
+    Ok(Some(q.bidx.unwrap_or(0)))
+}
+
+fn require_tms(tms_id: &str) -> Result<&'static TmsDef, ZarrError> {
+    lookup_tms(tms_id).ok_or_else(|| ZarrError::InvalidSelection {
+        detail: format!("unknown TileMatrixSet {tms_id:?}"),
+    })
+}
+
+fn zoom_range_for_zarr(tms: &TmsDef, geo: &ZarrGeo, width: u32, height: u32) -> (u8, u8) {
+    tms.zoom_range_for_cog(&geo.crs.model, &geo.affine, width, height, 1.0)
+}
+
+async fn handle_tileset_list(
+    q: &ZarrQuery,
+    host: &str,
+    raw_query: &str,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let wgs84 = wgs84_bounds_for_geo(&geo, w, h);
+    let qs = if raw_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{raw_query}")
+    };
+    let tilesets: Vec<Value> = crate::tms::ALL_TMS
+        .iter()
+        .map(|tms| {
+            json!({
+                "title": format!("Zarr tileset ({})", tms.id),
+                "dataType": "map",
+                "crs": tms.crs_uri,
+                "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{}", tms.id),
+                "boundingBox": {
+                    "lowerLeft": [wgs84[0], wgs84[1]],
+                    "upperRight": [wgs84[2], wgs84[3]],
+                    "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+                },
+                "links": [
+                    {
+                        "href": format!("{host}/zarr/tiles/{}{qs}", tms.id),
+                        "rel": "self",
+                        "type": "application/json",
+                    },
+                    {
+                        "href": format!("{host}/zarr/tiles/{}/{{z}}/{{x}}/{{y}}{qs}", tms.id),
+                        "rel": "item",
+                        "templated": true,
+                    },
+                ],
+            })
+        })
+        .collect();
+    Ok(json_ok(&json!({ "tilesets": tilesets }), "application/json"))
+}
+
+async fn handle_tileset(
+    q: &ZarrQuery,
+    tms_id: &str,
+    host: &str,
+    raw_query: &str,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let tms = require_tms(tms_id)?;
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let wgs84 = wgs84_bounds_for_geo(&geo, w, h);
+    let (minz, maxz) = zoom_range_for_zarr(tms, &geo, w, h);
+    let limits: Vec<Value> = (minz..=maxz)
+        .filter_map(|z| {
+            let m = tms.matrix(z)?;
+            let (min_col, max_col, min_row, max_row) = tms.tile_limits_for_wgs84_bounds(m, wgs84);
+            Some(json!({
+                "tileMatrix": m.id,
+                "minTileRow": min_row,
+                "maxTileRow": max_row,
+                "minTileCol": min_col,
+                "maxTileCol": max_col,
+            }))
+        })
+        .collect();
+    let qs = if raw_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{raw_query}")
+    };
+    let body = json!({
+        "title": format!("Zarr tileset ({})", tms.id),
+        "dataType": "map",
+        "crs": tms.crs_uri,
+        "tileMatrixSetURI": format!("http://www.opengis.net/def/tilematrixset/OGC/1.0/{}", tms.id),
+        "tileMatrixSetLimits": limits,
+        "boundingBox": {
+            "lowerLeft": [wgs84[0], wgs84[1]],
+            "upperRight": [wgs84[2], wgs84[3]],
+            "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        },
+        "links": [
+            {
+                "href": format!("{host}/zarr/tiles/{}{qs}", tms.id),
+                "rel": "self",
+                "type": "application/json",
+            },
+            {
+                "href": format!("{host}/zarr/tiles/{}/{{z}}/{{x}}/{{y}}{qs}", tms.id),
+                "rel": "item",
+                "templated": true,
+            },
+        ],
+    });
+    Ok(json_ok(&body, "application/json"))
+}
+
+async fn handle_tilejson(
+    q: &ZarrQuery,
+    tms_id: &str,
+    host: &str,
+    raw_query: &str,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let tms = require_tms(tms_id)?;
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let wgs84 = wgs84_bounds_for_geo(&geo, w, h);
+    let (minz, maxz) = zoom_range_for_zarr(tms, &geo, w, h);
+    let qs = if raw_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{raw_query}")
+    };
+    let tile_url = format!("{host}/zarr/tiles/{}/{{z}}/{{x}}/{{y}}{qs}", tms.id);
+    let body = json!({
+        "tilejson": "3.0.0",
+        "name": sel_var.name,
+        "version": "1.0.0",
+        "scheme": "xyz",
+        "tiles": [tile_url],
+        "minzoom": minz,
+        "maxzoom": maxz,
+        "bounds": wgs84,
+        "center": [0.5 * (wgs84[0] + wgs84[2]), 0.5 * (wgs84[1] + wgs84[3]), minz],
+    });
+    Ok(json_ok(&body, "application/json"))
+}
+
+fn handle_map_html(tms_id: &str, host: &str, raw_query: &str) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let tms = require_tms(tms_id)?;
+    let qs = if raw_query.is_empty() {
+        String::new()
+    } else {
+        format!("?{raw_query}")
+    };
+    let tj_url = format!("{host}/zarr/{}/tilejson.json{qs}", tms.id);
+    let html = build_map_html(&tj_url);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"))
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+        .body(Full::new(Bytes::from(html)))
+        .unwrap())
+}
+
+async fn handle_wmts(
+    q: &ZarrQuery,
+    tms_id: &str,
+    host: &str,
+    raw_query: &str,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let tms = require_tms(tms_id)?;
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let wgs84 = wgs84_bounds_for_geo(&geo, w, h);
+    let (minz, maxz) = zoom_range_for_zarr(tms, &geo, w, h);
+    let qs_esc = raw_query.replace('&', "&amp;");
+    let tile_href = format!(
+        "{host}/zarr/tiles/{}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.png?{qs_esc}",
+        tms.id
+    );
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0">
+  <Contents>
+    <Layer>
+      <ows:Title>{title}</ows:Title>
+      <ows:Identifier>{title}</ows:Identifier>
+      <ows:WGS84BoundingBox>
+        <ows:LowerCorner>{minx} {miny}</ows:LowerCorner>
+        <ows:UpperCorner>{maxx} {maxy}</ows:UpperCorner>
+      </ows:WGS84BoundingBox>
+      <Format>image/png</Format>
+      <TileMatrixSetLink><TileMatrixSet>{tms_id}</TileMatrixSet></TileMatrixSetLink>
+      <ResourceURL format="image/png" resourceType="tile" template="{tile_href}"/>
+    </Layer>
+    <TileMatrixSet>
+      <ows:Identifier>{tms_id}</ows:Identifier>
+      <ows:SupportedCRS>{crs_uri}</ows:SupportedCRS>
+      <!-- minzoom={minz} maxzoom={maxz} -->
+    </TileMatrixSet>
+  </Contents>
+</Capabilities>"#,
+        title = sel_var.name,
+        minx = wgs84[0],
+        miny = wgs84[1],
+        maxx = wgs84[2],
+        maxy = wgs84[3],
+        tms_id = tms.id,
+        crs_uri = tms.crs_uri,
+    );
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/xml"))
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+        .body(Full::new(Bytes::from(xml)))
+        .unwrap())
+}
+
+/// Build an exact `CoordPlan<N>` from any TMS bounds `[minx, miny, maxx, maxy]` in `dst_crs` into
+/// the Zarr array's pixel grid (`geo.crs.model` + `geo.affine`).
+fn build_general_tile_plan<const N: usize>(
+    dst_crs: &CrsModel,
+    dst_bounds: [f64; 4],
+    geo: &ZarrGeo,
+    ifd_w: u32,
+    ifd_h: u32,
+) -> Option<CoordPlan<N>> {
+    let crs_to_pixel = geo.affine.invert()?;
+    let [min_x, min_y, max_x, max_y] = dst_bounds;
+    let step_x = (max_x - min_x) / (N as f64);
+    let step_y = (max_y - min_y) / (N as f64);
+
+    let mut u = vec![f32::NAN; N * N].into_boxed_slice();
+    let mut v = vec![f32::NAN; N * N].into_boxed_slice();
+    let mut min_u = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let mut any_in = false;
+    let fw = ifd_w as f32;
+    let fh = ifd_h as f32;
+
+    let same_3857 = matches!(dst_crs, CrsModel::Epsg3857) && matches!(geo.crs.model, CrsModel::Epsg3857);
+    let same_geo = matches!(dst_crs, CrsModel::Geographic) && matches!(geo.crs.model, CrsModel::Geographic);
+
+    for py in 0..N {
+        let dy = max_y - (py as f64 + 0.5) * step_y;
+        let row_off = py * N;
+        for px in 0..N {
+            let dx = min_x + (px as f64 + 0.5) * step_x;
+            let (sx, sy) = if same_3857 || same_geo {
+                (dx, dy)
+            } else {
+                let (lon, lat) = dst_crs.to_lonlat_deg(dx, dy);
+                if !lon.is_finite() || !lat.is_finite() {
+                    continue;
+                }
+                geo.crs.model.from_lonlat_deg(lon, lat)
+            };
+            if sx.is_finite() && sy.is_finite() {
+                let (col, row) = crs_to_pixel.forward(sx, sy);
+                let uu = (col - 0.5) as f32;
+                let vv = (row - 0.5) as f32;
+                u[row_off + px] = uu;
+                v[row_off + px] = vv;
+                if uu >= -1.0 && uu <= fw && vv >= -1.0 && vv <= fh {
+                    any_in = true;
+                    min_u = min_u.min(uu);
+                    max_u = max_u.max(uu);
+                    min_v = min_v.min(vv);
+                    max_v = max_v.max(vv);
+                }
+            }
+        }
+    }
+    if !any_in {
+        return None;
+    }
+    let src_min_col = (min_u.floor() as i32).max(0);
+    let src_max_col = (max_u.floor() as i32)
+        .saturating_add(1)
+        .min(ifd_w as i32 - 1);
+    let src_min_row = (min_v.floor() as i32).max(0);
+    let src_max_row = (max_v.floor() as i32)
+        .saturating_add(1)
+        .min(ifd_h as i32 - 1);
+    if src_min_col > src_max_col || src_min_row > src_max_row {
+        return None;
+    }
+    Some(CoordPlan::Exact2D {
+        u,
+        v,
+        src_min_col,
+        src_max_col,
+        src_min_row,
+        src_max_row,
+        all_in_bounds: false,
+    })
+}
+
+async fn handle_tile(
+    q: &ZarrQuery,
+    tms_id: &str,
+    zs: &str,
+    xs: &str,
+    ys: &str,
+    raw_query: &str,
+    if_none_match: Option<&str>,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let tms = require_tms(tms_id)?;
+    let (Some(z), Some(x), Some((y, scale_opt, ext_opt))) =
+        (parse_u8_like(zs), parse_u32_like(xs), parse_y_scale_ext(ys))
+    else {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("invalid tile coordinate z={zs} x={xs} y={ys}"),
+        });
+    };
+
+    let tile_size = q
+        .tilesize
+        .unwrap_or_else(|| 256 * scale_opt.unwrap_or(1).clamp(1, 4));
+    if tile_size == 0 || tile_size > 2048 {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("tilesize {tile_size} out of allowed range 1..=2048"),
+        });
+    }
+
+    let Some(tile_bounds) = tms.tile_bounds(z, x, y, 0.0, tile_size) else {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("tile {z}/{x}/{y} is out of matrix bounds for {tms_id}"),
+        });
+    };
+
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
+
+    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let crs_to_pixel = geo.affine.invert().ok_or_else(|| ZarrError::IrregularGrid {
+        dim: geo.x_dim.clone(),
+        index: 0,
+        detail: "singular affine transform".into(),
+    })?;
+    let dst_crs = tms.crs_model().map_err(|e| ZarrError::UnsupportedCrs {
+        crs: tms_id.to_string(),
+        detail: e.to_string(),
+    })?;
+
+    let (fmt, content_type) = parse_output_format(ext_opt, q.format.as_deref());
+    let (rmin, rmax) = q.rescale.unwrap_or((0.0, 255.0));
+    let style = SingleBandStyle {
+        rescale_min: rmin,
+        rescale_max: rmax,
+        colormap: q.colormap(),
+        resample: q.resample_mode(),
+        format: fmt,
+    };
+
+    let caps = ZarrCaps::from_env();
+    let etag_key = format!("zarr:tile:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
+
+    // Fast path for standard 256x256 and 512x512 tiles directly through `render_single_band`
+    if tile_size == 256 {
+        let plan = if tms_id == "WebMercatorQuad" {
+            CoordPlan::<256>::build(
+                &geo.crs.model,
+                &crs_to_pixel,
+                ifd_w,
+                ifd_h,
+                TileCoord { z, x, y },
+            )
+        } else {
+            build_general_tile_plan::<256>(&dst_crs, tile_bounds, &geo, ifd_w, ifd_h)
+        };
+        let Some(plan) = plan else {
+            return Err(ZarrError::NotFound {
+                key: format!("tile {tms_id}/{z}/{x}/{y} outside Zarr dataset bounds"),
+            });
+        };
+        let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+        let pad = 2u32;
+        let wx0 = (c0.max(0) as u32).saturating_sub(pad);
+        let wy0 = (r0.max(0) as u32).saturating_sub(pad);
+        let wx1 = ((c1.max(0) as u32) + 1 + pad).min(ifd_w);
+        let wy1 = ((r1.max(0) as u32) + 1 + pad).min(ifd_h);
+
+        let wb = read_chunk_window_for_band_with_caps(
+            &store,
+            &sel_var.store_prefix,
+            sel_var.meta,
+            band_idx,
+            wx0,
+            wy0,
+            wx1,
+            wy1,
+            16,
+            &caps,
+        )
+        .await?;
+        let refs = wb.block_refs();
+        let mut src = wb.as_band_source(&refs);
+        if !q.unscale {
+            src.scale_offset = None;
+        }
+        if let Some(nd) = q.nodata {
+            src = src.with_nodata_override(Some(nd));
+        }
+        let body = if matches!(fmt, OutputFormat::RawF32) {
+            let raw = render_single_band::<256>(
+                &plan,
+                &src,
+                &SingleBandStyle {
+                    format: OutputFormat::RawF32,
+                    ..style
+                },
+            );
+            encode_geotiff_f32(256, 256, &raw, tile_bounds, tms.epsg, q.return_mask)
+        } else {
+            render_single_band::<256>(&plan, &src, &style)
+        };
+        return Ok(binary_ok_with_etag(body, content_type, &etag_key, if_none_match));
+    }
+
+    // General tile size (e.g. 512x512, @2x, custom tilesize): sample through `sample_general`
+    render_zarr_rect(
+        &store,
+        &sel_var,
+        &geo,
+        band_idx,
+        &dst_crs,
+        tile_bounds,
+        tms.epsg,
+        tile_size,
+        tile_size,
+        q,
+        fmt,
+        content_type,
+        &etag_key,
+        if_none_match,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_zarr_rect(
+    store: &ServerZarrStore,
+    sel_var: &cogzilla_zarr::SelectedVariable<'_>,
+    geo: &ZarrGeo,
+    band_idx: Option<u64>,
+    dst_crs: &CrsModel,
+    dst_bounds: [f64; 4],
+    dst_epsg: u16,
+    out_w: u32,
+    out_h: u32,
+    q: &ZarrQuery,
+    fmt: OutputFormat,
+    content_type: &'static str,
+    etag_key: &str,
+    if_none_match: Option<&str>,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let crs_to_pixel = geo.affine.invert().ok_or_else(|| ZarrError::IrregularGrid {
+        dim: geo.x_dim.clone(),
+        index: 0,
+        detail: "singular affine transform".into(),
+    })?;
+
+    let [min_x, min_y, max_x, max_y] = dst_bounds;
+    let step_x = (max_x - min_x) / (out_w as f64);
+    let step_y = (max_y - min_y) / (out_h as f64);
+    let same_3857 = matches!(dst_crs, CrsModel::Epsg3857) && matches!(geo.crs.model, CrsModel::Epsg3857);
+    let same_geo = matches!(dst_crs, CrsModel::Geographic) && matches!(geo.crs.model, CrsModel::Geographic);
+
+    let n_px = (out_w as usize) * (out_h as usize);
+    let mut u_coords = vec![f32::NAN; n_px];
+    let mut v_coords = vec![f32::NAN; n_px];
+    let mut min_u = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let mut any_in = false;
+    let fw = ifd_w as f32;
+    let fh = ifd_h as f32;
+
+    for py in 0..out_h as usize {
+        let dy = max_y - (py as f64 + 0.5) * step_y;
+        let row_off = py * (out_w as usize);
+        for px in 0..out_w as usize {
+            let dx = min_x + (px as f64 + 0.5) * step_x;
+            let (sx, sy) = if same_3857 || same_geo {
+                (dx, dy)
+            } else {
+                let (lon, lat) = dst_crs.to_lonlat_deg(dx, dy);
+                if !lon.is_finite() || !lat.is_finite() {
+                    continue;
+                }
+                geo.crs.model.from_lonlat_deg(lon, lat)
+            };
+            if sx.is_finite() && sy.is_finite() {
+                let (col, row) = crs_to_pixel.forward(sx, sy);
+                let uu = (col - 0.5) as f32;
+                let vv = (row - 0.5) as f32;
+                u_coords[row_off + px] = uu;
+                v_coords[row_off + px] = vv;
+                if uu >= -1.0 && uu <= fw && vv >= -1.0 && vv <= fh {
+                    any_in = true;
+                    min_u = min_u.min(uu);
+                    max_u = max_u.max(uu);
+                    min_v = min_v.min(vv);
+                    max_v = max_v.max(vv);
+                }
+            }
+        }
+    }
+
+    if !any_in {
+        return Err(ZarrError::NotFound {
+            key: "requested bbox/tile lies outside Zarr dataset bounds".into(),
+        });
+    }
+
+    let pad = 2u32;
+    let wx0 = (min_u.floor().max(0.0) as u32).saturating_sub(pad);
+    let wy0 = (min_v.floor().max(0.0) as u32).saturating_sub(pad);
+    let wx1 = ((max_u.ceil().max(0.0) as u32) + 1 + pad).min(ifd_w);
+    let wy1 = ((max_v.ceil().max(0.0) as u32) + 1 + pad).min(ifd_h);
+
+    let caps = ZarrCaps::from_env();
+    let wb = read_chunk_window_for_band_with_caps(
+        store,
+        &sel_var.store_prefix,
+        sel_var.meta,
+        band_idx,
+        wx0,
+        wy0,
+        wx1,
+        wy1,
+        16,
+        &caps,
+    )
+    .await?;
+    let refs = wb.block_refs();
+    let mut src = wb.as_band_source(&refs);
+    if !q.unscale {
+        src.scale_offset = None;
+    }
+    if let Some(nd) = q.nodata {
+        src = src.with_nodata_override(Some(nd));
+    }
+
+    let mode = q.resample_mode();
+    let mut plane = vec![f32::NAN; n_px];
+    for i in 0..n_px {
+        let u = u_coords[i];
+        let v = v_coords[i];
+        if u.is_finite() && v.is_finite() {
+            plane[i] = sample_general(&src, u, v, mode);
+        }
+    }
+
+    let body = encode_zarr_plane(&plane, out_w, out_h, dst_bounds, dst_epsg, q, fmt);
+    Ok(binary_ok_with_etag(body, content_type, etag_key, if_none_match))
+}
+
+fn encode_zarr_plane(
+    plane: &[f32],
+    out_w: u32,
+    out_h: u32,
+    dst_bounds: [f64; 4],
+    dst_epsg: u16,
+    q: &ZarrQuery,
+    fmt: OutputFormat,
+) -> Bytes {
+    match fmt {
+        OutputFormat::Npy => {
+            let mut raw = Vec::with_capacity(plane.len() * 4);
+            for &v in plane {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            wrap_raw_f32_as_npy_with_mask(Bytes::from(raw), 1, out_h, out_w, q.return_mask)
+        }
+        OutputFormat::RawF32 => {
+            let mut raw = Vec::with_capacity(plane.len() * 4);
+            for &v in plane {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            encode_geotiff_f32(out_w, out_h, &raw, dst_bounds, dst_epsg, q.return_mask)
+        }
+        _ => {
+            let (rmin, rmax) = q.rescale.unwrap_or((0.0, 255.0));
+            let denom = if (rmax - rmin).abs() < 1e-12 {
+                1.0
+            } else {
+                rmax - rmin
+            };
+            let lut = q.colormap().lut();
+            let mut rgba = vec![0u8; plane.len() * 4];
+            for (i, &val) in plane.iter().enumerate() {
+                if val.is_finite() {
+                    let norm = ((val - rmin) / denom).clamp(0.0, 1.0);
+                    let idx = (norm * 255.0).round() as usize;
+                    let c = lut.rgb[idx];
+                    rgba[i * 4] = c[0];
+                    rgba[i * 4 + 1] = c[1];
+                    rgba[i * 4 + 2] = c[2];
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+            encode_rgba_output(out_w as usize, out_h as usize, &rgba, fmt, q.return_mask)
+        }
+    }
+}
+
+async fn handle_point(q: &ZarrQuery, coords: &str) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let Some((xs, ys)) = coords.split_once(',') else {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("expected /zarr/point/{{lon}},{{lat}}, got {coords:?}"),
+        });
+    };
+    let (Ok(px), Ok(py)) = (xs.trim().parse::<f64>(), ys.trim().parse::<f64>()) else {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("invalid coordinates {coords:?}"),
+        });
+    };
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
+
+    let (sx, sy) = if let Some(epsg) = q.coord_crs {
+        let src_crs = CrsModel::from_epsg(epsg).map_err(|e| ZarrError::UnsupportedCrs {
+            crs: format!("EPSG:{epsg}"),
+            detail: e.to_string(),
+        })?;
+        let (lon, lat) = src_crs.to_lonlat_deg(px, py);
+        geo.crs.model.from_lonlat_deg(lon, lat)
+    } else {
+        let lon = normalize_geographic_lon(px).ok_or_else(|| ZarrError::NotFound {
+            key: format!("longitude {px} out of range"),
+        })?;
+        geo.crs.model.from_lonlat_deg(lon, py)
+    };
+
+    let crs_to_pixel = geo.affine.invert().ok_or_else(|| ZarrError::IrregularGrid {
+        dim: geo.x_dim.clone(),
+        index: 0,
+        detail: "singular affine transform".into(),
+    })?;
+    let (col_f, row_f) = crs_to_pixel.forward(sx, sy);
+    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as i32;
+    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as i32;
+    let col = col_f.floor() as i32;
+    let row = row_f.floor() as i32;
+    if col < 0 || row < 0 || col >= ifd_w || row >= ifd_h {
+        return Err(ZarrError::NotFound {
+            key: format!("point ({px}, {py}) outside Zarr dataset bounds"),
+        });
+    }
+
+    let caps = ZarrCaps::from_env();
+    let wb = read_chunk_window_for_band_with_caps(
+        &store,
+        &sel_var.store_prefix,
+        sel_var.meta,
+        band_idx,
+        col as u32,
+        row as u32,
+        (col as u32) + 1,
+        (row as u32) + 1,
+        1,
+        &caps,
+    )
+    .await?;
+    let refs = wb.block_refs();
+    let mut src = wb.as_band_source(&refs);
+    if !q.unscale {
+        src.scale_offset = None;
+    }
+    if let Some(nd) = q.nodata {
+        src = src.with_nodata_override(Some(nd));
+    }
+
+    let val_json = if sel_var.meta.dtype.needs_wide_path() {
+        let v = src.sample_f64_checked(col, row);
+        if v.is_nan() { Value::Null } else { json!(v) }
+    } else {
+        let v = src.sample_checked(col, row);
+        if v.is_nan() { Value::Null } else { json!(v) }
+    };
+
+    let body = json!({
+        "coordinates": [px, py],
+        "values": [val_json],
+        "band_names": ["b1"],
+    });
+    Ok(json_ok(&body, "application/json"))
+}
+
+async fn handle_preview(
+    q: &ZarrQuery,
+    dims: Option<(u32, u32)>,
+    ext: Option<&str>,
+    raw_query: &str,
+    if_none_match: Option<&str>,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
+
+    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let (out_w, out_h) = match dims {
+        Some((w, h)) => (w, h),
+        None => {
+            let max_s = q.max_size.unwrap_or(1024);
+            if max_s == 0 || (ifd_w <= max_s && ifd_h <= max_s) {
+                (ifd_w.min(2048), ifd_h.min(2048))
+            } else {
+                let scale = (max_s as f64) / (ifd_w.max(ifd_h) as f64);
+                (
+                    ((ifd_w as f64 * scale).round() as u32).max(1),
+                    ((ifd_h as f64 * scale).round() as u32).max(1),
+                )
+            }
+        }
+    };
+
+    let (fmt, content_type) = parse_output_format(ext, q.format.as_deref());
+    let etag_key = format!("zarr:preview:{out_w}x{out_h}?{raw_query}");
+    render_zarr_rect(
+        &store,
+        &sel_var,
+        &geo,
+        band_idx,
+        &geo.crs.model,
+        geo.bounds,
+        geo.crs.epsg.unwrap_or(4326),
+        out_w,
+        out_h,
+        q,
+        fmt,
+        content_type,
+        &etag_key,
+        if_none_match,
+    )
+    .await
+}
+
+async fn handle_bbox(
+    q: &ZarrQuery,
+    bbox_str: &str,
+    dims: Option<(u32, u32)>,
+    ext: Option<&str>,
+    raw_query: &str,
+    if_none_match: Option<&str>,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let parts: Vec<f64> = bbox_str
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect();
+    if parts.len() != 4 || parts.iter().any(|v| !v.is_finite()) {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("invalid bbox {bbox_str:?} (expected minx,miny,maxx,maxy)"),
+        });
+    }
+    let (mut minx, miny, mut maxx, maxy) = (parts[0], parts[1], parts[2], parts[3]);
+    let dst_epsg = q.coord_crs.unwrap_or(4326);
+    let dst_crs = CrsModel::from_epsg(dst_epsg).map_err(|e| ZarrError::UnsupportedCrs {
+        crs: format!("EPSG:{dst_epsg}"),
+        detail: e.to_string(),
+    })?;
+    if matches!(dst_crs, CrsModel::Geographic) && minx > maxx {
+        maxx += 360.0;
+    }
+    if minx >= maxx || miny >= maxy {
+        return Err(ZarrError::InvalidSelection {
+            detail: format!("invalid bbox ordering ({minx},{miny},{maxx},{maxy})"),
+        });
+    }
+    let _ = &mut minx;
+
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let geo = resolve_geo(&store, &group, sel_var.meta).await?;
+    let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
+
+    let (out_w, out_h) = dims.unwrap_or((256, 256));
+    let (fmt, content_type) = parse_output_format(ext, q.format.as_deref());
+    let etag_key = format!("zarr:bbox:{bbox_str}:{out_w}x{out_h}?{raw_query}");
+    render_zarr_rect(
+        &store,
+        &sel_var,
+        &geo,
+        band_idx,
+        &dst_crs,
+        [minx, miny, maxx, maxy],
+        dst_epsg,
+        out_w,
+        out_h,
+        q,
+        fmt,
+        content_type,
+        &etag_key,
+        if_none_match,
+    )
+    .await
+}
+
+async fn handle_get_statistics(q: &ZarrQuery) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let (store, hierarchy) = open_store_and_hierarchy(q).await?;
+    let sel_var = select_variable(&hierarchy, q.group.as_deref(), q.variable.as_deref())?;
+    let group = hierarchy.group(q.group.as_deref())?;
+    let band_idx = resolve_band_index(&store, &group, &sel_var, q).await?;
+
+    let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
+    let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
+    let caps = ZarrCaps::from_env();
+    let wb = read_chunk_window_for_band_with_caps(
+        &store,
+        &sel_var.store_prefix,
+        sel_var.meta,
+        band_idx,
+        0,
+        0,
+        ifd_w,
+        ifd_h,
+        16,
+        &caps,
+    )
+    .await?;
+    let refs = wb.block_refs();
+    let mut src = wb.as_band_source(&refs);
+    if !q.unscale {
+        src.scale_offset = None;
+    }
+    if let Some(nd) = q.nodata {
+        src = src.with_nodata_override(Some(nd));
+    }
+
+    let mut pixels = Vec::with_capacity((ifd_w as usize) * (ifd_h as usize));
+    for r in 0..ifd_h as i32 {
+        for c in 0..ifd_w as i32 {
+            pixels.push(src.sample_checked(c, r));
+        }
+    }
+    let opts = StatsOptions::default();
+    let b1 = compute_f32_band_stats(&pixels, &sel_var.name, &opts);
+    Ok(json_ok(&json!({ "b1": b1 }), "application/json"))
 }
 
 #[cfg(test)]
