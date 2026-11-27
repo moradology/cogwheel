@@ -309,7 +309,7 @@ pub fn decode_tile_rows_exact(
             }
         }
         let mut guard = cell.borrow_mut();
-        let st_guard = ScratchShrinkGuard(&mut *guard);
+        let st_guard = ScratchShrinkGuard(&mut guard);
         let st = &mut *st_guard.0;
         if st.scratch.len() < expected_bytes {
             st.scratch.resize(expected_bytes, 0);
@@ -1218,7 +1218,10 @@ pub fn apply_alpha_band_to_tile(tile: &mut DecodedTile, alpha: &DecodedBand) {
 }
 
 fn apply_alpha_data_to_band(b: &mut DecodedBand, alpha: &BandData) {
-    mask_band_where(b, alpha.len(), |i, _| !(alpha.get_f32(i) > 0.0));
+    mask_band_where(b, alpha.len(), |i, _| {
+        let a = alpha.get_f32(i);
+        a <= 0.0 || a.is_nan()
+    });
 }
 
 /// Decompress a 1-bit (packed MSB-first per row) or 8-bit internal transparency mask tile

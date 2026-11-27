@@ -15,3 +15,6 @@ deadpool-postgres.workspace = true
 tokio-postgres-rustls.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
+
+[lints]
+workspace = true

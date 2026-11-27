@@ -321,12 +321,11 @@ impl DiskBlockCache {
             return;
         }
         let path = self.entry_path(key);
-        if let Some(parent) = path.parent() {
-            if fs::create_dir_all(parent).is_err() {
+        if let Some(parent) = path.parent()
+            && fs::create_dir_all(parent).is_err() {
                 self.write_errors.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-        }
         let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("cgz.tmp.{}.{seq}", std::process::id()));
 

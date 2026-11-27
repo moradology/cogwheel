@@ -599,11 +599,10 @@ impl TmsDef {
         let min_res = res * ov_factor.max(1.0);
         let mut min_z = first_z;
         for m in self.matrices {
-            if let Ok(z) = m.id.parse::<u8>() {
-                if m.cell_size >= min_res {
+            if let Ok(z) = m.id.parse::<u8>()
+                && m.cell_size >= min_res {
                     min_z = z;
                 }
-            }
         }
         (min_z.clamp(first_z, max_z), max_z)
     }
@@ -687,10 +686,10 @@ mod tests {
         let tms = lookup_tms("WorldCRS84Quad").unwrap();
         let m1 = tms.matrix(1).unwrap();
         // RFC 7946 w > e crossing antimeridian
-        let (c0, c1, _, _) = tms.tile_limits_for_wgs84_bounds(&m1, [170.0, -10.0, -170.0, 10.0]);
+        let (c0, c1, _, _) = tms.tile_limits_for_wgs84_bounds(m1, [170.0, -10.0, -170.0, 10.0]);
         assert_eq!((c0, c1), (0, m1.matrix_width - 1));
         // Unwrapped e > 180 crossing antimeridian
-        let (c0b, c1b, _, _) = tms.tile_limits_for_wgs84_bounds(&m1, [170.0, -20.0, 190.0, 0.0]);
+        let (c0b, c1b, _, _) = tms.tile_limits_for_wgs84_bounds(m1, [170.0, -20.0, 190.0, 0.0]);
         assert_eq!((c0b, c1b), (0, m1.matrix_width - 1));
     }
 }

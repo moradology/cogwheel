@@ -229,8 +229,8 @@ fn resolve_input_bbox(
     if is_geo {
         // Symmetric ±2-turn longitude normalisation (matching point routes) before RFC 7946 §5.2
         // antimeridian unwrap: shift both bounds by the same whole multiple of 360° if needed.
-        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0) {
-            if let (Some(n0), Some(n2)) = (
+        if (bbox[0] < -180.0 || bbox[0] > 180.0) && (bbox[2] < -180.0 || bbox[2] > 180.0)
+            && let (Some(n0), Some(n2)) = (
                 cogzilla_proj::normalize_geographic_lon(bbox[0]),
                 cogzilla_proj::normalize_geographic_lon(bbox[2]),
             ) {
@@ -240,7 +240,6 @@ fn resolve_input_bbox(
                     bbox[2] += shift;
                 }
             }
-        }
     }
     if bbox[0] > bbox[2] {
         if is_geo && bbox[0] >= -180.0 && bbox[0] <= 180.0 && bbox[2] >= -180.0 && bbox[2] <= 180.0
@@ -791,8 +790,8 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                     bad("expected a number");
                 }
             }
-            "quality" => {
-                if v != "lossless" {
+            "quality"
+                if v != "lossless" => {
                     if let Ok(qual) = v.parse::<f32>()
                         && qual.is_finite()
                     {
@@ -802,7 +801,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
                         bad("expected a finite quality in 1..=100 or 'lossless'");
                     }
                 }
-            }
             "expr" | "expression" | "index" => {
                 // Standard HTTP clients (httpx, requests, URLSearchParams) form-encode spaces as `+`
                 // and literal plus as `%2B`, while raw CLI/browser URLs often write `(b1+b2)` directly.
@@ -1097,13 +1095,12 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     if let Some(e) = pq.errors.first() {
         return Err(e.clone());
     }
-    if let Some(alg) = pq.algorithm.as_deref() {
-        if !crate::titiler::is_supported_algorithm(alg) {
+    if let Some(alg) = pq.algorithm.as_deref()
+        && !crate::titiler::is_supported_algorithm(alg) {
             return Err(format!(
                 "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
             ));
         }
-    }
 
     // {family}/tiles/{tms}[/{z}/{x}/{y}], {family}/{tms}/tilejson.json, {family}/{tms}/map.html,
     // {family}/{tms}/WMTSCapabilities.xml
@@ -1128,13 +1125,12 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
                 _ => None,
             }
         };
-        if let Some(tms) = tms {
-            if crate::tms::lookup_tms(tms).is_none() {
+        if let Some(tms) = tms
+            && crate::tms::lookup_tms(tms).is_none() {
                 return Err(format!(
                     "tile matrix set '{tms}' is not supported (see /tileMatrixSets)"
                 ));
             }
-        }
     }
 
     let has = |names: &[&str]| pq.keys.iter().find(|k| names.contains(&k.as_str())).cloned();
@@ -1151,47 +1147,41 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
     let is_tileset_meta = matches!(segs[0], "cog" | "stac" | "mosaicjson")
         && segs.get(1) == Some(&"tiles")
         && segs.len() <= 3;
-    if family != "colorMaps" {
-        if let Some(k) = has(&["orientation"]) {
+    if family != "colorMaps"
+        && let Some(k) = has(&["orientation"]) {
             return Err(format!("parameter '{k}' is only supported on /colorMaps routes"));
         }
-    }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics") || family == "colorMaps") {
-        if let Some(k) = has(&["width", "height"]) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("wms") || route("statistics") || family == "colorMaps")
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, map, wms, statistics, and colorMaps routes"
             ));
         }
-    }
-    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics")) {
-        if let Some(k) = has(&["dst_crs"]) {
+    if !(route("preview") || route("bbox") || route("feature") || is_ogc_map || route("statistics"))
+        && let Some(k) = has(&["dst_crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on preview, bbox, feature, map, and statistics routes"
             ));
         }
-    }
-    if !(route("bounds") || route("info") || is_ogc_map || route("wms") || is_tileset_meta) {
-        if let Some(k) = has(&["crs"]) {
+    if !(route("bounds") || route("info") || is_ogc_map || route("wms") || is_tileset_meta)
+        && let Some(k) = has(&["crs"]) {
             return Err(format!(
                 "parameter '{k}' is only supported on bounds, info, tiles, map, and wms routes"
             ));
         }
-    }
     if route("statistics") || route("asset_statistics") {
-        if let Some(k) = has(&["algorithm"]) {
-            if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
+        if let Some(k) = has(&["algorithm"])
+            && !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
                 return Err(format!(
                     "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
-        }
-        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics"))) {
-            if let Some(k) = has(&["expression", "expr", "index"]) {
+        if !(segs[0] == "cog" || (segs[0] == "stac" && route("statistics")))
+            && let Some(k) = has(&["expression", "expr", "index"]) {
                 return Err(format!(
                     "parameter '{k}' is only supported on /cog/statistics and /stac/statistics routes"
                 ));
             }
-        }
     } else if let Some(k) = has(&["p", "histogram_bins", "histogram_range", "categorical", "c"]) {
         return Err(format!("parameter '{k}' is only supported on statistics routes"));
     }
@@ -1199,21 +1189,18 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         if let Some(k) = has(&["algorithm"]) {
             return Err(format!("parameter '{k}' is not supported on point routes"));
         }
-    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets"))) {
-        if let Some(k) = has(&["coord_crs"]) {
+    } else if !(route("bbox") || route("feature") || route("statistics") || (segs[0] == "mosaicjson" && route("assets")))
+        && let Some(k) = has(&["coord_crs"]) {
             return Err(format!("parameter '{k}' is not supported on this route"));
         }
-    }
-    if route("bbox") && segs.len() >= 4 {
-        if let Some(k) = has(&["width", "height"]) {
+    if route("bbox") && segs.len() >= 4
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
-    }
-    if (route("preview") || route("feature")) && segs.len() >= 3 {
-        if let Some(k) = has(&["width", "height"]) {
+    if (route("preview") || route("feature")) && segs.len() >= 3
+        && let Some(k) = has(&["width", "height"]) {
             return Err(format!("parameter '{k}' is not supported when explicit {{w}}x{{h}} dimensions are given"));
         }
-    }
     let last_seg = segs.last().copied().unwrap_or("");
     if !matches!(last_seg, "tilejson.json" | "map.html" | "WMTSCapabilities.xml") && !is_tileset_meta {
         if let Some(k) = has(&["minzoom", "maxzoom", "tile_format", "tile_scale"]) {
@@ -2322,7 +2309,7 @@ fn wants_f32_geotiff(
         ),
         BandRequest::Single { .. } => {
             pq.unscale
-                || (!source_cog.is_some_and(|c| c.index.color_map.is_some())
+                || (source_cog.is_none_or(|c| c.index.color_map.is_none())
                     && !matches!(sample_type, cogzilla_tiff::SampleType::Uint8))
         }
         BandRequest::Rgb { .. } => {
@@ -4631,7 +4618,7 @@ fn expand_stac_asset_bidx(
         if needs_per_asset {
             let mut expanded_cogs = Vec::new();
             let mut slot_bands = Vec::new();
-            for (name, cog) in names.iter().zip(cogs.into_iter()) {
+            for (name, cog) in names.iter().zip(cogs) {
                 let nb = cog.index.full_res().samples_per_pixel;
                 let sel: &[u16] = stac_asset_selected_bands(pq, name).unwrap_or(&[1]);
                 for &b in sel {
@@ -6177,11 +6164,10 @@ where
             .is_some_and(is_compressible_content_type);
     if compressible {
         if let Some(existing) = resp.headers().get(hyper::header::VARY).and_then(|v| v.to_str().ok()) {
-            if !existing.to_ascii_lowercase().contains("accept-encoding") {
-                if let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
+            if !existing.to_ascii_lowercase().contains("accept-encoding")
+                && let Ok(hv) = HeaderValue::from_str(&format!("{existing}, Accept-Encoding")) {
                     resp.headers_mut().insert(hyper::header::VARY, hv);
                 }
-            }
         } else {
             resp.headers_mut()
                 .insert(hyper::header::VARY, HeaderValue::from_static("Accept-Encoding"));
@@ -6228,13 +6214,11 @@ where
 
     if is_head {
         let (mut parts, body) = resp.into_parts();
-        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT {
-            if let Some(len) = hyper::body::Body::size_hint(&body).exact() {
-                if let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
+        if parts.status != StatusCode::NOT_MODIFIED && parts.status != StatusCode::NO_CONTENT
+            && let Some(len) = hyper::body::Body::size_hint(&body).exact()
+                && let Ok(hv) = HeaderValue::from_str(&len.to_string()) {
                     parts.headers.insert(hyper::header::CONTENT_LENGTH, hv);
                 }
-            }
-        }
         return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
     }
     Ok(resp)
@@ -7073,7 +7057,7 @@ where
                 let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or({
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -7128,7 +7112,7 @@ where
                 let urls = query_mosaicjson_wgs84_bbox(&mj, wgs_bbox);
                 let ext = ext_opt.or(pq.format_param.as_deref()).unwrap_or("png");
                 let (fmt, ct) = parse_ext_format(ext, pq.webp_quality, pq.jpeg_quality)?;
-                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or_else(|| {
+                let (dst_crs, dst_epsg) = resolve_bbox_dst_crs(&pq).unwrap_or({
                     if pq.coord_crs_3857 {
                         (cogzilla_proj::CrsModel::Epsg3857, 3857)
                     } else {
@@ -8304,7 +8288,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut map = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
+                for (name, cog) in names.into_iter().zip(cogs) {
                     let mut info = build_cog_info(&engine, &cog)?;
                     if pq.bounds_crs.is_some() {
                         let crs = engine.get_or_build_crs(&cog)?;
@@ -8324,7 +8308,7 @@ where
                 let (names, cogs, _) =
                     resolve_stac_assets(&engine, &item, &pq.assets, None, None).await?;
                 let mut props = serde_json::Map::new();
-                for (name, cog) in names.into_iter().zip(cogs.into_iter()) {
+                for (name, cog) in names.into_iter().zip(cogs) {
                     let mut info = build_cog_info(&engine, &cog)?;
                     if pq.bounds_crs.is_some() {
                         let crs = engine.get_or_build_crs(&cog)?;
@@ -8384,10 +8368,10 @@ where
                     ordered[idx] = Some(st);
                 }
                 let mut map = serde_json::Map::new();
-                for (name, st) in names.into_iter().zip(ordered.into_iter()) {
+                for (name, st) in names.into_iter().zip(ordered) {
                     if let Some(mut st) = st {
-                        if let Some(sel) = stac_asset_selected_bands(&pq, &name) {
-                            if let Some(obj) = st.as_object() {
+                        if let Some(sel) = stac_asset_selected_bands(&pq, &name)
+                            && let Some(obj) = st.as_object() {
                                 let mut filtered = serde_json::Map::new();
                                 for &b in sel {
                                     let k = format!("b{b}");
@@ -8397,7 +8381,6 @@ where
                                 }
                                 st = serde_json::Value::Object(filtered);
                             }
-                        }
                         map.insert(name, st);
                     }
                 }
@@ -8613,7 +8596,7 @@ where
                 }
                 let mut map = serde_json::Map::new();
                 let mut band_idx = 1usize;
-                for (name, slot) in names.iter().zip(ordered.into_iter()) {
+                for (name, slot) in names.iter().zip(ordered) {
                     let Some((nb, st)) = slot else { continue };
                     if let Some(obj) = st.as_object() {
                         let bands_iter: Vec<usize> = if stac_asset_expr(&pq, name).is_some() {
@@ -8916,7 +8899,7 @@ where
                         // Merge bands in numeric order 1..=nb across assets to match TiTiler's POST /stac/statistics.
                         let mut merged = serde_json::Map::new();
                         let mut b_counter = 1usize;
-                        for (name, slot) in names_c.iter().zip(ordered.into_iter()) {
+                        for (name, slot) in names_c.iter().zip(ordered) {
                             let Some((nb, st)) = slot else { continue };
                             if let Some(obj) = st.as_object() {
                                 let bands_iter: Vec<usize> =
@@ -9578,7 +9561,7 @@ where
                 let single_asset_expr = names.len() == 1 && rewritten_expr.is_some();
                 let single_band_per_asset = (names.len() > 1 && rewritten_expr.is_some()) || pq.asset_as_band;
                 let mut used_asset_bidx = false;
-                for (name, pt) in names.into_iter().zip(ordered.into_iter()) {
+                for (name, pt) in names.into_iter().zip(ordered) {
                     if let Some(vs) = pt.as_ref().and_then(|p| p["values"].as_array()) {
                         if !single_asset_expr
                             && let Some(expr_str) = stac_asset_expr(&pq, &name)
@@ -11985,9 +11968,9 @@ fn binary_or_plain_response(
     if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
     if let Some(etag_hv) = etag {
-        if let Some(inm) = if_none_match {
-            if let Ok(etag_str) = etag_hv.to_str() {
-                if etag_matches(inm, etag_str) {
+        if let Some(inm) = if_none_match
+            && let Ok(etag_str) = etag_hv.to_str()
+                && etag_matches(inm, etag_str) {
                     engine
                         .stats
                         .http_304_not_modified
@@ -12001,8 +11984,6 @@ fn binary_or_plain_response(
                         .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
                     return resp;
                 }
-            }
-        }
         let mut resp = plain_resp(StatusCode::OK, bytes, content_type);
         resp.headers_mut().insert(ETAG, etag_hv);
         resp.headers_mut()
@@ -12605,10 +12586,12 @@ mod tests {
         );
 
         // 2. cog_standard_epsg returns None for user-defined projected CRS (32767) even with geographic_type=4326
-        let mut gk = cogzilla_tiff::GeoKeys::default();
-        gk.model_type = Some(1);
-        gk.projected_cs_type = Some(32767);
-        gk.geographic_type = Some(4326);
+        let mut gk = cogzilla_tiff::GeoKeys {
+            model_type: Some(1),
+            projected_cs_type: Some(32767),
+            geographic_type: Some(4326),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         assert_eq!(cog_standard_epsg(&gk), None);
 
         // Standard projected EPSG returns Some(32610)
@@ -12616,9 +12599,11 @@ mod tests {
         assert_eq!(cog_standard_epsg(&gk), Some(32610));
 
         // Pure geographic returns Some(4326)
-        let mut gk_geo = cogzilla_tiff::GeoKeys::default();
-        gk_geo.model_type = Some(2);
-        gk_geo.geographic_type = Some(4326);
+        let gk_geo = cogzilla_tiff::GeoKeys {
+            model_type: Some(2),
+            geographic_type: Some(4326),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         assert_eq!(cog_standard_epsg(&gk_geo), Some(4326));
 
         // 3. GEOTIFF_CONTENT_TYPE matches parse_ext_format("tif", ...)

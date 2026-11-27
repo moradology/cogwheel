@@ -125,13 +125,12 @@ impl SingleflightBlockCache {
 
     #[inline(always)]
     pub fn try_get_fast(&self, key: &BlockKey) -> Option<Arc<DecodedTile>> {
-        if let Some(entry) = self.map.get(key) {
-            if let CacheEntry::Ready { tile, last_used } = entry.value() {
+        if let Some(entry) = self.map.get(key)
+            && let CacheEntry::Ready { tile, last_used } = entry.value() {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 last_used.store(self.tick(), Ordering::Relaxed);
                 return Some(tile.clone());
             }
-        }
         None
     }
 

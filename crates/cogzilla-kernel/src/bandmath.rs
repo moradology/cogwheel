@@ -3,7 +3,7 @@
 /// and ~5x faster than `libm::log10f`, fully inlineable and branch-minimal.
 #[inline(always)]
 pub fn fast_db_from_power(power: f32) -> f32 {
-    if !(power > 0.0) {
+    if power <= 0.0 || power.is_nan() {
         return f32::NAN;
     }
     if !power.is_finite() {

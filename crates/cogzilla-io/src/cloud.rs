@@ -1063,12 +1063,11 @@ async fn fetch_azure_inner(
         .unwrap_or_else(|| format!("https://{}.blob.core.windows.net", target.account));
     let clean_url = format!("{}/{}/{}", base, target.container, encode_path(&target.blob));
     let mut url = clean_url.clone();
-    if !cfg.no_sign {
-        if let Some(sas) = &cfg.sas_token {
+    if !cfg.no_sign
+        && let Some(sas) = &cfg.sas_token {
             url.push('?');
             url.push_str(sas);
         }
-    }
     let range_hdr = range.map(|(start, end)| format!("bytes={start}-{}", end.saturating_sub(1)));
     let managed_bearer = if !cfg.no_sign
         && cfg.sas_token.is_none()

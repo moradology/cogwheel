@@ -1130,11 +1130,10 @@ pub async fn query_point(
     let pidx = (ly as usize) * (ifd.tile_width as usize) + (lx as usize);
 
     let maybe_unscale = |b: usize, v: f64| -> f64 {
-        if let Some(nd) = nodata_override {
-            if !nd.is_nan() && v == nd as f64 {
+        if let Some(nd) = nodata_override
+            && !nd.is_nan() && v == nd as f64 {
                 return f64::NAN;
             }
-        }
         if unscale && !v.is_nan() {
             let sc = cog.index.scales_f64.get(b).copied().unwrap_or(1.0);
             let off = cog.index.offsets_f64.get(b).copied().unwrap_or(0.0);
@@ -1198,7 +1197,8 @@ pub async fn query_point(
 }
 
 /// Per-band statistics accumulator: uses exact O(1)-memory counting histograms for `U8`/`U16`
-/// bands (zero sort, zero per-pixel enum dispatch) and O(N) Quickselect for `F32` bands.
+/// bands (zero sort, zero per-pixel enum dispatch) and O(N) radix sort for `F32` bands.
+#[allow(clippy::large_enum_variant)] // Inline 2 KiB U8 histogram avoids a heap alloc per band
 enum BandStatsAcc {
     HistU8([u64; 256]),
     HistU16(Vec<u64>),
@@ -2176,11 +2176,10 @@ impl BandStatsAcc {
     ) -> serde_json::Value {
         match self {
             Self::HistU8(mut hist) => {
-                if let Some(nd) = nodata_override {
-                    if nd.is_finite() && nd >= 0.0 && nd <= 255.0 && nd.fract() == 0.0 {
+                if let Some(nd) = nodata_override
+                    && nd.is_finite() && (0.0..=255.0).contains(&nd) && nd.fract() == 0.0 {
                         hist[nd as usize] = 0;
                     }
-                }
                 Self::finalize_hist_with_opts(
                     &hist,
                     denom_pixels,
@@ -2193,11 +2192,10 @@ impl BandStatsAcc {
                 )
             }
             Self::HistU16(mut hist) => {
-                if let Some(nd) = nodata_override {
-                    if nd.is_finite() && nd >= 0.0 && nd <= 65535.0 && nd.fract() == 0.0 {
+                if let Some(nd) = nodata_override
+                    && nd.is_finite() && (0.0..=65535.0).contains(&nd) && nd.fract() == 0.0 {
                         hist[nd as usize] = 0;
                     }
-                }
                 Self::finalize_hist_with_opts(
                     &hist,
                     denom_pixels,
@@ -3100,11 +3098,11 @@ fn build_stats_separable_coords(
 }
 
 #[cfg(feature = "gpu")]
-fn stats_band_blocks<'a>(
-    fetched: &'a StatsTiles,
+fn stats_band_blocks(
+    fetched: &StatsTiles,
     n_tiles: usize,
     bi: usize,
-) -> Vec<Option<&'a cogzilla_codec::DecodedBand>> {
+) -> Vec<Option<&cogzilla_codec::DecodedBand>> {
     match fetched {
         StatsTiles::Chunky { tiles, .. } => tiles
             .iter()
@@ -3441,7 +3439,7 @@ fn compute_expression_statistics_cpu(
     }
 
     let mut out = serde_json::Map::new();
-    for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs.into_iter()).enumerate() {
+    for (i, ((expr_str, _), vals)) in exprs.iter().zip(accs).enumerate() {
         #[cfg(feature = "gpu")]
         if !opts.categorical
             && opts.histogram_edges.is_none()
@@ -4530,12 +4528,11 @@ pub async fn compute_statistics_with_options(
                         indices.push(None);
                         continue;
                     }
-                    if let Some(ref masks) = tile_masks {
-                        if masks[ti].is_none() {
+                    if let Some(ref masks) = tile_masks
+                        && masks[ti].is_none() {
                             indices.push(None);
                             continue;
                         }
-                    }
                     active_blocks += 1;
                     if active_blocks > MAX_STATS_BLOCKS {
                         return Err(EngineError::BadRequest(format!(
@@ -4600,12 +4597,11 @@ pub async fn compute_statistics_with_options(
                             all_indices.push(None);
                             continue;
                         }
-                        if let Some(ref masks) = tile_masks {
-                            if masks[ti].is_none() {
+                        if let Some(ref masks) = tile_masks
+                            && masks[ti].is_none() {
                                 all_indices.push(None);
                                 continue;
                             }
-                        }
                         active_blocks += 1;
                         if active_blocks > MAX_STATS_BLOCKS {
                             return Err(EngineError::BadRequest(format!(
@@ -4763,9 +4759,7 @@ pub fn extract_geojson_crs(
             .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON crs: {e}")))?;
         return Ok(Some(model));
     }
-    Err(EngineError::BadRequest(format!(
-        "unsupported GeoJSON crs member (expected type 'name' or 'EPSG'; pass ?coord_crs=EPSG:<code>)"
-    )))
+    Err(EngineError::BadRequest("unsupported GeoJSON crs member (expected type 'name' or 'EPSG'; pass ?coord_crs=EPSG:<code>)".to_string()))
 }
 
 impl PolygonMask {
@@ -5181,14 +5175,13 @@ impl PolygonMask {
             return false;
         }
         for poly in &self.polygons {
-            if let Some(outer) = poly.first() {
-                if Self::ring_contains(outer, lon, lat) {
+            if let Some(outer) = poly.first()
+                && Self::ring_contains(outer, lon, lat) {
                     let in_hole = poly[1..].iter().any(|h| Self::ring_contains(h, lon, lat));
                     if !in_hole {
                         return true;
                     }
                 }
-            }
         }
         false
     }
@@ -5263,7 +5256,6 @@ impl PolygonMask {
                                         push_densified(a, pa, mid, pm, depth + 1, project, out);
                                         out.push(pm);
                                         push_densified(mid, pm, b, pb, depth + 1, project, out);
-                                        return;
                                     }
                                 }
                             }
@@ -7427,11 +7419,10 @@ async fn render_bbox_core(
                         } else {
                             for px in x0..x1 {
                                 let lon = bbox[0] + (px as f64 + 0.5) * dlx;
-                                if let Some(ref tm) = touched_mask {
-                                    if !tm[row_off + px] {
+                                if let Some(ref tm) = touched_mask
+                                    && !tm[row_off + px] {
                                         continue;
                                     }
-                                }
                                 let (sx, sy) = to_src_crs(lon, lat);
                                 if !sx.is_finite() || !sy.is_finite() {
                                     continue;

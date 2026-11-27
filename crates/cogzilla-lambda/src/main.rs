@@ -110,12 +110,11 @@ async fn lambda_handler(engine: Arc<TileEngine>, event: Request) -> Result<Respo
     let (mut new_uri, stage_prefix) = strip_stage_prefix(&parts.uri, stage.as_deref());
     // API GW v2 stage root without trailing slash (`rawPath == "/{stage}"`): `lambda_http`
     // prepends `/{stage}` to produce `/{stage}/{stage}`, so strip the second copy cleanly.
-    if let Some(ref prefix) = stage_prefix {
-        if public_path.as_deref() == Some(prefix.as_str()) && new_uri.path() == prefix.as_str() {
+    if let Some(ref prefix) = stage_prefix
+        && public_path.as_deref() == Some(prefix.as_str()) && new_uri.path() == prefix.as_str() {
             let (norm_uri, _) = strip_stage_prefix(&new_uri, stage.as_deref());
             new_uri = norm_uri;
         }
-    }
     parts.uri = new_uri;
     // Only inject `x-forwarded-prefix: /{stage}` when the public request path actually begins
     // with `/{stage}` (avoids breaking custom domains mapped to a named stage).
@@ -128,11 +127,10 @@ async fn lambda_handler(engine: Arc<TileEngine>, event: Request) -> Result<Respo
             }
             None => true,
         };
-        if public_has_stage && !parts.headers.contains_key("x-forwarded-prefix") {
-            if let Ok(hv) = lambda_http::http::HeaderValue::from_str(&prefix) {
+        if public_has_stage && !parts.headers.contains_key("x-forwarded-prefix")
+            && let Ok(hv) = lambda_http::http::HeaderValue::from_str(&prefix) {
                 parts.headers.insert("x-forwarded-prefix", hv);
             }
-        }
     }
     let req_bytes = match body {
         Body::Empty => Bytes::new(),

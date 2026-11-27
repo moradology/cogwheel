@@ -992,7 +992,7 @@ impl TileEngine {
                         .tiles_served
                         .fetch_add(items.len() as u64, Ordering::Relaxed);
                     self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
-                    for (item, bytes) in items.into_iter().zip(batch_out.into_iter()) {
+                    for (item, bytes) in items.into_iter().zip(batch_out) {
                         results[item.req_idx] = Some(Ok(bytes));
                     }
                 }
@@ -1123,8 +1123,8 @@ impl TileEngine {
                     format: req.format,
                 };
                 #[cfg(feature = "gpu")]
-                if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu
+                if let Some(gpu) = &self.gpu
+                    && let Some(bytes) = gpu
                         .try_render_single_band::<N>(
                             cog.id, ifd_idx, band0, tx0, ty0, &plan, &src, &style,
                         )
@@ -1133,7 +1133,6 @@ impl TileEngine {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
-                }
                 Ok(run_cpu_render(N, style.resample, || {
                     render_single_band::<N>(&plan, &src, &style)
                 }))
@@ -1189,8 +1188,8 @@ impl TileEngine {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
                 #[cfg(feature = "gpu")]
-                if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu
+                if let Some(gpu) = &self.gpu
+                    && let Some(bytes) = gpu
                         .try_render_terrain::<N>(
                             cog.id,
                             ifd_idx,
@@ -1208,7 +1207,6 @@ impl TileEngine {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
-                }
                 Ok(run_cpu_render(N, req.resample, || {
                     render_terrain_tile::<N>(&plan, &src, *encoding, req.resample, req.format)
                 }))
@@ -1277,8 +1275,8 @@ impl TileEngine {
                     format: req.format,
                 };
                 #[cfg(feature = "gpu")]
-                if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu
+                if let Some(gpu) = &self.gpu
+                    && let Some(bytes) = gpu
                         .try_render_dem::<N>(
                             cog.id,
                             ifd_idx,
@@ -1296,7 +1294,6 @@ impl TileEngine {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
-                }
                 Ok(run_cpu_render(N, style.resample, || {
                     render_dem_algorithm::<N>(&plan, &src, *algorithm, pixel_size_m, &style)
                 }))
@@ -1350,8 +1347,8 @@ impl TileEngine {
                     format: req.format,
                 };
                 #[cfg(feature = "gpu")]
-                if let Some(gpu) = &self.gpu {
-                    if let Some(bytes) = gpu
+                if let Some(gpu) = &self.gpu
+                    && let Some(bytes) = gpu
                         .try_render_spectral::<N>(
                             cog.id,
                             ifd_idx,
@@ -1366,7 +1363,6 @@ impl TileEngine {
                         self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
-                }
                 Ok(run_cpu_render(N, style.resample, || {
                     render_bandmath1::<N>(&plan, &src, *expr, &style)
                 }))
@@ -1437,8 +1433,8 @@ impl TileEngine {
                             .with_scale_offset(s1, o1),
                         ];
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_sar_rgb::<N>(
                                     cog.id,
                                     ifd_idx,
@@ -1452,7 +1448,6 @@ impl TileEngine {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_sar_rgb::<N>(&plan, &srcs, &style)
                 }))
@@ -1490,8 +1485,8 @@ impl TileEngine {
                             .with_scale_offset(s1, o1),
                         ];
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_sar_rgb::<N>(
                                     cog.id,
                                     ifd_idx,
@@ -1505,7 +1500,6 @@ impl TileEngine {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_sar_rgb::<N>(&plan, &srcs, &style)
                 }))
@@ -1598,15 +1592,14 @@ impl TileEngine {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
                                 .await
                             {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                             render_rgb_bands::<N>(&plan, &srcs, &style)
                         }))
@@ -1671,15 +1664,14 @@ impl TileEngine {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_rgb::<N>(cog.id, ifd_idx, *bands_1based, &plan, &srcs, &style)
                                 .await
                             {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                             render_rgb_bands::<N>(&plan, &srcs, &style)
                         }))
@@ -1754,8 +1746,8 @@ impl TileEngine {
                             .with_scale_offset(s1, o1),
                         ];
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
                                     cog.id,
                                     ifd_idx,
@@ -1770,7 +1762,6 @@ impl TileEngine {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_bandmath2::<N>(&plan, &srcs, *expr, &style)
                 }))
@@ -1808,8 +1799,8 @@ impl TileEngine {
                             .with_scale_offset(s1, o1),
                         ];
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
                                     cog.id,
                                     ifd_idx,
@@ -1824,7 +1815,6 @@ impl TileEngine {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_bandmath2::<N>(&plan, &srcs, *expr, &style)
                 }))
@@ -1910,8 +1900,8 @@ impl TileEngine {
                             .with_scale_offset(s2, o2),
                         ];
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
                                     cog.id,
                                     ifd_idx,
@@ -1926,7 +1916,6 @@ impl TileEngine {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_bandmath3::<N>(&plan, &srcs, *expr, &style)
                 }))
@@ -1984,8 +1973,8 @@ impl TileEngine {
                             .with_scale_offset(s2, o2),
                         ];
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_spectral::<N>(
                                     cog.id,
                                     ifd_idx,
@@ -2000,7 +1989,6 @@ impl TileEngine {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_bandmath3::<N>(&plan, &srcs, *expr, &style)
                 }))
@@ -2083,15 +2071,14 @@ impl TileEngine {
                             })
                             .collect();
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
                                 .await
                             {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height))
                 }))
@@ -2138,15 +2125,14 @@ impl TileEngine {
                             })
                             .collect();
                         #[cfg(feature = "gpu")]
-                        if let Some(gpu) = &self.gpu {
-                            if let Some(bytes) = gpu
+                        if let Some(gpu) = &self.gpu
+                            && let Some(bytes) = gpu
                                 .try_render_expr::<N>(cog.id, ifd_idx, &plan, &srcs, prog, &style)
                                 .await
                             {
                                 self.stats.gpu_dispatches.fetch_add(1, Ordering::Relaxed);
                                 return Ok(bytes);
                             }
-                        }
                         Ok(run_cpu_render(N, style.resample, || {
                     render_expr_vm::<N>(&plan, &srcs, prog, &style, (ifd.width, ifd.height))
                 }))
@@ -3545,9 +3531,11 @@ mod tests {
         ifd.tile_offsets = vec![0, 0, 0, 0].into_boxed_slice();
         ifd.tile_byte_counts = vec![0, 0, 0, payload.len() as u32].into_boxed_slice();
 
-        let mut geo_keys = cogzilla_tiff::GeoKeys::default();
-        geo_keys.model_type = Some(1);
-        geo_keys.projected_cs_type = Some(3857);
+        let geo_keys = cogzilla_tiff::GeoKeys {
+            model_type: Some(1),
+            projected_cs_type: Some(3857),
+            ..cogzilla_tiff::GeoKeys::default()
+        };
         let index = cogzilla_tiff::CogIndex {
             byte_order: cogzilla_tiff::ByteOrder::Little,
             is_bigtiff: false,

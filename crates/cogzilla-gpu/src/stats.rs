@@ -405,7 +405,7 @@ pub fn decode_stats_readback(
 ) -> GpuBandStats {
     let rb = std::mem::size_of::<ResolvedStats>();
     let hb = 2 * CDF_BINS * std::mem::size_of::<u32>();
-    if bytes.len() < rb + hb || (bytes.len() - rb - hb) % 4 != 0 {
+    if bytes.len() < rb + hb || !(bytes.len() - rb - hb).is_multiple_of(4) {
         return empty_stats(total_pixels, percentiles);
     }
     let n_bins = num_bins.clamp(1, CDF_BINS);

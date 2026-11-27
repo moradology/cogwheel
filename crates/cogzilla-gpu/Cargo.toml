@@ -16,3 +16,6 @@ cogzilla-codec = { path = "../cogzilla-codec" }
 cogzilla-kernel = { path = "../cogzilla-kernel" }
 cogzilla-tiff = { path = "../cogzilla-tiff" }
 zune-jpeg.workspace = true
+
+[lints]
+workspace = true

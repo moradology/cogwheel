@@ -306,26 +306,24 @@ fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
         return headers;
     }
     let mut push_line = |line: &str| {
-        if let Some((k, v)) = line.split_once(':') {
-            if let (Ok(name), Ok(mut val)) = (
+        if let Some((k, v)) = line.split_once(':')
+            && let (Ok(name), Ok(mut val)) = (
                 HeaderName::from_bytes(k.trim().as_bytes()),
                 HeaderValue::from_str(v.trim()),
             ) {
                 val.set_sensitive(true);
                 headers.insert(name, val);
             }
-        }
     };
 
-    if let Ok(path) = std::env::var("GDAL_HTTP_HEADER_FILE") {
-        if !path.trim().is_empty()
+    if let Ok(path) = std::env::var("GDAL_HTTP_HEADER_FILE")
+        && !path.trim().is_empty()
             && let Ok(contents) = std::fs::read_to_string(path.trim())
         {
             for line in contents.lines() {
                 push_line(line);
             }
         }
-    }
     if let Ok(raw) = std::env::var("GDAL_HTTP_HEADERS") {
         for part in raw.split(['\n', '\r']) {
             push_line(part);
@@ -918,14 +916,13 @@ impl CogStore {
             }
             impl Drop for OpenAbortGuard<'_> {
                 fn drop(&mut self) {
-                    if !self.done {
-                        if let Some((_, OpenSlot::InFlight(f))) = self.map.remove_if(
+                    if !self.done
+                        && let Some((_, OpenSlot::InFlight(f))) = self.map.remove_if(
                             &self.uri,
                             |_, v| matches!(v, OpenSlot::InFlight(cur) if Arc::ptr_eq(cur, &self.flight)),
                         ) {
                             f.notify.notify_waiters();
                         }
-                    }
                 }
             }
             let my_flight = own_flight.expect("owner branch always allocates OpenFlight");
@@ -1203,8 +1200,8 @@ impl CogStore {
                             cog.index.nodata_f64,
                             rows,
                         )?;
-                        if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                            if mask_ifd.tile_width == ifd.tile_width
+                        if let Some(mask_ifd) = ifd.mask_ifd.as_deref()
+                            && mask_ifd.tile_width == ifd.tile_width
                                 && mask_ifd.tile_height == ifd.tile_height
                             {
                                 let per_plane =
@@ -1231,7 +1228,6 @@ impl CogStore {
                                     SidecarTileRange::NotApplicable => {}
                                 }
                             }
-                        }
                         if let Some(alpha_plane) = planar_alpha_plane(ifd) {
                             match planar_alpha_tile_range(ifd, tile_idx, alpha_plane) {
                                 SidecarTileRange::Present(aoff, alen) => {
@@ -1518,8 +1514,8 @@ impl CogStore {
                     let mut decode_err: Option<IoError> = None;
 
                     for (orig_slot, guard_opt, offset, count) in owned.drain(..) {
-                        if decode_set.len() >= num_workers {
-                            if let Some(res) = decode_set.join_next().await {
+                        if decode_set.len() >= num_workers
+                            && let Some(res) = decode_set.join_next().await {
                                 match res {
                                     Ok(Ok((s, arc))) => results[s] = Some(arc),
                                     Ok(Err(e)) => decode_err = Some(e),
@@ -1530,7 +1526,6 @@ impl CogStore {
                                     }
                                 }
                             }
-                        }
                         let rows = tile_indices[orig_slot]
                             .map(|tidx| ifd.block_height(tidx))
                             .unwrap_or(ifd.tile_height);
@@ -1599,11 +1594,10 @@ impl CogStore {
                                 .unwrap_or(ifd.tile_height);
                             let mut decoded =
                                 decode_tile_rows(slice, ifd, byte_order, nodata, rows)?;
-                            if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                                if mask_ifd.tile_width == ifd.tile_width
+                            if let Some(mask_ifd) = ifd.mask_ifd.as_deref()
+                                && mask_ifd.tile_width == ifd.tile_width
                                     && mask_ifd.tile_height == ifd.tile_height
-                                {
-                                    if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                                    && let Some(Some(tidx)) = tile_indices.get(orig_slot) {
                                         let per_plane = (ifd.tiles_across as usize)
                                             * (ifd.tiles_down as usize);
                                         let mask_idx = (*tidx as usize) % per_plane.max(1);
@@ -1633,10 +1627,8 @@ impl CogStore {
                                             SidecarTileRange::NotApplicable => {}
                                         }
                                     }
-                                }
-                            }
-                            if let Some(ap) = alpha_plane {
-                                if let Some(Some(tidx)) = tile_indices.get(orig_slot) {
+                            if let Some(ap) = alpha_plane
+                                && let Some(Some(tidx)) = tile_indices.get(orig_slot) {
                                     match planar_alpha_tile_range(ifd, *tidx, ap) {
                                         SidecarTileRange::Present(aoff, alen) => {
                                             let Some(aslice) = cog.source.local_slice(aoff, alen)
@@ -1662,7 +1654,6 @@ impl CogStore {
                                         SidecarTileRange::NotApplicable => {}
                                     }
                                 }
-                            }
                             Ok(decoded)
                         })();
                         let decoded = match decode_res {
@@ -1735,12 +1726,9 @@ impl CogStore {
                                         None => None,
                                     };
                                     let decoded_opt = tokio::task::spawn_blocking(move || {
-                                        let Some(compressed) = dc_c.read_verified_sync(key, &path)
-                                        else {
-                                            return None;
-                                        };
-                                        if compressed.len() == count as usize {
-                                            if let Ok(decoded) = decode_tile_rows(
+                                        let compressed = dc_c.read_verified_sync(key, &path)?;
+                                        if compressed.len() == count as usize
+                                            && let Ok(decoded) = decode_tile_rows(
                                                 &compressed,
                                                 &m,
                                                 byte_order,
@@ -1749,7 +1737,6 @@ impl CogStore {
                                             ) {
                                                 return Some(Arc::new(decoded));
                                             }
-                                        }
                                         // Stale length or undecodable payload: evict from disk cache
                                         // so the remote refetch can persist the fresh block.
                                         dc_c.invalidate(key);
@@ -1887,8 +1874,8 @@ impl CogStore {
                                         .get_or_insert_with(|| Arc::new(clone_for_decode(ifd)))
                                         .clone();
                                     for item in span.items {
-                                        if decode_set.len() >= num_workers {
-                                            if let Some(res) = decode_set.join_next().await {
+                                        if decode_set.len() >= num_workers
+                                            && let Some(res) = decode_set.join_next().await {
                                                 match res {
                                                     Ok(Ok((s, arc))) => results[s] = Some(arc),
                                                     Ok(Err(e)) => fetch_err = Some(e),
@@ -1901,7 +1888,6 @@ impl CogStore {
                                                     }
                                                 }
                                             }
-                                        }
                                         let (orig_slot, guard_opt, _, _) = &mut owned[item.slot];
                                         let orig_slot = *orig_slot;
                                         let rel_start = (item.offset - span.start) as usize;
@@ -2005,8 +1991,8 @@ impl CogStore {
                                         vec![None; span.items.len()];
                                     let mut sparse_transparent_by_slot: Vec<bool> =
                                         vec![false; span.items.len()];
-                                    if let Some(mask_ifd) = ifd.mask_ifd.as_deref() {
-                                        if mask_ifd.tile_width == ifd.tile_width
+                                    if let Some(mask_ifd) = ifd.mask_ifd.as_deref()
+                                        && mask_ifd.tile_width == ifd.tile_width
                                             && mask_ifd.tile_height == ifd.tile_height
                                         {
                                             let per_plane = (ifd.tiles_across as usize)
@@ -2098,7 +2084,6 @@ impl CogStore {
                                                 }
                                             }
                                         }
-                                    }
 
                                     // If this IFD is a planar RGBA COG, coalesce and fetch paired
                                     // alpha-plane tiles for this span concurrently too.
@@ -2402,20 +2387,18 @@ impl CogStore {
             let retry_indices: Vec<Option<u32>> =
                 retry_slots.iter().map(|&(_, tidx)| Some(tidx)).collect();
             let recovered = Box::pin(self.get_blocks(cog, ifd_idx, &retry_indices)).await?;
-            for ((slot, _), tile) in retry_slots.into_iter().zip(recovered.into_iter()) {
+            for ((slot, _), tile) in retry_slots.into_iter().zip(recovered) {
                 results[slot] = tile;
             }
         }
 
         // Fill any duplicate slots that shared a tile_idx with an owned slot
         for (slot, &opt_idx) in tile_indices.iter().enumerate() {
-            if results[slot].is_none() {
-                if let Some(tile_idx) = opt_idx {
-                    if let Some(&first_slot) = seen_owned.get(&tile_idx) {
+            if results[slot].is_none()
+                && let Some(tile_idx) = opt_idx
+                    && let Some(&first_slot) = seen_owned.get(&tile_idx) {
                         results[slot] = results[first_slot].clone();
                     }
-                }
-            }
         }
 
         Ok(results)
@@ -2442,15 +2425,14 @@ impl CogStore {
         }
         let want = byte_len as usize;
         let dc_uri = cog.disk_cache_uri();
-        if let (Some(dc), Some(dcu)) = (&self.disk_cache, &dc_uri) {
-            if let Some(cached) = dc.get(dcu, ifd_idx as u16, tile_idx).await {
+        if let (Some(dc), Some(dcu)) = (&self.disk_cache, &dc_uri)
+            && let Some(cached) = dc.get(dcu, ifd_idx as u16, tile_idx).await {
                 if cached.len() == want {
                     return Ok(cached);
                 }
                 let key = DiskBlockCache::key_bytes(dcu, ifd_idx as u16, tile_idx);
                 dc.invalidate(key);
             }
-        }
         let end = offset.checked_add(byte_len as u64).ok_or_else(|| {
             IoError::Tiff(TiffError::NeedMoreBytes {
                 required: u64::MAX,

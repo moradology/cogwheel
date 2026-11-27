@@ -317,12 +317,11 @@ impl DynamicCredsCache {
                 .filter(|s| !s.trim().is_empty()),
         };
 
-        if let Some(url) = ecs_url {
-            if let Some(creds) = fetch_ecs_credentials(client, &url).await {
+        if let Some(url) = ecs_url
+            && let Some(creds) = fetch_ecs_credentials(client, &url).await {
                 *self.cached.write() = Some(CachedDynamicCreds::Creds(creds.clone()));
                 return Some(creds);
             }
-        }
 
         // 2. Web Identity Token / EKS IRSA (AWS_WEB_IDENTITY_TOKEN_FILE + AWS_ROLE_ARN)
         if let Some(creds) = fetch_web_identity_credentials(client).await {
@@ -331,12 +330,11 @@ impl DynamicCredsCache {
         }
 
         // 3. EC2 IMDSv2 (only when not explicitly disabled via AWS_EC2_METADATA_DISABLED=true)
-        if !env_truthy("AWS_EC2_METADATA_DISABLED") {
-            if let Some(creds) = fetch_imds_v2_credentials(client).await {
+        if !env_truthy("AWS_EC2_METADATA_DISABLED")
+            && let Some(creds) = fetch_imds_v2_credentials(client).await {
                 *self.cached.write() = Some(CachedDynamicCreds::Creds(creds.clone()));
                 return Some(creds);
             }
-        }
 
         *self.cached.write() = Some(CachedDynamicCreds::Unavailable(
             Instant::now() + Duration::from_secs(60),
@@ -1040,11 +1038,10 @@ async fn fetch_s3_inner(
                 continue;
             }
             Err(e) => {
-                if let Some(p) = permit {
-                    if is_retryable_transport_error(&e) {
+                if let Some(p) = permit
+                    && is_retryable_transport_error(&e) {
                         p.on_throttle();
                     }
-                }
                 return Err(IoError::Http(e.without_url()));
             }
         };
@@ -1102,11 +1099,10 @@ async fn fetch_s3_inner(
                     continue;
                 }
                 Err(IoError::Http(e)) => {
-                    if let Some(p) = permit {
-                        if is_retryable_transport_error(&e) {
+                    if let Some(p) = permit
+                        && is_retryable_transport_error(&e) {
                             p.on_throttle();
                         }
-                    }
                     return Err(IoError::Http(e.without_url()));
                 }
                 Err(e) => return Err(e),
@@ -1115,8 +1111,8 @@ async fn fetch_s3_inner(
 
         // Automatic S3 bucket region discovery on 301 / 307 / 400 / 403 with `x-amz-bucket-region`.
         // Strictly validate region syntax to prevent SSRF/credential exfiltration via spoofed headers.
-        if !region_redirected && matches!(status, 301 | 307 | 400 | 403) {
-            if let Some(discovered) = resp
+        if !region_redirected && matches!(status, 301 | 307 | 400 | 403)
+            && let Some(discovered) = resp
                 .headers()
                 .get("x-amz-bucket-region")
                 .and_then(|v| v.to_str().ok())
@@ -1132,7 +1128,6 @@ async fn fetch_s3_inner(
                 drop(permit);
                 continue;
             }
-        }
 
         // Transient S3 retry (429 SlowDown, 500, 502, 503 ServiceUnavailable, 504)
         if attempt < cfg.max_retries && is_retryable_status(status) {
@@ -1149,11 +1144,10 @@ async fn fetch_s3_inner(
             continue;
         }
 
-        if let Some(p) = permit {
-            if is_retryable_status(status) {
+        if let Some(p) = permit
+            && is_retryable_status(status) {
                 p.on_throttle();
             }
-        }
         return Err(IoError::HttpStatus {
             status,
             url: crate::backend::redact_http_url(&url),

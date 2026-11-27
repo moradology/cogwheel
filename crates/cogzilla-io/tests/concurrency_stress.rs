@@ -44,8 +44,8 @@ async fn start_mock_range_server(file_bytes: Arc<Vec<u8>>, delay_ms: u64) -> (St
                             .get("range")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.strip_prefix("bytes="));
-                        if let Some(r) = range {
-                            if let Some((a, b)) = r.split_once('-') {
+                        if let Some(r) = range
+                            && let Some((a, b)) = r.split_once('-') {
                                 let start: usize = a.parse().unwrap_or(0);
                                 let end_incl: usize = b.parse().unwrap_or(total - 1).min(total - 1);
                                 let slice = &data[start..=end_incl];
@@ -63,7 +63,6 @@ async fn start_mock_range_server(file_bytes: Arc<Vec<u8>>, delay_ms: u64) -> (St
                                 );
                                 return Ok::<_, Infallible>(resp);
                             }
-                        }
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
                     }
                 });
@@ -220,7 +219,7 @@ async fn cache_thundering_herd_stays_bounded_and_exact() {
                             tokio::task::yield_now().await;
                         }
                         // Abort 20% of owned fetches to hammer abort + waiter recovery
-                        if rng % 5 == 0 {
+                        if rng.is_multiple_of(5) {
                             drop(guard);
                         } else {
                             guard.complete(make_test_tile(BLOCK_FLOATS, tidx as f32));
@@ -230,13 +229,12 @@ async fn cache_thundering_herd_stays_bounded_and_exact() {
                         let fut = notify.notified();
                         tokio::pin!(fut);
                         fut.as_mut().enable();
-                        if let Some(Err(live)) = c.peek_state(&key) {
-                            if Arc::ptr_eq(&notify, &live) {
-                                let _ = tokio::time::timeout(Duration::from_secs(2), fut)
+                        if let Some(Err(live)) = c.peek_state(&key)
+                            && Arc::ptr_eq(&notify, &live) {
+                                tokio::time::timeout(Duration::from_secs(2), fut)
                                     .await
                                     .expect("singleflight waiter deadlocked!");
                             }
-                        }
                     }
                 }
             }
@@ -424,8 +422,8 @@ async fn flaky_remote_singleflight_and_aborts_never_deadlock() {
                             .get("range")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.strip_prefix("bytes="));
-                        if let Some(r) = range {
-                            if let Some((a, b)) = r.split_once('-') {
+                        if let Some(r) = range
+                            && let Some((a, b)) = r.split_once('-') {
                                 let start: usize = a.parse().unwrap_or(0);
                                 let end_incl: usize = b.parse().unwrap_or(total - 1).min(total - 1);
                                 let slice = &data[start..=end_incl];
@@ -443,7 +441,6 @@ async fn flaky_remote_singleflight_and_aborts_never_deadlock() {
                                 );
                                 return Ok::<_, Infallible>(resp);
                             }
-                        }
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
                     }
                 });
@@ -563,8 +560,8 @@ async fn aimd_limiter_bounds_upstream_concurrency_and_adapts_on_503() {
                             .get("range")
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.strip_prefix("bytes="));
-                        if let Some(r) = range {
-                            if let Some((a, b)) = r.split_once('-') {
+                        if let Some(r) = range
+                            && let Some((a, b)) = r.split_once('-') {
                                 let start: usize = a.parse().unwrap_or(0);
                                 let end_incl: usize = b.parse().unwrap_or(total - 1).min(total - 1);
                                 let slice = &data[start..=end_incl];
@@ -582,7 +579,6 @@ async fn aimd_limiter_bounds_upstream_concurrency_and_adapts_on_503() {
                                 );
                                 return Ok::<_, Infallible>(resp);
                             }
-                        }
                         Ok::<_, Infallible>(Response::new(Full::new(Bytes::copy_from_slice(&data))))
                     }
                 });
