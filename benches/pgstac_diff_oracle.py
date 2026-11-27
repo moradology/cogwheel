@@ -948,6 +948,16 @@ def main() -> int:
                 f"/searches/{sid}/statistics?assets=red&assets=nir&max_size=64&algorithm=normalizedIndex", "POST", in_degrees)
         o.check("statistics of normalizedIndex, a histogram range", "zonal",
                 f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&max_size=64&algorithm=normalizedIndex&histogram_range=-1,1&histogram_bins=7", "POST", in_degrees)
+        # The other algorithms, applied to the mosaic's bands as titiler-pgstac's post_process does.
+        rgb = "assets=red&assets=green&assets=blue&asset_as_band=true"
+        for alg, assets in (("grayscale", rgb), ("bitonal", "assets=visual"), ("mean", rgb), ("median", "assets=visual"),
+                            ("std", rgb), ("var", "assets=visual"), ("min", rgb), ("max", "assets=visual"), ("sum", rgb),
+                            ("cast", "assets=red"), ("floor", "assets=visual"), ("terrarium", "assets=red"), ("terrainrgb", "assets=red")):
+            o.check(f"statistics of {alg}", "zonal", f"/searches/{sid}/statistics?{assets}&max_size=64&algorithm={alg}", "POST", in_degrees)
+        o.check("statistics of grayscale after band math", "zonal",
+                f"/searches/{sid}/statistics?assets=red&assets=nir&asset_as_band=true&expression=b1*2;b2;b1&max_size=64&algorithm=grayscale", "POST", in_degrees)
+        o.check("statistics of a mean after a pixel selection", "zonal",
+                f"/searches/{sid}/statistics?assets=visual&max_size=64&algorithm=mean&pixel_selection=mean", "POST", in_degrees)
         o.check("statistics of normalizedIndex on one asset", "zonal",
                 f"/searches/{sid}/statistics?assets=visual&max_size=64&algorithm=normalizedIndex", "POST", in_degrees)
         o.check("statistics of where", "zonal",
