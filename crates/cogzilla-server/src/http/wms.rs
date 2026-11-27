@@ -4,7 +4,7 @@ use bytes::Bytes;
 use cogzilla_kernel::OutputFormat;
 
 use crate::engine::{EngineError, TileEngine};
-use crate::titiler::render_crs_bbox;
+use crate::stats::render_crs_bbox;
 
 use super::{
     ParsedQuery, apply_unscale_cogs, build_band_request_for_output, data_band_count,
@@ -52,7 +52,7 @@ pub(super) fn build_wms_capabilities(
         [-180.0, -90.0, 180.0, 90.0]
     };
     let online_href = wms_online_resource(host, raw_query);
-    let href_esc = crate::titiler::xml_escape(&online_href);
+    let href_esc = crate::stats::xml_escape(&online_href);
     let [w, s, e, n] = bounds;
     let [mw, ms, me, mn] = crate::catalog::wgs84_bbox_to_3857(bounds);
     let extra_crs = match native_epsg {

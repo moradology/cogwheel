@@ -563,15 +563,177 @@ pub(crate) fn write_geotiff_typed_f64(
     })
 }
 
+/// Encode an RGBA buffer as a spec-compliant uncompressed Classic GeoTIFF (`EPSG:3857` or `EPSG:4326`).
+pub fn encode_geotiff_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    bbox: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> Bytes {
+    let width = width.clamp(1, 4096);
+    let height = height.clamp(1, 4096);
+    let n_px = (width as usize) * (height as usize);
+    let mut has_opaque = false;
+    let mut all_gray = true;
+    for px in rgba.chunks_exact(4).take(n_px) {
+        if px[3] > 0 {
+            has_opaque = true;
+            if px[0] != px[1] || px[1] != px[2] {
+                all_gray = false;
+                break;
+            }
+        }
+    }
+    let is_gray = has_opaque && all_gray;
+    let spp: u16 = if is_gray {
+        if return_mask { 2 } else { 1 }
+    } else if return_mask {
+        4
+    } else {
+        3
+    };
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: spp,
+        sample: GeoTiffSample::U8,
+        // 8-bit unsigned is the TIFF default, and GDAL's own byte GeoTIFFs carry no SampleFormat.
+        sample_format_tag: false,
+        layout: GeoTiffLayout::Chunky,
+        photometric: if is_gray { GeoTiffPhotometric::MinIsBlack } else { GeoTiffPhotometric::Rgb },
+        extra_samples: if return_mask { &[2] } else { &[] }, // UnassociatedAlpha
+        nodata: None,
+        bbox,
+        epsg,
+    };
+    // A short `rgba` leaves the rest of the strip zero-filled by the writer.
+    write_geotiff(&spec, |buf| {
+        if is_gray {
+            if return_mask {
+                for px in rgba.chunks_exact(4).take(n_px) {
+                    buf.put_u8(px[0]);
+                    buf.put_u8(px[3]);
+                }
+            } else {
+                for px in rgba.chunks_exact(4).take(n_px) {
+                    buf.put_u8(px[0]);
+                }
+            }
+        } else if return_mask {
+            let take = (n_px * 4).min(rgba.len());
+            buf.put_slice(&rgba[..take]);
+        } else {
+            for px in rgba.chunks_exact(4).take(n_px) {
+                buf.put_u8(px[0]);
+                buf.put_u8(px[1]);
+                buf.put_u8(px[2]);
+            }
+        }
+    })
+}
+
+/// Encode a CHW `f32` little-endian buffer as a spec-compliant uncompressed Classic IEEE Float32
+/// GeoTIFF (`SampleFormat=3`, `BitsPerSample=32`, `GDAL_NODATA="nan"`). When `return_mask` is
+/// `true`, appends an extra float32 validity mask band (`255.0` valid / `0.0` nodata) matching
+/// TiTiler / `rio-tiler` GeoTIFF output.
+pub fn encode_geotiff_f32(
+    width: u32,
+    height: u32,
+    raw_f32_chw: &[u8],
+    bbox: [f64; 4],
+    epsg: u16,
+    return_mask: bool,
+) -> Bytes {
+    let width = width.clamp(1, 4096);
+    let height = height.clamp(1, 4096);
+    let n_px = (width as usize) * (height as usize);
+    let data_spp: u16 = if n_px > 0 && raw_f32_chw.len() >= n_px * 4 {
+        (raw_f32_chw.len() / (n_px * 4)).clamp(1, 15) as u16
+    } else {
+        1
+    };
+    let spp: u16 = if return_mask { data_spp + 1 } else { data_spp };
+    let pixel_bytes = n_px * (spp as usize) * 4;
+    // RGB when data has 3 bands, MinIsBlack otherwise
+    let photometric =
+        if data_spp == 3 { GeoTiffPhotometric::Rgb } else { GeoTiffPhotometric::MinIsBlack };
+    let extra_samples_count: u16 = match photometric {
+        GeoTiffPhotometric::Rgb => spp.saturating_sub(3),
+        GeoTiffPhotometric::MinIsBlack => spp.saturating_sub(1),
+    };
+    let mut extra_samples = Vec::with_capacity(extra_samples_count as usize);
+    for idx in 0..extra_samples_count {
+        let is_mask = return_mask && idx + 1 == extra_samples_count;
+        // 2 = UnassociatedAlpha for the appended validity mask, 0 = Unspecified for extra data bands.
+        extra_samples.push(if is_mask { 2u16 } else { 0u16 });
+    }
+    let spec = GeoTiffSpec {
+        width,
+        height,
+        bands: spp,
+        sample: GeoTiffSample::F32,
+        sample_format_tag: true,
+        layout: GeoTiffLayout::Chunky,
+        photometric,
+        extra_samples: &extra_samples,
+        nodata: Some("nan"),
+        bbox,
+        epsg,
+    };
+    write_geotiff(&spec, |buf| {
+        // Pixel data: interleave CHW f32 planes into Chunky f32 (plus optional validity mask band)
+        if spp == 1 && !return_mask {
+            let take = (pixel_bytes.min(raw_f32_chw.len()) / 4) * 4;
+            buf.put_slice(&raw_f32_chw[..take]);
+            if take < pixel_bytes {
+                let rem_f32 = (pixel_bytes - take) / 4;
+                for _ in 0..rem_f32 {
+                    buf.put_f32_le(f32::NAN);
+                }
+            }
+        } else {
+            let data_spp_us = data_spp as usize;
+            let plane_bytes = n_px * 4;
+            let valid_le = 255.0f32.to_le_bytes();
+            let zero_le = 0.0f32.to_le_bytes();
+            for px in 0..n_px {
+                let px_off = px * 4;
+                let mut any_valid = false;
+                for b in 0..data_spp_us {
+                    let off = b * plane_bytes + px_off;
+                    if off + 4 <= raw_f32_chw.len() {
+                        let sl = &raw_f32_chw[off..off + 4];
+                        if return_mask
+                            && !any_valid
+                            && f32::from_le_bytes([sl[0], sl[1], sl[2], sl[3]]).is_finite()
+                        {
+                            any_valid = true;
+                        }
+                        buf.put_slice(sl);
+                    } else {
+                        buf.put_f32_le(f32::NAN);
+                    }
+                }
+                if return_mask {
+                    buf.put_slice(if any_valid { &valid_le } else { &zero_le });
+                }
+            }
+        }
+    })
+}
+
+
 #[cfg(test)]
 mod golden_tests {
     //! Byte-exact pins of `encode_geotiff_rgba` / `encode_geotiff_f32` output: every case records
     //! the exact length and a 128-bit FNV-1a digest of the encoded file.
 
+    use super::{encode_geotiff_f32, encode_geotiff_rgba};
     use bytes::Bytes;
 
-    use crate::titiler::{encode_geotiff_f32, encode_geotiff_rgba};
-
+    
     const MERC: [f64; 4] = [-20037508.342789244, -7.081154551613622e-10, 0.0, 20037508.342789244];
     const UTM: [f64; 4] = [399960.0, 4890240.0, 509760.0, 5000040.0];
     const GEO: [f64; 4] = [8.25, 45.5, 9.75, 46.125];
@@ -1275,8 +1437,7 @@ mod writer_tests {
 #[cfg(test)]
 mod retype_tests {
     use super::*;
-    use crate::titiler::encode_geotiff_f32;
-    use cogzilla_tiff::SampleType as T;
+        use cogzilla_tiff::SampleType as T;
 
     fn f32s(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -1331,7 +1492,7 @@ mod retype_tests {
 
     #[test]
     fn what_is_not_a_float32_geotiff_is_left_alone() {
-        let rgba = crate::titiler::encode_geotiff_rgba(2, 1, &[1, 2, 3, 255, 4, 5, 6, 255], [0.0, 0.0, 2.0, 1.0], 3857, true);
+        let rgba = encode_geotiff_rgba(2, 1, &[1, 2, 3, 255, 4, 5, 6, 255], [0.0, 0.0, 2.0, 1.0], 3857, true);
         assert!(retype_f32_geotiff(&rgba, T::Uint16, true).is_none());
         let f32_tif = encode_geotiff_f32(2, 1, &f32s(&[1.0, 2.0]), [0.0, 0.0, 2.0, 1.0], 3857, false);
         assert!(retype_f32_geotiff(&f32_tif, T::Uint16, true).is_none());

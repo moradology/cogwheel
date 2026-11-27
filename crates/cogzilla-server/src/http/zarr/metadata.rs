@@ -13,7 +13,7 @@ use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HeaderValue};
 use hyper::{Response, StatusCode};
 use serde_json::{Value, json};
 
-use crate::titiler::build_map_html;
+use crate::stats::build_map_html;
 use crate::tms::{TmsDef, lookup_tms};
 
 use super::{ZarrQuery, json_ok, open_store_and_hierarchy};

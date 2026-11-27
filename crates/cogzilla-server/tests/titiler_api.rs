@@ -5386,7 +5386,7 @@ async fn audit77_shown_npy_multiband_palette_and_invalid_formula() {
         let h = 16u32;
         let bounds = [-122.5f64, 37.7, -122.3, 37.9];
         let rgba = vec![100u8; (w * h * 4) as usize];
-        let tif = cogzilla_server::titiler::encode_geotiff_rgba(w, h, &rgba, bounds, 4326, false);
+        let tif = cogzilla_server::geotiff::encode_geotiff_rgba(w, h, &rgba, bounds, 4326, false);
         std::fs::write(&rgb_path, tif).unwrap();
     }
 
@@ -5534,7 +5534,7 @@ async fn sweeps_34_to_37_kk1_ii1_jj1_hh1_self_contained() {
         let raw: Vec<u8> = (0..(w * h))
             .flat_map(|i| (100.0f32 + (i % 32) as f32).to_le_bytes())
             .collect();
-        let tif = cogzilla_server::titiler::encode_geotiff_f32(w, h, &raw, tile_b.into(), 3857, false);
+        let tif = cogzilla_server::geotiff::encode_geotiff_f32(w, h, &raw, tile_b.into(), 3857, false);
         std::fs::write(&f32_path, tif).unwrap();
     }
     let f32_stac_path = tmp.join("kk1_stac.json");
@@ -5596,7 +5596,7 @@ async fn sweeps_34_to_37_kk1_ii1_jj1_hh1_self_contained() {
         // lon=179°E (-181°) at lat=-17° -> x ≈ 74_300 m; lon=-176°W at lat=-17° -> x ≈ 606_500 m
         // lat=-18° -> y ≈ 8_009_000 m; lat=-16° -> y ≈ 8_231_000 m
         let utm_bbox = [74_300.0, 8_009_000.0, 606_500.0, 8_231_000.0];
-        let tif = cogzilla_server::titiler::encode_geotiff_f32(w, h, &raw, utm_bbox, 32701, false);
+        let tif = cogzilla_server::geotiff::encode_geotiff_f32(w, h, &raw, utm_bbox, 32701, false);
         std::fs::write(&am_path, tif).unwrap();
     }
     let am_stac_path = tmp.join("am_stac.json");

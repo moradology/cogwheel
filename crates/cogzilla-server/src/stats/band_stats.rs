@@ -3,7 +3,7 @@
 use cogzilla_kernel::ResampleMode;
 
 use crate::engine::TileEngine;
-use crate::histogram::{AscendingBins, HistDtype, bin_of, sorted_bin_ranges};
+use crate::stats::histogram::{AscendingBins, HistDtype, bin_of, sorted_bin_ranges};
 
 /// Per-band statistics accumulator: uses exact O(1)-memory counting histograms for `U8`/`U16`
 /// bands (zero sort, zero per-pixel enum dispatch) and O(N) radix sort for `F32` bands.
@@ -460,7 +460,7 @@ pub struct StatsOptions {
 impl StatsOptions {
     /// numpy's histogram bin edges for this request over data spanning `min_max`.
     pub fn histogram_bin_edges(&self, min_max: Option<(f64, f64)>, dtype: HistDtype) -> Vec<f64> {
-        crate::histogram::bin_edges(
+        crate::stats::histogram::bin_edges(
             self.histogram_bins.clamp(1, 1000),
             self.histogram_edges.as_deref(),
             self.histogram_range,
@@ -779,11 +779,11 @@ pub(super) fn gpu_band_stats_to_json(
     }
     let edges = opts.histogram_bin_edges(gs.min.zip(gs.max), dtype);
     let counts = match values {
-        Some(v) => crate::histogram::unsorted_counts(v, &edges),
+        Some(v) => crate::stats::histogram::unsorted_counts(v, &edges),
         None if gs.min.is_some() && gs.min == gs.max => {
             let mut c = vec![0u64; edges.len().saturating_sub(1)];
             if let Some(v) = gs.min
-                && let Some(b) = crate::histogram::bin_of(&edges, v)
+                && let Some(b) = crate::stats::histogram::bin_of(&edges, v)
             {
                 c[b] = gs.valid_pixels as u64;
             }

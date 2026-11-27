@@ -308,7 +308,7 @@ pub(super) async fn render_non_mercator_tms_tile(
             grey,
         )?;
         if made.1 == crate::http::GEOTIFF_CONTENT_TYPE && made.0.len() == dim * dim * 4 {
-            let body = crate::titiler::encode_geotiff_rgba(
+            let body = crate::geotiff::encode_geotiff_rgba(
                 grown,
                 grown,
                 &made.0,

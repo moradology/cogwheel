@@ -27,7 +27,7 @@ mod paint;
 mod html;
 pub(crate) mod pixel_selection;
 mod cql2_text;
-mod geo;
+pub(crate) mod geo;
 mod point_expr;
 mod query;
 mod server;
@@ -41,8 +41,8 @@ pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
 pub(crate) use self::geo::{parse_coord_crs_with_epsg, tile_box_intersects_cog};
 use self::geo::{
     bbox_to_wgs84, cog_native_epsg_and_bounds, coord_to_lonlat, dataset_native_crs_and_bounds,
-    normalize_render_bbox, query_mosaicjson_wgs84_bbox, reproject_wgs84_bounds,
-    tile_intersects_cog, wgs84_bboxes_intersect,
+    native_bbox_dims_in_crs, normalize_render_bbox, query_mosaicjson_wgs84_bbox,
+    reproject_wgs84_bounds, tile_intersects_cog, wgs84_bboxes_intersect,
 };
 #[cfg(test)]
 use self::geo::cog_standard_epsg;
@@ -58,15 +58,17 @@ use crate::stac::{
     StacItem, StacSource, get_colormap_image, get_colormap_json, get_tms_json,
     list_colormaps_json, list_tms_json, resolve_stac_assets,
 };
-use crate::titiler::{
+use crate::geotiff::{encode_geotiff_f32, encode_geotiff_rgba};
+use crate::multi_asset::render_multi_asset_bbox;
+use crate::stats::{
     PolygonMask, StatsOptions, build_cog_info, build_cog_info_geojson, build_cog_validate,
     build_map_html, build_tilejson, build_wmts_capabilities, build_wmts_capabilities_multi,
     compute_f32_band_stats, compute_f32_band_stats_with_engine,
     compute_statistics_with_options,
-    encode_auto_image, encode_geotiff_f32, encode_geotiff_rgba, encode_rgba_output,
+    encode_auto_image, encode_rgba_output,
     get_algorithm_json,
-    list_algorithms_json, native_bbox_dims_in_crs, query_point,
-    render_crs_bbox, render_mercator_bbox, render_multi_asset_bbox, render_native_preview,
+    list_algorithms_json, query_point,
+    render_crs_bbox, render_mercator_bbox, render_native_preview,
     render_native_preview_stats, render_wgs84_bbox, render_wgs84_bbox_stats,
 };
 
@@ -2276,7 +2278,7 @@ fn compile_stats_parts(
     pq: &ParsedQuery,
     parts: Vec<(String, String)>,
     read: Option<cogzilla_tiff::SampleType>,
-) -> Result<(Vec<(String, ExprProgram)>, Option<crate::histogram::HistDtype>), EngineError> {
+) -> Result<(Vec<(String, ExprProgram)>, Option<crate::stats::histogram::HistDtype>), EngineError> {
     if parts.len() > 16 {
         return Err(EngineError::BadRequest("expression exceeds max 16 semicolon-separated outputs".into()));
     }
@@ -2286,7 +2288,7 @@ fn compile_stats_parts(
         None => None,
     };
     let (parts, max_ops, hist) = match composed {
-        Some(c) => (c.outputs, c.max_ops, c.kind.map(|kind| crate::histogram::HistDtype::for_sample_type(kind, false))),
+        Some(c) => (c.outputs, c.max_ops, c.kind.map(|kind| crate::stats::histogram::HistDtype::for_sample_type(kind, false))),
         None => (parts, ExprProgram::MAX_OPS, None),
     };
     let compiled = parts
@@ -3785,7 +3787,7 @@ async fn compute_mosaic_statistics_with_fold(
     wgs_bbox: [f64; 4],
     poly_mask: Option<&PolygonMask>,
     pq: &ParsedQuery,
-    stats_opts: &crate::titiler::StatsOptions,
+    stats_opts: &crate::stats::StatsOptions,
 ) -> Result<(serde_json::Value, Vec<String>), EngineError> {
     if urls.is_empty() {
         return Err(EngineError::NotFound(
@@ -3823,14 +3825,14 @@ async fn compute_mosaic_statistics_with_fold(
         }
         let mut exact_opts = stats_opts.clone();
         if exact_opts.hist_dtype.is_none() {
-            let band_dtype = crate::histogram::HistDtype::for_sample_type(
+            let band_dtype = crate::stats::histogram::HistDtype::for_sample_type(
                 opened[0].1.index.full_res().sample_type,
                 pq.unscale,
             );
             exact_opts.hist_dtype = Some(if method == Selection::Count {
-                crate::histogram::HistDtype::Float64
+                crate::stats::histogram::HistDtype::Float64
             } else if let Some(expr) = pq.expr_raw.as_deref() {
-                crate::histogram::HistDtype::for_expression(expr, band_dtype)
+                crate::stats::histogram::HistDtype::for_expression(expr, band_dtype)
             } else {
                 band_dtype
             });
@@ -4073,11 +4075,11 @@ async fn compute_mosaic_statistics_with_fold(
     if eff_opts.hist_dtype.is_none()
         && let Some(st) = first_sample_type
     {
-        let band_dtype = crate::histogram::HistDtype::for_sample_type(st, pq.unscale);
+        let band_dtype = crate::stats::histogram::HistDtype::for_sample_type(st, pq.unscale);
         eff_opts.hist_dtype = Some(if method == Selection::Count {
-            crate::histogram::HistDtype::Float64
+            crate::stats::histogram::HistDtype::Float64
         } else if let Some(expr) = pq.expr_raw.as_deref() {
-            crate::histogram::HistDtype::for_expression(expr, band_dtype)
+            crate::stats::histogram::HistDtype::for_expression(expr, band_dtype)
         } else {
             band_dtype
         });
@@ -5479,7 +5481,7 @@ where
                     .map_err(|e| EngineError::BadRequest(format!("invalid GeoJSON: {e}")))?;
                 let fc_crs = match pq.coord_crs.as_ref() {
                     Some(c) => Some(c.clone()),
-                    None => crate::titiler::extract_geojson_crs(&geojson)?,
+                    None => crate::stats::extract_geojson_crs(&geojson)?,
                 };
                 let pq_shared = Arc::new(pq.clone());
                 let compute_for_mask = {
@@ -7646,7 +7648,7 @@ where
                 if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
                     let fc_crs = match pq.coord_crs.as_ref() {
                         Some(c) => Some(c.clone()),
-                        None => crate::titiler::extract_geojson_crs(&geojson)?,
+                        None => crate::stats::extract_geojson_crs(&geojson)?,
                     };
                     let compute_shared = Arc::new(compute_stac_merged_stats);
                     run_feature_collection_stats(
@@ -9125,7 +9127,7 @@ where
                     if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
                         let fc_crs = match pq.coord_crs.as_ref() {
                             Some(c) => Some(c.clone()),
-                            None => crate::titiler::extract_geojson_crs(&geojson)?,
+                            None => crate::stats::extract_geojson_crs(&geojson)?,
                         };
                         let eng_c = engine.clone();
                         let cog_c = cogs[0].clone();

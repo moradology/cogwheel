@@ -362,7 +362,7 @@ impl GpuBackend {
         format: OutputFormat,
         return_mask: bool,
     ) -> Bytes {
-        crate::titiler::encode_rgba_output(width, height, rgba, format, return_mask)
+        crate::stats::encode_rgba_output(width, height, rgba, format, return_mask)
     }
 
     #[inline(always)]

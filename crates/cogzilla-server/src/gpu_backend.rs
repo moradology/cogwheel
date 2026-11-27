@@ -1062,7 +1062,7 @@ impl GpuBackend {
                         return Bytes::from(jpg);
                     }
         }
-        crate::titiler::encode_rgba_output(dst_w, dst_h, rgba, format, return_mask)
+        crate::stats::encode_rgba_output(dst_w, dst_h, rgba, format, return_mask)
     }
 
     /// Compute GPU-accelerated band statistics, histogram, and percentiles for large `f32`
@@ -2646,7 +2646,7 @@ impl GpuBackend {
                         if *format == OutputFormat::RawRgba {
                             Bytes::from(raw)
                         } else {
-                            crate::titiler::encode_rgba_output(
+                            crate::stats::encode_rgba_output(
                                 width as usize,
                                 height as usize,
                                 &raw,
@@ -2698,7 +2698,7 @@ impl GpuBackend {
                 let bytes = if *format == OutputFormat::RawRgba {
                     Bytes::from(rgba)
                 } else {
-                    crate::titiler::encode_rgba_output(
+                    crate::stats::encode_rgba_output(
                         width as usize,
                         height as usize,
                         &rgba,

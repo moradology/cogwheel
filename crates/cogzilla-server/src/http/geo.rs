@@ -666,6 +666,168 @@ pub(super) fn tile_intersects_cog(
     ))
 }
 
+/// Project a WGS84 polygon bbox into an IFD's pixel space and return `(win_w, win_h, intersects)`.
+/// Compute the native pixel dimensions `(w, h)` for a WGS84 bounding box against `ifd`,
+/// matching GDAL `WarpedVRT` / `rio-tiler` suggested output sizing (preserving the target bbox
+/// aspect ratio without upsampling past native resolution).
+pub fn native_bbox_dims_in_crs(
+    ifd: &cogzilla_tiff::IfdMeta,
+    src_crs: &cogzilla_proj::CrsModel,
+    dst_crs: &cogzilla_proj::CrsModel,
+    wgs_bbox: [f64; 4],
+    dst_bbox: [f64; 4],
+) -> (u32, u32) {
+    // Scale `(w_f, h_f)` proportionally into `[1, 4096]` without squashing aspect ratio on
+    // large non-square rasters (e.g. a 21600x10800 global COG must stay 2:1, not 4096x4096).
+    let scale_dims_to_cap = |w_f: f64, h_f: f64| -> (u32, u32) {
+        let max_d = w_f.max(h_f);
+        if max_d > 4096.0 && max_d.is_finite() {
+            let s = 4096.0 / max_d;
+            (
+                (w_f * s).round().clamp(1.0, 4096.0) as u32,
+                (h_f * s).round().clamp(1.0, 4096.0) as u32,
+            )
+        } else {
+            (
+                w_f.round().clamp(1.0, 4096.0) as u32,
+                h_f.round().clamp(1.0, 4096.0) as u32,
+            )
+        }
+    };
+
+    let dx = if dst_bbox[2] < dst_bbox[0] && dst_bbox[0].abs() <= 180.0 && dst_bbox[2].abs() <= 180.0 {
+        (dst_bbox[2] + 360.0) - dst_bbox[0]
+    } else {
+        (dst_bbox[2] - dst_bbox[0]).abs()
+    };
+    let dy = (dst_bbox[3] - dst_bbox[1]).abs();
+
+    // Primary path: match GDAL `GDALSuggestedWarpOutput2` / `rasterio.warp.calculate_default_transform`
+    // (diagonal distance in `dst_crs` divided by pixel diagonal `hypot(src_w, src_h)`), or native
+    // per-axis pixel resolution when `src_crs` and `dst_crs` coincide.
+    if dx > 1e-12 && dy > 1e-12 && ifd.width > 0 && ifd.height > 0 && ifd.gcp_poly.is_none() {
+        let (sx0, sy0) = ifd.pixel_to_crs.forward(0.0, 0.0);
+        let (sx1, sy1) = ifd.pixel_to_crs.forward(ifd.width as f64, ifd.height as f64);
+        let both_geographic = src_crs.is_geographic() && dst_crs.is_geographic();
+        if both_geographic {
+            let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+            let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+            if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
+                return scale_dims_to_cap(dx / w_res, dy / h_res);
+            }
+        }
+        let (lon0, mut lat0) = src_crs.to_lonlat_deg(sx0, sy0);
+        let (lon1, mut lat1) = src_crs.to_lonlat_deg(sx1, sy1);
+        let mut eff_h = ifd.height as f64;
+        if src_crs.is_geographic()
+            && dst_crs.is_web_mercator()
+            && (lat0.abs() > 85.06 || lat1.abs() > 85.06)
+        {
+            let orig_span = (lat1 - lat0).abs().max(1e-9);
+            lat0 = lat0.clamp(-85.06, 85.06);
+            lat1 = lat1.clamp(-85.06, 85.06);
+            eff_h = (eff_h * ((lat1 - lat0).abs() / orig_span)).max(1.0);
+        }
+        let (dx0, dy0) = dst_crs.from_lonlat_deg(lon0, lat0);
+        let (dx1, dy1) = dst_crs.from_lonlat_deg(lon1, lat1);
+        if dx0.is_finite() && dy0.is_finite() && dx1.is_finite() && dy1.is_finite() {
+            let src_diag_crs = (sx1 - sx0).hypot(sy1 - sy0);
+            let same_crs = src_diag_crs > 0.0
+                && (dx0 - sx0).hypot(dy0 - sy0) <= 1e-4 * src_diag_crs
+                && (dx1 - sx1).hypot(dy1 - sy1) <= 1e-4 * src_diag_crs;
+            if same_crs {
+                let w_res = ifd.pixel_to_crs.a.hypot(ifd.pixel_to_crs.d);
+                let h_res = ifd.pixel_to_crs.b.hypot(ifd.pixel_to_crs.e);
+                if w_res.is_finite() && h_res.is_finite() && w_res > 0.0 && h_res > 0.0 {
+                    return scale_dims_to_cap(dx / w_res, dy / h_res);
+                }
+            }
+            let mut ddx = if src_crs.is_geographic() && dst_crs.is_web_mercator() {
+                // Preserve full unwrapped span for 0..360° global geographic rasters -> 3857.
+                (sx1 - sx0) * (20_037_508.342_789_244 / 180.0)
+            } else {
+                dx1 - dx0
+            };
+            if dst_crs.is_geographic() && ddx.abs() > 180.0 {
+                let (lon_mid, _) = src_crs.to_lonlat_deg(0.5 * (sx0 + sx1), 0.5 * (sy0 + sy1));
+                // Wrap only when the midpoint lies on the opposite hemisphere from the arithmetic
+                // mean of endpoints (antimeridian-crossing scene), NOT on wide/global scenes
+                // centered near 0° longitude.
+                if (lon_mid - 0.5 * (lon0 + lon1)).abs() > 90.0 {
+                    ddx = if ddx > 0.0 { ddx - 360.0 } else { ddx + 360.0 };
+                }
+            }
+            let ddy = dy1 - dy0;
+            let px_diag = (ifd.width as f64).hypot(eff_h);
+            let res = ddx.hypot(ddy) / px_diag;
+            if res.is_finite() && res > 0.0 {
+                return scale_dims_to_cap(dx / res, dy / res);
+            }
+        }
+    }
+
+    let [w, s, mut e, n] = wgs_bbox;
+    if e < w {
+        e += 360.0;
+    }
+    let mx = 0.5 * (w + e);
+    let my = 0.5 * (s + n);
+    let pts = [
+        (w, s),
+        (e, s),
+        (w, n),
+        (e, n),
+        (mx, s),
+        (mx, n),
+        (w, my),
+        (e, my),
+    ];
+    let mut cmin = f64::INFINITY;
+    let mut cmax = f64::NEG_INFINITY;
+    let mut rmin = f64::INFINITY;
+    let mut rmax = f64::NEG_INFINITY;
+    let Some(crs_to_px) = ifd.pixel_to_crs.invert() else {
+        return (1, 1);
+    };
+    let wrap_lo = src_crs.geographic_0_360_min_lon(&ifd.pixel_to_crs, ifd.width);
+    for (mut lon, lat) in pts {
+        if let Some(lo) = wrap_lo
+            && lon < lo
+        {
+            lon += 360.0;
+        }
+        let (sx, sy) = src_crs.from_lonlat_deg(lon, lat);
+        if sx.is_finite() && sy.is_finite() {
+            let (col, row) = crs_to_px.forward(sx, sy);
+            if col.is_finite() && row.is_finite() {
+                cmin = cmin.min(col);
+                cmax = cmax.max(col);
+                rmin = rmin.min(row);
+                rmax = rmax.max(row);
+            }
+        }
+    }
+    if !cmin.is_finite() || !rmin.is_finite() {
+        return (1, 1);
+    }
+    let nat_w = (cmax - cmin).abs();
+    let nat_h = (rmax - rmin).abs();
+    if dx <= 1e-12 || dy <= 1e-12 || nat_w <= 1e-6 || nat_h <= 1e-6 {
+        return (
+            nat_w.round().clamp(1.0, 4096.0) as u32,
+            nat_h.round().clamp(1.0, 4096.0) as u32,
+        );
+    }
+    // Equal-pixel-density isotropic resolution in dst_crs fallback:
+    let area_px = (nat_w * nat_h).max(1.0);
+    let res = ((dx * dy) / area_px).sqrt();
+    if !res.is_finite() || res <= 0.0 {
+        return scale_dims_to_cap(nat_w, nat_h);
+    }
+    scale_dims_to_cap(dx / res, dy / res)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
