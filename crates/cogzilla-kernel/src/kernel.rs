@@ -187,10 +187,9 @@ unsafe fn bilinear_row_flat_neon<const N: usize>(
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for flat single-block `Separable1D + CleanFastPath`.
 /// Uses 64-bit adjacent-pair loads + shuffle instead of microcoded `vgatherdps` (much faster on
 /// AMD Zen 4 / EPYC as well as Intel).
-// SAFETY: Caller checks AVX2+FMA and guarantees `x_idx`/`x_idx+1` are in-bounds of `r0`/`r1`.
+// SAFETY: Caller checks AVX2+FMA and guarantees `row0_ptr`/`row1_ptr` have `>= max_x + 2` elements and `out_row.len() >= N`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_row_flat_avx2<const N: usize>(
     u_coords: &[f32; N],
     base_col: u32,
@@ -219,22 +218,27 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
             let c6 = idxs[6] as usize;
             let c7 = idxs[7] as usize;
 
-            let p01 = _mm_castpd_ps(_mm_set_pd(
-                ($ptr.add(c1) as *const f64).read_unaligned(),
-                ($ptr.add(c0) as *const f64).read_unaligned(),
-            ));
-            let p23 = _mm_castpd_ps(_mm_set_pd(
-                ($ptr.add(c3) as *const f64).read_unaligned(),
-                ($ptr.add(c2) as *const f64).read_unaligned(),
-            ));
-            let p45 = _mm_castpd_ps(_mm_set_pd(
-                ($ptr.add(c5) as *const f64).read_unaligned(),
-                ($ptr.add(c4) as *const f64).read_unaligned(),
-            ));
-            let p67 = _mm_castpd_ps(_mm_set_pd(
-                ($ptr.add(c7) as *const f64).read_unaligned(),
-                ($ptr.add(c6) as *const f64).read_unaligned(),
-            ));
+            // SAFETY: Each `c` is clamped to `0..=max_x`, so `c` and `c + 1` (8 bytes) are in-bounds.
+            let (p01, p23, p45, p67) = unsafe {
+                (
+                    _mm_castpd_ps(_mm_set_pd(
+                        ($ptr.add(c1) as *const f64).read_unaligned(),
+                        ($ptr.add(c0) as *const f64).read_unaligned(),
+                    )),
+                    _mm_castpd_ps(_mm_set_pd(
+                        ($ptr.add(c3) as *const f64).read_unaligned(),
+                        ($ptr.add(c2) as *const f64).read_unaligned(),
+                    )),
+                    _mm_castpd_ps(_mm_set_pd(
+                        ($ptr.add(c5) as *const f64).read_unaligned(),
+                        ($ptr.add(c4) as *const f64).read_unaligned(),
+                    )),
+                    _mm_castpd_ps(_mm_set_pd(
+                        ($ptr.add(c7) as *const f64).read_unaligned(),
+                        ($ptr.add(c6) as *const f64).read_unaligned(),
+                    )),
+                )
+            };
 
             let lo0 = _mm_shuffle_ps::<0x88>(p01, p23);
             let lo1 = _mm_shuffle_ps::<0xDD>(p01, p23);
@@ -248,11 +252,12 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
     }
 
     while px + 8 <= N {
-        let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_base);
+        // SAFETY: `px + 8 <= N` guarantees 8 readable `f32`s in `u_coords` and 8 writable `i32`s in `idxs`.
+        let u = _mm256_sub_ps(unsafe { _mm256_loadu_ps(u_coords.as_ptr().add(px)) }, v_base);
         let x0_f = _mm256_floor_ps(u);
         let fx = _mm256_sub_ps(u, x0_f);
         let idx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero), v_max_x);
-        _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
+        unsafe { _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx) };
 
         let (v00, v10) = load_8_pairs!(row0_ptr);
         let (v01, v11) = load_8_pairs!(row1_ptr);
@@ -261,20 +266,24 @@ unsafe fn bilinear_row_flat_avx2<const N: usize>(
         let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
         let res = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), v_fy, top);
 
-        _mm256_storeu_ps(out_row.as_mut_ptr().add(px), res);
+        // SAFETY: `px + 8 <= N <= out_row.len()`.
+        unsafe { _mm256_storeu_ps(out_row.as_mut_ptr().add(px), res) };
         px += 8;
     }
     let bc_f = base_col as f32;
     while px < N {
         let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc_f);
         let c = x0_raw.clamp(0, max_x) as usize;
-        let v00 = *row0_ptr.add(c);
-        let v10 = *row0_ptr.add(c + 1);
-        let v01 = *row1_ptr.add(c);
-        let v11 = *row1_ptr.add(c + 1);
-        let top = v00 + (v10 - v00) * fx;
-        let bot = v01 + (v11 - v01) * fx;
-        *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        // SAFETY: `c <= max_x` and `px < N <= out_row.len()`.
+        unsafe {
+            let v00 = *row0_ptr.add(c);
+            let v10 = *row0_ptr.add(c + 1);
+            let v01 = *row1_ptr.add(c);
+            let v11 = *row1_ptr.add(c + 1);
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        }
         px += 1;
     }
 }
@@ -437,10 +446,9 @@ unsafe fn bilinear_row_typed_neon<T: Copy, F: Fn(T) -> f32, const N: usize>(
 }
 
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for single-block `U16`/`U8` (`Separable1D + CleanFastPath`).
-// SAFETY: Caller checks AVX2+FMA and guarantees `x_idx`/`x_idx+1` are in-bounds of `r0`/`r1`.
+// SAFETY: Caller checks AVX2+FMA and guarantees `row0_ptr`/`row1_ptr` have `>= max_x + 2` elements and `out_row.len() >= N`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_row_typed_avx2<T: Copy, F: Fn(T) -> f32, const N: usize>(
     u_coords: &[f32; N],
     base_col: u32,
@@ -459,11 +467,12 @@ unsafe fn bilinear_row_typed_avx2<T: Copy, F: Fn(T) -> f32, const N: usize>(
     let mut idxs = [0i32; 8];
     let mut px = 0usize;
     while px + 8 <= N {
-        let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_base);
+        // SAFETY: `px + 8 <= N` guarantees 8 readable `f32`s in `u_coords` and 8 writable `i32`s in `idxs`.
+        let u = _mm256_sub_ps(unsafe { _mm256_loadu_ps(u_coords.as_ptr().add(px)) }, v_base);
         let x0_f = _mm256_floor_ps(u);
         let fx = _mm256_sub_ps(u, x0_f);
         let idx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero), v_max_x);
-        _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx);
+        unsafe { _mm256_storeu_si256(idxs.as_mut_ptr() as *mut __m256i, idx) };
 
         let mut a00 = [0.0f32; 8];
         let mut a10 = [0.0f32; 8];
@@ -471,34 +480,46 @@ unsafe fn bilinear_row_typed_avx2<T: Copy, F: Fn(T) -> f32, const N: usize>(
         let mut a11 = [0.0f32; 8];
         for k in 0..8 {
             let c = idxs[k] as usize;
-            a00[k] = to_f32(*row0_ptr.add(c));
-            a10[k] = to_f32(*row0_ptr.add(c + 1));
-            a01[k] = to_f32(*row1_ptr.add(c));
-            a11[k] = to_f32(*row1_ptr.add(c + 1));
+            // SAFETY: `c` is clamped to `0..=max_x`, so `c` and `c + 1` are in-bounds.
+            unsafe {
+                a00[k] = to_f32(*row0_ptr.add(c));
+                a10[k] = to_f32(*row0_ptr.add(c + 1));
+                a01[k] = to_f32(*row1_ptr.add(c));
+                a11[k] = to_f32(*row1_ptr.add(c + 1));
+            }
         }
 
-        let v00 = _mm256_loadu_ps(a00.as_ptr());
-        let v10 = _mm256_loadu_ps(a10.as_ptr());
-        let v01 = _mm256_loadu_ps(a01.as_ptr());
-        let v11 = _mm256_loadu_ps(a11.as_ptr());
+        // SAFETY: `a00..a11` are 8-element `f32` stack arrays (32 bytes each).
+        let (v00, v10, v01, v11) = unsafe {
+            (
+                _mm256_loadu_ps(a00.as_ptr()),
+                _mm256_loadu_ps(a10.as_ptr()),
+                _mm256_loadu_ps(a01.as_ptr()),
+                _mm256_loadu_ps(a11.as_ptr()),
+            )
+        };
 
         let top = _mm256_fmadd_ps(_mm256_sub_ps(v10, v00), fx, v00);
         let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
         let res = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), v_fy, top);
-        _mm256_storeu_ps(out_row.as_mut_ptr().add(px), res);
+        // SAFETY: `px + 8 <= N <= out_row.len()`.
+        unsafe { _mm256_storeu_ps(out_row.as_mut_ptr().add(px), res) };
         px += 8;
     }
     let bc_f = base_col as f32;
     while px < N {
         let (x0_raw, fx) = fast_floor_i32(u_coords[px] - bc_f);
         let c = x0_raw.clamp(0, max_x) as usize;
-        let v00 = to_f32(*row0_ptr.add(c));
-        let v10 = to_f32(*row0_ptr.add(c + 1));
-        let v01 = to_f32(*row1_ptr.add(c));
-        let v11 = to_f32(*row1_ptr.add(c + 1));
-        let top = v00 + (v10 - v00) * fx;
-        let bot = v01 + (v11 - v01) * fx;
-        *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        // SAFETY: `c <= max_x` and `px < N <= out_row.len()`.
+        unsafe {
+            let v00 = to_f32(*row0_ptr.add(c));
+            let v10 = to_f32(*row0_ptr.add(c + 1));
+            let v01 = to_f32(*row1_ptr.add(c));
+            let v11 = to_f32(*row1_ptr.add(c + 1));
+            let top = v00 + (v10 - v00) * fx;
+            let bot = v01 + (v11 - v01) * fx;
+            *out_row.get_unchecked_mut(px) = top + (bot - top) * fy;
+        }
         px += 1;
     }
 }
@@ -3696,10 +3717,9 @@ fn bilinear_rgb_single_block_row<const N: usize, T: Copy, F>(
     }
 }
 
-// SAFETY: Caller checks AVX2+FMA and guarantees `x_idx`/`x_idx+1` are in-bounds of each band's row slices.
+// SAFETY: Caller checks AVX2+FMA and guarantees `stride >= 2`, `max_y >= 0`, `r_ptr`/`g_ptr`/`b_ptr` cover `(max_y + 2) * stride` elements, and `row_rgb.len() >= N * 3`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -> f32>(
     u_row: &[f32; N],
     v_row: &[f32; N],
@@ -3739,16 +3759,24 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
 
     let mut px = 0usize;
     while px + 8 <= N {
-        let u = _mm256_sub_ps(_mm256_loadu_ps(u_row.as_ptr().add(px)), v_bc);
-        let v = _mm256_sub_ps(_mm256_loadu_ps(v_row.as_ptr().add(px)), v_br);
+        // SAFETY: `px + 8 <= N` guarantees 8 readable `f32`s in `u_row`/`v_row`.
+        let (u, v) = unsafe {
+            (
+                _mm256_sub_ps(_mm256_loadu_ps(u_row.as_ptr().add(px)), v_bc),
+                _mm256_sub_ps(_mm256_loadu_ps(v_row.as_ptr().add(px)), v_br),
+            )
+        };
         let x0_f = _mm256_floor_ps(u);
         let y0_f = _mm256_floor_ps(v);
         let fx = _mm256_sub_ps(u, x0_f);
         let fy = _mm256_sub_ps(v, y0_f);
         let vx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero_i), v_max_x);
         let vy = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(y0_f), v_zero_i), v_max_y);
-        _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, vx);
-        _mm256_storeu_si256(ys.as_mut_ptr() as *mut __m256i, vy);
+        // SAFETY: `xs` and `ys` are 8-element `i32` stack arrays (32 bytes each).
+        unsafe {
+            _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, vx);
+            _mm256_storeu_si256(ys.as_mut_ptr() as *mut __m256i, vy);
+        }
 
         let mut p = [0usize; 8];
         for k in 0..8 {
@@ -3763,24 +3791,35 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
                 let mut a11 = [0.0f32; 8];
                 for k in 0..8 {
                     let pk = p[k];
-                    a00[k] = to_f32(*$ptr.add(pk));
-                    a10[k] = to_f32(*$ptr.add(pk + 1));
-                    a01[k] = to_f32(*$ptr.add(pk + stride));
-                    a11[k] = to_f32(*$ptr.add(pk + stride + 1));
+                    // SAFETY: `xs[k] <= max_x` and `ys[k] <= max_y` keep the 2x2 neighborhood in-bounds.
+                    unsafe {
+                        a00[k] = to_f32(*$ptr.add(pk));
+                        a10[k] = to_f32(*$ptr.add(pk + 1));
+                        a01[k] = to_f32(*$ptr.add(pk + stride));
+                        a11[k] = to_f32(*$ptr.add(pk + stride + 1));
+                    }
                 }
-                let v00 = _mm256_loadu_ps(a00.as_ptr());
-                let v10 = _mm256_loadu_ps(a10.as_ptr());
-                let v01 = _mm256_loadu_ps(a01.as_ptr());
-                let v11 = _mm256_loadu_ps(a11.as_ptr());
+                // SAFETY: `a00..a11` are 8-element `f32` stack arrays (32 bytes each).
+                let (v00, v10, v01, v11) = unsafe {
+                    (
+                        _mm256_loadu_ps(a00.as_ptr()),
+                        _mm256_loadu_ps(a10.as_ptr()),
+                        _mm256_loadu_ps(a01.as_ptr()),
+                        _mm256_loadu_ps(a11.as_ptr()),
+                    )
+                };
                 let top = _mm256_fmadd_ps(_mm256_sub_ps(v10, v00), fx, v00);
                 let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
                 let val = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), fy, top);
                 let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
                 let clamped = _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255);
-                _mm256_storeu_si256(
-                    $out.as_mut_ptr() as *mut __m256i,
-                    _mm256_cvttps_epi32(clamped),
-                );
+                // SAFETY: `$out` is an 8-element `i32` stack array (32 bytes).
+                unsafe {
+                    _mm256_storeu_si256(
+                        $out.as_mut_ptr() as *mut __m256i,
+                        _mm256_cvttps_epi32(clamped),
+                    );
+                }
             }};
         }
 
@@ -3789,10 +3828,13 @@ unsafe fn bilinear_rgb_single_block_row_avx2<const N: usize, T: Copy, F: Fn(T) -
         eval_band_avx2!(b_ptr, v_inv2, v_min2, out_b);
 
         let base = px * 3;
-        for k in 0..8 {
-            *row_rgb.get_unchecked_mut(base + k * 3) = out_r[k] as u8;
-            *row_rgb.get_unchecked_mut(base + k * 3 + 1) = out_g[k] as u8;
-            *row_rgb.get_unchecked_mut(base + k * 3 + 2) = out_b[k] as u8;
+        // SAFETY: `px + 8 <= N` guarantees `base + 24 <= N * 3 <= row_rgb.len()`.
+        unsafe {
+            for k in 0..8 {
+                *row_rgb.get_unchecked_mut(base + k * 3) = out_r[k] as u8;
+                *row_rgb.get_unchecked_mut(base + k * 3 + 1) = out_g[k] as u8;
+                *row_rgb.get_unchecked_mut(base + k * 3 + 2) = out_b[k] as u8;
+            }
         }
         px += 8;
     }
@@ -4158,10 +4200,9 @@ unsafe fn bilinear_row_rgb_u8_separable_neon<const N: usize>(
 }
 
 /// x86_64 AVX2+FMA 8-wide bilinear row sampler for interleaved `RgbU8Channel` on `Separable1D`.
-// SAFETY: Caller checks AVX2+FMA and guarantees `x_off3` offsets are in-bounds of `r0`/`r1`.
+// SAFETY: Caller checks AVX2+FMA and guarantees `r0_ptr`/`r1_ptr` have `>= (max_x + 2) * 3` bytes and `row_rgb.len() >= N * 3`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
     u_coords: &[f32; N],
     bc: f32,
@@ -4194,11 +4235,12 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
     let mut out_b = [0i32; 8];
     let mut px = 0usize;
     while px + 8 <= N {
-        let u = _mm256_sub_ps(_mm256_loadu_ps(u_coords.as_ptr().add(px)), v_bc);
+        // SAFETY: `px + 8 <= N` guarantees 8 readable `f32`s in `u_coords` and `xs` holds 8 `i32`s.
+        let u = _mm256_sub_ps(unsafe { _mm256_loadu_ps(u_coords.as_ptr().add(px)) }, v_bc);
         let x0_f = _mm256_floor_ps(u);
         let fx = _mm256_sub_ps(u, x0_f);
         let vx = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(x0_f), v_zero_i), v_max_x);
-        _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, vx);
+        unsafe { _mm256_storeu_si256(xs.as_mut_ptr() as *mut __m256i, vx) };
 
         let mut os = [0usize; 8];
         for k in 0..8 {
@@ -4213,15 +4255,23 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
                 let mut a11 = [0.0f32; 8];
                 for k in 0..8 {
                     let o = os[k];
-                    a00[k] = *r0_ptr.add(o + $ch) as f32;
-                    a10[k] = *r0_ptr.add(o + 3 + $ch) as f32;
-                    a01[k] = *r1_ptr.add(o + $ch) as f32;
-                    a11[k] = *r1_ptr.add(o + 3 + $ch) as f32;
+                    // SAFETY: `xs[k] <= max_x` guarantees `o + 3 + $ch < (max_x + 2) * 3`.
+                    unsafe {
+                        a00[k] = *r0_ptr.add(o + $ch) as f32;
+                        a10[k] = *r0_ptr.add(o + 3 + $ch) as f32;
+                        a01[k] = *r1_ptr.add(o + $ch) as f32;
+                        a11[k] = *r1_ptr.add(o + 3 + $ch) as f32;
+                    }
                 }
-                let v00 = _mm256_loadu_ps(a00.as_ptr());
-                let v10 = _mm256_loadu_ps(a10.as_ptr());
-                let v01 = _mm256_loadu_ps(a01.as_ptr());
-                let v11 = _mm256_loadu_ps(a11.as_ptr());
+                // SAFETY: `a00..a11` are 8-element `f32` stack arrays (32 bytes each).
+                let (v00, v10, v01, v11) = unsafe {
+                    (
+                        _mm256_loadu_ps(a00.as_ptr()),
+                        _mm256_loadu_ps(a10.as_ptr()),
+                        _mm256_loadu_ps(a01.as_ptr()),
+                        _mm256_loadu_ps(a11.as_ptr()),
+                    )
+                };
                 let top = _mm256_fmadd_ps(_mm256_sub_ps(v10, v00), fx, v00);
                 let bot = _mm256_fmadd_ps(_mm256_sub_ps(v11, v01), fx, v01);
                 let val = _mm256_fmadd_ps(_mm256_sub_ps(bot, top), v_fy, top);
@@ -4231,7 +4281,10 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
                     let scaled = _mm256_mul_ps(_mm256_sub_ps(val, $v_min), $v_inv);
                     _mm256_min_ps(_mm256_max_ps(scaled, v_zero), v_255)
                 };
-                _mm256_storeu_si256($out.as_mut_ptr() as *mut __m256i, _mm256_cvttps_epi32(rounded));
+                // SAFETY: `$out` is an 8-element `i32` stack array (32 bytes).
+                unsafe {
+                    _mm256_storeu_si256($out.as_mut_ptr() as *mut __m256i, _mm256_cvttps_epi32(rounded));
+                }
             }};
         }
 
@@ -4240,10 +4293,13 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
         eval_ch!(2, v_inv2, v_min2, out_b);
 
         let base = px * 3;
-        for k in 0..8 {
-            *row_rgb.get_unchecked_mut(base + k * 3) = out_r[k] as u8;
-            *row_rgb.get_unchecked_mut(base + k * 3 + 1) = out_g[k] as u8;
-            *row_rgb.get_unchecked_mut(base + k * 3 + 2) = out_b[k] as u8;
+        // SAFETY: `px + 8 <= N` guarantees `base + 24 <= N * 3 <= row_rgb.len()`.
+        unsafe {
+            for k in 0..8 {
+                *row_rgb.get_unchecked_mut(base + k * 3) = out_r[k] as u8;
+                *row_rgb.get_unchecked_mut(base + k * 3 + 1) = out_g[k] as u8;
+                *row_rgb.get_unchecked_mut(base + k * 3 + 2) = out_b[k] as u8;
+            }
         }
         px += 8;
     }
@@ -4252,18 +4308,21 @@ unsafe fn bilinear_row_rgb_u8_separable_avx2<const N: usize>(
         let o = (x0_raw.clamp(0, max_x) as usize) * 3;
         let off = px * 3;
         for ch in 0..3 {
-            let v00 = *r0_ptr.add(o + ch) as f32;
-            let v10 = *r0_ptr.add(o + 3 + ch) as f32;
-            let v01 = *r1_ptr.add(o + ch) as f32;
-            let v11 = *r1_ptr.add(o + 3 + ch) as f32;
-            let top = v00 + (v10 - v00) * fx;
-            let bot = v01 + (v11 - v01) * fx;
-            let val = top + (bot - top) * fy;
-            *row_rgb.get_unchecked_mut(off + ch) = if identity {
-                (val + 0.5) as u8
-            } else {
-                rescale_u8(val, inv[ch], mins[ch])
-            };
+            // SAFETY: `o <= max_x * 3` and `off + ch < N * 3 <= row_rgb.len()`.
+            unsafe {
+                let v00 = *r0_ptr.add(o + ch) as f32;
+                let v10 = *r0_ptr.add(o + 3 + ch) as f32;
+                let v01 = *r1_ptr.add(o + ch) as f32;
+                let v11 = *r1_ptr.add(o + 3 + ch) as f32;
+                let top = v00 + (v10 - v00) * fx;
+                let bot = v01 + (v11 - v01) * fx;
+                let val = top + (bot - top) * fy;
+                *row_rgb.get_unchecked_mut(off + ch) = if identity {
+                    (val + 0.5) as u8
+                } else {
+                    rescale_u8(val, inv[ch], mins[ch])
+                };
+            }
         }
         px += 1;
     }
@@ -6455,10 +6514,9 @@ fn eval_hillshade_row_clean<const N: usize>(
     }
 }
 
-// SAFETY: Caller checks AVX2+FMA and guarantees 3x3 stencil rows (`top`, `mid`, `bot`) have `>= N + 2` elements.
+// SAFETY: Caller checks AVX2+FMA and guarantees 3x3 stencil rows (`r0`, `r1`, `r2`) have `>= N + 2` elements and `out_idx.len() >= N`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn eval_hillshade_row_clean_avx2<const N: usize>(
     r0: *const f32,
     r1: *const f32,
@@ -6488,10 +6546,15 @@ unsafe fn eval_hillshade_row_clean_avx2<const N: usize>(
     let out_ptr = out_idx.as_mut_ptr();
     let mut px = 0usize;
     while px + 8 <= N {
-        let n = _mm256_loadu_ps(r0.add(px + 1));
-        let w = _mm256_loadu_ps(r1.add(px));
-        let e = _mm256_loadu_ps(r1.add(px + 2));
-        let s = _mm256_loadu_ps(r2.add(px + 1));
+        // SAFETY: `px + 8 <= N` guarantees `px + 2 + 8 <= N + 2` readable `f32`s in `r0..r2`.
+        let (n, w, e, s) = unsafe {
+            (
+                _mm256_loadu_ps(r0.add(px + 1)),
+                _mm256_loadu_ps(r1.add(px)),
+                _mm256_loadu_ps(r1.add(px + 2)),
+                _mm256_loadu_ps(r2.add(px + 1)),
+            )
+        };
 
         let nx = _mm256_mul_ps(_mm256_sub_ps(e, w), v_neg_zs);
         let ny = _mm256_mul_ps(_mm256_sub_ps(s, n), v_pos_zs);
@@ -6516,7 +6579,8 @@ unsafe fn eval_hillshade_row_clean_avx2<const N: usize>(
         let u16_v = _mm_packus_epi32(lo128, hi128);
         let u8_v = _mm_packus_epi16(u16_v, u16_v);
         let packed = _mm_cvtsi128_si64(u8_v) as u64;
-        (out_ptr.add(px) as *mut u64).write_unaligned(packed);
+        // SAFETY: `px + 8 <= N <= out_idx.len()` guarantees 8 writable bytes at `out_ptr.add(px)`.
+        unsafe { (out_ptr.add(px) as *mut u64).write_unaligned(packed) };
         px += 8;
     }
 }
