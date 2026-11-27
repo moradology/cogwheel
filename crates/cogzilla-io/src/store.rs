@@ -337,37 +337,13 @@ fn build_gdal_http_headers() -> reqwest::header::HeaderMap {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
-        let b64 = encode_base64_std(userpwd.as_bytes());
+        let b64 = crate::cloud::base64_encode(userpwd.as_bytes());
         if let Ok(mut val) = HeaderValue::from_str(&format!("Basic {b64}")) {
             val.set_sensitive(true);
             headers.insert(AUTHORIZATION, val);
         }
     }
     headers
-}
-
-fn encode_base64_std(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((n >> 6) & 63) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(n & 63) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 impl CogStore {

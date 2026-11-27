@@ -1020,30 +1020,6 @@ fn parse_query(q: Option<&str>) -> ParsedQuery {
     pq
 }
 
-const SUPPORTED_ALGORITHMS: &[&str] = &[
-    "hillshade",
-    "slope",
-    "aspect",
-    "terrarium",
-    "terrainrgb",
-    "terrain-rgb",
-    "mapbox",
-    "normalizedindex",
-    "cast",
-    "ceil",
-    "floor",
-    "min",
-    "max",
-    "median",
-    "mean",
-    "std",
-    "var",
-    "sum",
-    "grayscale",
-    "bitonal",
-    "contours",
-];
-
 fn parse_resample_mode(raw: &str) -> Option<ResampleMode> {
     match raw {
         "nearest" => Some(ResampleMode::Nearest),
@@ -1111,7 +1087,7 @@ fn validate_query(segs: &[&str], pq: &ParsedQuery) -> Result<(), String> {
         return Err(e.clone());
     }
     if let Some(alg) = pq.algorithm.as_deref() {
-        if !SUPPORTED_ALGORITHMS.contains(&alg) {
+        if !crate::titiler::is_supported_algorithm(alg) {
             return Err(format!(
                 "algorithm '{alg}' is not supported (use hillshade, slope, aspect, terrarium or terrainrgb)"
             ));
@@ -5383,6 +5359,80 @@ fn fc_worker_count(n: usize) -> usize {
         .min(n)
 }
 
+/// Shared worker pool for `POST /*/statistics` on GeoJSON `FeatureCollection` payloads.
+/// Parses every feature's polygon mask against `fc_crs`, runs `compute` across bounded
+/// tokio workers, inserts each feature's `"statistics"` property, and returns per-feature
+/// sidecar outputs `T` (e.g. used asset lists for `X-Assets`).
+async fn run_feature_collection_stats<T, F, Fut>(
+    geojson: &mut serde_json::Value,
+    fc_crs: Option<&cogzilla_proj::CrsModel>,
+    compute: F,
+) -> Result<Vec<T>, EngineError>
+where
+    T: Send + 'static,
+    F: Fn(Arc<PolygonMask>, [f64; 4]) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(serde_json::Value, T), EngineError>> + Send + 'static,
+{
+    let features = geojson
+        .get_mut("features")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| EngineError::BadRequest("FeatureCollection missing 'features' array".into()))?;
+    check_feature_collection_len(features.len())?;
+    let n_feats = features.len();
+    let mut parsed = Vec::with_capacity(n_feats);
+    for (idx, feat) in features.iter().enumerate() {
+        let (mask, bbox) = parse_feature_mask_or_null(feat, fc_crs)
+            .map_err(|e| wrap_feature_error(idx, feat, e))?;
+        parsed.push((Arc::new(mask), bbox));
+    }
+    let mut extras = Vec::with_capacity(n_feats);
+    if n_feats <= 1 {
+        for (idx, (mask, bbox)) in parsed.into_iter().enumerate() {
+            let (stats, extra) = compute(mask, bbox)
+                .await
+                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
+            insert_feature_stats(&mut features[idx], stats);
+            extras.push(extra);
+        }
+    } else {
+        let parsed = Arc::new(parsed);
+        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers = fc_worker_count(n_feats);
+        let compute = Arc::new(compute);
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..workers {
+            let parsed_c = parsed.clone();
+            let next_c = next_idx.clone();
+            let compute_c = compute.clone();
+            set.spawn(async move {
+                let mut local = Vec::new();
+                loop {
+                    let idx = next_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= parsed_c.len() {
+                        break;
+                    }
+                    let (ref mask, bbox) = parsed_c[idx];
+                    let (stats, extra) = compute_c(mask.clone(), bbox)
+                        .await
+                        .map_err(|e| (idx, e))?;
+                    local.push((idx, stats, extra));
+                }
+                Ok::<_, (usize, EngineError)>(local)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let batch = joined
+                .map_err(|e| EngineError::BadRequest(format!("statistics worker failed: {e}")))?
+                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
+            for (idx, stats, extra) in batch {
+                insert_feature_stats(&mut features[idx], stats);
+                extras.push(extra);
+            }
+        }
+    }
+    Ok(extras)
+}
+
 async fn read_limited_body_with_timeout<B>(body: B, timeout_secs: u64) -> Result<Bytes, EngineError>
 where
     B: hyper::body::Body,
@@ -6409,75 +6459,17 @@ where
                     })
                 };
                 if geojson.get("type").and_then(|v| v.as_str()) == Some("FeatureCollection") {
-                    let features = geojson
-                        .get_mut("features")
-                        .and_then(|v| v.as_array_mut())
-                        .ok_or_else(|| {
-                            EngineError::BadRequest(
-                                "FeatureCollection missing 'features' array".into(),
-                            )
-                        })?;
-                    check_feature_collection_len(features.len())?;
-                    let n_feats = features.len();
-                    let mut parsed = Vec::with_capacity(n_feats);
-                    for (idx, feat) in features.iter().enumerate() {
-                        let (mask, bbox) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
-                            .map_err(|e| wrap_feature_error(idx, feat, e))?;
-                        parsed.push((mask, bbox));
-                    }
+                    let used_batches = run_feature_collection_stats(
+                        &mut geojson,
+                        fc_crs.as_ref(),
+                        move |mask, bbox| compute_for_mask((*mask).clone(), bbox),
+                    )
+                    .await?;
                     let mut seen_assets = std::collections::HashSet::new();
-                    if n_feats <= 1 {
-                        for (idx, (mask, bbox)) in parsed.into_iter().enumerate() {
-                            let (stats, used) = compute_for_mask(mask, bbox)
-                                .await
-                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
-                            for a in used {
-                                if seen_assets.insert(a.clone()) {
-                                    x_assets.push(a);
-                                }
-                            }
-                            insert_feature_stats(&mut features[idx], stats);
-                        }
-                    } else {
-                        let parsed = Arc::new(parsed);
-                        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                        let workers = fc_worker_count(n_feats);
-                        let mut set = tokio::task::JoinSet::new();
-                        for _ in 0..workers {
-                            let parsed_c = parsed.clone();
-                            let next_c = next_idx.clone();
-                            let compute_c = compute_for_mask.clone();
-                            set.spawn(async move {
-                                let mut local = Vec::new();
-                                loop {
-                                    let idx = next_c
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if idx >= parsed_c.len() {
-                                        break;
-                                    }
-                                    let (ref mask, bbox) = parsed_c[idx];
-                                    let (stats, used) =
-                                        compute_c(mask.clone(), bbox).await.map_err(|e| (idx, e))?;
-                                    local.push((idx, stats, used));
-                                }
-                                Ok::<_, (usize, EngineError)>(local)
-                            });
-                        }
-                        while let Some(joined) = set.join_next().await {
-                            let batch = joined
-                                .map_err(|e| {
-                                    EngineError::BadRequest(format!(
-                                        "statistics worker failed: {e}"
-                                    ))
-                                })?
-                                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
-                            for (idx, stats, used) in batch {
-                                for a in used {
-                                    if seen_assets.insert(a.clone()) {
-                                        x_assets.push(a);
-                                    }
-                                }
-                                insert_feature_stats(&mut features[idx], stats);
+                    for used in used_batches {
+                        for a in used {
+                            if seen_assets.insert(a.clone()) {
+                                x_assets.push(a);
                             }
                         }
                     }
@@ -8564,67 +8556,16 @@ where
                         Some(c) => Some(c.clone()),
                         None => crate::titiler::extract_geojson_crs(&geojson)?,
                     };
-                    let features = geojson
-                        .get_mut("features")
-                        .and_then(|v| v.as_array_mut())
-                        .ok_or_else(|| {
-                            EngineError::BadRequest("FeatureCollection missing 'features' array".into())
-                        })?;
-                    check_feature_collection_len(features.len())?;
-                    let n_feats = features.len();
-                    let mut parsed = Vec::with_capacity(n_feats);
-                    for (idx, feat) in features.iter().enumerate() {
-                        let (mask, poly_bbox) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
-                            .map_err(|e| wrap_feature_error(idx, feat, e))?;
-                        parsed.push((Arc::new(mask), poly_bbox));
-                    }
-                    if n_feats <= 1 {
-                        for (idx, (mask, poly_bbox)) in parsed.into_iter().enumerate() {
-                            let stats = compute_stac_merged_stats(mask, poly_bbox)
-                                .await
-                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
-                            insert_feature_stats(&mut features[idx], stats);
-                        }
-                    } else {
-                        let parsed = Arc::new(parsed);
-                        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                        let workers = fc_worker_count(n_feats);
-                        let compute_shared = Arc::new(compute_stac_merged_stats);
-                        let mut set = tokio::task::JoinSet::new();
-                        for _ in 0..workers {
-                            let parsed_c = parsed.clone();
-                            let next_c = next_idx.clone();
+                    let compute_shared = Arc::new(compute_stac_merged_stats);
+                    run_feature_collection_stats(
+                        &mut geojson,
+                        fc_crs.as_ref(),
+                        move |mask, poly_bbox| {
                             let compute_c = compute_shared.clone();
-                            set.spawn(async move {
-                                let mut local = Vec::new();
-                                loop {
-                                    let idx = next_c
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if idx >= parsed_c.len() {
-                                        break;
-                                    }
-                                    let (ref mask, poly_bbox) = parsed_c[idx];
-                                    let stats = compute_c(mask.clone(), poly_bbox)
-                                        .await
-                                        .map_err(|e| (idx, e))?;
-                                    local.push((idx, stats));
-                                }
-                                Ok::<_, (usize, EngineError)>(local)
-                            });
-                        }
-                        while let Some(joined) = set.join_next().await {
-                            let batch = joined
-                                .map_err(|e| {
-                                    EngineError::BadRequest(format!(
-                                        "statistics worker failed: {e}"
-                                    ))
-                                })?
-                                .map_err(|(idx, e)| wrap_feature_error(idx, &features[idx], e))?;
-                            for (idx, stats) in batch {
-                                insert_feature_stats(&mut features[idx], stats);
-                            }
-                        }
-                    }
+                            async move { Ok((compute_c(mask, poly_bbox).await?, ())) }
+                        },
+                    )
+                    .await?;
                     Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                 } else {
                     let (mask, poly_bbox) =
@@ -10085,90 +10026,35 @@ where
                             Some(c) => Some(c.clone()),
                             None => crate::titiler::extract_geojson_crs(&geojson)?,
                         };
-                        let features = geojson
-                            .get_mut("features")
-                            .and_then(|v| v.as_array_mut())
-                            .ok_or_else(|| {
-                                EngineError::BadRequest(
-                                    "FeatureCollection missing 'features' array".into(),
-                                )
-                            })?;
-                        check_feature_collection_len(features.len())?;
-                        let n_feats = features.len();
-                        let mut masks = Vec::with_capacity(n_feats);
-                        for (idx, feat) in features.iter().enumerate() {
-                            let (mask, _) = parse_feature_mask_or_null(feat, fc_crs.as_ref())
-                                .map_err(|e| wrap_feature_error(idx, feat, e))?;
-                            masks.push(mask);
-                        }
-                        if n_feats <= 1 {
-                            for (idx, mask) in masks.into_iter().enumerate() {
-                                let stats = compute_statistics_with_options(
-                                    &engine,
-                                    &cogs[0],
-                                    pq.max_size,
-                                    Some(&mask),
-                                    pq.unscale,
-                                    pq.nodata,
-                                    &stats_opts,
-                                )
-                                .await
-                                .map_err(|e| wrap_feature_error(idx, &features[idx], e))?;
-                                insert_feature_stats(&mut features[idx], stats);
-                            }
-                        } else {
-                            let masks = Arc::new(masks);
-                            let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                            let workers = fc_worker_count(n_feats);
-                            let mut set = tokio::task::JoinSet::new();
-                            for _ in 0..workers {
-                                let eng_c = engine.clone();
-                                let cog_c = cogs[0].clone();
-                                let masks_c = masks.clone();
-                                let next_c = next_idx.clone();
-                                let opts_c = stats_opts.clone();
-                                let max_size = pq.max_size;
-                                let unscale = pq.unscale;
-                                let nodata = pq.nodata;
-                                set.spawn(async move {
-                                    let mut local = Vec::new();
-                                    loop {
-                                        let idx = next_c
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        if idx >= masks_c.len() {
-                                            break;
-                                        }
-                                        let stats = compute_statistics_with_options(
-                                            &eng_c,
-                                            &cog_c,
-                                            max_size,
-                                            Some(&masks_c[idx]),
-                                            unscale,
-                                            nodata,
-                                            &opts_c,
-                                        )
-                                        .await
-                                        .map_err(|e| (idx, e))?;
-                                        local.push((idx, stats));
-                                    }
-                                    Ok::<_, (usize, EngineError)>(local)
-                                });
-                            }
-                            while let Some(joined) = set.join_next().await {
-                                let batch = joined
-                                    .map_err(|e| {
-                                        EngineError::BadRequest(format!(
-                                            "statistics worker failed: {e}"
-                                        ))
-                                    })?
-                                    .map_err(|(idx, e)| {
-                                        wrap_feature_error(idx, &features[idx], e)
-                                    })?;
-                                for (idx, stats) in batch {
-                                    insert_feature_stats(&mut features[idx], stats);
+                        let eng_c = engine.clone();
+                        let cog_c = cogs[0].clone();
+                        let opts_c = stats_opts.clone();
+                        let max_size = pq.max_size;
+                        let unscale = pq.unscale;
+                        let nodata = pq.nodata;
+                        run_feature_collection_stats(
+                            &mut geojson,
+                            fc_crs.as_ref(),
+                            move |mask, _| {
+                                let eng_c = eng_c.clone();
+                                let cog_c = cog_c.clone();
+                                let opts_c = opts_c.clone();
+                                async move {
+                                    let stats = compute_statistics_with_options(
+                                        &eng_c,
+                                        &cog_c,
+                                        max_size,
+                                        Some(&mask),
+                                        unscale,
+                                        nodata,
+                                        &opts_c,
+                                    )
+                                    .await?;
+                                    Ok((stats, ()))
                                 }
-                            }
-                        }
+                            },
+                        )
+                        .await?;
                         Ok((Bytes::from(geojson.to_string()), "application/geo+json"))
                     } else {
                         let (mask, _) =
