@@ -3,7 +3,8 @@
 Live HTTP Differential Oracle: TiTiler 2.4 vs. cogzilla-server.
 
 Spins up BOTH `cogzilla-server` (--release) and stock `TiTiler` (uvicorn) on loopback,
-sends identical HTTP requests across the full `/cog/*`, `/stac/*`, `/algorithms/*`,
+sends identical HTTP requests across the family-parameterised `/cog/*`, `/stac/*`,
+`/mosaicjson/*` (plus optional `/searches/*` and `/zarr/*`), `/algorithms/*`,
 `/colorMaps/*`, and `/tileMatrixSets/*` API surface, asserts status codes, headers,
 JSON schema/numerical parity, XML well-formedness, GeoTIFF/NPY structure, and
 visual PNG/JPEG/WebP mask agreement & PSNR, and reports warm latency speedups.
@@ -13,6 +14,8 @@ Exits non-zero if any check fails.
 
 from __future__ import annotations
 
+import argparse
+import importlib.util
 import io
 import json
 import math
@@ -40,6 +43,126 @@ COGZILLA_BIN = ROOT / "target" / "release" / "cogzilla-server"
 
 PORT_CW = 18801
 PORT_TT = 18802
+
+# Family registry (#450): every route family cogzilla serves, its prefix, whether it runs
+# by default, and any optional reference dependency required on the TiTiler side.
+FAMILIES: dict[str, dict[str, object]] = {
+    "cog":        {"prefix": "/cog",        "default": True,  "needs": None},
+    "stac":       {"prefix": "/stac",       "default": True,  "needs": None},
+    "mosaicjson": {"prefix": "/mosaicjson", "default": True,  "needs": "titiler.mosaic"},
+    "searches":   {"prefix": "/searches",   "default": False, "needs": "titiler.pgstac"},
+    "zarr":       {"prefix": "/zarr",       "default": False, "needs": "titiler.xarray"},
+}
+
+
+def tile_to_quadkey(z: int, x: int, y: int) -> str:
+    """Convert XYZ WebMercator tile coordinates to a Bing quadkey string."""
+    digits = []
+    for i in range(z, 0, -1):
+        mask = 1 << (i - 1)
+        d = 0
+        if x & mask:
+            d += 1
+        if y & mask:
+            d += 2
+        digits.append(str(d))
+    return "".join(digits)
+
+
+def ensure_mosaicjson_fixture(sat_path: str) -> str:
+    """Write a local MosaicJSON 0.0.2 fixture pointing at `sat_path` covering tile 12/652/1583."""
+    out = FIXTURES / "satellite_mosaic.json"
+    qk = tile_to_quadkey(12, 652, 1583)
+    # Include the 3x3 neighbourhood around 12/652/1583 so bbox/point/stats queries cover it too.
+    tiles = {
+        tile_to_quadkey(12, x, y): [sat_path]
+        for x in range(651, 654)
+        for y in range(1582, 1585)
+    }
+    tiles[qk] = [sat_path]
+    doc = {
+        "mosaicjson": "0.0.2",
+        "name": "cogzilla_oracle_satellite",
+        "version": "1.0.0",
+        "minzoom": 10,
+        "maxzoom": 14,
+        "quadkey_zoom": 12,
+        "bounds": [-123.0, 37.5, -122.3, 38.0],
+        "center": [-122.65, 37.75, 12],
+        "tiles": tiles,
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2))
+    return str(out.resolve())
+
+
+def build_shared_mosaicjson_cases(
+    mosaic_url: str,
+    poly_feature: dict,
+    hs_params: str,
+) -> list[tuple[str, str, str, dict | None, str]]:
+    """Family-parameterised shared differential cases for `/mosaicjson/*` (#450)."""
+    p = "/mosaicjson"
+    return [
+        (f"GET {p}/WebMercatorQuad/tilejson.json", "GET", f"{p}/WebMercatorQuad/tilejson.json?url={mosaic_url}", None, "json_tj"),
+        (f"GET {p}/WebMercatorQuad/WMTSCapabilities.xml", "GET", f"{p}/WebMercatorQuad/WMTSCapabilities.xml?url={mosaic_url}", None, "wmts_xml"),
+        (f"GET {p}/tiles/WebMercatorQuad/12/652/1583.png (RGB)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png?tilesize=512", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&tilesize=512&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.jpg (JPEG)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.jpg?url={mosaic_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.webp (WebP)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.webp?url={mosaic_url}&bidx=1&bidx=2&bidx=3&rescale=0,0.35&reproject=bilinear", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png (colormap viridis)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&rescale=0,0.35&colormap_name=viridis", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png (expression NDVI)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&expression=(b2-b1)/(b2%2Bb1)&rescale=-1,1&colormap_name=rdylgn", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.png (algorithm=hillshade)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&algorithm=hillshade&algorithm_params={hs_params}", None, "png_loose"),
+        (f"GET {p}/tiles/.../12/652/1583.png (nodata=0)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.png?url={mosaic_url}&bidx=1&rescale=0,0.35&nodata=0", None, "png"),
+        (f"GET {p}/tiles/.../12/652/1583.npy (NPY)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.npy?url={mosaic_url}&bidx=1&bidx=2&bidx=3", None, "npy"),
+        (f"GET {p}/tiles/.../12/652/1583.tif (GeoTIFF)", "GET", f"{p}/tiles/WebMercatorQuad/12/652/1583.tif?url={mosaic_url}&bidx=1&bidx=2&bidx=3", None, "geotiff"),
+        (f"GET {p}/point/-122.65,37.75", "GET", f"{p}/point/-122.65,37.75?url={mosaic_url}", None, "json_point"),
+        (f"POST {p}/statistics (polygon)", "POST", f"{p}/statistics?url={mosaic_url}&bidx=1", poly_feature, "json_post_stats"),
+    ]
+
+
+def build_shared_zarr_cases(zarr_url: str) -> list[tuple[str, str, str, dict | None, str]]:
+    """Family-parameterised shared differential cases for `/zarr/*` when `titiler.xarray` is mounted."""
+    p = "/zarr"
+    q = f"url={quote(zarr_url, safe='')}"
+    return [
+        (f"GET {p}/info", "GET", f"{p}/info?{q}", None, "json_info"),
+        (f"GET {p}/WebMercatorQuad/tilejson.json", "GET", f"{p}/WebMercatorQuad/tilejson.json?{q}", None, "json_tj"),
+        (f"GET {p}/tiles/WebMercatorQuad/0/0/0.png (rescale+viridis)", "GET", f"{p}/tiles/WebMercatorQuad/0/0/0.png?{q}&rescale=0,255&colormap_name=viridis", None, "png"),
+        (f"GET {p}/tiles/WebMercatorQuad/0/0/0.jpg (JPEG)", "GET", f"{p}/tiles/WebMercatorQuad/0/0/0.jpg?{q}&rescale=0,255", None, "png"),
+        (f"GET {p}/tiles/WebMercatorQuad/0/0/0.npy (NPY)", "GET", f"{p}/tiles/WebMercatorQuad/0/0/0.npy?{q}", None, "npy"),
+    ]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Live HTTP differential oracle: TiTiler 2.4 vs cogzilla-server")
+    default_fams = ",".join(k for k, v in FAMILIES.items() if v["default"])
+    parser.add_argument(
+        "--families",
+        default=default_fams,
+        help=f"Comma-separated route families to test (available: {','.join(FAMILIES)}; default: {default_fams})",
+    )
+    parser.add_argument(
+        "--list-families",
+        action="store_true",
+        help="Print the route family coverage registry and exit",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Do not invoke `cargo build --release -p cogzilla-server` when the binary is absent",
+    )
+    parser.add_argument(
+        "--zarr-url",
+        default="",
+        help="Zarr store path/URL for `--families zarr` (defaults to benches/fixtures/zarr/v2_2d.zarr when present)",
+    )
+    parser.add_argument(
+        "--json-out",
+        default=str(RESULTS / "titiler_diff_oracle.json"),
+        help="Path to write JSON summary report",
+    )
+    return parser.parse_args(argv)
 
 
 def ensure_dtype_fixtures() -> dict[str, tuple[str, str]]:
@@ -176,34 +299,77 @@ def compare_wmts_xml(cw_bytes: bytes, tt_bytes: bytes) -> tuple[bool, str]:
     return True, f"tms={cw_tms} matrices=cw:{cw_mats}/tt:{tt_mats}"
 
 
-def main():
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
+    if args.list_families:
+        print(f"{'family':12s} | {'prefix':12s} | {'default':7s} | {'reference_pkg'}")
+        print("-" * 60)
+        for name, spec in FAMILIES.items():
+            needs = spec["needs"] or "titiler.core"
+            avail = importlib.util.find_spec(str(needs)) is not None
+            print(f"{name:12s} | {str(spec['prefix']):12s} | {str(spec['default']):7s} | {needs} (installed={avail})")
+        return
+
+    requested_families = [f.strip() for f in args.families.split(",") if f.strip()]
+    unknown = [f for f in requested_families if f not in FAMILIES]
+    if unknown:
+        raise SystemExit(f"Unknown route family(ies): {unknown} (valid: {list(FAMILIES)})")
+
+    active_families: set[str] = set()
+    for fam in requested_families:
+        needs = FAMILIES[fam]["needs"]
+        if needs and importlib.util.find_spec(str(needs)) is None:
+            print(f"[oracle] skipping family '{fam}': optional reference package '{needs}' is not installed")
+            continue
+        active_families.add(fam)
+
     RESULTS.mkdir(parents=True, exist_ok=True)
     if not COGZILLA_BIN.exists():
+        if args.skip_build:
+            raise SystemExit(f"cogzilla-server binary not found at {COGZILLA_BIN} (--skip-build set)")
         print("Building cogzilla-server --release...")
         subprocess.run(["cargo", "build", "--release", "-p", "cogzilla-server"], cwd=ROOT, check=True)
 
+    app_lines = [
+        "from fastapi import FastAPI",
+        "from rio_tiler.errors import PointOutsideBounds",
+        "from rio_tiler.io import STACReader",
+        "from titiler.core.errors import DEFAULT_STATUS_CODES, add_exception_handlers",
+        "from titiler.core.factory import (",
+        "    TilerFactory, MultiBaseTilerFactory, ColorMapFactory, TMSFactory, AlgorithmFactory",
+        ")",
+    ]
+    if "mosaicjson" in active_families:
+        app_lines.append("from titiler.mosaic.factory import MosaicTilerFactory")
+    if "zarr" in active_families:
+        app_lines.append("from titiler.xarray.factory import TilerFactory as XarrayTilerFactory")
+    app_lines += [
+        "app = FastAPI()",
+        "add_exception_handlers(app, {**DEFAULT_STATUS_CODES, PointOutsideBounds: 404})",
+        "cog = TilerFactory(router_prefix='/cog', add_ogc_maps=True)",
+        "stac = MultiBaseTilerFactory(reader=STACReader, router_prefix='/stac', add_ogc_maps=True)",
+        "cmaps = ColorMapFactory()",
+        "tms = TMSFactory()",
+        "algs = AlgorithmFactory()",
+        "app.include_router(cog.router, prefix='/cog')",
+        "app.include_router(stac.router, prefix='/stac')",
+        "app.include_router(cmaps.router)",
+        "app.include_router(tms.router)",
+        "app.include_router(algs.router)",
+    ]
+    if "mosaicjson" in active_families:
+        app_lines += [
+            "mosaic = MosaicTilerFactory(router_prefix='/mosaicjson', add_ogc_maps=True)",
+            "app.include_router(mosaic.router, prefix='/mosaicjson')",
+        ]
+    if "zarr" in active_families:
+        app_lines += [
+            "zarr_tiler = XarrayTilerFactory(router_prefix='/zarr')",
+            "app.include_router(zarr_tiler.router, prefix='/zarr')",
+        ]
+
     tt_app = RESULTS / "_titiler_oracle_app.py"
-    tt_app.write_text(
-        "from fastapi import FastAPI\n"
-        "from rio_tiler.errors import PointOutsideBounds\n"
-        "from rio_tiler.io import STACReader\n"
-        "from titiler.core.errors import DEFAULT_STATUS_CODES, add_exception_handlers\n"
-        "from titiler.core.factory import (\n"
-        "    TilerFactory, MultiBaseTilerFactory, ColorMapFactory, TMSFactory, AlgorithmFactory\n"
-        ")\n"
-        "app = FastAPI()\n"
-        "add_exception_handlers(app, {**DEFAULT_STATUS_CODES, PointOutsideBounds: 404})\n"
-        "cog = TilerFactory(router_prefix='/cog', add_ogc_maps=True)\n"
-        "stac = MultiBaseTilerFactory(reader=STACReader, router_prefix='/stac', add_ogc_maps=True)\n"
-        "cmaps = ColorMapFactory()\n"
-        "tms = TMSFactory()\n"
-        "algs = AlgorithmFactory()\n"
-        "app.include_router(cog.router, prefix='/cog')\n"
-        "app.include_router(stac.router, prefix='/stac')\n"
-        "app.include_router(cmaps.router)\n"
-        "app.include_router(tms.router)\n"
-        "app.include_router(algs.router)\n"
-    )
+    tt_app.write_text("\n".join(app_lines) + "\n")
 
     cw_proc = subprocess.Popen(
         [str(COGZILLA_BIN), "--bind", f"127.0.0.1:{PORT_CW}", "--cache-mb", "512"],
@@ -561,7 +727,20 @@ def main():
             ("STAC [2-asset per-asset expr .npy]", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.npy?url={stac_item}&assets=red|expression=b1*2&assets=green|expression=b1*3", None, "npy"),
         ])
 
-        print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks) ===")
+        # Filter built-in /cog and /stac cases when the caller requests a specific subset.
+        if "cog" not in active_families:
+            cases = [c for c in cases if not c[2].startswith("/cog/")]
+        if "stac" not in active_families:
+            cases = [c for c in cases if not c[2].startswith("/stac/")]
+        if "mosaicjson" in active_families:
+            mosaic_url = ensure_mosaicjson_fixture(sat)
+            cases.extend(build_shared_mosaicjson_cases(mosaic_url, poly_feature, hs_params))
+        if "zarr" in active_families:
+            zarr_target = args.zarr_url or str((FIXTURES / "zarr" / "v2_2d.zarr").resolve())
+            if Path(zarr_target).exists() or zarr_target.startswith(("http://", "https://", "s3://", "gs://")):
+                cases.extend(build_shared_zarr_cases(zarr_target))
+
+        print(f"\n=== Live HTTP Differential Oracle: cogzilla vs. TiTiler ({len(cases)} checks; families: {', '.join(sorted(active_families))}) ===")
         print(f"{'St':4s} | {'Endpoint':54s} | {'cogzilla':>9s} | {'TiTiler':>9s} | {'Speedup':>8s} | Parity vs TiTiler")
         print("-" * 145)
 
@@ -768,7 +947,8 @@ def main():
                     "parity": parity,
                 })
 
-        (RESULTS / "titiler_diff_oracle.json").write_text(json.dumps(summary, indent=2))
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(summary, indent=2))
         passed = len(cases) - len(failures)
         print(f"\nOracle summary: {passed}/{len(cases)} passed, {len(failures)} failed")
         if failures:
