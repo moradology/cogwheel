@@ -274,16 +274,18 @@ async fn main() {
         let big_plane = vec![100.0f32; 2048 * 2048];
         let refs: Vec<&[f32]> = (0..16).map(|_| big_plane.as_slice()).collect();
         let rgb_planes: [&[&[f32]]; 3] = [&refs, &refs, &refs];
-        let oversized = gpu.try_composite_mosaic_rgb_styled(
-            2048,
-            2048,
-            &rgb_planes,
-            GpuPixelSelection::Median,
-            [0.0; 3],
-            [255.0; 3],
-            OutputFormat::Jpeg { quality: 85 },
-            false,
-        );
+        let oversized = gpu.try_composite_mosaic(&cogzilla_server::gpu_backend::MosaicCompositeRequest {
+            width: 2048,
+            height: 2048,
+            input: cogzilla_server::gpu_backend::MosaicCompositeInput::Rgb(&rgb_planes),
+            method: GpuPixelSelection::Median,
+            output: cogzilla_server::gpu_backend::MosaicCompositeOutput::RgbStyled {
+                rescale_min: [0.0; 3],
+                rescale_max: [255.0; 3],
+                format: OutputFormat::Jpeg { quality: 85 },
+                return_mask: false,
+            },
+        });
         assert!(
             oversized.is_none(),
             "768 MiB stack should cleanly fall back to None instead of panicking"
@@ -634,16 +636,23 @@ async fn main() {
                             .gpu
                             .as_ref()
                             .unwrap()
-                            .try_composite_mosaic_rgb_styled(
-                                1024,
-                                1024,
-                                &rgb,
-                                GpuPixelSelection::Median,
-                                [0.0; 3],
-                                [255.0; 3],
-                                OutputFormat::Jpeg { quality: 85 },
-                                false,
+                            .try_composite_mosaic(
+                                &cogzilla_server::gpu_backend::MosaicCompositeRequest {
+                                    width: 1024,
+                                    height: 1024,
+                                    input: cogzilla_server::gpu_backend::MosaicCompositeInput::Rgb(
+                                        &rgb,
+                                    ),
+                                    method: GpuPixelSelection::Median,
+                                    output: cogzilla_server::gpu_backend::MosaicCompositeOutput::RgbStyled {
+                                        rescale_min: [0.0; 3],
+                                        rescale_max: [255.0; 3],
+                                        format: OutputFormat::Jpeg { quality: 85 },
+                                        return_mask: false,
+                                    },
+                                },
                             )
+                            .and_then(cogzilla_server::gpu_backend::MosaicCompositeResult::into_bytes)
                         {
                             assert!(jpg.starts_with(&[0xff, 0xd8]));
                             true

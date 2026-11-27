@@ -514,6 +514,75 @@ fn to_owned_plan(coords: BboxCoordSource<'_>, bc: f32, br: f32) -> OwnedCoordPla
     }
 }
 
+/// Input planes for [`GpuBackend::try_composite_mosaic`].
+pub enum MosaicCompositeInput<'a> {
+    /// Single band across `2..=32` aligned scenes.
+    Single(&'a [&'a [f32]]),
+    /// `B` bands × `2..=32` aligned scenes.
+    Bands(&'a [Vec<&'a [f32]>]),
+    /// 3 RGB bands × `2..=32` aligned scenes.
+    Rgb(&'a [&'a [&'a [f32]]; 3]),
+}
+
+/// Desired output mode for [`GpuBackend::try_composite_mosaic`].
+pub enum MosaicCompositeOutput {
+    /// Raw reduced `f32` plane(s).
+    F32,
+    /// Fused single-band rescale + colormap to PNG / WebP / JPEG / RawRgba.
+    Styled {
+        rescale: (f32, f32),
+        colormap: ColormapName,
+        format: OutputFormat,
+        return_mask: bool,
+    },
+    /// Fused 3-band RGB per-channel rescale to JPEG / PNG / WebP / RawRgba.
+    RgbStyled {
+        rescale_min: [f32; 3],
+        rescale_max: [f32; 3],
+        format: OutputFormat,
+        return_mask: bool,
+    },
+}
+
+/// Request descriptor for [`GpuBackend::try_composite_mosaic`].
+pub struct MosaicCompositeRequest<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub input: MosaicCompositeInput<'a>,
+    pub method: GpuPixelSelection,
+    pub output: MosaicCompositeOutput,
+}
+
+/// Output produced by [`GpuBackend::try_composite_mosaic`].
+pub enum MosaicCompositeResult {
+    F32(Vec<f32>),
+    F32Bands(Vec<Vec<f32>>),
+    Bytes(Bytes),
+}
+
+impl MosaicCompositeResult {
+    pub fn into_f32(self) -> Option<Vec<f32>> {
+        match self {
+            Self::F32(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn into_f32_bands(self) -> Option<Vec<Vec<f32>>> {
+        match self {
+            Self::F32Bands(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn into_bytes(self) -> Option<Bytes> {
+        match self {
+            Self::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
 fn source_slab_key(cog_id: u64, ifd_idx: usize, band0: u16, src: &BandSource<'_>) -> Option<SlabKey> {
     if src.nodata_override.is_some()
         || src.scale_offset.is_some()
@@ -1879,79 +1948,142 @@ impl GpuBackend {
         }
     }
 
-    /// Attempt GPU-accelerated multi-scene pixel selection (`First`, `Highest`, `Lowest`, `Mean`,
-    /// `Median`, `Stdev`, `Count`) over `2..=32` aligned `f32` planes, returning reduced `f32` pixels.
-    pub fn try_composite_mosaic_f32(
+    /// Unified GPU-accelerated multi-scene mosaic pixel-selection compositing (`First`, `Highest`,
+    /// `Lowest`, `Mean`, `Median`, `Stdev`, `Count`) over `2..=32` aligned `f32` scenes.
+    ///
+    /// Collapses the single-band `f32`, multi-band `f32`, fused single-band styled (PNG `IndexedU8`
+    /// / GPU JPEG FDCT / WebP / RawRgba), and fused 3-band RGB styled paths behind one dispatch
+    /// gate and one `(input, output)` match table.
+    pub fn try_composite_mosaic(
         &self,
-        width: u32,
-        height: u32,
-        planes: &[&[f32]],
-        method: GpuPixelSelection,
-    ) -> Option<Vec<f32>> {
-        if planes.len() < 2 || planes.len() > 32 || width == 0 || height == 0 {
+        req: &MosaicCompositeRequest<'_>,
+    ) -> Option<MosaicCompositeResult> {
+        let (width, height, method) = (req.width, req.height, req.method);
+        if width == 0 || height == 0 {
             return None;
         }
         let pixels = (width as usize).checked_mul(height as usize)?;
-        let upload_bytes = planes.len().saturating_mul(pixels).saturating_mul(4);
-        let readback_bytes = pixels.saturating_mul(4);
-        let decision = self.policy.decide(&DispatchRequest {
-            op: Self::mosaic_policy_op(method, planes.len()),
-            dst_pixels: pixels,
-            upload_bytes,
-            readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
+        let jpeg_readback = || {
+            let mcu_w = (width as usize).div_ceil(16);
+            let mcu_h = (height as usize).div_ceil(16);
+            mcu_w.saturating_mul(mcu_h).saturating_mul(192 * 4)
+        };
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
+        // 1. Validate shape + compute policy dimensions in one table.
+        let (num_scenes, dst_pixels, upload_bytes, readback_bytes, batch_size, styled_out_kind) =
+            match (&req.input, &req.output) {
+                (MosaicCompositeInput::Single(planes), MosaicCompositeOutput::F32) => {
+                    if !(2..=32).contains(&planes.len()) {
+                        return None;
+                    }
+                    (
+                        planes.len(),
+                        pixels,
+                        planes.len().saturating_mul(pixels).saturating_mul(4),
+                        pixels.saturating_mul(4),
+                        1,
+                        None,
+                    )
+                }
+                (MosaicCompositeInput::Bands(band_planes), MosaicCompositeOutput::F32) => {
+                    if band_planes.is_empty() {
+                        return None;
+                    }
+                    let ns = band_planes[0].len();
+                    if !(2..=32).contains(&ns) || band_planes.iter().any(|bp| bp.len() != ns) {
+                        return None;
+                    }
+                    let nb = band_planes.len();
+                    (
+                        ns,
+                        pixels.saturating_mul(nb),
+                        nb.saturating_mul(ns).saturating_mul(pixels).saturating_mul(4),
+                        nb.saturating_mul(pixels).saturating_mul(4),
+                        nb,
+                        None,
+                    )
+                }
+                (
+                    MosaicCompositeInput::Single(planes),
+                    MosaicCompositeOutput::Styled {
+                        format,
+                        return_mask,
+                        ..
+                    },
+                ) => {
+                    if !(2..=32).contains(&planes.len()) {
+                        return None;
+                    }
+                    let out_kind = match format {
+                        OutputFormat::Png if *return_mask => GpuPixelOutput::IndexedU8,
+                        OutputFormat::Png
+                        | OutputFormat::Webp { .. }
+                        | OutputFormat::Jpeg { .. }
+                        | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
+                        _ => return None,
+                    };
+                    let rb = match format {
+                        OutputFormat::Jpeg { .. } => jpeg_readback(),
+                        _ => match out_kind {
+                            GpuPixelOutput::IndexedU8 => pixels,
+                            GpuPixelOutput::Rgba8 => pixels.saturating_mul(4),
+                        },
+                    };
+                    (
+                        planes.len(),
+                        pixels,
+                        planes.len().saturating_mul(pixels).saturating_mul(4),
+                        rb,
+                        1,
+                        Some(out_kind),
+                    )
+                }
+                (
+                    MosaicCompositeInput::Rgb(rgb_planes),
+                    MosaicCompositeOutput::RgbStyled { format, .. },
+                ) => {
+                    let ns = rgb_planes[0].len();
+                    if !(2..=32).contains(&ns)
+                        || rgb_planes[1].len() != ns
+                        || rgb_planes[2].len() != ns
+                    {
+                        return None;
+                    }
+                    if !matches!(
+                        format,
+                        OutputFormat::Png
+                            | OutputFormat::Webp { .. }
+                            | OutputFormat::Jpeg { .. }
+                            | OutputFormat::RawRgba
+                    ) {
+                        return None;
+                    }
+                    let rb = match format {
+                        OutputFormat::Jpeg { .. } => jpeg_readback(),
+                        _ => pixels.saturating_mul(4),
+                    };
+                    (
+                        ns,
+                        pixels.saturating_mul(3),
+                        3usize
+                            .saturating_mul(ns)
+                            .saturating_mul(pixels)
+                            .saturating_mul(4),
+                        rb,
+                        3,
+                        None,
+                    )
+                }
+                // Unfilled combinations fall back to CPU cleanly.
+                _ => return None,
+            };
 
-        let mut mosaic_guard = self.mosaic.lock().ok()?;
-        mosaic_guard
-            .composite_f32_direct(planes, width, height, method)
-            .ok()
-    }
-
-    /// Attempt GPU-accelerated multi-band, multi-scene pixel selection (`First`, `Highest`,
-    /// `Lowest`, `Mean`, `Median`, `Stdev`, `Count`) over `B` bands × `2..=32` aligned `f32`
-    /// planes in **1 `CommandEncoder` → 1 `queue.submit()` → 1 `map_async()`**.
-    pub fn try_composite_mosaic_f32_bands(
-        &self,
-        width: u32,
-        height: u32,
-        band_planes: &[Vec<&[f32]>],
-        method: GpuPixelSelection,
-    ) -> Option<Vec<Vec<f32>>> {
-        if band_planes.is_empty() || width == 0 || height == 0 {
-            return None;
-        }
-        let num_scenes = band_planes[0].len();
-        if !(2..=32).contains(&num_scenes)
-            || band_planes.iter().any(|bp| bp.len() != num_scenes)
-        {
-            return None;
-        }
-        if band_planes.len() == 1 {
-            return self
-                .try_composite_mosaic_f32(width, height, &band_planes[0], method)
-                .map(|v| vec![v]);
-        }
-        let pixels = (width as usize).checked_mul(height as usize)?;
-        let nb = band_planes.len();
-        let upload_bytes = nb
-            .saturating_mul(num_scenes)
-            .saturating_mul(pixels)
-            .saturating_mul(4);
-        let readback_bytes = nb.saturating_mul(pixels).saturating_mul(4);
         let decision = self.policy.decide(&DispatchRequest {
             op: Self::mosaic_policy_op(method, num_scenes),
-            dst_pixels: pixels.saturating_mul(nb),
+            dst_pixels,
             upload_bytes,
             readback_bytes,
-            batch_size: nb,
+            batch_size,
             in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
         });
         if !decision.use_gpu {
@@ -1961,219 +2093,146 @@ impl GpuBackend {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         let _guard = InFlightGuard(&self.in_flight);
 
-        let mut mosaic_guard = self.mosaic.lock().ok()?;
-        mosaic_guard
-            .composite_f32_bands_direct(band_planes, width, height, method)
-            .ok()
-    }
-
-    /// Attempt fused GPU multi-scene pixel selection + rescale + colormap directly to PNG / WebP /
-    /// JPEG / RawRgba (using 4×-smaller `IndexedU8` readback for masked PNGs and 1-pass fused
-    /// Mosaic → GPU JPEG FDCT with zero RGBA8 readback for `OutputFormat::Jpeg`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_composite_mosaic_styled(
-        &self,
-        width: u32,
-        height: u32,
-        planes: &[&[f32]],
-        method: GpuPixelSelection,
-        rescale: (f32, f32),
-        colormap: ColormapName,
-        format: OutputFormat,
-        return_mask: bool,
-    ) -> Option<Bytes> {
-        if planes.len() < 2 || planes.len() > 32 || width == 0 || height == 0 {
-            return None;
-        }
-        let out_kind = match format {
-            OutputFormat::Png if return_mask => GpuPixelOutput::IndexedU8,
-            OutputFormat::Png
-            | OutputFormat::Webp { .. }
-            | OutputFormat::Jpeg { .. }
-            | OutputFormat::RawRgba => GpuPixelOutput::Rgba8,
-            _ => return None,
-        };
-        let pixels = (width as usize).checked_mul(height as usize)?;
-        let upload_bytes = planes.len().saturating_mul(pixels).saturating_mul(4);
-        let readback_bytes = match format {
-            OutputFormat::Jpeg { .. } => {
-                let mcu_w = (width as usize).div_ceil(16);
-                let mcu_h = (height as usize).div_ceil(16);
-                mcu_w.saturating_mul(mcu_h).saturating_mul(192 * 4)
+        // 2. Dispatch to the specialized fused GPU kernel for each filled cell.
+        match (&req.input, &req.output) {
+            (MosaicCompositeInput::Single(planes), MosaicCompositeOutput::F32) => {
+                let mut mosaic_guard = self.mosaic.lock().ok()?;
+                mosaic_guard
+                    .composite_f32_direct(planes, width, height, method)
+                    .ok()
+                    .map(MosaicCompositeResult::F32)
             }
-            _ => match out_kind {
-                GpuPixelOutput::IndexedU8 => pixels,
-                GpuPixelOutput::Rgba8 => pixels.saturating_mul(4),
-            },
-        };
-        let decision = self.policy.decide(&DispatchRequest {
-            op: Self::mosaic_policy_op(method, planes.len()),
-            dst_pixels: pixels,
-            upload_bytes,
-            readback_bytes,
-            batch_size: 1,
-            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
+            (MosaicCompositeInput::Bands(band_planes), MosaicCompositeOutput::F32) => {
+                let mut mosaic_guard = self.mosaic.lock().ok()?;
+                if band_planes.len() == 1 {
+                    mosaic_guard
+                        .composite_f32_direct(&band_planes[0], width, height, method)
+                        .ok()
+                        .map(|v| MosaicCompositeResult::F32Bands(vec![v]))
+                } else {
+                    mosaic_guard
+                        .composite_f32_bands_direct(band_planes, width, height, method)
+                        .ok()
+                        .map(MosaicCompositeResult::F32Bands)
+                }
+            }
+            (
+                MosaicCompositeInput::Single(planes),
+                MosaicCompositeOutput::Styled {
+                    rescale,
+                    colormap,
+                    format,
+                    return_mask,
+                },
+            ) => {
+                let out_kind = styled_out_kind?;
+                let lut = colormap.lut();
+                let lut_u32 = pack_rgb_lut(&lut.rgb);
+                let mut mosaic_guard = self.mosaic.lock().ok()?;
 
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
-        let lut = colormap.lut();
-        let lut_u32 = pack_rgb_lut(&lut.rgb);
-        let mut mosaic_guard = self.mosaic.lock().ok()?;
-
-        // 1-pass fused Mosaic -> GPU JPEG FDCT: zero per-call VRAM alloc, zero RGBA8 readback,
-        // zero CPU JPEG encode.
-        if let OutputFormat::Jpeg { quality } = format
-            && let Ok(mut jpeg_guard) = self.jpeg.lock()
-                && let Ok(jpg) = mosaic_guard.composite_styled_jpeg_direct(
-                    planes,
-                    width,
-                    height,
-                    method,
-                    rescale.0,
-                    rescale.1,
-                    &lut_u32,
-                    &mut jpeg_guard,
-                    quality,
-                ) {
-                    return Some(Bytes::from(jpg));
+                if let OutputFormat::Jpeg { quality } = *format
+                    && let Ok(mut jpeg_guard) = self.jpeg.lock()
+                    && let Ok(jpg) = mosaic_guard.composite_styled_jpeg_direct(
+                        planes,
+                        width,
+                        height,
+                        method,
+                        rescale.0,
+                        rescale.1,
+                        &lut_u32,
+                        &mut jpeg_guard,
+                        quality,
+                    )
+                {
+                    return Some(MosaicCompositeResult::Bytes(Bytes::from(jpg)));
                 }
 
-        let raw = mosaic_guard
-            .composite_styled_direct(
-                planes,
-                width,
-                height,
-                method,
-                rescale.0,
-                rescale.1,
-                &lut_u32,
-                out_kind,
-            )
-            .ok()?;
-        drop(mosaic_guard);
+                let raw = mosaic_guard
+                    .composite_styled_direct(
+                        planes,
+                        width,
+                        height,
+                        method,
+                        rescale.0,
+                        rescale.1,
+                        &lut_u32,
+                        out_kind,
+                    )
+                    .ok()?;
+                drop(mosaic_guard);
 
-        Some(match out_kind {
-            GpuPixelOutput::IndexedU8 => encode_indexed_u8_png(&raw, width, height, &lut.rgb),
-            GpuPixelOutput::Rgba8 => {
-                if format == OutputFormat::RawRgba {
-                    Bytes::from(raw)
+                let bytes = match out_kind {
+                    GpuPixelOutput::IndexedU8 => {
+                        encode_indexed_u8_png(&raw, width, height, &lut.rgb)
+                    }
+                    GpuPixelOutput::Rgba8 => {
+                        if *format == OutputFormat::RawRgba {
+                            Bytes::from(raw)
+                        } else {
+                            crate::titiler::encode_rgba_output(
+                                width as usize,
+                                height as usize,
+                                &raw,
+                                *format,
+                                *return_mask,
+                            )
+                        }
+                    }
+                };
+                Some(MosaicCompositeResult::Bytes(bytes))
+            }
+            (
+                MosaicCompositeInput::Rgb(rgb_planes),
+                MosaicCompositeOutput::RgbStyled {
+                    rescale_min,
+                    rescale_max,
+                    format,
+                    return_mask,
+                },
+            ) => {
+                let mut mosaic_guard = self.mosaic.lock().ok()?;
+                if let OutputFormat::Jpeg { quality } = *format
+                    && let Ok(mut jpeg_guard) = self.jpeg.lock()
+                    && let Ok(jpg) = mosaic_guard.composite_rgb_styled_jpeg_direct(
+                        rgb_planes,
+                        width,
+                        height,
+                        method,
+                        *rescale_min,
+                        *rescale_max,
+                        &mut jpeg_guard,
+                        quality,
+                    )
+                {
+                    return Some(MosaicCompositeResult::Bytes(Bytes::from(jpg)));
+                }
+                let rgba = mosaic_guard
+                    .composite_rgb_styled_direct(
+                        rgb_planes,
+                        width,
+                        height,
+                        method,
+                        *rescale_min,
+                        *rescale_max,
+                    )
+                    .ok()?;
+                drop(mosaic_guard);
+
+                let bytes = if *format == OutputFormat::RawRgba {
+                    Bytes::from(rgba)
                 } else {
                     crate::titiler::encode_rgba_output(
                         width as usize,
                         height as usize,
-                        &raw,
-                        format,
-                        return_mask,
+                        &rgba,
+                        *format,
+                        *return_mask,
                     )
-                }
+                };
+                Some(MosaicCompositeResult::Bytes(bytes))
             }
-        })
-    }
-
-    /// Attempt 1-pass fused GPU 3-band RGB multi-scene pixel selection + per-channel rescale
-    /// directly to JPEG (1-pass fused Mosaic → GPU JPEG FDCT with zero f32/RGBA8 readback and
-    /// zero CPU JPEG encode), PNG, WebP, or RawRgba (3× smaller readback than 3×f32).
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_composite_mosaic_rgb_styled(
-        &self,
-        width: u32,
-        height: u32,
-        rgb_planes: &[&[&[f32]]; 3],
-        method: GpuPixelSelection,
-        rescale_min: [f32; 3],
-        rescale_max: [f32; 3],
-        format: OutputFormat,
-        return_mask: bool,
-    ) -> Option<Bytes> {
-        let num_scenes = rgb_planes[0].len();
-        if !(2..=32).contains(&num_scenes)
-            || rgb_planes[1].len() != num_scenes
-            || rgb_planes[2].len() != num_scenes
-            || width == 0
-            || height == 0
-        {
-            return None;
+            _ => None,
         }
-        if !matches!(
-            format,
-            OutputFormat::Png
-                | OutputFormat::Webp { .. }
-                | OutputFormat::Jpeg { .. }
-                | OutputFormat::RawRgba
-        ) {
-            return None;
-        }
-        let pixels = (width as usize).checked_mul(height as usize)?;
-        let upload_bytes = 3usize
-            .saturating_mul(num_scenes)
-            .saturating_mul(pixels)
-            .saturating_mul(4);
-        let readback_bytes = match format {
-            OutputFormat::Jpeg { .. } => {
-                let mcu_w = (width as usize).div_ceil(16);
-                let mcu_h = (height as usize).div_ceil(16);
-                mcu_w.saturating_mul(mcu_h).saturating_mul(192 * 4)
-            }
-            _ => pixels.saturating_mul(4),
-        };
-        let decision = self.policy.decide(&DispatchRequest {
-            op: Self::mosaic_policy_op(method, num_scenes),
-            dst_pixels: pixels.saturating_mul(3),
-            upload_bytes,
-            readback_bytes,
-            batch_size: 3,
-            in_flight: self.in_flight.load(Ordering::Relaxed) / 32,
-        });
-        if !decision.use_gpu {
-            return None;
-        }
-
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        let _guard = InFlightGuard(&self.in_flight);
-
-        let mut mosaic_guard = self.mosaic.lock().ok()?;
-        if let OutputFormat::Jpeg { quality } = format
-            && let Ok(mut jpeg_guard) = self.jpeg.lock()
-                && let Ok(jpg) = mosaic_guard.composite_rgb_styled_jpeg_direct(
-                    rgb_planes,
-                    width,
-                    height,
-                    method,
-                    rescale_min,
-                    rescale_max,
-                    &mut jpeg_guard,
-                    quality,
-                ) {
-                    return Some(Bytes::from(jpg));
-                }
-        let rgba = mosaic_guard
-            .composite_rgb_styled_direct(
-                rgb_planes,
-                width,
-                height,
-                method,
-                rescale_min,
-                rescale_max,
-            )
-            .ok()?;
-        drop(mosaic_guard);
-
-        Some(if format == OutputFormat::RawRgba {
-            Bytes::from(rgba)
-        } else {
-            crate::titiler::encode_rgba_output(
-                width as usize,
-                height as usize,
-                &rgba,
-                format,
-                return_mask,
-            )
-        })
     }
 
     /// Attempt GPU-accelerated raw `f32` single-band resampling for `.npy`, `.tif`, `.f32`,
@@ -3371,7 +3430,15 @@ mod tests {
         }
         let refs: Vec<&[f32]> = scenes.iter().map(Vec::as_slice).collect();
 
-        if let Some(gpu_med) = gpu.try_composite_mosaic_f32(w, h, &refs, GpuPixelSelection::Median)
+        if let Some(gpu_med) = gpu
+            .try_composite_mosaic(&MosaicCompositeRequest {
+                width: w,
+                height: h,
+                input: MosaicCompositeInput::Single(&refs),
+                method: GpuPixelSelection::Median,
+                output: MosaicCompositeOutput::F32,
+            })
+            .and_then(MosaicCompositeResult::into_f32)
         {
             assert_eq!(gpu_med.len(), n_px);
             let mut scratch = Vec::with_capacity(n_scenes);
@@ -3399,30 +3466,40 @@ mod tests {
             assert!(max_err < 1e-4, "GPU mosaic median max err {max_err} >= 1e-4");
         }
 
-        if let Some(png) = gpu.try_composite_mosaic_styled(
-            w,
-            h,
-            &refs,
-            GpuPixelSelection::Median,
-            (50.0, 250.0),
-            ColormapName::Viridis,
-            OutputFormat::Png,
-            true,
-        ) {
+        if let Some(png) = gpu
+            .try_composite_mosaic(&MosaicCompositeRequest {
+                width: w,
+                height: h,
+                input: MosaicCompositeInput::Single(&refs),
+                method: GpuPixelSelection::Median,
+                output: MosaicCompositeOutput::Styled {
+                    rescale: (50.0, 250.0),
+                    colormap: ColormapName::Viridis,
+                    format: OutputFormat::Png,
+                    return_mask: true,
+                },
+            })
+            .and_then(MosaicCompositeResult::into_bytes)
+        {
             assert!(png.starts_with(b"\x89PNG"), "fused mosaic styled output must be valid PNG");
         }
 
         // 1-pass fused Mosaic -> GPU JPEG
-        if let Some(jpg) = gpu.try_composite_mosaic_styled(
-            w,
-            h,
-            &refs,
-            GpuPixelSelection::Median,
-            (50.0, 250.0),
-            ColormapName::Viridis,
-            OutputFormat::Jpeg { quality: 85 },
-            false,
-        ) {
+        if let Some(jpg) = gpu
+            .try_composite_mosaic(&MosaicCompositeRequest {
+                width: w,
+                height: h,
+                input: MosaicCompositeInput::Single(&refs),
+                method: GpuPixelSelection::Median,
+                output: MosaicCompositeOutput::Styled {
+                    rescale: (50.0, 250.0),
+                    colormap: ColormapName::Viridis,
+                    format: OutputFormat::Jpeg { quality: 85 },
+                    return_mask: false,
+                },
+            })
+            .and_then(MosaicCompositeResult::into_bytes)
+        {
             assert!(
                 jpg.starts_with(&[0xff, 0xd8]) && jpg.ends_with(&[0xff, 0xd9]),
                 "fused mosaic styled JPEG must be valid JFIF"
@@ -3432,8 +3509,22 @@ mod tests {
         // 1-submit batched 3-band RGB median must be bit-exact vs per-band GPU median
         let band_planes: Vec<Vec<&[f32]>> = vec![refs.clone(), refs.clone(), refs.clone()];
         if let (Some(single), Some(batched)) = (
-            gpu.try_composite_mosaic_f32(w, h, &refs, GpuPixelSelection::Median),
-            gpu.try_composite_mosaic_f32_bands(w, h, &band_planes, GpuPixelSelection::Median),
+            gpu.try_composite_mosaic(&MosaicCompositeRequest {
+                width: w,
+                height: h,
+                input: MosaicCompositeInput::Single(&refs),
+                method: GpuPixelSelection::Median,
+                output: MosaicCompositeOutput::F32,
+            })
+            .and_then(MosaicCompositeResult::into_f32),
+            gpu.try_composite_mosaic(&MosaicCompositeRequest {
+                width: w,
+                height: h,
+                input: MosaicCompositeInput::Bands(&band_planes),
+                method: GpuPixelSelection::Median,
+                output: MosaicCompositeOutput::F32,
+            })
+            .and_then(MosaicCompositeResult::into_f32_bands),
         ) {
             assert_eq!(batched.len(), 3);
             for (b, got) in batched.iter().enumerate() {
@@ -3450,16 +3541,21 @@ mod tests {
 
         // 1-pass fused 3-band RGB Mosaic -> GPU JPEG & RawRgba
         let rgb_planes: [&[&[f32]]; 3] = [&refs, &refs, &refs];
-        if let Some(rgb_jpg) = gpu.try_composite_mosaic_rgb_styled(
-            w,
-            h,
-            &rgb_planes,
-            GpuPixelSelection::Median,
-            [50.0, 50.0, 50.0],
-            [250.0, 250.0, 250.0],
-            OutputFormat::Jpeg { quality: 85 },
-            false,
-        ) {
+        if let Some(rgb_jpg) = gpu
+            .try_composite_mosaic(&MosaicCompositeRequest {
+                width: w,
+                height: h,
+                input: MosaicCompositeInput::Rgb(&rgb_planes),
+                method: GpuPixelSelection::Median,
+                output: MosaicCompositeOutput::RgbStyled {
+                    rescale_min: [50.0, 50.0, 50.0],
+                    rescale_max: [250.0, 250.0, 250.0],
+                    format: OutputFormat::Jpeg { quality: 85 },
+                    return_mask: false,
+                },
+            })
+            .and_then(MosaicCompositeResult::into_bytes)
+        {
             assert!(
                 rgb_jpg.starts_with(&[0xff, 0xd8]) && rgb_jpg.ends_with(&[0xff, 0xd9]),
                 "fused RGB mosaic JPEG must be valid JFIF"
