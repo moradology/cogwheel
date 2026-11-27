@@ -183,8 +183,17 @@ async fn codec_chain_decodes_v2_v3_and_big_endian_fixtures_identically() {
     let expected = decode_chunk_bytes(ref_meta, &ref_raw, &ref_key).unwrap();
     assert_eq!(expected.len(), 64 * 64 * 4);
 
-    // All v3 non-blosc codecs must match `expected` bit-for-bit
-    for name in ["gzip", "zstd", "transpose_f_order"] {
+    // All v3 codecs (including all Blosc variants) must match `expected` bit-for-bit
+    for name in [
+        "gzip",
+        "zstd",
+        "transpose_f_order",
+        "blosc_zstd_shuffle",
+        "blosc_zstd_bitshuffle",
+        "blosc_lz4_shuffle",
+        "blosc_lz4_noshuffle",
+        "blosc_blosclz_shuffle",
+    ] {
         let meta = v3_root.array(name).unwrap();
         let key = format!("{name}/{}", meta.chunk_key(&[0, 0]));
         let raw = v3_store.get(&key).await.unwrap().unwrap();
@@ -192,11 +201,21 @@ async fn codec_chain_decodes_v2_v3_and_big_endian_fixtures_identically() {
         assert_eq!(got, expected, "v3 codec {name} diverged from uncompressed");
     }
 
-    // All v2 non-blosc codecs must match `expected` bit-for-bit
+    // All v2 codecs (including all Blosc variants) must match `expected` bit-for-bit
     let v2_store = FsStore::new(dir.join("codecs_v2.zarr"));
     let v2_h = ZarrHierarchy::open(&v2_store).await.unwrap();
     let v2_root = v2_h.group(None).unwrap();
-    for name in ["uncompressed", "gzip", "zstd", "shuffle_zstd"] {
+    for name in [
+        "uncompressed",
+        "gzip",
+        "zstd",
+        "shuffle_zstd",
+        "blosc_zstd_shuffle",
+        "blosc_zstd_bitshuffle",
+        "blosc_lz4_shuffle",
+        "blosc_lz4_noshuffle",
+        "blosc_blosclz_shuffle",
+    ] {
         let meta = v2_root.array(name).unwrap();
         let key = format!("{name}/{}", meta.chunk_key(&[0, 0]));
         let raw = v2_store.get(&key).await.unwrap().unwrap();

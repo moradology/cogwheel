@@ -30,6 +30,7 @@
 //! with the credential chain, concurrency limiting, caching and eviction. A Zarr chunk is one more
 //! object to ask it for.
 
+pub mod blosc;
 pub mod codecs;
 pub mod hierarchy;
 

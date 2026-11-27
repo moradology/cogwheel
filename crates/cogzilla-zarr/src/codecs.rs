@@ -13,7 +13,8 @@ use crate::{ArrayMeta, DataType, Endianness, ZarrError, ZarrVersion};
 pub const MAX_DECODED_CHUNK_BYTES: usize = 128 * 1024 * 1024;
 
 /// Human-readable list of codecs supported by this build (included in `UnsupportedCodec` errors).
-pub const SUPPORTED_CODECS: &str = "bytes, transpose, gzip, zlib, zstd, lz4, shuffle, bitshuffle";
+pub const SUPPORTED_CODECS: &str =
+    "bytes, transpose, gzip, zlib, zstd, lz4, blosc, shuffle, bitshuffle";
 
 /// Compute the expected uncompressed byte length of one chunk, enforcing `MAX_DECODED_CHUNK_BYTES`.
 pub fn expected_chunk_bytes(
@@ -95,6 +96,9 @@ pub fn decode_chunk_with_shape(
             }
             "lz4" => {
                 buf = decompress_lz4(&buf, expected, chunk_key)?;
+            }
+            "blosc" => {
+                buf = crate::blosc::decompress_blosc(&buf, expected, chunk_key)?;
             }
             "shuffle" => {
                 let elem_size = codec
@@ -212,6 +216,22 @@ fn decompress_gzip(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u
         })?;
     out.truncate(n);
     Ok(out)
+}
+
+pub(crate) fn decompress_zlib_raw(
+    src: &[u8],
+    expected: usize,
+    chunk_key: &str,
+) -> Result<Vec<u8>, ZarrError> {
+    decompress_zlib(src, expected, chunk_key)
+}
+
+pub(crate) fn decompress_zstd_raw(
+    src: &[u8],
+    expected: usize,
+    chunk_key: &str,
+) -> Result<Vec<u8>, ZarrError> {
+    decompress_zstd(src, expected, chunk_key)
 }
 
 fn decompress_zlib(src: &[u8], expected: usize, chunk_key: &str) -> Result<Vec<u8>, ZarrError> {
