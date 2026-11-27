@@ -47,9 +47,9 @@ enum SceneFailure {
     Unread(EngineError),
 }
 
-/// Whether opening a scene failed because the allowlist refuses its asset.
+/// Whether opening a scene failed because of a fatal error (e.g. allowlist refusal).
 fn refused(e: &EngineError) -> bool {
-    matches!(e, EngineError::Io(io) if matches!(io.root(), cogzilla_io::IoError::Forbidden(_)))
+    e.is_fatal()
 }
 
 impl SceneFailure {
@@ -251,9 +251,11 @@ pub struct EngineStats {
 /// `502 Bad Gateway` naming the asset (while preserving `403 Forbidden` for allowlist rejections
 /// and `400 Bad Request` for invalid URIs / corrupt TIFFs).
 pub fn asset_fetch_error(asset_uri: &str, err: IoError) -> EngineError {
+    if err.is_fatal() {
+        return EngineError::Io(err);
+    }
     match err.root() {
-        IoError::Forbidden(_)
-        | IoError::InvalidUri(_)
+        IoError::InvalidUri(_)
         | IoError::Tiff(_)
         | IoError::SourceChanged { .. } => EngineError::Io(err),
         _ => {
@@ -262,6 +264,28 @@ pub fn asset_fetch_error(asset_uri: &str, err: IoError) -> EngineError {
                 "referenced asset '{safe}' could not be fetched: {err}"
             ))
         }
+    }
+}
+
+impl EngineError {
+    /// True when this error must never be swallowed by a per-asset fallback
+    /// (e.g. an allowlist / SSRF refusal).
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            Self::Io(io) => io.is_fatal(),
+            Self::Shared(inner) => inner.is_fatal(),
+            _ => false,
+        }
+    }
+}
+
+/// Absorb non-fatal per-asset errors as `Ok(None)` while always propagating fatal errors
+/// (such as [`IoError::Forbidden`] allowlist refusals).
+pub fn tolerate_asset_failure<T>(result: Result<T, EngineError>) -> Result<Option<T>, EngineError> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.is_fatal() => Err(e),
+        Err(_) => Ok(None),
     }
 }
 
@@ -3055,7 +3079,7 @@ impl TileEngine {
                     }
                     // As on `main`: a scene that opened but could not be read is passed over
                     // too, unless the allowlist refused what it reads.
-                    Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                    Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !e.is_fatal() => {
                         failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
                         last_open_err = Some(asset_fetch_error(&scene_urls[0], e));
                         continue;
@@ -3153,7 +3177,7 @@ impl TileEngine {
                     last_open_err = Some(e);
                     continue;
                 }
-                Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !matches!(e.root(), cogzilla_io::IoError::Forbidden(_)) => {
+                Err(SceneFailure::Unread(EngineError::Io(e))) if skip_unopened && !e.is_fatal() => {
                     failed_assets.extend(scene_urls.iter().map(|u| cogzilla_io::redact_http_url(u)));
                     last_open_err = Some(asset_fetch_error(&scene_urls[0], e));
                     continue;
@@ -3721,5 +3745,26 @@ mod tests {
         let hdr = std::str::from_utf8(&npy64[10..10 + hdr_len]).unwrap();
         assert!(hdr.contains("<f8"), "expected float64 dtype, got {hdr}");
         assert!(hdr.contains("(2, 2, 2)"), "expected (band+mask, 2, 2), got {hdr}");
+    }
+
+    #[test]
+    fn tolerate_asset_failure_surfaces_fatal_and_absorbs_non_fatal() {
+        let forbidden = EngineError::Io(IoError::Forbidden("https://blocked.example/a.tif".into()));
+        assert!(forbidden.is_fatal());
+        assert!(tolerate_asset_failure::<u32>(Err(forbidden)).is_err());
+
+        let shared_forbidden = EngineError::Shared(Arc::new(EngineError::Io(IoError::Shared(
+            Arc::new(IoError::Forbidden("https://blocked.example/b.tif".into())),
+        ))));
+        assert!(shared_forbidden.is_fatal());
+        assert!(tolerate_asset_failure::<u32>(Err(shared_forbidden)).is_err());
+
+        let transient = EngineError::Io(IoError::HttpStatus {
+            status: 503,
+            url: "https://ok.example/a.tif".into(),
+        });
+        assert!(!transient.is_fatal());
+        assert_eq!(tolerate_asset_failure::<u32>(Err(transient)).unwrap(), None);
+        assert_eq!(tolerate_asset_failure(Ok(42u32)).unwrap(), Some(42));
     }
 }
