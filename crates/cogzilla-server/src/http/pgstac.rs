@@ -2176,7 +2176,7 @@ impl Window {
                         };
                         return Ok((in_raster_type(planes, full.sample_type, request.unscale), full.sample_type));
                     }
-                    let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject).await?;
+                    let (planes, sample_type) = engine.raster_planes(href, bands_1based, request, resampling, reproject, nodata).await?;
                     return Ok((in_raster_type(planes, sample_type, request.unscale), sample_type));
                 };
                 // The way GDAL's warp reads a tile: from the overview it would pick for
