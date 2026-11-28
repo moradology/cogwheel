@@ -122,6 +122,17 @@ cogzilla keeps its choice. Against the area mean of the 10 m pixels (the ideal v
 - **Mutable-store freshness (#387):** Local stores validate on open via `stat(len, mtime)`, remote stores revalidate via `HEAD` after `COGZILLA_CACHE_TTL_SECS`, and `/zarr/*` ETags fold in the store metadata validator so revalidation after an append returns `200 OK` with fresh bytes instead of a stale `304`.
 - **Exact analytical zonal stats & wide dtypes:** `POST /zarr/statistics` reuses `zonal.rs` (exact coverage & ellipsoidal area weighting), and `Int32`/`UInt32`/`Int64`/`UInt64`/`Float64` stay exact in `BandData::F64`.
 
+### 1.15 Additional Correctness & Robustness Improvements Verified by Differential Oracle
+
+Confirmed against stock TiTiler 2.4.1 (`rio-tiler 9.4.14`, `rasterio 1.5.2`) across 318 adversarial differential checks:
+- **Inverted `rescale` ranges (`rescale=max,min`, e.g. `rescale=1000,0`):** `rio_tiler.utils.linear_rescale` calls `numpy.clip(image, imin, imax)` which collapses every pixel to `imax` whenever `imin > imax`, rendering a solid `255` tile. `cogzilla` performs proper linear inversion across `[imin, imax]`.
+- **Extended GDAL `resampling=` modes (`min`, `max`, `med`, `q1`, `q3`, `sum`):** TiTiler 2.4.1 rejects these six modes with `422 literal_error`; `cogzilla` supports all 15 GDAL resampling modes across tiles and previews.
+- **`color_formula` on single-band grayscale imagery:** TiTiler crashes with `500` (`index 1 is out of bounds for axis 0 with size 1`) when `color_formula` (e.g. `Gamma RGB 1.8`) is applied to a 1-band COG; `cogzilla` applies the formula cleanly and returns a valid `200` grayscale PNG.
+- **`0..360°` geographic rasters:** For geographic COGs whose longitude bounds lie in `[180°, 360°]` (e.g. `[237°, 238°]` ≡ `[-123°, -122°]`), `cogzilla` wraps longitudes so `WebMercatorQuad` tiles and `/cog/point` queries in `[-180°, 180°]` succeed (`200`), where TiTiler returns `404`.
+- **Exact polar TMS footprint checks:** On polar TileMatrixSets such as `UPSArcticWGS84Quad`, TiTiler's WGS84 corner-reprojection check can invert latitude bounds and return blank `200` tiles hundreds of kilometres outside the raster (e.g. `UPSArcticWGS84Quad/2/1/1` vs `EPSG:3413` COG 580 km away). `cogzilla` evaluates the densified footprint in native CRS, returning `404` outside the raster and bit-identical `200` tiles inside it.
+- **Out-of-range `bidx` validation (`bidx=0` / `bidx > count`):** TiTiler crashes with `500 Internal Server Error`; `cogzilla` returns `422` / `400` naming the invalid band index.
+- **Embedded palette COGs on `.npy`:** TiTiler unconditionally expands an embedded TIFF `ColorMap` into `(4, H, W)` RGB+mask on `.npy` with no query parameter to opt out, destroying raw integer class IDs for scientific/ML land-cover datasets (NLCD, WorldCover, CDL). `cogzilla` applies the embedded palette on visual formats (`.png`/`.jpg`/`.webp`) and preserves raw class indices `(2, H, W)` on `.npy` (matching `/point` and `/statistics`).
+
 ## 2. Deliberate API & Error-Handling Divergences
 
 | Area | TiTiler 2.4.1 | `cogzilla` | Why |
@@ -138,6 +149,8 @@ cogzilla keeps its choice. Against the area mean of the 10 m pixels (the ideal v
 | **Validation error body shape** (`E3`) | FastAPI/Pydantic nested `422` dict schema | Clear, concise error messages (JSON `detail`) | Avoids coupling to FastAPI's internal validation format. |
 | **Band keys in `/statistics`** (`P4`/`M6`) | `b1`, `b2`, … | Keeps `b1`, `b2`, … (ported scripts index by them) | Preserves drop-in compatibility for existing TiTiler scripts. |
 | **Float64 `.tif` / `.npy` on multi-COG & mosaic paths** (`#396`) | Preserves full `float64` precision across multi-asset stacks | Single-COG `/cog/{tiles,bbox,preview}` Float64 requests preserve full `f64` precision; multi-COG and mosaic compositing paths (`render_multi_cog_tile`, `render_mosaic_scenes`, `render_catalog_mosaic_tile`) composite in `f32` and widen into `f64` containers (`RawF64`/`NpyF64`) | Keeps the mosaic/multi-COG hot path on compact `f32` slabs while still honouring the requested `float64` container dtype. |
+| **`return_mask=false` on 1-bit mask & RGBA COGs** | Preserves underlying RGB collar bytes behind `mask=0` / `alpha=0` and strips the alpha channel | Zeroes masked pixels (`[0, 0, 0]`) at block-decode time; valid pixels match TiTiler (`MAE ≤ 0.19`) | Folding the mask once at decode keeps `BandData` / `BlockStats` branchless across all CPU/GPU/stats hot paths, and pixels behind `mask=0` are undefined JPEG/collar fill. |
+| **2-band PNG (`bidx=1&bidx=2`)** | Returns `200` with `[b1, b2, mask]` stuffed into an `RGB` PNG (`return_mask=true`) or `LA` with `b2` as alpha (`return_mask=false`) | Returns `400 Bad Request` across all dtypes directing callers to `.tif`, `.npy`, or `.f32` | PNG has no 2-data-band color type; browsers premultiply `LA` alpha (destroying `b1` where `b2 == 0`) and `[b1, b2, mask]` as RGB is a GDAL driver artifact. |
 
 ---
 

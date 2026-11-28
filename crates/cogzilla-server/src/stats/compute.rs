@@ -1478,8 +1478,9 @@ pub async fn compute_statistics_with_options(
         engine.get_or_build_crs(cog)?
     };
     if let Some(pm) = poly_mask {
-        if pm.is_empty() || (opts.width.is_none() && opts.height.is_none()) {
-            return crate::zonal::compute_native_exact_polygon_stats(
+        let explicit_dims = opts.width.is_some() || opts.height.is_some();
+        if (pm.is_empty() || !explicit_dims)
+            && let Some(exact) = crate::zonal::compute_native_exact_polygon_stats(
                 engine,
                 cog,
                 &crs,
@@ -1489,7 +1490,9 @@ pub async fn compute_statistics_with_options(
                 nodata_override,
                 opts,
             )
-            .await;
+            .await?
+        {
+            return Ok(exact);
         }
         let full = cog.index.full_res();
         let count = full.samples_per_pixel;
@@ -1562,6 +1565,144 @@ pub async fn compute_statistics_with_options(
         };
         let cogs = [cog.clone()];
         let n_px = (out_w as usize) * (out_h as usize);
+        // When we fell back from native exact stats because explicit `max_size > 0` required
+        // downsampling, run exact analytical coverage on the `max_size`-capped WGS84 grid so
+        // `area`, `length`, `category_areas`, and FeatureCollection schemas stay 100% consistent.
+        if !explicit_dims {
+            let mut rendered: Vec<(String, String, Vec<f32>)> = Vec::new();
+            let grid_opts = if let Some(ref exprs) = opts.expressions {
+                let expr_dtype = exprs.first().map(|(desc, _)| {
+                    HistDtype::for_expression(
+                        desc,
+                        HistDtype::for_sample_type(full.sample_type, unscale),
+                    )
+                });
+                for (i, (desc, prog)) in exprs.iter().enumerate() {
+                    let bands = BandRequest::CustomExpr {
+                        prog: prog.clone(),
+                        rescale: (0.0, 1.0),
+                        colormap: ColormapName::Grayscale,
+                    };
+                    let raw = match render_wgs84_bbox(
+                        engine,
+                        &cogs,
+                        eff_bbox,
+                        out_w,
+                        out_h,
+                        None,
+                        &bands,
+                        ResampleMode::Nearest,
+                        OutputFormat::RawF32,
+                        nodata_override,
+                        None,
+                        None,
+                        true,
+                        unscale,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(EngineError::NotFound(_)) => Bytes::new(),
+                        Err(e) => return Err(e),
+                    };
+                    let mut pixels: Vec<f32> = raw
+                        .chunks_exact(4)
+                        .take(n_px)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    if pixels.len() < n_px {
+                        pixels.resize(n_px, f32::NAN);
+                    }
+                    rendered.push((format!("b{}", i + 1), desc.clone(), pixels));
+                }
+                StatsOptions {
+                    hist_dtype: opts.hist_dtype.or(expr_dtype),
+                    ..opts.clone()
+                }
+            } else {
+                let alpha_idx = cogzilla_codec::alpha_channel_index(count as usize, &full.extra_samples);
+                let sel_bands: Vec<u16> = match &opts.bidx {
+                    Some(b) if !b.is_empty() => b.clone(),
+                    _ => (1..=count)
+                        .filter(|&b| Some((b - 1) as usize) != alpha_idx)
+                        .collect(),
+                };
+                for chunk in sel_bands.chunks(15) {
+                    let bands_req = if chunk.len() == 1 {
+                        BandRequest::Single {
+                            band_1based: chunk[0],
+                            rescale: (0.0, 1.0),
+                            colormap: ColormapName::Grayscale,
+                        }
+                    } else {
+                        BandRequest::MultiBand {
+                            bands_1based: chunk.to_vec(),
+                        }
+                    };
+                    let raw = match render_wgs84_bbox(
+                        engine,
+                        &cogs,
+                        eff_bbox,
+                        out_w,
+                        out_h,
+                        None,
+                        &bands_req,
+                        ResampleMode::Nearest,
+                        OutputFormat::RawF32,
+                        nodata_override,
+                        None,
+                        None,
+                        true,
+                        unscale,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(EngineError::NotFound(_)) => Bytes::new(),
+                        Err(e) => return Err(e),
+                    };
+                    for (ci, &b1) in chunk.iter().enumerate() {
+                        let start = ci * n_px * 4;
+                        let end = (start + n_px * 4).min(raw.len());
+                        let slice = if start < end { &raw[start..end] } else { &[] };
+                        let mut pixels: Vec<f32> = slice
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        if pixels.len() < n_px {
+                            pixels.resize(n_px, f32::NAN);
+                        }
+                        let desc = cog
+                            .index
+                            .band_descriptions
+                            .get((b1 - 1) as usize)
+                            .map(String::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .unwrap_or_else(|| format!("b{b1}"));
+                        rendered.push((format!("b{b1}"), desc, pixels));
+                    }
+                }
+                StatsOptions {
+                    hist_dtype: opts
+                        .hist_dtype
+                        .or(Some(HistDtype::for_sample_type(full.sample_type, unscale))),
+                    ..opts.clone()
+                }
+            };
+            let plane_refs: Vec<(&str, &str, &[f32])> = rendered
+                .iter()
+                .map(|(k, d, p)| (k.as_str(), d.as_str(), p.as_slice()))
+                .collect();
+            return Ok(crate::zonal::compute_exact_grid_polygon_stats(
+                &plane_refs,
+                eff_bbox,
+                out_w as usize,
+                out_h as usize,
+                pm,
+                &grid_opts,
+            ));
+        }
         let (_, feature_covered_px) = pm.rasterize_all_touched_bits(
             out_w as usize,
             out_h as usize,
