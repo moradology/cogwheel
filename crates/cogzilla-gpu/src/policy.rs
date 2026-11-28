@@ -249,16 +249,18 @@ impl DispatchPolicy {
     }
 
     /// Estimated CPU time in microseconds per pixel (conservative single-core baseline).
+    /// Calibrated after separable SIMD + LUT Lanczos3/Cubic optimization (`~230 us` per 512² band,
+    /// `~690 us` per 512² 3-band RGB on Apple M5; non-separable DEM Horn stays high).
     fn cpu_us_per_pixel(op: GpuOp) -> f64 {
         match op {
             GpuOp::ResampleBilinear => 0.0012,
-            GpuOp::ResampleCubic => 0.0032,
-            GpuOp::ResampleLanczos3 => 0.1250,
+            GpuOp::ResampleCubic => 0.0016,
+            GpuOp::ResampleLanczos3 => 0.0018,
             GpuOp::FusedColormapBilinear => 0.0022,
-            GpuOp::FusedColormapCubic => 0.0045,
-            GpuOp::FusedColormapLanczos3 => 0.1270,
+            GpuOp::FusedColormapCubic => 0.0024,
+            GpuOp::FusedColormapLanczos3 => 0.0028,
             GpuOp::DemHornCubic => 0.0085,
-            GpuOp::DemHornLanczos3 => 0.1320,
+            GpuOp::DemHornLanczos3 => 0.0650,
             GpuOp::DemTerrainRgbCubic => 0.0055,
         }
     }
@@ -356,7 +358,7 @@ mod tests {
         assert!(!d_small_cubic.use_gpu);
         assert_eq!(d_small_cubic.reason, DispatchReason::CpuFasterOrBelowMargin);
 
-        // 256x256 warm Lanczos3 -> should route to GPU
+        // 256x256 warm Lanczos3 -> now stays on CPU after separable SIMD + LUT optimization
         let d_small_lanczos = policy.decide(&DispatchRequest {
             op: GpuOp::FusedColormapLanczos3,
             dst_pixels: 256 * 256,
@@ -365,10 +367,22 @@ mod tests {
             batch_size: 1,
             in_flight: 0,
         });
-        assert!(d_small_lanczos.use_gpu);
-        assert_eq!(d_small_lanczos.reason, DispatchReason::GpuFasterByMargin);
+        assert!(!d_small_lanczos.use_gpu);
+        assert_eq!(d_small_lanczos.reason, DispatchReason::CpuFasterOrBelowMargin);
 
-        // 2048x2048 warm Cubic with indexed u8 readback -> should route to GPU
+        // 256x256 warm DEM Horn Lanczos3 -> still routes to GPU (non-separable stencil)
+        let d_small_dem = policy.decide(&DispatchRequest {
+            op: GpuOp::DemHornLanczos3,
+            dst_pixels: 256 * 256,
+            upload_bytes: 0,
+            readback_bytes: 256 * 256,
+            batch_size: 1,
+            in_flight: 0,
+        });
+        assert!(d_small_dem.use_gpu);
+        assert_eq!(d_small_dem.reason, DispatchReason::GpuFasterByMargin);
+
+        // 2048x2048 warm Cubic & Lanczos3 with indexed u8 readback -> should route to GPU
         let d_large_cubic = policy.decide(&DispatchRequest {
             op: GpuOp::FusedColormapCubic,
             dst_pixels: 2048 * 2048,
@@ -378,6 +392,15 @@ mod tests {
             in_flight: 0,
         });
         assert!(d_large_cubic.use_gpu);
+        let d_large_lanczos = policy.decide(&DispatchRequest {
+            op: GpuOp::FusedColormapLanczos3,
+            dst_pixels: 2048 * 2048,
+            upload_bytes: 0,
+            readback_bytes: 2048 * 2048,
+            batch_size: 1,
+            in_flight: 0,
+        });
+        assert!(d_large_lanczos.use_gpu);
 
         // Backpressure fallback when queue is full
         let d_busy = policy.decide(&DispatchRequest {
