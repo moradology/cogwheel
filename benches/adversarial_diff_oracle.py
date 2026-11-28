@@ -1100,6 +1100,34 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(dem_w40, 1)
     out["w40_rect_dem"] = p_w40_rect
 
+    # Wave 41: 4-band float32 (even band count for median/std/var/min/max/mean/sum) & 3-band high-value uint16 (sum > 65535 -> uint64)
+    p_w41_4b = synth_dir / "w41_f32_4b.tif"
+    b4_w41 = np.stack([
+        (10.0 + xx9 * 0.5).astype(np.float32),
+        (50.0 + yy9 * 0.8).astype(np.float32),
+        (20.0 + (xx9 + yy9) * 0.4).astype(np.float32),
+        (120.0 - xx9 * 0.3 + yy9 * 0.2).astype(np.float32),
+    ])
+    with rasterio.open(
+        p_w41_4b, "w", driver="GTiff", width=128, height=128, count=4, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(b4_w41)
+    out["w41_f32_4b"] = p_w41_4b
+
+    p_w41_u16 = synth_dir / "w41_u16_3b_hi.tif"
+    b3_w41 = np.stack([
+        (30000 + xx9.astype(np.uint32) * 100).astype(np.uint16),
+        (35000 + yy9.astype(np.uint32) * 100).astype(np.uint16),
+        (40000 + (xx9 + yy9).astype(np.uint32) * 50).astype(np.uint16),
+    ])
+    with rasterio.open(
+        p_w41_u16, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(b3_w41)
+    out["w41_u16_3b_hi"] = p_w41_u16
+
     return out
 
 
@@ -4577,6 +4605,17 @@ def main() -> int:
                 ("BETTER W40 ALG aspect .npy (cw 200 0..360 deg, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w40_rect_dem'])}&algorithm=aspect", None, "better_aspect_w40"),
                 ("BETTER W40 ALG aspect&buffer=3 .npy (cw 262x262, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w40_rect_dem'])}&algorithm=aspect&buffer=3", None, "better_aspect_w40"),
                 ("BETTER W40 ALG aspect twilight .png (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w40_rect_dem'])}&algorithm=aspect&rescale=0,360&colormap_name=twilight", None, "better_aspect_w40"),
+                # --- Wave 41: All 7 multi-band reduction algorithms (min/max/mean/std/var/median/sum) + u16 sum>65535 promotion ---
+                ("PARITY W41 ALG 4-band f32 min .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=min", None, "npy"),
+                ("PARITY W41 ALG 4-band f32 max .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=max", None, "npy"),
+                ("PARITY W41 ALG 4-band f32 mean .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=mean", None, "npy"),
+                ("PARITY W41 ALG 4-band f32 std .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=std", None, "npy"),
+                ("PARITY W41 ALG 4-band f32 var .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=var", None, "npy"),
+                ("PARITY W41 ALG 4-band f32 median (even) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=median", None, "npy"),
+                ("PARITY W41 ALG 4-band f32 sum .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&algorithm=sum", None, "npy"),
+                ("BETTER W41 ALG 3-band u16 sum >65535 (cw 200 u64, tt 500)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_u16_3b_hi'])}&algorithm=sum", None, "better_u16_sum_u64"),
+                ("PARITY W41 ALG 3-band u16 median (odd) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_u16_3b_hi'])}&algorithm=median", None, "npy"),
+                ("PARITY W41 ALG 3-band u16 min .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_u16_3b_hi'])}&algorithm=min", None, "npy"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -5112,6 +5151,16 @@ def main() -> int:
                             vmax = float(ac[0][vm].max()) if vm.any() else -1.0
                             ok = ac.shape == (2, exp_dim, exp_dim) and ac.dtype == np.float32 and int(vm.sum()) > 10000 and 0.0 <= vmin <= vmax <= 360.0 and (vmax - vmin) > 10.0
                             detail = f"cw=200 shape={ac.shape} range=[{vmin:.1f}..{vmax:.1f}] tt=422"
+                    elif kind == "better_u16_sum_u64":
+                        if r_cw.status_code != 200 or r_tt.status_code != 500:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 500)"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            vm = ac[1] > 0
+                            vmin = int(ac[0][vm].min()) if vm.any() else 0
+                            vmax = int(ac[0][vm].max()) if vm.any() else 0
+                            ok = ac.shape == (2, 256, 256) and ac.dtype == np.uint64 and int(vm.sum()) > 10000 and vmin > 100000 and vmax < 160000
+                            detail = f"cw=200 dtype={ac.dtype} valid={int(vm.sum())} sum_range=[{vmin}..{vmax}] tt=500"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
