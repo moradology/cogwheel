@@ -1076,6 +1076,18 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(i32_w38, 1)
     out["w38_i32_hi"] = p_w38_i32
 
+    # Wave 39: High-precision float64 (> 1e9, where f32 ULP=64 wipes out 0.001/0.003 ramps) + nodata hole
+    p_w39_f64 = synth_dir / "w39_f64_hi.tif"
+    f64_w39 = (1_000_000_000.0 + xx9.astype(np.float64) * 0.001 + yy9.astype(np.float64) * 0.003)
+    f64_w39[80:100, 60:90] = -9999.0
+    with rasterio.open(
+        p_w39_f64, "w", driver="GTiff", width=128, height=128, count=1, dtype="float64",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", predictor=3, nodata=-9999.0,
+    ) as ds:
+        ds.write(f64_w39, 1)
+    out["w39_f64_hi"] = p_w39_f64
+
     return out
 
 
@@ -3600,6 +3612,7 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W30 TIFF RPC-only (tag 50844) -> 400 RPC msg & 200 validate",
         "W32 ZARR v3 sharding_indexed + gzip + missing chunk .npy",
         "W32 ZARR v3 /zarr/preview cubic .png",
+        "W39 ZARR f64 >1e9 /zarr/point exact",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -3873,6 +3886,39 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
                             gpu_diffs.append({"label": lb, "detail": det_g})
             else:
                 rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+    # --- Wave 39: High-precision float64 Zarr /point (1e9 + 0.001*x + 0.003*y, where f32 ULP=64) ---
+    lb = "W39 ZARR f64 >1e9 /zarr/point exact"
+    if wanted(lb):
+        zf64 = w30_dir / "w39_f64_hi.zarr"
+        zf64.mkdir()
+        (zf64 / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+        zf64_arr = (1_000_000_000.0 + xx.astype(np.float64) * 0.001 + yy.astype(np.float64) * 0.003)
+        for vname, varr, vdims in [("lon", lon, ["lon"]), ("lat", lat, ["lat"]), ("val", zf64_arr, ["lat", "lon"])]:
+            vd = zf64 / vname
+            vd.mkdir()
+            (vd / ".zarray").write_text(json.dumps({
+                "zarr_format": 2, "shape": list(varr.shape), "chunks": list(varr.shape),
+                "dtype": "<f8", "compressor": None, "fill_value": None, "order": "C", "filters": None,
+            }))
+            (vd / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": vdims}))
+            (vd / ("0" if varr.ndim == 1 else "0.0")).write_bytes(np.ascontiguousarray(varr).tobytes())
+        p = f"/zarr/point/-122.25,37.75?url={q(zf64)}&variable=val"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            vals = r.json().get("values", [])
+            ok = len(vals) == 1 and abs(vals[0] - 1_000_000_000.128) < 1e-3
+            rec(lb, ok, f"values={vals} (exp ~1000000000.128)", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    gvals = rg.json().get("values", [])
+                    if len(gvals) != 1 or abs(vals[0] - gvals[0]) >= 1e-4:
+                        gpu_diffs.append({"label": lb, "detail": f"cpu={vals} gpu={gvals}"})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
 
     return ran
 
@@ -4500,6 +4546,16 @@ def main() -> int:
                 ("PARITY W38 DTYPE i32 <-2^24+nodata /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w38_i32_hi'])}", None, "point"),
                 ("PARITY W38 DISCOVERY /tileMatrixSets & /algorithms", "GET", "/algorithms", None, "discovery_w38"),
                 ("PARITY W38 DISCOVERY /colorMaps", "GET", "/colorMaps", None, "discovery_w38"),
+                # --- Wave 39: High-precision float64 (>1e9, f32 ULP=64), OGC /cog/tiles metadata & STAC expr feature/stats ---
+                ("PARITY W39 DTYPE f64 >1e9 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w39_f64_hi'])}", None, "npy_f64_exact"),
+                ("PARITY W39 DTYPE f64 >1e9 bilinear .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w39_f64_hi'])}&resampling=bilinear", None, "npy_f64_exact"),
+                ("PARITY W39 DTYPE f64 >1e9 .tif", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.tif?url={q(s['w39_f64_hi'])}", None, "geotiff_f64_exact"),
+                ("PARITY W39 DTYPE f64 >1e9 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w39_f64_hi'])}", None, "point_f64_exact"),
+                ("PARITY W39 DTYPE f64 >1e9 /statistics", "GET", f"/cog/statistics?url={q(s['w39_f64_hi'])}", None, "stats"),
+                ("PARITY W39 OGC /cog/tiles tilesets list", "GET", f"/cog/tiles?url={q(s['w39_f64_hi'])}", None, "ogc_tiles_w39"),
+                ("PARITY W39 OGC /cog/tiles/WebMercatorQuad tileset", "GET", f"/cog/tiles/WebMercatorQuad?url={q(s['w39_f64_hi'])}", None, "ogc_tiles_w39"),
+                ("PARITY W39 STAC POST /feature NDVI .npy", "POST", f"/stac/feature/64x64.npy?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&expression={qe('(b2-b1)/(b2+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}, "npy"),
+                ("PARITY W39 STAC POST /statistics NDVI", "POST", f"/stac/statistics?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&expression={qe('(b2-b1)/(b2+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}, "post_stats"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -4567,6 +4623,26 @@ def main() -> int:
                                 gd = idet if "image/jpeg" in gct else f"gpu content-type={gct!r}"
                             elif "image/png" in ct or "image/jpeg" in ct or "image/webp" in ct:
                                 gok, gd = compare_images(r_cw.content, r_gpu.content)
+                            elif kind == "npy_f64_exact":
+                                ac, ag = np.load(io.BytesIO(r_cw.content)), np.load(io.BytesIO(r_gpu.content))
+                                low = np.finfo(np.float64).min
+                                mc, mg = ac[1] > low, ag[1] > low
+                                both = mc & mg
+                                merr = float(np.max(np.abs(ac[0][both] - ag[0][both]))) if both.any() else 999.0
+                                gok = ac.dtype == np.float64 and ag.dtype == np.float64 and bool((mc == mg).all()) and merr < 1e-4
+                                gd = f"f64 max_abs_err={merr:.6f}"
+                            elif kind == "geotiff_f64_exact":
+                                with rasterio.MemoryFile(r_cw.content) as mfc, mfc.open() as dc, rasterio.MemoryFile(r_gpu.content) as mfg, mfg.open() as dg:
+                                    ac, ag = dc.read(), dg.read()
+                                    mc, mg = ac[1] > 0, ag[1] > 0
+                                    both = mc & mg
+                                    merr = float(np.max(np.abs(ac[0][both] - ag[0][both]))) if both.any() else 999.0
+                                    gok = ac.dtype == np.float64 and ag.dtype == np.float64 and bool((mc == mg).all()) and merr < 1e-4
+                                    gd = f"f64 tif max_abs_err={merr:.6f}"
+                            elif kind == "point_f64_exact":
+                                vc, vg = r_cw.json().get("values", []), r_gpu.json().get("values", [])
+                                gok = len(vc) == 1 and len(vg) == 1 and abs(vc[0] - vg[0]) < 1e-4
+                                gd = f"cpu={vc} gpu={vg}"
                             elif "application/x-binary" in ct or ".npy" in path:
                                 gok, gd = compare_npy(r_cw.content, r_gpu.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                             elif "image/tiff" in ct:
@@ -4604,6 +4680,15 @@ def main() -> int:
                                 ic = [x["id"] if isinstance(x, dict) else x for x in jc.get(k, [])]
                                 ig = [x["id"] if isinstance(x, dict) else x for x in jg.get(k, [])]
                                 gok, gd = (ic == ig), f"ids match ({len(ic)})" if ic == ig else f"cw={len(ic)} gpu={len(ig)}"
+                            elif kind == "ogc_tiles_w39":
+                                jc, jg = r_cw.json(), r_gpu.json()
+                                if "tilesets" in jc:
+                                    ic = [t.get("tileMatrixSetId") or t.get("title") for t in jc["tilesets"]]
+                                    ig = [t.get("tileMatrixSetId") or t.get("title") for t in jg.get("tilesets", [])]
+                                    gok, gd = (ic == ig), f"tilesets match ({len(ic)})"
+                                else:
+                                    gok = jc.get("dataType") == jg.get("dataType") and jc.get("boundingBox") == jg.get("boundingBox")
+                                    gd = "tileset meta match" if gok else "tileset meta diff"
                             else:
                                 gok, gd = (r_cw.content == r_gpu.content), "bytes diff"
                             if not gok:
@@ -4938,6 +5023,51 @@ def main() -> int:
                             cc, ct = _cm_ids(r_cw.json()), _cm_ids(r_tt.json())
                             ok = {"viridis", "plasma", "inferno", "terrain", "turbo"}.issubset(cc) and len(cc & ct) >= 100
                             detail = f"cw_cmaps={len(cc)} tt_cmaps={len(ct)} shared={len(cc & ct)}"
+                    elif kind == "ogc_tiles_w39":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            jc, jt = r_cw.json(), r_tt.json()
+                            if "tilesets" in jc:
+                                ok = len(jc["tilesets"]) >= 10 and len(jt.get("tilesets", [])) >= 10
+                                detail = f"cw_tilesets={len(jc['tilesets'])} tt_tilesets={len(jt.get('tilesets', []))}"
+                            else:
+                                ok = "boundingBox" in jc and len(jc.get("links", [])) > 0 and "boundingBox" in jt
+                                detail = f"dataType={jc.get('dataType')} links={len(jc.get('links', []))}"
+                    elif kind == "npy_f64_exact":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ac, at = np.load(io.BytesIO(r_cw.content)), np.load(io.BytesIO(r_tt.content))
+                            low = np.finfo(np.float64).min
+                            mc, mt = ac[1] > low, at[1] > low
+                            both = mc & mt
+                            mask_eq = float((mc == mt).mean()) * 100.0
+                            merr = float(np.max(np.abs(ac[0][both] - at[0][both]))) if both.any() else 999.0
+                            cstd = float(ac[0][mc].std()) if mc.any() else 0.0
+                            ok = ac.dtype == np.float64 and at.dtype == np.float64 and mask_eq >= 99.0 and merr < 1e-4 and cstd > 0.05
+                            detail = f"f64 mask={mask_eq:.2f}% max_abs_err={merr:.6f} std={cstd:.4f}"
+                    elif kind == "geotiff_f64_exact":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            with rasterio.MemoryFile(r_cw.content) as mfc, mfc.open() as dc, rasterio.MemoryFile(r_tt.content) as mft, mft.open() as dt:
+                                ac, at = dc.read(), dt.read()
+                                mc, mt = ac[1] > 0, at[1] > 0
+                                both = mc & mt
+                                mask_eq = float((mc == mt).mean()) * 100.0
+                                merr = float(np.max(np.abs(ac[0][both] - at[0][both]))) if both.any() else 999.0
+                                cstd = float(ac[0][mc].std()) if mc.any() else 0.0
+                                ok = ac.dtype == np.float64 and at.dtype == np.float64 and mask_eq >= 99.0 and merr < 1e-4 and cstd > 0.05
+                                detail = f"f64 tif mask={mask_eq:.2f}% max_abs_err={merr:.6f} std={cstd:.4f}"
+                    elif kind == "point_f64_exact":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            vc, vt = r_cw.json().get("values", []), r_tt.json().get("values", [])
+                            aerr = abs(vc[0] - vt[0]) if len(vc) == 1 and len(vt) == 1 else 999.0
+                            ok = aerr < 1e-4 and abs(vc[0] - 1_000_000_000.256) < 1e-4
+                            detail = f"cw={vc} tt={vt} abs_err={aerr:.6f}"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
