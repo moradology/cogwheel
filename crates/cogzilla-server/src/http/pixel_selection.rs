@@ -51,6 +51,22 @@ impl Selection {
     pub(crate) fn by_last_band(self) -> bool {
         matches!(self, Self::LastBandLow | Self::LastBandHigh)
     }
+
+    /// Matching GPU shader mode, or `None` for methods that no shader implements
+    /// (`LastBandLow` / `LastBandHigh`, which remain CPU-only).
+    pub(crate) const fn gpu(self) -> Option<cogzilla_raster::GpuPixelSelection> {
+        use cogzilla_raster::GpuPixelSelection as G;
+        match self {
+            Self::First => Some(G::First),
+            Self::Highest => Some(G::Highest),
+            Self::Lowest => Some(G::Lowest),
+            Self::Mean => Some(G::Mean),
+            Self::Median => Some(G::Median),
+            Self::Stdev => Some(G::Stdev),
+            Self::Count => Some(G::Count),
+            Self::LastBandLow | Self::LastBandHigh => None,
+        }
+    }
 }
 
 /// A value a selection is worked out over: `f32` for pictures, `f64` for statistics.
@@ -275,10 +291,14 @@ impl<T: Sample> Fold<T> {
         }
     }
 
-    /// Borrow held scenes for GPU-accelerated Median compositing when `method == Selection::Median`,
-    /// `scenes >= 3`, and `!integer`. Returns `Some((bands, scenes))` if eligible.
-    pub(crate) fn median_scenes(&self) -> Option<(usize, &[Vec<T>])> {
-        if self.method == Selection::Median && !self.integer && self.scenes >= 3
+    /// Borrow held scene planes for GPU compositing when the fold retains all scenes in memory
+    /// (`State::All`, currently `Selection::Median`), `scenes >= 3`, and `!integer`. Streaming
+    /// methods (`First`, `Highest`, `Lowest`, `Mean`, `Stdev`, `Count`) fold in O(1) per-pixel
+    /// state on CPU without allocating a scene stack, so they return `None`.
+    pub(crate) fn held_scenes_for_gpu(&self) -> Option<(usize, &[Vec<T>])> {
+        if self.method.gpu().is_some()
+            && !self.integer
+            && self.scenes >= 3
             && let State::All(ref scenes) = self.state
         {
             return Some((self.bands, scenes.as_slice()));
@@ -551,5 +571,30 @@ mod tests {
         for method in [Selection::Highest, Selection::Lowest, Selection::Mean, Selection::Stdev, Selection::Count] {
             assert_eq!(Fold::<f32>::held_bytes(method, 10_000, 3, 512 * 512), 0);
         }
+    }
+
+    #[test]
+    fn selection_gpu_mapping_covers_all_wire_codes_and_excludes_lastband() {
+        use cogzilla_raster::GpuPixelSelection;
+
+        let all_api = [
+            Selection::First,
+            Selection::Highest,
+            Selection::Lowest,
+            Selection::Mean,
+            Selection::Median,
+            Selection::Stdev,
+            Selection::Count,
+            Selection::LastBandLow,
+            Selection::LastBandHigh,
+        ];
+        let gpu_mapped: Vec<GpuPixelSelection> = all_api.iter().filter_map(|m| m.gpu()).collect();
+        assert_eq!(
+            gpu_mapped.as_slice(),
+            &GpuPixelSelection::ALL,
+            "Selection::gpu() must map 1-to-1 onto GpuPixelSelection::ALL in wire-code order"
+        );
+        assert!(Selection::LastBandLow.gpu().is_none());
+        assert!(Selection::LastBandHigh.gpu().is_none());
     }
 }
