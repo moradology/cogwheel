@@ -1545,6 +1545,24 @@ def main() -> int:
                 ("PARITY W9 ALG terrainrgb .png", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=terrainrgb", None, "png"),
             ]
 
+            # --- 5e. Wave 10: Expression VM torture, multi-expr (;), WebP/JPEG/GeoTIFF, WorldCRS84Quad ---
+            cases += [
+                ("PARITY W10 EXPR abs+sqrt+neg .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('abs(-b1)+sqrt(abs(b2))')}", None, "npy"),
+                ("PARITY W10 EXPR exp+log+log10 .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('exp(b1)+log(b2+1.0)+log10(b3+1.0)')}", None, "npy"),
+                ("PARITY W10 EXPR cos+tan+arctan2 .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('cos(b1)+tan(b2*0.5)+arctan2(b1,b2+0.1)')}", None, "npy"),
+                ("PARITY W10 EXPR arcsin+arccos .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('arcsin(b1*0.5)+arccos(b2*0.5)')}", None, "npy"),
+                ("PARITY W10 EXPR floor+ceil .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('floor(b1*10.0)+ceil(b2*10.0)')}", None, "npy"),
+                ("PARITY W10 EXPR multi-expr 3-band .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('b1+b2;b2-b1;b3*2.0')}", None, "npy"),
+                ("PARITY W10 EXPR multi-expr 3-band .png", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={q(sat)}&expression={qe('b1+b2;b2-b1;b3*2.0')}&rescale=0,0.6&rescale=-0.2,0.2&rescale=0,0.6", None, "png"),
+                ("PARITY W10 EXPR div-by-zero safe .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('where(b1>0.15,b2/b1,0.0)')}", None, "npy"),
+                ("PARITY W10 EXPR nested where int32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('where(b1>0.2,2,where(b1>0.1,1,0))')}", None, "npy"),
+                ("PARITY W10 FMT WebP RGB .webp", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.webp?url={q(sat)}&rescale=0,0.35", None, "png"),
+                ("PARITY W10 FMT JPEG RGB .jpg", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.jpg?url={q(sat)}&rescale=0,0.35", None, "png"),
+                ("PARITY W10 FMT GeoTIFF DEM .tif", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={q(merc)}", None, "geotiff"),
+                ("PARITY W10 FMT GeoTIFF DEM return_mask=false", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={q(merc)}&return_mask=false", None, "geotiff"),
+                ("PARITY W10 TMS WorldCRS84Quad .npy", "GET", f"/cog/tiles/WorldCRS84Quad/11/652/593.npy?url={q(sat)}", None, "npy"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
                 ("BETTER W9 nbits_1 .npy raw 0/1 (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.npy?url={q(s['w9_nbits_1'])}", None, "better_palette_npy"),
@@ -1605,7 +1623,7 @@ def main() -> int:
                             elif "application/x-binary" in ct or ".npy" in path:
                                 gok, gd = compare_npy(r_cw.content, r_gpu.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                             elif "image/tiff" in ct:
-                                gok, gd = compare_geotiffs(r_cw.content, r_gpu.content, compare_pixels=True)
+                                gok, gd = compare_geotiffs(r_cw.content, r_gpu.content, compare_pixels=True, masked=not is_unmasked, smooth=is_smooth)
                             elif kind == "stats":
                                 gok, gd = compare_stats_strict(r_cw.json(), r_gpu.json())
                             elif kind == "post_stats":
@@ -1714,7 +1732,7 @@ def main() -> int:
                     elif kind == "npy":
                         ok, detail = compare_npy(r_cw.content, r_tt.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                     elif kind == "geotiff":
-                        ok, detail = compare_geotiffs(r_cw.content, r_tt.content, compare_pixels=True)
+                        ok, detail = compare_geotiffs(r_cw.content, r_tt.content, compare_pixels=True, masked=not is_unmasked, smooth=is_smooth)
                     elif kind == "json_exact":
                         d = first_json_diff(r_cw.json(), r_tt.json())
                         ok, detail = (d is None), (d or "exact JSON match")
