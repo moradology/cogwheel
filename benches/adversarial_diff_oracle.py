@@ -1438,6 +1438,48 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(f64_53, 1)
     out["w53_zstd_f64_p3"] = p_w53_f64
 
+    # Wave 54: WebMercator-aligned (1:1 tile 10/164/396, 256x256) JPEG-in-TIFF PHOTOMETRIC=RGB & YCBCR
+    # with shared tag 347 JPEGTables — genuinely exercises zero-decode passthrough + splice_jpeg_tables
+    # (YCBCR .jpg), the photometric=2 RGB passthrough guard (RGB .jpg), and decode-path JPEGTables (.png).
+    b54 = mercantile.xy_bounds(164, 396, 10)
+    tf_w54 = from_bounds(b54.left, b54.bottom, b54.right, b54.top, 256, 256)
+    yy54, xx54 = np.mgrid[0:256, 0:256]
+    r54 = np.clip(40 + xx54 * 0.75, 0, 255).astype(np.uint8)
+    g54 = np.clip(30 + yy54 * 0.70, 0, 255).astype(np.uint8)
+    b54_ch = np.clip(220 - xx54 * 0.60, 0, 255).astype(np.uint8)
+    rgb54 = np.stack([r54, g54, b54_ch])
+
+    def _has_tiff_tag(path: Path, tag_id: int) -> bool:
+        raw = path.read_bytes()
+        bo = "<" if raw[:2] == b"II" else ">"
+        ifd_off = struct.unpack(bo + "I", raw[4:8])[0]
+        n_ent = struct.unpack(bo + "H", raw[ifd_off:ifd_off + 2])[0]
+        for i in range(n_ent):
+            t = struct.unpack(bo + "H", raw[ifd_off + 2 + i * 12:ifd_off + 4 + i * 12])[0]
+            if t == tag_id:
+                return True
+        return False
+
+    p_w54_rgb_jt = synth_dir / "w54_rgb_jpeg_tables.tif"
+    with rasterio.open(
+        p_w54_rgb_jt, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint8",
+        crs="EPSG:3857", transform=tf_w54, tiled=True, blockxsize=256, blockysize=256,
+        compress="JPEG", photometric="RGB", jpeg_quality=92, JPEGTABLESMODE=1,
+    ) as ds:
+        ds.write(rgb54)
+    assert _has_tiff_tag(p_w54_rgb_jt, 347), "w54_rgb_jpeg_tables IFD must contain tag 347 JPEGTables"
+    out["w54_rgb_jpeg_tables"] = p_w54_rgb_jt
+
+    p_w54_ycbcr_jt = synth_dir / "w54_ycbcr_jpeg_tables.tif"
+    with rasterio.open(
+        p_w54_ycbcr_jt, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint8",
+        crs="EPSG:3857", transform=tf_w54, tiled=True, blockxsize=256, blockysize=256,
+        compress="JPEG", photometric="YCBCR", jpeg_quality=92, JPEGTABLESMODE=1,
+    ) as ds:
+        ds.write(rgb54)
+    assert _has_tiff_tag(p_w54_ycbcr_jt, 347), "w54_ycbcr_jpeg_tables IFD must contain tag 347 JPEGTables"
+    out["w54_ycbcr_jpeg_tables"] = p_w54_ycbcr_jt
+
     return out
 
 
@@ -3536,6 +3578,8 @@ def run_wave28_wms_and_mosaic_checks(
         "W38 MOSAIC GET /point",
         "W43 MOSAIC expression + resampling=cubic .npy",
         "W43 MOSAIC expression + colormap_name=viridis .png",
+        "W54 MOSAIC bidx=3,2,1 + pixel_selection=median + color_formula .png",
+        "W54 MOSAIC POST /statistics donut coord_crs=EPSG:3857",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -3907,6 +3951,53 @@ def run_wave28_wms_and_mosaic_checks(
         else:
             rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
 
+    lb = "W54 MOSAIC bidx=3,2,1 + pixel_selection=median + color_formula .png"
+    if wanted(lb):
+        p = f"/mosaicjson/tiles/WebMercatorQuad/10/164/396.png?url={q(mj_p)}&bidx=3&bidx=2&bidx=1&pixel_selection=median&color_formula={qe('Gamma RGB 1.4')}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+            vm = im[..., 3] == 255
+            cstd = float(im[vm, :3].std(axis=0).max()) if vm.any() else 0.0
+            ok = im.shape == (256, 256, 4) and int(vm.sum()) > 10000 and cstd > 5.0
+            rec(lb, ok, f"shape={im.shape} valid={int(vm.sum())} std={cstd:.1f}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_images(r.content, rg.content)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W54 MOSAIC POST /statistics donut coord_crs=EPSG:3857"
+    if wanted(lb):
+        ox, oy = rasterio.warp.transform("EPSG:4326", "EPSG:3857", [-122.48, -122.02, -122.02, -122.48, -122.48], [37.52, 37.52, 37.98, 37.98, 37.52])
+        ix, iy = rasterio.warp.transform("EPSG:4326", "EPSG:3857", [-122.34, -122.34, -122.16, -122.16, -122.34], [37.66, 37.84, 37.84, 37.66, 37.66])
+        donut_3857 = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [list(zip(ox, oy)), list(zip(ix, iy))]}}
+        p = f"/mosaicjson/statistics?url={q(mj_p)}&coord_crs=EPSG:3857"
+        r = client.post(cw_base + p, json=donut_3857)
+        if r.status_code == 200:
+            st = r.json().get("properties", {}).get("statistics", {})
+            b1 = st.get("b1", {})
+            vp = float(b1.get("valid_percent", 0.0))
+            cnt = float(b1.get("count", 0.0))
+            # Exterior 0.46x0.46 deg (~13867 px) minus interior hole 0.18x0.18 deg (~2123 px) = ~11744 px
+            ok = "b1" in st and abs(vp - 100.0) < 0.5 and 11000.0 < cnt < 12500.0
+            rec(lb, ok, f"bands={sorted(st.keys())} b1.valid_percent={vp:.1f} count={cnt:.1f} (exp ~11744)", p)
+            if gpu_base:
+                rg = client.post(gpu_base + p, json=donut_3857)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    d_st = first_json_diff(r.json(), rg.json())
+                    if d_st is not None:
+                        gpu_diffs.append({"label": lb, "detail": d_st})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
     return ran
 
 
@@ -4016,6 +4107,9 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W44 ZARR POST /statistics coord_crs=EPSG:3857",
         "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy",
         "W52 ZARR v2 shuffle filter + zlib compressor /bbox .npy",
+        "W54 ZARR v3 blosc (v3 spec byte-shuffle+zlib) /bbox .npy",
+        "W54 ZARR GET /tiles algorithm=hillshade .png",
+        "W54 ZARR POST /feature donut coord_crs=EPSG:3857 .npy",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -4333,6 +4427,9 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W44 ZARR POST /statistics coord_crs=EPSG:3857",
         "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy",
         "W52 ZARR v2 shuffle filter + zlib compressor /bbox .npy",
+        "W54 ZARR v3 blosc (v3 spec byte-shuffle+zlib) /bbox .npy",
+        "W54 ZARR GET /tiles algorithm=hillshade .png",
+        "W54 ZARR POST /feature donut coord_crs=EPSG:3857 .npy",
     ]
     if any(wanted(l) for l in w44_labels):
         def _crc32c_w44(data: bytes) -> int:
@@ -4457,7 +4554,13 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
             rec(lb, ok, f"status={rb.status_code} msg={rb.text[:70]!r}", p_bb)
 
         z_gz44 = None
-        if any(wanted(l) for l in ("W44 ZARR v3 gzip codec /bbox .npy", "W44 ZARR POST /statistics 2-feature FeatureCollection", "W44 ZARR POST /statistics coord_crs=EPSG:3857")):
+        if any(wanted(l) for l in (
+            "W44 ZARR v3 gzip codec /bbox .npy",
+            "W44 ZARR POST /statistics 2-feature FeatureCollection",
+            "W44 ZARR POST /statistics coord_crs=EPSG:3857",
+            "W54 ZARR GET /tiles algorithm=hillshade .png",
+            "W54 ZARR POST /feature donut coord_crs=EPSG:3857 .npy",
+        )):
             z_gz44 = _mk_z3_w44(
                 "w44_z3_gzip.zarr",
                 [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "gzip", "configuration": {"level": 5}}],
@@ -4606,6 +4709,79 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
                             gpu_diffs.append({"label": lb, "detail": det_g})
             else:
                 rec(lb, False, f"HTTP {rb.status_code} {rb.text[:80]!r}", p_bb)
+
+        lb = "W54 ZARR v3 blosc (v3 spec byte-shuffle+zlib) /bbox .npy"
+        if wanted(lb):
+            z_blosc3 = _mk_z3_w44(
+                "w54_z3_blosc.zarr",
+                [
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                    {"name": "blosc", "configuration": {"cname": "zlib", "clevel": 5, "shuffle": "shuffle", "typesize": 4, "blocksize": 0}},
+                ],
+                _encode_blosc1(raw44, 4, shuffle=1, use_zlib=True),
+            )
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_blosc3)}&variable=data"
+            rb = client.get(cw_base + p_bb)
+            if rb.status_code == 200:
+                ab = np.load(io.BytesIO(rb.content))
+                err = float(np.abs(ab[0] - arr44).max())
+                rec(lb, err < 1e-4, f"max_err={err:.5f}", p_bb)
+                if gpu_base:
+                    rbg = client.get(gpu_base + p_bb)
+                    if rbg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rbg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(rb.content, rbg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {rb.status_code} {rb.text[:80]!r}", p_bb)
+
+        lb = "W54 ZARR GET /tiles algorithm=hillshade .png"
+        if wanted(lb):
+            p_hs = f"/zarr/tiles/WebMercatorQuad/10/164/396.png?url={q(z_gz44)}&variable=data&algorithm=hillshade"
+            r_hs = client.get(cw_base + p_hs)
+            if r_hs.status_code == 200:
+                im = np.array(Image.open(io.BytesIO(r_hs.content)).convert("RGBA"))
+                vm = im[..., 3] == 255
+                ok = im.shape == (256, 256, 4) and int(vm.sum()) > 10000 and int(im[vm, 0].max()) > 100
+                rec(lb, ok, f"shape={im.shape} valid={int(vm.sum())} max_r={int(im[vm, 0].max()) if vm.any() else 0}", p_hs)
+                if gpu_base:
+                    rg = client.get(gpu_base + p_hs)
+                    if rg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_images(r_hs.content, rg.content)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {r_hs.status_code} {r_hs.text[:80]!r}", p_hs)
+
+        lb = "W54 ZARR POST /feature donut coord_crs=EPSG:3857 .npy"
+        if wanted(lb):
+            ox, oy = rasterio.warp.transform("EPSG:4326", "EPSG:3857", [-122.45, -122.05, -122.05, -122.45, -122.45], [37.55, 37.55, 37.95, 37.95, 37.55])
+            ix, iy = rasterio.warp.transform("EPSG:4326", "EPSG:3857", [-122.33, -122.33, -122.17, -122.17, -122.33], [37.67, 37.83, 37.83, 37.67, 37.67])
+            donut_z38 = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [list(zip(ox, oy)), list(zip(ix, iy))]}}
+            p_ft = f"/zarr/feature/64x64.npy?url={q(z_gz44)}&variable=data&coord_crs=EPSG:3857"
+            r_ft = client.post(cw_base + p_ft, json=donut_z38)
+            if r_ft.status_code == 200:
+                af = np.load(io.BytesIO(r_ft.content))
+                fmin = np.finfo(af.dtype).min
+                center_masked = bool(af[1, 32, 32] == fmin)
+                ring_valid = bool(af[1, 8, 32] > fmin)
+                nvalid = int((af[1] > fmin).sum())
+                ok = af.shape == (2, 64, 64) and center_masked and ring_valid and 2000 < nvalid < 3600
+                rec(lb, ok, f"shape={af.shape} center_masked={center_masked} ring_valid={ring_valid} valid={nvalid}", p_ft)
+                if gpu_base:
+                    rg = client.post(gpu_base + p_ft, json=donut_z38)
+                    if rg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(r_ft.content, rg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {r_ft.status_code} {r_ft.text[:80]!r}", p_ft)
 
     return ran
 
@@ -5393,6 +5569,12 @@ def main() -> int:
                 ("PARITY W53 NEG-SCALE unscale=true /statistics", "GET", f"/cog/statistics?url={q(s['w53_neg_scale'])}&unscale=true", None, "stats"),
                 ("PARITY W53 WEBP lossless 3-band RGB .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w53_webp_lossless'])}", None, "npy"),
                 ("PARITY W53 ZSTD float64 Predictor=3 (>1e9) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w53_zstd_f64_p3'])}", None, "npy_f64_exact"),
+                # --- Wave 54: WebMercator-aligned JPEG-in-TIFF PHOTOMETRIC=RGB & YCBCR with shared tag 347 JPEGTables ---
+                ("PARITY W54 RGB JPEG+JPEGTables .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w54_rgb_jpeg_tables'])}", None, "png"),
+                ("PARITY W54 RGB JPEG+JPEGTables .jpg", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.jpg?url={q(s['w54_rgb_jpeg_tables'])}", None, "png"),
+                ("PARITY W54 RGB JPEG+JPEGTables /point", "GET", f"/cog/point/{(mercantile.bounds(164, 396, 10).west + mercantile.bounds(164, 396, 10).east) / 2:.5f},{(mercantile.bounds(164, 396, 10).south + mercantile.bounds(164, 396, 10).north) / 2:.5f}?url={q(s['w54_rgb_jpeg_tables'])}", None, "point"),
+                ("PARITY W54 YCbCr JPEG+JPEGTables .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w54_ycbcr_jpeg_tables'])}", None, "png"),
+                ("PARITY W54 YCbCr JPEG+JPEGTables .jpg", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.jpg?url={q(s['w54_ycbcr_jpeg_tables'])}", None, "png"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
