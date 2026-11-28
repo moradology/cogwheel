@@ -48,13 +48,72 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
     }
 }
 
-/// The type band math comes out in, as numexpr has it in TiTiler, from the type `read`
-/// of the bands it is worked on: whole numbers of up to 16 bits stay whole, as 32-bit
-/// ones, through sums, differences and products, and 32-bit floats stay so; a division, a
-/// function or a fraction makes doubles.
-pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> + Clone, read: SampleType) -> SampleType {
-    let whole = |e: &String| {
-        let mut rest = e.as_str();
+/// Split a top-level `where(cond, a, b)` call into its `(then_branch, else_branch)` substrings.
+fn where_branches(expr: &str) -> Option<(&str, &str)> {
+    let trimmed = expr.trim();
+    let inner = trimmed
+        .strip_prefix("where")
+        .or_else(|| trimmed.strip_prefix("WHERE"))?
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    let mut depth = 0usize;
+    let mut commas = [0usize; 2];
+    let mut found = 0usize;
+    for (idx, b) in inner.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                // Closing paren before the final char means `where(...)` wasn't the outer expression.
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => {
+                if found < 2 {
+                    commas[found] = idx;
+                }
+                found += 1;
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 && found == 2 {
+        Some((inner[commas[0] + 1..commas[1]].trim(), inner[commas[1] + 1..].trim()))
+    } else {
+        None
+    }
+}
+
+fn is_int_literal(expr: &str) -> bool {
+    let s = expr.trim();
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && s.parse::<i32>().is_ok()
+}
+
+fn single_expr_type(expr: &str, read: SampleType) -> SampleType {
+    let trimmed = expr.trim();
+    if let Some((a, b)) = where_branches(trimmed) {
+        let a_lit = is_int_literal(a);
+        let b_lit = is_int_literal(b);
+        if a_lit && b_lit {
+            return SampleType::Int32;
+        }
+        let ta = single_expr_type(a, read);
+        let tb = single_expr_type(b, read);
+        // In numexpr, combining an integer literal with float32 keeps float32 (unlike numpy wider_type).
+        return match (ta, tb) {
+            (SampleType::Float32, SampleType::Int32) if b_lit => SampleType::Float32,
+            (SampleType::Int32, SampleType::Float32) if a_lit => SampleType::Float32,
+            _ => wider_type(ta, tb),
+        };
+    }
+    if is_int_literal(trimmed) {
+        return SampleType::Int32;
+    }
+    let whole = |e: &str| {
+        let mut rest = e;
         while let Some(at) = rest.find('b') {
             let digits = rest[at + 1..].bytes().take_while(u8::is_ascii_digit).count();
             if digits == 0 {
@@ -69,13 +128,13 @@ pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> +
     };
     // float32 stays float32 through operations and functions alike; a literal with a
     // fraction or an exponent is a double and makes the result one.
-    let plain = |e: &String| {
-        let e = e.as_bytes();
-        !e.contains(&b'.') && !e.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
+    let plain = |e: &str| {
+        let bytes = e.as_bytes();
+        !bytes.contains(&b'.') && !bytes.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
     };
-    if read == SampleType::Float32 && expressions.clone().all(plain) {
+    if read == SampleType::Float32 && plain(trimmed) {
         SampleType::Float32
-    } else if !expressions.clone().all(whole) {
+    } else if !whole(trimmed) {
         SampleType::Float64
     } else {
         match read {
@@ -88,6 +147,22 @@ pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String> +
             _ => SampleType::Float64,
         }
     }
+}
+
+/// The type band math comes out in, as numexpr has it in TiTiler, from the type `read`
+/// of the bands it is worked on: whole numbers of up to 16 bits stay whole, as 32-bit
+/// ones, through sums, differences and products, and 32-bit floats stay so; a division, a
+/// function or a fraction makes doubles; `where(cond, a, b)` takes its type from `(a, b)`.
+pub(crate) fn band_math_type<'a>(expressions: impl Iterator<Item = &'a String>, read: SampleType) -> SampleType {
+    let mut out: Option<SampleType> = None;
+    for e in expressions {
+        let t = single_expr_type(e, read);
+        out = Some(match out {
+            Some(prev) => wider_type(prev, t),
+            None => t,
+        });
+    }
+    out.unwrap_or(SampleType::Float64)
 }
 
 /// Whether a request turns values into a picture's bytes: a rescale, a colour map, a colour
@@ -332,6 +407,15 @@ mod tests {
         assert_eq!(kind("b1^-1", T::Uint8), T::Float64);
         assert_eq!(kind("b1**3", T::Uint16), T::Float64);
         assert_eq!(kind("b1**-1", T::Float32), T::Float32);
+        // where(cond, a, b) takes its type from (a, b), not float literals in cond
+        for read in [T::Uint8, T::Uint16, T::Int16, T::Float32, T::Float64] {
+            assert_eq!(kind("where((b1>0.1)&(b2<0.3),1,0)", read), T::Int32, "{read:?}");
+        }
+        assert_eq!(kind("where((b1>0.25)|(b3>0.25),b1,b2)", T::Float32), T::Float32);
+        assert_eq!(kind("where((b1>0.25)|(b3>0.25),b1,b2)", T::Uint8), T::Int32);
+        assert_eq!(kind("where(b1>0.5,b1,0)", T::Float32), T::Float32);
+        assert_eq!(kind("where(b1>0.5,b1,0.5)", T::Float32), T::Float64);
+        assert_eq!(kind("where(b1>0.5,1,0)+0.5", T::Float32), T::Float64);
     }
 
     #[test]
