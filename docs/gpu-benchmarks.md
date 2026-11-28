@@ -29,6 +29,10 @@ All benchmarks in this document were measured on two hardware configurations (no
 ## Performance Scaling Overview
 
 <p align="center">
+  <img src="../assets/bench-gpu-scaling.png" alt="GPU acceleration across heavy single-request endpoints (1-core CPU vs Apple M5 Metal vs RTX 3090 Ti Vulkan) and sustained map-server soak throughput and latency" width="100%" />
+</p>
+
+<p align="center">
   <img src="../assets/bench-concurrency-overload.png" alt="Apples-to-apples 512x512 RGB Lanczos3 JPEG concurrency scaling (cogzilla vs TiTiler 2.4) and live HTTP AIMD overload tail latency across Apple M5 and Threadripper 3960X + RTX 3090 Ti" width="100%" />
 </p>
 
