@@ -28,6 +28,7 @@ import json
 import math
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1614,6 +1615,341 @@ def run_wave14_fault_checks(
     return ran
 
 
+def _crc32c(data: bytes) -> int:
+    """Pure-Python Castagnoli CRC32C (polynomial 0x82F63B78) for Zarr v3 sharding_indexed."""
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x82F63B78
+            else:
+                crc >>= 1
+    return crc ^ 0xFFFFFFFF
+
+
+def _build_zarr_v3_sharded(store: Path) -> tuple[Path, np.ndarray]:
+    """Build a Zarr v3 store with `sharding_indexed` (1 shard of 128x128 = 2x2 inner chunks of 64x64)."""
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "zarr.json").write_text(
+        json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {"Conventions": "CF-1.8"}})
+    )
+
+    lat = np.linspace(38.0 - 0.5 / 128, 37.0 + 0.5 / 128, 128, dtype=np.float64)
+    lon = np.linspace(-123.0 + 0.5 / 128, -122.0 - 0.5 / 128, 128, dtype=np.float64)
+    for name, arr, std in (("lat", lat, "latitude"), ("lon", lon, "longitude")):
+        ad = store / name
+        ad.mkdir()
+        (ad / "zarr.json").write_text(json.dumps({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [128],
+            "data_type": "float64",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [128]}},
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+            "fill_value": "NaN",
+            "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+            "dimension_names": [name],
+            "attributes": {"standard_name": std},
+        }))
+        cp = ad / "c" / "0"
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_bytes(np.ascontiguousarray(arr).tobytes())
+
+    yy, xx = np.mgrid[0:128, 0:128].astype(np.float32)
+    data = 50.0 + xx * 1.5 + yy * 0.75
+    data[0:32, 0:32] = -9999.0
+
+    ad = store / "sharded_var"
+    ad.mkdir()
+    (ad / "zarr.json").write_text(json.dumps({
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [128, 128],
+        "data_type": "float32",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [128, 128]}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": -9999.0,
+        "codecs": [{
+            "name": "sharding_indexed",
+            "configuration": {
+                "chunk_shape": [64, 64],
+                "codecs": [
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                    {"name": "gzip", "configuration": {"level": 1}},
+                ],
+                "index_codecs": [
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                    {"name": "crc32c"},
+                ],
+                "index_location": "end",
+            },
+        }],
+        "dimension_names": ["lat", "lon"],
+        "attributes": {},
+    }))
+
+    buf = bytearray()
+    index_entries = []
+    for cy in range(2):
+        for cx in range(2):
+            sub = np.ascontiguousarray(data[cy * 64:(cy + 1) * 64, cx * 64:(cx + 1) * 64])
+            comp = gzip.compress(sub.tobytes(), compresslevel=1)
+            off = len(buf)
+            buf.extend(comp)
+            index_entries.append((off, len(comp)))
+    idx_bytes = b"".join(struct.pack("<QQ", o, n) for o, n in index_entries)
+    chk = struct.pack("<I", _crc32c(idx_bytes))
+    buf.extend(idx_bytes)
+    buf.extend(chk)
+
+    sp = ad / "c" / "0" / "0"
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_bytes(bytes(buf))
+    return store, data
+
+
+def run_wave15_resilience_checks(
+    client: httpx.Client,
+    cw_base: str,
+    gpu_base: str | None,
+    tmp_dir: Path,
+    only_filter: str,
+    failures: list[dict],
+    gpu_diffs: list[dict],
+) -> int:
+    """Wave 15: HTTP If-Match 412 race recovery, range-misbehavior fault injection, hostile/corrupt TIFF+Zarr fuzzing, and Zarr v3 sharding_indexed."""
+    w15_dir = tmp_dir / "w15"
+    w15_dir.mkdir(parents=True, exist_ok=True)
+    tf = from_bounds(-122.5, 37.5, -122.0, 38.0, 128, 128)
+
+    for ver, val in (("v1", 100.0), ("v2", 250.0)):
+        with rasterio.open(
+            w15_dir / f"{ver}.tif", "w", driver="GTiff", width=128, height=128, count=1,
+            dtype="float32", crs="EPSG:4326", transform=tf,
+            tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+        ) as ds:
+            ds.write(np.full((1, 128, 128), val, dtype=np.float32))
+    v1_bytes = (w15_dir / "v1.tif").read_bytes()
+    v2_bytes = (w15_dir / "v2.tif").read_bytes()
+
+    # > 64 KB uncompressed tiled COG so opening + tile fetch genuinely requires a second HTTP Range GET
+    tf_big = from_bounds(-122.5, 37.5, -122.0, 38.0, 512, 512)
+    with rasterio.open(
+        w15_dir / "big_norange.tif", "w", driver="GTiff", width=512, height=512, count=1,
+        dtype="float32", crs="EPSG:4326", transform=tf_big,
+        tiled=True, blockxsize=64, blockysize=64,
+    ) as ds:
+        ds.write(np.full((1, 512, 512), 42.0, dtype=np.float32))
+    big_bytes = (w15_dir / "big_norange.tif").read_bytes()
+
+    # Hostile / corrupt TIFF fixtures
+    p_trunc = w15_dir / "truncated.tif"
+    p_trunc.write_bytes(v1_bytes[:24])
+    p_garbage = w15_dir / "garbage.tif"
+    p_garbage.write_bytes(b"NOT_A_TIFF_AT_ALL_0123456789" * 20)
+    p_corrupt_tile = w15_dir / "corrupt_tile.tif"
+    ba = bytearray(v1_bytes)
+    for i in range(max(0, len(ba) - 128), len(ba)):
+        ba[i] ^= 0xFF
+    p_corrupt_tile.write_bytes(bytes(ba))
+
+    # Zarr v3 sharded store + Zarr error-table fixtures
+    z_sharded, z_sharded_gt = _build_zarr_v3_sharded(w15_dir / "v3_sharded.zarr")
+
+    z_err = w15_dir / "zarr_errors.zarr"
+    z_err.mkdir()
+    (z_err / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    lat64 = np.linspace(38.0 - 0.5 / 64, 37.5 + 0.5 / 64, 64, dtype=np.float64)
+    lon64 = np.linspace(-122.5 + 0.5 / 64, -122.0 - 0.5 / 64, 64, dtype=np.float64)
+    _write_v2_zarr_array(z_err, "time", np.array([0, 1], dtype=np.int64), (2,), {"_ARRAY_DIMENSIONS": ["time"]})
+    _write_v2_zarr_array(z_err, "lat", lat64, (64,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+    _write_v2_zarr_array(z_err, "lon", lon64, (64,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+    _write_v2_zarr_array(
+        z_err, "a", np.ones((2, 64, 64), dtype=np.float32), (1, 64, 64),
+        {"_ARRAY_DIMENSIONS": ["time", "lat", "lon"]}, compressor={"id": "gzip", "level": 1},
+    )
+    _write_v2_zarr_array(
+        z_err, "b", np.ones((2, 64, 64), dtype=np.float32), (1, 64, 64),
+        {"_ARRAY_DIMENSIONS": ["time", "lat", "lon"]}, compressor={"id": "gzip", "level": 1},
+    )
+    (z_err / "a" / "0.0.0").write_bytes(b"\x1f\x8bCORRUPT_GZIP_GARBAGE")
+    (z_err / "mystery").mkdir()
+    (z_err / "mystery" / ".zarray").write_text(json.dumps({
+        "chunks": [64, 64], "compressor": {"id": "alien_lz99"}, "dtype": "<f4",
+        "fill_value": None, "filters": None, "order": "C", "shape": [64, 64], "zarr_format": 2,
+    }))
+    (z_err / "mystery" / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": ["lat", "lon"]}))
+    (z_err / "mystery" / "0.0").write_bytes(b"xxxx")
+
+    state = {"bytes": v1_bytes, "etag": '"v1"', "saw_412": False}
+    srv_port = pick_free_port()
+
+    class RaceFaultHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_HEAD(self):
+            if self.path.startswith("/norange"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(big_bytes)))
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(state["bytes"])))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", state["etag"])
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path.startswith("/norange"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(big_bytes)))
+                self.end_headers()
+                try:
+                    self.wfile.write(big_bytes)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            if self.path.startswith("/truncrange"):
+                rng = self.headers.get("Range")
+                if rng and rng.startswith("bytes="):
+                    chunk = v1_bytes[:8]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes 0-7/{len(v1_bytes)}")
+                    self.send_header("Content-Length", "8")
+                    self.end_headers()
+                    self.wfile.write(chunk)
+                    return
+            ifm = self.headers.get("If-Match")
+            if ifm and ifm != state["etag"]:
+                state["saw_412"] = True
+                self.send_response(412)
+                self.send_header("ETag", state["etag"])
+                self.end_headers()
+                return
+            rng = self.headers.get("Range")
+            data = state["bytes"]
+            if rng and rng.startswith("bytes="):
+                s0, e0 = rng[6:].split("-", 1)
+                start = int(s0)
+                end = min(int(e0) if e0 else len(data) - 1, len(data) - 1)
+                chunk = data[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.send_header("ETag", state["etag"])
+                self.end_headers()
+                self.wfile.write(chunk)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("ETag", state["etag"])
+                self.end_headers()
+                self.wfile.write(data)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", srv_port), RaceFaultHandler)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+
+    ran = 0
+
+    def rec(lb: str, ok: bool, detail: str, path: str = ""):
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": lb, "method": "GET", "path": path, "kind": "w15", "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {lb:54s} | {detail}")
+
+    def wanted(lb: str) -> bool:
+        return not only_filter or only_filter.lower() in lb.lower()
+
+    try:
+        # 1. HTTP If-Match 412 mid-read race recovery -> 200 fresh v2
+        lb = "W15 HTTP If-Match 412 race -> 200 fresh v2"
+        if wanted(lb):
+            race_url = f"http://127.0.0.1:{srv_port}/race.tif"
+            r_info = client.get(f"{cw_base}/cog/info?url={qe(race_url)}")
+            state["bytes"] = v2_bytes
+            state["etag"] = '"v2"'
+            tile_path = f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={qe(race_url)}"
+            r_tile = client.get(cw_base + tile_path)
+            if r_tile.status_code == 200:
+                arr = np.load(io.BytesIO(r_tile.content))
+                v = float(arr[0, 128, 128])
+                rec(lb, r_info.status_code == 200 and state["saw_412"] and v == 250.0, f"saw_412={state['saw_412']} val={v} (exp 250.0)", tile_path)
+            else:
+                rec(lb, False, f"HTTP {r_tile.status_code} saw_412={state['saw_412']} {r_tile.text[:80]!r}", tile_path)
+
+        # 2. HTTP Range misbehavior: no-Range 200 on >64KB COG -> 502; truncated Range -> 502
+        lb = "W15 HTTP no-Range 200 (>64KB COG) -> 502"
+        if wanted(lb):
+            p_nr = f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={qe(f'http://127.0.0.1:{srv_port}/norange.tif')}"
+            r_nr = client.get(cw_base + p_nr)
+            rec(lb, r_nr.status_code == 502, f"status={r_nr.status_code} {r_nr.text[:80]!r}", p_nr)
+
+        lb = "W15 HTTP truncated Range -> 502"
+        if wanted(lb):
+            p_tr = f"/cog/info?url={qe(f'http://127.0.0.1:{srv_port}/truncrange.tif')}"
+            r_tr = client.get(cw_base + p_tr)
+            rec(lb, r_tr.status_code in (400, 502), f"status={r_tr.status_code} {r_tr.text[:80]!r}", p_tr)
+
+        # 3. Hostile / corrupt TIFF & Zarr fuzzing (zero 500s!)
+        for lb, path, allowed in [
+            ("W15 FUZZ truncated TIFF -> 400", f"/cog/info?url={q(p_trunc)}", (400,)),
+            ("W15 FUZZ garbage bytes -> 400", f"/cog/info?url={q(p_garbage)}", (400,)),
+            ("W15 FUZZ corrupt compressed tile -> 502 (not 500)", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(p_corrupt_tile)}", (502,)),
+            ("W15 FUZZ ftp:// scheme -> 400", f"/cog/info?url={qe('ftp://example.com/a.tif')}", (400,)),
+            ("W15 ZARR ambiguous variable -> 400", f"/zarr/info?url={q(z_err)}", (400,)),
+            ("W15 ZARR out-of-range sel=time=999 -> 400", f"/zarr/point/-122.25,37.75?url={q(z_err)}&variable=b&sel={qe('time=999')}", (400,)),
+            ("W15 ZARR unknown codec -> 501", f"/zarr/point/-122.25,37.75?url={q(z_err)}&variable=mystery", (501,)),
+            ("W15 ZARR corrupt gzip chunk -> 502", f"/zarr/point/-122.25,37.75?url={q(z_err)}&variable=a&sel={qe('time=0')}", (502,)),
+        ]:
+            if wanted(lb):
+                r = client.get(cw_base + path)
+                rec(lb, r.status_code in allowed, f"status={r.status_code} {r.text[:80]!r}", path)
+
+        # 4. Zarr v3 sharding_indexed exact pixel parity against NumPy ground truth (+ CPU vs GPU)
+        lb = "W15 ZARR v3 sharding_indexed /bbox .npy"
+        if wanted(lb):
+            sh_path = f"/zarr/bbox/-123,37,-122,38/128x128.npy?url={q(z_sharded)}&variable=sharded_var"
+            r_sh = client.get(cw_base + sh_path)
+            if r_sh.status_code != 200:
+                rec(lb, False, f"HTTP {r_sh.status_code} {r_sh.text[:100]!r}", sh_path)
+            else:
+                arr = np.load(io.BytesIO(r_sh.content))
+                mask = arr[1] > np.finfo(np.float32).min
+                exp_mask = z_sharded_gt != -9999.0
+                both = mask & exp_mask
+                max_err = float(np.max(np.abs(arr[0][both] - z_sharded_gt[both]))) if both.any() else 999.0
+                rec(
+                    lb,
+                    arr.shape == (2, 128, 128) and bool((mask == exp_mask).all()) and max_err < 1e-3,
+                    f"shape={arr.shape} mask_eq={float((mask == exp_mask).mean()) * 100:.1f}% max_err={max_err:.5f}",
+                    sh_path,
+                )
+                if gpu_base is not None:
+                    r_g = client.get(gpu_base + sh_path)
+                    if r_g.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"status cpu=200 gpu={r_g.status_code}"})
+                    else:
+                        gok, gd = compare_npy(r_sh.content, r_g.content, check_values=True, masked=True)
+                        if not gok:
+                            gpu_diffs.append({"label": lb, "detail": gd})
+
+        # 5. Server health check after all hostile fuzzing
+        lb = "W15 SERVER healthy after hostile fuzzing -> 200"
+        if wanted(lb):
+            rh = client.get(f"{cw_base}/healthz")
+            rec(lb, rh.status_code == 200, f"status={rh.status_code}", "/healthz")
+    finally:
+        httpd.shutdown()
+        t.join(timeout=5)
+        httpd.server_close()
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -2268,8 +2604,9 @@ def main() -> int:
                 w7_ran = run_wave7_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w8_ran = run_wave8_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w14_ran = run_wave14_fault_checks(client, cw_base, tmp_dir, s, args.only, failures)
+                w15_ran = run_wave15_resilience_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")

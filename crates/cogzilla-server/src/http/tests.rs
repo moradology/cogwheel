@@ -450,6 +450,10 @@ fn xyz_bounds_and_http_error_status_mapping() {
         cogzilla_tiff::TiffError::Corrupt("not a tiff"),
     )));
     assert_eq!(r_tiff.status(), StatusCode::BAD_REQUEST);
+    let r_codec = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Codec(
+        cogzilla_codec::CodecError::Deflate("corrupt deflate payload".into()),
+    )));
+    assert_eq!(r_codec.status(), StatusCode::BAD_GATEWAY);
 
     // AlgorithmFactory JSON responses (/algorithms and /algorithms/{id})
     let algs = list_algorithms_json("http://localhost:8080");
