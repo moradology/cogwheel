@@ -2820,6 +2820,323 @@ def run_wave26_security_checks(
     return ran
 
 
+def run_wave28_wms_and_mosaic_checks(
+    client: httpx.Client,
+    cw_base: str,
+    gpu_base: str | None,
+    tmp_dir: Path,
+    only_filter: str | None,
+    failures: list[dict],
+    gpu_diffs: list[dict],
+) -> int:
+    """Wave 28: OGC WMS 1.3.0 / 1.1.1 (GetCapabilities, axis order, CRS:84, TRANSPARENT, JPEG/GeoTIFF)
+    + MosaicJSON TileJSON / WMTS / FeatureCollection POST /statistics."""
+    ran = 0
+
+    def wanted(lb: str) -> bool:
+        return not only_filter or only_filter.lower() in lb.lower()
+
+    def rec(lb: str, ok: bool, detail: str, path: str, method: str = "GET") -> None:
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": lb, "method": method, "path": path, "kind": "w28", "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {lb:54s} | {detail}")
+
+    def check_gpu_img(lb: str, path: str, cpu_bytes: bytes) -> None:
+        if not gpu_base:
+            return
+        rg = client.get(gpu_base + path)
+        if rg.status_code != 200:
+            gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+            return
+        ok_g, det_g = compare_images(cpu_bytes, rg.content)
+        if not ok_g:
+            gpu_diffs.append({"label": lb, "detail": det_g})
+
+    labels = [
+        "W28 WMS 1.3.0 GetCapabilities XML axis order",
+        "W28 WMS 1.3.0 GetMap EPSG:4326 (lat,lon) vs GDAL",
+        "W28 WMS 1.3.0 GetMap CRS:84 (lon,lat) + Content-Crs",
+        "W28 WMS 1.1.1 GetMap SRS=EPSG:4326 (lon,lat) vs GDAL",
+        "W28 WMS 1.3.0 GetMap EPSG:3857 (x,y) vs GDAL",
+        "W28 WMS TRANSPARENT=FALSE opaque RGB",
+        "W28 WMS FORMAT=image/jpeg",
+        "W28 WMS FORMAT=image/tiff georeferenced GeoTIFF",
+        "W28 WMS invalid REQUEST=Bogus -> 400",
+        "W28 MOSAIC TileJSON WebMercatorQuad",
+        "W28 MOSAIC WMTS Capabilities XML",
+        "W28 MOSAIC POST /statistics FeatureCollection",
+    ]
+    if not any(wanted(lb) for lb in labels):
+        return 0
+
+    w28_dir = tmp_dir / "w28"
+    w28_dir.mkdir(parents=True, exist_ok=True)
+    w, h = 128, 128
+    tf = from_bounds(-122.5, 37.5, -122.0, 38.0, w, h)
+    yy, xx = np.mgrid[0:h, 0:w]
+    arr = np.stack([
+        np.maximum(((xx * 2) % 255).astype(np.uint8), 1),
+        np.maximum(((yy * 2) % 255).astype(np.uint8), 1),
+        np.maximum(((xx + yy) % 255).astype(np.uint8), 1),
+    ], axis=0)
+    arr[:, 48:80, 48:80] = 0  # interior nodata hole
+    cog_p = w28_dir / "wms_hole.tif"
+    with rasterio.open(
+        cog_p, "w", driver="GTiff", width=w, height=h, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=tf, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", nodata=0,
+    ) as ds:
+        ds.write(arr)
+    gt_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    gt_rgba[:, :, :3] = np.transpose(arr, (1, 2, 0))
+    gt_rgba[:, :, 3] = np.where((arr[0] == 0) & (arr[1] == 0) & (arr[2] == 0), 0, 255).astype(np.uint8)
+    valid_mask = gt_rgba[:, :, 3] == 255
+
+    # Build MosaicJSON covering [-122.5, 37.5, -122.0, 38.0] at z=10
+    qks = sorted({
+        mercantile.quadkey(mercantile.tile(lo, la, 10))
+        for lo in (-122.45, -122.25, -122.05)
+        for la in (37.55, 37.75, 37.95)
+    })
+    mj_p = w28_dir / "w28_mosaic.json"
+    mj_p.write_text(json.dumps({
+        "mosaicjson": "0.0.3",
+        "minzoom": 8,
+        "maxzoom": 14,
+        "bounds": [-122.5, 37.5, -122.0, 38.0],
+        "quadkey_zoom": 10,
+        "tiles": {qk: [str(cog_p)] for qk in qks},
+    }))
+
+    lb = "W28 WMS 1.3.0 GetCapabilities XML axis order"
+    if wanted(lb):
+        p = f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetCapabilities"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            root = ET.fromstring(r.content)
+            ns = {"w": "http://www.opengis.net/wms"}
+            bbs = {
+                el.attrib.get("CRS"): tuple(float(el.attrib[k]) for k in ("minx", "miny", "maxx", "maxy"))
+                for el in root.findall(".//w:BoundingBox", ns)
+            }
+            ok = (
+                root.tag.endswith("WMS_Capabilities")
+                and bbs.get("CRS:84") == (-122.5, 37.5, -122.0, 38.0)
+                and bbs.get("EPSG:4326") == (37.5, -122.5, 38.0, -122.0)
+                and "EPSG:3857" in bbs
+            )
+            rec(lb, ok, f"root={root.tag.split('}')[-1]} crs84={bbs.get('CRS:84')} epsg4326={bbs.get('EPSG:4326')}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS 1.3.0 GetMap EPSG:4326 (lat,lon) vs GDAL"
+    if wanted(lb):
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            f"&LAYERS=cog&STYLES=&CRS=EPSG:4326&BBOX=37.5,-122.5,38.0,-122.0&WIDTH=128&HEIGHT=128&FORMAT=image/png"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+            mae = float(np.abs(im[valid_mask, :3].astype(float) - gt_rgba[valid_mask, :3].astype(float)).mean())
+            ok = im.shape == (128, 128, 4) and mae < 0.01 and int(im[64, 64, 3]) == 0 and int(im[10, 10, 3]) == 255
+            rec(lb, ok, f"MAE={mae:.2f} hole_a={im[64,64,3]} valid_a={im[10,10,3]}", p)
+            check_gpu_img(lb, p, r.content)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS 1.3.0 GetMap CRS:84 (lon,lat) + Content-Crs"
+    if wanted(lb):
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            f"&LAYERS=cog&STYLES=&CRS=CRS:84&BBOX=-122.5,37.5,-122.0,38.0&WIDTH=128&HEIGHT=128&FORMAT=image/png&TRANSPARENT=TRUE"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+            mae = float(np.abs(im[valid_mask, :3].astype(float) - gt_rgba[valid_mask, :3].astype(float)).mean())
+            crs_hdr = r.headers.get("content-crs", "")
+            ok = mae < 0.01 and int(im[64, 64, 3]) == 0 and "CRS84" in crs_hdr
+            rec(lb, ok, f"MAE={mae:.2f} hole_a={im[64,64,3]} Content-Crs={crs_hdr}", p)
+            check_gpu_img(lb, p, r.content)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS 1.1.1 GetMap SRS=EPSG:4326 (lon,lat) vs GDAL"
+    if wanted(lb):
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+            f"&SRS=EPSG:4326&BBOX=-122.5,37.5,-122.0,38.0&WIDTH=128&HEIGHT=128&FORMAT=image/png"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+            mae = float(np.abs(im[valid_mask, :3].astype(float) - gt_rgba[valid_mask, :3].astype(float)).mean())
+            ok = mae < 0.01 and int(im[64, 64, 3]) == 0
+            rec(lb, ok, f"MAE={mae:.2f} hole_a={im[64,64,3]}", p)
+            check_gpu_img(lb, p, r.content)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS 1.3.0 GetMap EPSG:3857 (x,y) vs GDAL"
+    if wanted(lb):
+        mb = transform_bounds("EPSG:4326", "EPSG:3857", -122.5, 37.5, -122.0, 38.0)
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            f"&CRS=EPSG:3857&BBOX={mb[0]},{mb[1]},{mb[2]},{mb[3]}&WIDTH=128&HEIGHT=128&FORMAT=image/png"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            from rasterio.warp import reproject, Resampling as RioResampling
+            dst_tf = from_bounds(*mb, 128, 128)
+            gt3857 = np.zeros((3, 128, 128), dtype=np.uint8)
+            for b in range(3):
+                reproject(
+                    source=arr[b], destination=gt3857[b],
+                    src_transform=tf, src_crs="EPSG:4326", src_nodata=0,
+                    dst_transform=dst_tf, dst_crs="EPSG:3857", dst_nodata=0,
+                    resampling=RioResampling.nearest,
+                )
+            im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+            vm = (im[:, :, 3] == 255) & (gt3857[0] > 0)
+            mae = float(np.abs(im[vm, :3].astype(float) - np.transpose(gt3857, (1, 2, 0))[vm].astype(float)).mean())
+            ok = bool(vm.sum() > 10000) and mae < 1.0 and int(im[64, 64, 3]) == 0
+            rec(lb, ok, f"MAE={mae:.2f} valid_px={int(vm.sum())} hole_a={im[64,64,3]}", p)
+            check_gpu_img(lb, p, r.content)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS TRANSPARENT=FALSE opaque RGB"
+    if wanted(lb):
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            f"&CRS=CRS:84&BBOX=-122.5,37.5,-122.0,38.0&WIDTH=128&HEIGHT=128&FORMAT=image/png&TRANSPARENT=FALSE"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            pil = Image.open(io.BytesIO(r.content))
+            im = np.array(pil)
+            ok = pil.mode == "RGB" and im[64, 64].tolist() == [0, 0, 0] and im[10, 10].tolist() == gt_rgba[10, 10, :3].tolist()
+            rec(lb, ok, f"mode={pil.mode} hole={im[64,64].tolist()} valid={im[10,10].tolist()}", p)
+            check_gpu_img(lb, p, r.content)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS FORMAT=image/jpeg"
+    if wanted(lb):
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            f"&CRS=CRS:84&BBOX=-122.5,37.5,-122.0,38.0&WIDTH=128&HEIGHT=128&FORMAT=image/jpeg"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            pil = Image.open(io.BytesIO(r.content))
+            im = np.array(pil)
+            mae = float(np.abs(im[valid_mask].astype(float) - gt_rgba[valid_mask, :3].astype(float)).mean())
+            ok = r.headers.get("content-type", "").startswith("image/jpeg") and pil.mode == "RGB" and mae < 5.0
+            rec(lb, ok, f"ct={r.headers.get('content-type')} mode={pil.mode} MAE={mae:.2f}", p)
+            check_gpu_img(lb, p, r.content)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS FORMAT=image/tiff georeferenced GeoTIFF"
+    if wanted(lb):
+        p = (
+            f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+            f"&CRS=EPSG:4326&BBOX=37.5,-122.5,38.0,-122.0&WIDTH=128&HEIGHT=128&FORMAT=image/tiff"
+        )
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            with rasterio.MemoryFile(r.content) as mf, mf.open() as ds:
+                d = ds.read()
+                b = ds.bounds
+                max_diff = int(np.max(np.abs(d[:3, 10:30, 10:30].astype(int) - arr[:, 10:30, 10:30].astype(int))))
+                ok = (
+                    ds.crs is not None and ds.crs.to_epsg() == 4326
+                    and abs(b.left - (-122.5)) < 1e-6 and abs(b.bottom - 37.5) < 1e-6
+                    and abs(b.right - (-122.0)) < 1e-6 and abs(b.top - 38.0) < 1e-6
+                    and max_diff == 0
+                )
+                rec(lb, ok, f"crs={ds.crs} shape={d.shape} max_diff={max_diff}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_geotiffs(r.content, rg.content, compare_pixels=True)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 WMS invalid REQUEST=Bogus -> 400"
+    if wanted(lb):
+        p = f"/cog/wms?url={q(cog_p)}&SERVICE=WMS&VERSION=1.3.0&REQUEST=Bogus"
+        r = client.get(cw_base + p)
+        rec(lb, r.status_code == 400, f"status={r.status_code}", p)
+
+    lb = "W28 MOSAIC TileJSON WebMercatorQuad"
+    if wanted(lb):
+        p = f"/mosaicjson/WebMercatorQuad/tilejson.json?url={q(mj_p)}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            j = r.json()
+            ok = (
+                j.get("tilejson") == "3.0.0"
+                and j.get("bounds") == [-122.5, 37.5, -122.0, 38.0]
+                and j.get("minzoom") == 8 and j.get("maxzoom") == 14
+                and "/mosaicjson/tiles/WebMercatorQuad/" in j.get("tiles", [""])[0]
+            )
+            rec(lb, ok, f"tilejson={j.get('tilejson')} z={j.get('minzoom')}..{j.get('maxzoom')}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 MOSAIC WMTS Capabilities XML"
+    if wanted(lb):
+        p = f"/mosaicjson/WebMercatorQuad/WMTSCapabilities.xml?url={q(mj_p)}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            root = ET.fromstring(r.content)
+            ok = root.tag.endswith("Capabilities") and "WebMercatorQuad" in r.text
+            rec(lb, ok, f"root={root.tag.split('}')[-1]} len={len(r.text)}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W28 MOSAIC POST /statistics FeatureCollection"
+    if wanted(lb):
+        p = f"/mosaicjson/statistics?url={q(mj_p)}"
+        fc = {
+            "type": "FeatureCollection",
+            "features": [
+                {"type": "Feature", "id": "f1", "properties": {}, "geometry": {
+                    "type": "Polygon", "coordinates": [[[-122.45, 37.85], [-122.35, 37.85], [-122.35, 37.95], [-122.45, 37.95], [-122.45, 37.85]]]
+                }},
+                {"type": "Feature", "id": "f2", "properties": {}, "geometry": {
+                    "type": "Polygon", "coordinates": [[[-122.2, 37.55], [-122.1, 37.55], [-122.1, 37.65], [-122.2, 37.65], [-122.2, 37.55]]]
+                }},
+            ],
+        }
+        r = client.post(cw_base + p, json=fc)
+        if r.status_code == 200:
+            j = r.json()
+            feats = j.get("features", [])
+            if j.get("type") == "FeatureCollection" and len(feats) == 2:
+                m1 = feats[0]["properties"]["statistics"]["b1"]["mean"]
+                m2 = feats[1]["properties"]["statistics"]["b1"]["mean"]
+                # f1 is in left columns (x ~ 13..38 -> b1 ~ 26..76 -> mean ~ 51)
+                # f2 is in right columns (x ~ 77..102 -> b1 ~ 154..204 -> mean ~ 179)
+                ok = 40.0 < m1 < 65.0 and 165.0 < m2 < 195.0
+                rec(lb, ok, f"n_feat=2 f1.b1.mean={m1:.1f} f2.b1.mean={m2:.1f}", p, "POST")
+            else:
+                rec(lb, False, f"unexpected FC shape: {j.get('type')} n={len(feats)}", p, "POST")
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p, "POST")
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -3757,6 +4074,7 @@ def main() -> int:
                 w15_ran = run_wave15_resilience_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w17_ran = run_wave17_zarr_deep_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w26_ran = run_wave26_security_checks(client, cw_base, bin_path, tmp_dir, args.only, failures)
+                w28_ran = run_wave28_wms_and_mosaic_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w18_extra = 0
                 lb_wmts = "W18 WMTS Capabilities XML WebMercatorQuad"
                 if not args.only or args.only.lower() in lb_wmts.lower():
@@ -3773,7 +4091,7 @@ def main() -> int:
                         failures.append({"label": lb_wmts, "method": "GET", "path": wmts_path, "kind": "w18_wmts", "detail": det_w})
                     print(f"{'PASS' if ok_w else 'FAIL'} | {lb_wmts:54s} | {det_w}")
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w18_extra
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w28_ran + w18_extra
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
