@@ -1984,7 +1984,7 @@ fn try_gpu_weighted_polygon_exprs(
     )
 }
 
-struct ProjectedMaskWindow {
+pub(crate) struct ProjectedMaskWindow {
     polys_px: Vec<Vec<Vec<(f64, f64)>>>,
     poly_area_px: f64,
     lines_px: Vec<Vec<(f64, f64)>>,
@@ -2174,6 +2174,120 @@ fn project_mask_to_ifd(
     })
 }
 
+/// Maximum pixel count admitted for a single native exact-statistics window (`4096 × 4096`).
+pub(crate) const MAX_EXACT_WINDOW_PX: usize = 4096 * 4096;
+/// Maximum internal TIFF blocks admitted for a single native exact-statistics read.
+pub(crate) const MAX_EXACT_BLOCKS: usize = 512;
+/// Maximum retained band-samples (`pixels × bands`) admitted for a single exact-statistics read
+/// (~256 MiB in `f32`).
+pub(crate) const MAX_EXACT_TOTAL_SAMPLES: usize = 67_108_864;
+
+/// How a caller enforces the block-count and total-sample caps on an admitted native window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExactWindowCaps {
+    /// Multiplier applied to `blocks_x * blocks_y` for the [`MAX_EXACT_BLOCKS`] check.
+    /// `None` means the caller checks blocks itself (e.g. mosaic fold falls back to resampled
+    /// instead of refusing with 400 when a planar asset exceeds [`MAX_EXACT_BLOCKS`]).
+    pub block_multiplier: Option<usize>,
+    /// Retained band count for the [`MAX_EXACT_TOTAL_SAMPLES`] check (`None` when streaming one
+    /// chunky band at a time or when the caller enforces a separate memory budget).
+    pub retained_bands: Option<usize>,
+}
+
+/// Outcome of [`admit_exact_window`].
+pub(crate) enum ExactWindowAdmission {
+    /// Polygon does not intersect any source pixel -> return empty statistics.
+    Empty,
+    /// Native grid cannot satisfy the request (unaligned multi-COG grid or explicit `max_size`
+    /// smaller than any valid overview) -> fall back to the resampled `max_size`-capped grid.
+    FallbackToResampled,
+    /// Native IFD index and projected mask window that passed all admission caps.
+    Admitted(usize, Box<ProjectedMaskWindow>),
+}
+
+/// Pick the IFD an exact-statistics read should use and enforce the shared pixel/block/sample
+/// admission caps in one place (#534).
+///
+/// `validate(ifd_idx)` selects which IFDs this caller may use:
+/// - single-COG exact stats passes `|i| i == 0` (full-res only; explicit `max_size` smaller than
+///   the native window falls back to the resampled `max_size`-capped grid);
+/// - multi-COG / mosaic-fold exact stats passes `|i| validate_multi_cog_grid(cogs, i).is_ok()`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_exact_window(
+    ifds: &[cogzilla_tiff::IfdMeta],
+    pm: &PolygonMask,
+    crs: &CrsModel,
+    max_size: u32,
+    opts: &StatsOptions,
+    caps: ExactWindowCaps,
+    validate: impl Fn(usize) -> bool,
+) -> Result<ExactWindowAdmission, EngineError> {
+    if ifds.is_empty() || !validate(0) {
+        return Ok(ExactWindowAdmission::FallbackToResampled);
+    }
+    let is_geo = crs.is_geographic();
+    let densify_lonlat = !is_geo && !pm.coord_crs_projected;
+    let total_verts = pm.vertex_count();
+
+    let mut ifd_idx = 0usize;
+    let mut proj = project_mask_to_ifd(pm, crs, &ifds[0], is_geo, densify_lonlat, total_verts)?;
+    if proj.is_empty() {
+        return Ok(ExactWindowAdmission::Empty);
+    }
+    if opts.max_size_explicit && max_size > 0 && proj.max_dim() > max_size as usize {
+        for (i, ov) in ifds.iter().enumerate().skip(1) {
+            if !validate(i) {
+                break;
+            }
+            proj = project_mask_to_ifd(pm, crs, ov, is_geo, densify_lonlat, total_verts)?;
+            ifd_idx = i;
+            if proj.max_dim() <= max_size as usize {
+                break;
+            }
+        }
+        // If explicit max_size could not be satisfied by matching native overviews, fall back
+        // to the resampled exact-grid path (which caps to max_size cleanly).
+        if proj.max_dim() > max_size as usize {
+            return Ok(ExactWindowAdmission::FallbackToResampled);
+        }
+        if proj.is_empty() {
+            return Ok(ExactWindowAdmission::Empty);
+        }
+    }
+
+    let ifd = &ifds[ifd_idx];
+    let win_w = proj.c1 - proj.c0;
+    let win_h = proj.r1 - proj.r0;
+    let n_px = win_w.saturating_mul(win_h);
+    if n_px > MAX_EXACT_WINDOW_PX {
+        return Err(EngineError::BadRequest(format!(
+            "polygon window ({win_w}x{win_h} = {n_px} px) exceeds maximum exact statistics window ({MAX_EXACT_WINDOW_PX} px); pass max_size to downsample"
+        )));
+    }
+    if let Some(mult) = caps.block_multiplier {
+        let tw = ifd.tile_width as usize;
+        let th = ifd.tile_height as usize;
+        let blocks_x = (proj.c1 - 1) / tw - proj.c0 / tw + 1;
+        let blocks_y = (proj.r1 - 1) / th - proj.r0 / th + 1;
+        let total_blocks = mult.saturating_mul(blocks_x.saturating_mul(blocks_y));
+        if total_blocks > MAX_EXACT_BLOCKS {
+            return Err(EngineError::BadRequest(format!(
+                "polygon window requires {total_blocks} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample"
+            )));
+        }
+    }
+    if let Some(bands) = caps.retained_bands {
+        let total_samples = n_px.saturating_mul(bands);
+        if total_samples > MAX_EXACT_TOTAL_SAMPLES {
+            return Err(EngineError::BadRequest(format!(
+                "polygon window requires {total_samples} band-samples across {bands} bands (max {MAX_EXACT_TOTAL_SAMPLES}); pass bidx or max_size to narrow"
+            )));
+        }
+    }
+
+    Ok(ExactWindowAdmission::Admitted(ifd_idx, Box::new(proj)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn compute_native_exact_polygon_stats(
     engine: &TileEngine,
@@ -2240,22 +2354,30 @@ pub async fn compute_native_exact_polygon_stats(
         serde_json::Value::Object(out)
     };
 
-    let total_verts = pm.vertex_count();
-    let is_geo_dataset = crs.is_geographic();
-    let densify_lonlat = !is_geo_dataset && !pm.coord_crs_projected;
-
-    // Start on full-resolution IFD 0; if explicit max_size > 0 requests downsampling below the
-    // native polygon window, return Ok(None) so the caller renders the exact max_size-capped grid
-    // with `compute_exact_grid_polygon_stats` (preserving exact coverage, area/length/category_areas,
-    // and matching TiTiler's max_size grid even on overview-less COGs).
-    let ifd_idx = 0usize;
-    let proj = project_mask_to_ifd(pm, crs, full, is_geo_dataset, densify_lonlat, total_verts)?;
-    if proj.is_empty() {
-        return Ok(Some(empty_result()));
-    }
-    if opts.max_size_explicit && max_size > 0 && proj.max_dim() > max_size as usize {
-        return Ok(None);
-    }
+    let stream_chunky =
+        matches!(full.planar_config, PlanarConfig::Chunky) && opts.expressions.is_none();
+    let block_mult = match full.planar_config {
+        PlanarConfig::Chunky => 1,
+        PlanarConfig::Planar => sel_bands.len(),
+    };
+    let (ifd_idx, proj) = match admit_exact_window(
+        &cog.index.ifds,
+        pm,
+        crs,
+        max_size,
+        opts,
+        ExactWindowCaps {
+            block_multiplier: Some(block_mult),
+            retained_bands: (!stream_chunky).then_some(sel_bands.len()),
+        },
+        // Single-COG exact stats runs on full-res IFD 0; explicit max_size smaller than the
+        // native window falls back to the resampled max_size-capped exact-grid path.
+        |i| i == 0,
+    )? {
+        ExactWindowAdmission::Empty => return Ok(Some(empty_result())),
+        ExactWindowAdmission::FallbackToResampled => return Ok(None),
+        ExactWindowAdmission::Admitted(idx, proj) => (idx, *proj),
+    };
     let ProjectedMaskWindow {
         polys_px,
         poly_area_px: total_poly_area_px_val,
@@ -2272,12 +2394,6 @@ pub async fn compute_native_exact_polygon_stats(
     let win_w = c1 - c0;
     let win_h = r1 - r0;
     let n_px = win_w.saturating_mul(win_h);
-    const MAX_EXACT_WINDOW_PIXELS: usize = 16_777_216; // 4096 x 4096
-    if n_px > MAX_EXACT_WINDOW_PIXELS {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window ({win_w}x{win_h} = {n_px} px) exceeds maximum exact statistics window ({MAX_EXACT_WINDOW_PIXELS} px); pass max_size to downsample"
-        )));
-    }
 
     let tw = ifd.tile_width as usize;
     let th = ifd.tile_height as usize;
@@ -2287,18 +2403,6 @@ pub async fn compute_native_exact_polygon_stats(
     let ty1 = (r1 - 1) / th;
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
-    const MAX_EXACT_BLOCKS: usize = 512;
-    let total_blocks = match ifd.planar_config {
-        PlanarConfig::Chunky => blocks_x.saturating_mul(blocks_y),
-        PlanarConfig::Planar => sel_bands
-            .len()
-            .saturating_mul(blocks_x.saturating_mul(blocks_y)),
-    };
-    if total_blocks > MAX_EXACT_BLOCKS {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window requires {total_blocks} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
-        )));
-    }
 
     // Validate requested bands against the selected IFD's actual band count (guards against
     // out-of-range expression bands like `b99` or heterogeneous overview band counts).
@@ -2307,19 +2411,6 @@ pub async fn compute_native_exact_polygon_stats(
             return Err(EngineError::BadRequest(format!(
                 "band index b{b1} out of range for {}-band dataset",
                 ifd.samples_per_pixel
-            )));
-        }
-    }
-
-    let stream_chunky =
-        matches!(ifd.planar_config, PlanarConfig::Chunky) && opts.expressions.is_none();
-    const MAX_EXACT_TOTAL_SAMPLES: usize = 67_108_864; // 256 MiB across retained bands
-    if !stream_chunky {
-        let total_samples = n_px.saturating_mul(sel_bands.len());
-        if total_samples > MAX_EXACT_TOTAL_SAMPLES {
-            return Err(EngineError::BadRequest(format!(
-                "polygon window requires {total_samples} band-samples across {} bands (max {MAX_EXACT_TOTAL_SAMPLES}); pass bidx or max_size to narrow",
-                sel_bands.len()
             )));
         }
     }
@@ -2872,9 +2963,6 @@ async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
         .await;
     }
 
-    let is_geo = crs.is_geographic();
-    let densify_lonlat = !is_geo && !pm.coord_crs_projected;
-    let total_verts = pm.vertex_count();
     let geom_kind = geom_kind_for_mask(pm);
 
     let empty_expr_result = || -> serde_json::Value {
@@ -2889,43 +2977,31 @@ async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
         serde_json::Value::Object(out)
     };
 
-    // Start on full-resolution IFD 0; only step down to an overview if explicit max_size > 0
-    // requests it (matching `compute_native_exact_polygon_stats`).
-    let mut ifd_idx = 0usize;
-    if crate::engine::validate_multi_cog_grid(cogs, 0).is_err() {
-        return Ok(None);
+    let mut ref_slots: Vec<u16> = Vec::new();
+    for (_, prog) in exprs {
+        for &b1 in &prog.used_bands {
+            if !ref_slots.contains(&b1) {
+                ref_slots.push(b1);
+            }
+        }
     }
-    let mut proj = project_mask_to_ifd(
+
+    let (ifd_idx, proj) = match admit_exact_window(
+        &primary.index.ifds,
         pm,
         &crs,
-        &primary.index.ifds[0],
-        is_geo,
-        densify_lonlat,
-        total_verts,
-    )?;
-    if proj.is_empty() {
-        return Ok(Some(empty_expr_result()));
-    }
-    if opts.max_size_explicit && max_size > 0 && proj.max_dim() > max_size as usize {
-        for (i, ov) in primary.index.ifds.iter().enumerate().skip(1) {
-            if crate::engine::validate_multi_cog_grid(cogs, i).is_err() {
-                break;
-            }
-            proj = project_mask_to_ifd(pm, &crs, ov, is_geo, densify_lonlat, total_verts)?;
-            ifd_idx = i;
-            if proj.max_dim() <= max_size as usize {
-                break;
-            }
-        }
-        // If explicit max_size could not be satisfied by matching native overviews, fall back
-        // to the resampled exact-grid path (which caps to max_size cleanly).
-        if proj.max_dim() > max_size as usize {
-            return Ok(None);
-        }
-    }
-    if proj.is_empty() {
-        return Ok(Some(empty_expr_result()));
-    }
+        max_size,
+        opts,
+        ExactWindowCaps {
+            block_multiplier: Some(ref_slots.len().max(1)),
+            retained_bands: Some(ref_slots.len()),
+        },
+        |i| crate::engine::validate_multi_cog_grid(cogs, i).is_ok(),
+    )? {
+        ExactWindowAdmission::Empty => return Ok(Some(empty_expr_result())),
+        ExactWindowAdmission::FallbackToResampled => return Ok(None),
+        ExactWindowAdmission::Admitted(idx, proj) => (idx, *proj),
+    };
     let ProjectedMaskWindow {
         polys_px,
         poly_area_px: total_poly_area_px_val,
@@ -2941,21 +3017,6 @@ async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
     let win_w = c1 - c0;
     let win_h = r1 - r0;
     let n_px = win_w.saturating_mul(win_h);
-    const MAX_EXACT_WINDOW_PX: usize = 4096 * 4096;
-    if n_px > MAX_EXACT_WINDOW_PX {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window {win_w}x{win_h} ({n_px} px) exceeds max {MAX_EXACT_WINDOW_PX} px; pass a smaller max_size"
-        )));
-    }
-
-    let mut ref_slots: Vec<u16> = Vec::new();
-    for (_, prog) in exprs {
-        for &b1 in &prog.used_bands {
-            if !ref_slots.contains(&b1) {
-                ref_slots.push(b1);
-            }
-        }
-    }
 
     let tw = ifd.tile_width as usize;
     let th = ifd.tile_height as usize;
@@ -2965,24 +3026,6 @@ async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
     let ty1 = (r1 - 1) / th;
     let blocks_x = tx1 - tx0 + 1;
     let blocks_y = ty1 - ty0 + 1;
-    const MAX_EXACT_BLOCKS: usize = 512;
-    let total_blocks = ref_slots
-        .len()
-        .max(1)
-        .saturating_mul(blocks_x.saturating_mul(blocks_y));
-    if total_blocks > MAX_EXACT_BLOCKS {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window requires {total_blocks} blocks (max {MAX_EXACT_BLOCKS}); pass max_size to downsample",
-        )));
-    }
-    const MAX_EXACT_TOTAL_SAMPLES: usize = 67_108_864; // 256 MiB across retained bands
-    let total_samples = n_px.saturating_mul(ref_slots.len());
-    if total_samples > MAX_EXACT_TOTAL_SAMPLES {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window requires {total_samples} band-samples across {} bands (max {MAX_EXACT_TOTAL_SAMPLES}); pass max_size to narrow",
-            ref_slots.len()
-        )));
-    }
 
     let mut indices = Vec::with_capacity(blocks_x * blocks_y);
     for ty in ty0..=ty1 {
@@ -3579,42 +3622,22 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
         serde_json::Value::Object(out)
     };
 
-    let is_geo = crs.is_geographic();
-    let densify_lonlat = !is_geo && !pm.coord_crs_projected;
-    let total_verts = pm.vertex_count();
-
-    let mut ifd_idx = 0usize;
-    let mut proj = project_mask_to_ifd(
+    let (ifd_idx, proj) = match admit_exact_window(
+        &primary.index.ifds,
         pm,
         &crs,
-        &primary.index.ifds[0],
-        is_geo,
-        densify_lonlat,
-        total_verts,
-    )?;
-    if proj.is_empty() {
-        return Ok(Some((empty_result(), Vec::new())));
-    }
-    if opts.max_size_explicit && max_size > 0 && proj.max_dim() > max_size as usize {
-        for (i, ov) in primary.index.ifds.iter().enumerate().skip(1) {
-            if crate::engine::validate_multi_cog_grid(&cogs, i).is_err() {
-                break;
-            }
-            proj = project_mask_to_ifd(pm, &crs, ov, is_geo, densify_lonlat, total_verts)?;
-            ifd_idx = i;
-            if proj.max_dim() <= max_size as usize {
-                break;
-            }
-        }
-        // If explicit max_size could not be satisfied by matching native overviews, fall back
-        // to the resampled exact-grid path (which caps to max_size cleanly).
-        if proj.max_dim() > max_size as usize {
-            return Ok(None);
-        }
-    }
-    if proj.is_empty() {
-        return Ok(Some((empty_result(), Vec::new())));
-    }
+        max_size,
+        opts,
+        ExactWindowCaps {
+            block_multiplier: None,
+            retained_bands: None,
+        },
+        |i| crate::engine::validate_multi_cog_grid(&cogs, i).is_ok(),
+    )? {
+        ExactWindowAdmission::Empty => return Ok(Some((empty_result(), Vec::new()))),
+        ExactWindowAdmission::FallbackToResampled => return Ok(None),
+        ExactWindowAdmission::Admitted(idx, proj) => (idx, *proj),
+    };
     let ProjectedMaskWindow {
         polys_px,
         poly_area_px: total_poly_area_px_val,
@@ -3636,12 +3659,6 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let win_w = c1 - c0;
     let win_h = r1 - r0;
     let n_px = win_w.saturating_mul(win_h);
-    const MAX_EXACT_WINDOW_PX: usize = 4096 * 4096;
-    if n_px > MAX_EXACT_WINDOW_PX {
-        return Err(EngineError::BadRequest(format!(
-            "polygon window ({win_w}x{win_h} = {n_px} px) exceeds maximum exact statistics window ({MAX_EXACT_WINDOW_PX} px); pass max_size to downsample"
-        )));
-    }
     let scene_samples = nb.checked_mul(n_px).ok_or_else(|| {
         EngineError::BadRequest("pixel_selection buffer size overflow".into())
     })?;
@@ -3668,7 +3685,6 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     let blocks_y = ty1 - ty0 + 1;
     // Match CogStore::get_blocks MAX_BLOCKS_PER_REQUEST (512); fall back to the resampled
     // exact-grid path if the native window would exceed it on any asset.
-    const MAX_NATIVE_BLOCKS: usize = 512;
     let grid_blocks = blocks_x.saturating_mul(blocks_y);
     let any_planar = cogs
         .iter()
@@ -3678,7 +3694,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
     } else {
         grid_blocks
     };
-    if grid_blocks > MAX_NATIVE_BLOCKS || max_per_asset_blocks > MAX_NATIVE_BLOCKS {
+    if grid_blocks > MAX_EXACT_BLOCKS || max_per_asset_blocks > MAX_EXACT_BLOCKS {
         return Ok(None);
     }
 
@@ -4397,5 +4413,148 @@ mod tests {
         assert_eq!(cov[9 * 10], 1.0); // (0, 10) -> bottom-left cell (0, 9)
         assert_eq!(cov[5 * 10 + 5], 1.0); // (5, 5) -> center cell (5, 5)
         assert_eq!(cov[9], 1.0); // (10, 0) -> top-right cell (9, 0)
+    }
+
+    #[test]
+    fn admit_exact_window_enforces_overview_stepdown_and_all_caps() {
+        use cogzilla_raster::{Affine2D, SampleType};
+        use cogzilla_tiff::{Compression, IfdMeta, PlanarConfig, Predictor};
+
+        let make_ifd = |w: u32, h: u32, tile: u32, deg_per_px: f64| {
+            let pixel_to_crs = Affine2D {
+                a: deg_per_px,
+                b: 0.0,
+                c: 0.0,
+                d: 0.0,
+                e: -deg_per_px,
+                f: (h as f64) * deg_per_px,
+            };
+            let crs_to_pixel = pixel_to_crs.invert().unwrap();
+            IfdMeta {
+                width: w,
+                height: h,
+                tile_width: tile,
+                tile_height: tile,
+                tiles_across: w.div_ceil(tile),
+                tiles_down: h.div_ceil(tile),
+                sample_type: SampleType::Uint8,
+                samples_per_pixel: 3,
+                planar_config: PlanarConfig::Chunky,
+                compression: Compression::None,
+                predictor: Predictor::None,
+                photometric: 2,
+                extra_samples: Vec::new(),
+                jpeg_tables: None,
+                mask_ifd: None,
+                is_stripped: false,
+                pixel_to_crs,
+                crs_to_pixel,
+                gcp_poly: None,
+                tile_offsets: Box::new([]),
+                tile_byte_counts: Box::new([]),
+            }
+        };
+        let make_box = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            let gj = serde_json::json!({
+                "type": "Polygon",
+                "coordinates": [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]]
+            });
+            PolygonMask::from_geojson(&gj).unwrap().0
+        };
+
+        let crs = CrsModel::Geographic;
+        let ifds = vec![
+            make_ifd(8192, 8192, 256, 0.001),
+            make_ifd(1024, 1024, 256, 0.008),
+        ];
+        let default_caps = ExactWindowCaps {
+            block_multiplier: Some(1),
+            retained_bands: Some(3),
+        };
+        let mut opts = StatsOptions::default();
+
+        // 1. Disjoint polygon -> Empty
+        let empty_pm = make_box(20.0, 20.0, 21.0, 21.0);
+        assert!(matches!(
+            admit_exact_window(&ifds, &empty_pm, &crs, 0, &opts, default_caps, |_| true).unwrap(),
+            ExactWindowAdmission::Empty
+        ));
+
+        // 2. Small polygon under cap -> Admitted on IFD 0
+        let small_pm = make_box(0.0, 0.0, 0.256, 0.256);
+        assert!(matches!(
+            admit_exact_window(&ifds, &small_pm, &crs, 0, &opts, default_caps, |i| i == 0).unwrap(),
+            ExactWindowAdmission::Admitted(0, _)
+        ));
+
+        // 3. Explicit max_size=512 on a 2048x2048 window:
+        //    - single-COG (`|i| i == 0`) falls back to resampled grid
+        //    - multi-COG (`|_| true`) steps down to overview 1 (256x256 <= 512)
+        //    - multi-COG with max_size=128 (smaller than overview 1) falls back to resampled grid
+        let med_pm = make_box(0.0, 0.0, 2.048, 2.048);
+        opts.max_size_explicit = true;
+        assert!(matches!(
+            admit_exact_window(&ifds, &med_pm, &crs, 512, &opts, default_caps, |i| i == 0).unwrap(),
+            ExactWindowAdmission::FallbackToResampled
+        ));
+        assert!(matches!(
+            admit_exact_window(&ifds, &med_pm, &crs, 512, &opts, default_caps, |_| true).unwrap(),
+            ExactWindowAdmission::Admitted(1, _)
+        ));
+        assert!(matches!(
+            admit_exact_window(&ifds, &med_pm, &crs, 128, &opts, default_caps, |_| true).unwrap(),
+            ExactWindowAdmission::FallbackToResampled
+        ));
+
+        // 4. Over MAX_EXACT_WINDOW_PX without explicit max_size -> canonical 400
+        opts.max_size_explicit = false;
+        let huge_pm = make_box(0.0, 0.0, 5.0, 5.0);
+        let err_px = admit_exact_window(&ifds, &huge_pm, &crs, 0, &opts, default_caps, |_| true)
+            .err()
+            .expect("over MAX_EXACT_WINDOW_PX must fail");
+        assert!(
+            err_px.to_string().contains("exceeds maximum exact statistics window"),
+            "unexpected px refusal: {err_px}"
+        );
+
+        // 5. Over MAX_EXACT_BLOCKS (64 blocks * 9 multiplier = 576 > 512) -> canonical 400
+        let err_blk = admit_exact_window(
+            &ifds,
+            &med_pm,
+            &crs,
+            0,
+            &opts,
+            ExactWindowCaps {
+                block_multiplier: Some(9),
+                retained_bands: Some(1),
+            },
+            |_| true,
+        )
+        .err()
+        .expect("over MAX_EXACT_BLOCKS must fail");
+        assert!(
+            err_blk.to_string().contains("blocks (max 512)"),
+            "unexpected block refusal: {err_blk}"
+        );
+
+        // 6. Over MAX_EXACT_TOTAL_SAMPLES (4_194_304 px * 17 bands > 67_108_864) -> canonical 400
+        let err_samp = admit_exact_window(
+            &ifds,
+            &med_pm,
+            &crs,
+            0,
+            &opts,
+            ExactWindowCaps {
+                block_multiplier: Some(1),
+                retained_bands: Some(17),
+            },
+            |_| true,
+        )
+        .err()
+        .expect("over MAX_EXACT_TOTAL_SAMPLES must fail");
+        assert!(
+            err_samp.to_string().contains("pass bidx or max_size to narrow"),
+            "unexpected sample refusal: {err_samp}"
+        );
     }
 }
