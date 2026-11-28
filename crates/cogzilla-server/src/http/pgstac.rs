@@ -2411,7 +2411,7 @@ fn band_math(expression: &str, bands: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, Engi
         for (part, plane) in out.iter_mut().enumerate() {
             let v = program.eval(part, &pixel);
             if v.is_finite() {
-                plane[i] = v as f32;
+                plane[i] = cogzilla_kernel::band_math_nan_to_num(v as f32);
             }
         }
     }
@@ -4930,9 +4930,12 @@ async fn feature_statistics(
                         for (part, band) in bands.iter_mut().enumerate() {
                             if band[i].is_nan() {
                                 let v = program.eval(part, &pixel);
-                                let v = if req.single { f64::from(v as f32) } else { v };
                                 if v.is_finite() {
-                                    band[i] = v;
+                                    band[i] = if req.single {
+                                        f64::from(cogzilla_kernel::band_math_nan_to_num(v as f32))
+                                    } else {
+                                        v
+                                    };
                                 }
                             }
                         }
