@@ -6689,7 +6689,12 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a&expression=b2*2&algorithm=terrarium").await, [128.0, 10.0, 0.0]);
     assert_eq!(pixel("&assets=a&assets=b&expression=b3-b1;b1&algorithm=terrarium").await, [128.0, 8.0, 0.0]);
     // Its statistics read the same stack, asset names included (terrarium's green is the value).
-    for q in ["&assets=a&assets=b&expression=b3-b1", "&assets=a&assets=b&expression=b_b1-a_b1"] {
+    // An asset's own band math is read there too: `a|expression=b1+b2` is 3 + 5.
+    for q in [
+        "&assets=a&assets=b&expression=b3-b1",
+        "&assets=a&assets=b&expression=b_b1-a_b1",
+        "&assets=a%7Cexpression%3Db1%2Bb2",
+    ] {
         let resp = client
             .get(format!("{base}/stac/statistics?url={url}&max_size=16&algorithm=terrarium{q}"))
             .send()
@@ -6699,6 +6704,13 @@ async fn stac_stacks_every_band_of_several_assets() {
         let stats: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
         assert_eq!(stats["b2"]["mean"].as_f64(), Some(8.0), "{q}: {stats}");
     }
+    // An expression beside an algorithm that is not a terrain one is left to that algorithm.
+    let resp = client
+        .get(format!("{base}/stac/preview.png?url={url}&max_size=16&assets=a&expression=ndvi&algorithm=cast"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
     // An expression that reads no band has nowhere to read elevations.
     let resp = client
         .get(format!("{base}/stac/preview.png?url={url}&assets=a&expression=42&algorithm=hillshade"))

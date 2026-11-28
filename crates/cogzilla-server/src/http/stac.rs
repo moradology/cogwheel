@@ -220,7 +220,7 @@ where
                 // Band math reads the stack the image routes read: asset names rewritten and
                 // each asset's bands in its own slots.
                 let mut pq_dem = pq.clone();
-                let (cogs, dem_slots) = if pq.expr_raw.is_some() {
+                let (cogs, dem_slots) = if pq.expr_raw.is_some() || !pq.asset_exprs.is_empty() {
                     expand_stac_asset_bidx(&mut pq_dem, &names, cogs.clone(), rewritten_expr.clone(), stac_prefix == "stac")?
                 } else {
                     (cogs.clone(), None)
@@ -503,7 +503,7 @@ where
                 stats_opts_post.hist_dtype = post_hist;
             }
             // A terrain algorithm's band math reads the stack the image routes read.
-            let (cogs, pq, dem_slots) = if is_dem_alg && pq.expr_raw.is_some() {
+            let (cogs, pq, dem_slots) = if is_dem_alg && (pq.expr_raw.is_some() || !pq.asset_exprs.is_empty()) {
                 let mut pq_dem = pq.clone();
                 let (cogs, slots) =
                     expand_stac_asset_bidx(&mut pq_dem, &names, cogs, rewritten_expr.clone(), stac_prefix == "stac")?;

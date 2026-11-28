@@ -1376,7 +1376,12 @@ fn build_band_request(
         let band_1based = pq.bidx.first().copied().unwrap_or(1);
         // A terrain algorithm over band math reads the expression's first output, as rio-tiler
         // gives the algorithm the expression's results.
-        let dem_math = match pq.expr_raw.as_deref().and_then(|expr| expression_parts(expr).next()) {
+        let dem_math = match pq
+            .expr_raw
+            .as_deref()
+            .filter(|_| def.kind == crate::algorithms::AlgorithmKind::Dem)
+            .and_then(|expr| expression_parts(expr).next())
+        {
             Some(first) => {
                 let prog = ExprProgram::compile(first).map_err(EngineError::BadRequest)?;
                 // The elevations are read where the bands are: an expression that reads
