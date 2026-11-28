@@ -741,6 +741,29 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
             ds.write(grad24[None])
         out[key] = p_reg
 
+    # Wave 25: High-latitude 84°N (EPSG:3413 -> WebMercatorQuad) & Global (-180..180, -85..85) zoom-0 COGs
+    t_3413_25 = Transformer.from_crs("EPSG:4326", "EPSG:3413", always_xy=True)
+    px0, py0 = t_3413_25.transform(10.0, 82.5)
+    px1, py1 = t_3413_25.transform(25.0, 84.5)
+    p_w25_hi = synth_dir / "w25_highlat_84n_3413.tif"
+    with rasterio.open(
+        p_w25_hi, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:3413", transform=from_bounds(min(px0, px1) - 100000, min(py0, py1) - 100000, max(px0, px1) + 100000, max(py0, py1) + 100000, 128, 128),
+        tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(grad24[None])
+    out["w25_highlat_84n"] = p_w25_hi
+
+    p_w25_glob = synth_dir / "w25_global_4326.tif"
+    yy64, xx128g = np.mgrid[0:64, 0:128].astype(np.float32)
+    with rasterio.open(
+        p_w25_glob, "w", driver="GTiff", width=128, height=64, count=1, dtype="float32",
+        crs="EPSG:4326", transform=from_bounds(-180.0, -85.0, 180.0, 85.0, 128, 64),
+        tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write((50.0 + xx128g * 1.5 + yy64 * 2.0)[None])
+    out["w25_global"] = p_w25_glob
+
     return out
 
 
@@ -2483,6 +2506,109 @@ def run_wave17_zarr_deep_checks(
         else:
             rec(lb, False, f"HTTP {rc.status_code} {rc.text[:80]!r}", p)
 
+    # --- Wave 25: Big-Endian Zarr v2 (>f4, >i2), Zarr v3 ("endian": "big"), POST /zarr/statistics hole exclusion, TileJSON & WMTS ---
+    z_be2 = w17_dir / "w25_v2_be.zarr"
+    z_be2.mkdir()
+    (z_be2 / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    _write_v2_zarr_array(z_be2, "lat", lat, (64,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+    _write_v2_zarr_array(z_be2, "lon", lon, (64,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+    _write_v2_zarr_array(z_be2, "be_f32", grad.astype(">f4"), (64, 64), {"_ARRAY_DIMENSIONS": ["lat", "lon"]}, fill_value=-9999.0)
+    be_i16 = (-500 + xx * 10 + yy * 5).astype(">i2")
+    be_i16[0:16, 0:16] = -32768
+    _write_v2_zarr_array(z_be2, "be_i16", be_i16, (64, 64), {"_ARRAY_DIMENSIONS": ["lat", "lon"], "_FillValue": -32768}, fill_value=-32768)
+
+    z_be3 = w17_dir / "w25_v3_be.zarr"
+    z_be3.mkdir()
+    (z_be3 / "zarr.json").write_text(json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {"Conventions": "CF-1.8"}}))
+    for nm, arr_c, std in (("lat", lat, "latitude"), ("lon", lon, "longitude")):
+        vd = z_be3 / nm
+        vd.mkdir()
+        (vd / "zarr.json").write_text(json.dumps({
+            "zarr_format": 3, "node_type": "array", "shape": [64], "data_type": "float64",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64]}},
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+            "fill_value": "NaN", "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+            "dimension_names": [nm], "attributes": {"standard_name": std},
+        }))
+        (vd / "c").mkdir()
+        (vd / "c" / "0").write_bytes(np.ascontiguousarray(arr_c).tobytes())
+    vd = z_be3 / "be_var"
+    vd.mkdir()
+    (vd / "zarr.json").write_text(json.dumps({
+        "zarr_format": 3, "node_type": "array", "shape": [64, 64], "data_type": "float32",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64, 64]}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": -9999.0,
+        "codecs": [{"name": "bytes", "configuration": {"endian": "big"}}],
+        "dimension_names": ["lat", "lon"], "attributes": {},
+    }))
+    (vd / "c" / "0").mkdir(parents=True)
+    (vd / "c" / "0" / "0").write_bytes(np.ascontiguousarray(grad.astype(">f4")).tobytes())
+
+    lb = "W25 ZARR v2 Big-Endian >f4 /bbox .npy"
+    if wanted(lb):
+        p = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_be2)}&variable=be_f32"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            err = float(np.max(np.abs(arr[0] - grad)))
+            rec(lb, arr.shape == (2, 64, 64) and err < 1e-3, f"err={err:.5f}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W25 ZARR v2 Big-Endian >i2 /bbox .npy"
+    if wanted(lb):
+        p = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_be2)}&variable=be_i16"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            mask = arr[1] > np.finfo(np.float32).min
+            exp_m = be_i16 != -32768
+            err = float(np.max(np.abs(arr[0][exp_m] - be_i16.astype(np.float32)[exp_m])))
+            rec(lb, bool((mask == exp_m).all()) and err < 1e-3, f"mask_eq={float((mask == exp_m).mean()) * 100:.1f}% err={err:.5f}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W25 ZARR v3 Big-Endian /bbox .npy"
+    if wanted(lb):
+        p = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_be3)}&variable=be_var"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            err = float(np.max(np.abs(arr[0] - grad)))
+            rec(lb, arr.shape == (2, 64, 64) and err < 1e-3, f"err={err:.5f}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W25 ZARR POST /statistics hole exclusion"
+    if wanted(lb):
+        p = f"/zarr/statistics?url={q(z_be2)}&variable=be_f32"
+        poly_nh = {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-122.75, 37.25], [-122.25, 37.25], [-122.25, 37.75], [-122.75, 37.75], [-122.75, 37.25]]]}, "properties": {}}
+        poly_wh = {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-122.75, 37.25], [-122.25, 37.25], [-122.25, 37.75], [-122.75, 37.75], [-122.75, 37.25]], [[-122.625, 37.375], [-122.375, 37.375], [-122.375, 37.625], [-122.625, 37.625], [-122.625, 37.375]]]}, "properties": {}}
+        r_nh = client.post(cw_base + p, json=poly_nh)
+        r_wh = client.post(cw_base + p, json=poly_wh)
+        if r_nh.status_code == 200 and r_wh.status_code == 200:
+            c_nh = r_nh.json()["properties"]["statistics"]["b1"]["count"]
+            c_wh = r_wh.json()["properties"]["statistics"]["b1"]["count"]
+            ratio = c_wh / c_nh if c_nh > 0 else 0.0
+            rec(lb, abs(c_nh - 1024.0) < 1.0 and abs(ratio - 0.75) < 0.01, f"outer={c_nh:.1f} w_hole={c_wh:.1f} ratio={ratio:.4f}", p, "POST")
+        else:
+            rec(lb, False, f"HTTP nh={r_nh.status_code} wh={r_wh.status_code}", p, "POST")
+
+    lb = "W25 ZARR TileJSON WebMercatorQuad"
+    if wanted(lb):
+        p = f"/zarr/WebMercatorQuad/tilejson.json?url={q(z_be2)}&variable=be_f32&rescale=0,300&colormap_name=viridis"
+        r = client.get(cw_base + p)
+        ok_tj = r.status_code == 200 and "variable=be_f32" in r.json().get("tiles", [""])[0]
+        rec(lb, ok_tj, f"status={r.status_code}", p)
+
+    lb = "W25 ZARR WMTS Capabilities XML"
+    if wanted(lb):
+        p = f"/zarr/WebMercatorQuad/WMTSCapabilities.xml?url={q(z_be2)}&variable=be_f32"
+        r = client.get(cw_base + p)
+        ok_wm = r.status_code == 200 and ET.fromstring(r.content).tag.endswith("Capabilities") and "variable=be_f32" in r.text
+        rec(lb, ok_wm, f"status={r.status_code} len={len(r.text)}", p)
+
     return ran
 
 
@@ -2991,6 +3117,15 @@ def main() -> int:
                 t24 = morecantile.tms.get(tms_id).tile(lon, lat, z)
                 cases.append((f"PARITY W24 TMS {tms_id} {z}/{t24.x}/{t24.y}.npy", "GET", f"/cog/tiles/{tms_id}/{z}/{t24.x}/{t24.y}.npy?url={q(fpath)}", None, "npy"))
                 cases.append((f"PARITY W24 TMS {tms_id} {z}/{t24.x}/{t24.y}.png+hdr", "GET", f"/cog/tiles/{tms_id}/{z}/{t24.x}/{t24.y}.png?url={q(fpath)}&bidx=1&rescale=100,600&colormap_name=viridis", None, "headers"))
+            # --- Wave 25: High-latitude 84°N (10:1 Mercator stretch) & Global zoom-0 tiles ---
+            t25_hi = morecantile.tms.get("WebMercatorQuad").tile(17.5, 83.5, 5)
+            cases += [
+                ("PARITY W25 HIGH-LAT 84N 3413->3857 .npy", "GET", f"/cog/tiles/WebMercatorQuad/5/{t25_hi.x}/{t25_hi.y}.npy?url={q(s['w25_highlat_84n'])}", None, "npy"),
+                ("PARITY W25 HIGH-LAT 84N 3413->3857 bilinear .png", "GET", f"/cog/tiles/WebMercatorQuad/5/{t25_hi.x}/{t25_hi.y}.png?url={q(s['w25_highlat_84n'])}&resampling=bilinear&rescale=100,550&colormap_name=viridis", None, "png"),
+                ("PARITY W25 GLOBAL WebMercatorQuad 0/0/0 .npy", "GET", f"/cog/tiles/WebMercatorQuad/0/0/0.npy?url={q(s['w25_global'])}", None, "npy"),
+                ("PARITY W25 GLOBAL WGS1984Quad 0/0/0 .npy", "GET", f"/cog/tiles/WGS1984Quad/0/0/0.npy?url={q(s['w25_global'])}", None, "npy"),
+                ("PARITY W25 GLOBAL WGS1984Quad 0/1/0 .png", "GET", f"/cog/tiles/WGS1984Quad/0/1/0.png?url={q(s['w25_global'])}&rescale=50,370&colormap_name=viridis", None, "png"),
+            ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
