@@ -223,11 +223,23 @@ pub fn retype_f32_npy_with(
     let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
     let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
     out.extend_from_slice(&hdr);
-    let data = body[..data_bytes]
-        .chunks_exact(4)
-        .map(|v| prepare(f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]]))));
-    let mask_bits = mask.then(|| {
-        body[data_bytes..].chunks_exact(4).map(|v| {
+    let mask_slice = mask.then(|| &body[data_bytes..]);
+    let data = body[..data_bytes].chunks_exact(4).enumerate().map(|(i, v)| {
+        let mut x = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+        if x.is_nan()
+            && let Some(ms) = mask_slice
+        {
+            let px = i % pixels;
+            let off = px * 4;
+            let m = f32::from_le_bytes([ms[off], ms[off + 1], ms[off + 2], ms[off + 3]]);
+            if m.is_finite() && m != 0.0 {
+                x = 0.0;
+            }
+        }
+        prepare(f64::from(x))
+    });
+    let mask_bits = mask_slice.map(|ms| {
+        ms.chunks_exact(4).map(|v| {
             let m = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
             m.is_finite() && m != 0.0
         })
@@ -354,5 +366,33 @@ mod tests {
         assert_eq!(npy_body(&u8_npy), &[7u8, 0u8]);
         let bool_npy = encode_npy_typed_f64(&[1.0, f64::NAN], 1, 1, 2, SampleType::Bool, None, false);
         assert_eq!(npy_body(&bool_npy), &[1u8, 0u8]);
+    }
+
+    #[test]
+    fn retype_f32_npy_replaces_nan_with_zero_on_valid_masked_pixels() {
+        // 2-band, 1x2 CHW float32 array + mask plane:
+        // pixel 0: band0=NaN (nodata), band1=100.0 (valid) -> mask=255.0 (valid)
+        // pixel 1: band0=NaN, band1=NaN -> mask=0.0 (masked)
+        let raw_vals: [f32; 4] = [f32::NAN, f32::NAN, 100.0, f32::NAN];
+        let mut raw_bytes = Vec::with_capacity(16);
+        for v in raw_vals {
+            raw_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let wrapped = wrap_raw_f32_as_npy_with_mask(Bytes::from(raw_bytes), 2, 1, 2, true);
+        let retyped = retype_f32_npy(&wrapped, SampleType::Float32, true).expect("retype f32");
+        let body = npy_body(&retyped);
+        let out: Vec<f32> = body
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Band 0: pixel 0 (valid!) must be 0.0 (not NaN); pixel 1 (masked) stays NaN.
+        assert_eq!(out[0], 0.0);
+        assert!(out[1].is_nan());
+        // Band 1: pixel 0 = 100.0, pixel 1 = NaN.
+        assert_eq!(out[2], 100.0);
+        assert!(out[3].is_nan());
+        // Mask plane: pixel 0 = f32::MAX, pixel 1 = f32::MIN.
+        assert_eq!(out[4], f32::MAX);
+        assert_eq!(out[5], f32::MIN);
     }
 }
