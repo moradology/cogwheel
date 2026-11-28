@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import http.server
 import io
 import json
 import math
@@ -30,6 +31,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
 import zlib
 from pathlib import Path
@@ -42,7 +44,7 @@ from PIL import Image
 import rasterio
 from rasterio.control import GroundControlPoint
 from rasterio.crs import CRS as RasterioCRS
-from rasterio.enums import Resampling
+from rasterio.enums import ColorInterp, Resampling
 from rasterio.transform import Affine, from_bounds
 from rasterio.warp import transform_bounds
 
@@ -399,6 +401,105 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         },
     }))
     out["w11_stac"] = p_stac_local
+
+    # Wave 14: High-risk qualitative blind spots (Big-Endian MM TIFFs with predictors,
+    # overview mask IFDs, external .msk sidecar, per-band scales/offsets, negative scale,
+    # 6-band multispectral, Gray+Alpha, 16-bit RGBA, +/-Inf, constant-value, all-nodata,
+    # South Pole EPSG:3031, antimeridian [170..190]).
+    for name, arr_be, kw_be in [
+        ("w14_be_u16", (1000 + xx9 * 100 + yy9 * 50).astype(np.uint16)[None], dict(compress="deflate", predictor=2, endianness="BIG")),
+        ("w14_be_i16", ((xx9 * 50 - yy9 * 40 - 1000).astype(np.int16))[None], dict(compress="deflate", predictor=2, nodata=-32768, endianness="BIG")),
+        ("w14_be_f32_p3", (100.5 + xx9.astype(np.float32) * 2.25 + yy9.astype(np.float32) * 1.125)[None], dict(compress="deflate", predictor=3, endianness="BIG")),
+        ("w14_be_f64_p3", (100.123456 + xx9.astype(np.float64) * 2.5 + yy9.astype(np.float64) * 1.25)[None], dict(compress="zstd", predictor=3, endianness="BIG")),
+    ]:
+        p = synth_dir / f"{name}.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=128, height=128, count=1, dtype=arr_be.dtype, crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, **kw_be) as ds:
+            ds.write(arr_be)
+        out[name] = p
+
+    p_ovrmask = synth_dir / "w14_ovr_with_mask.tif"
+    yy5, xx5 = np.mgrid[0:512, 0:512]
+    rgb5 = np.stack([np.clip(40 + xx5 // 3, 1, 255).astype(np.uint8), np.clip(60 + yy5 // 3, 1, 255).astype(np.uint8), np.clip(200 - (xx5 + yy5) // 6, 1, 255).astype(np.uint8)], axis=0)
+    mask5 = np.where((xx5 < 256) & (yy5 < 256), 0, 255).astype(np.uint8)
+    with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+        with rasterio.open(p_ovrmask, "w", driver="GTiff", width=512, height=512, count=3, dtype="uint8", crs="EPSG:4326", transform=from_bounds(-123.0, 37.0, -122.0, 38.0, 512, 512), tiled=True, blockxsize=256, blockysize=256, compress="deflate") as ds:
+            ds.write(rgb5)
+            ds.write_mask(mask5)
+            ds.build_overviews([2, 4], Resampling.average)
+    out["w14_ovr_mask"] = p_ovrmask
+
+    p_extmsk = synth_dir / "w14_ext_mask.tif"
+    with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=False):
+        with rasterio.open(p_extmsk, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+            ds.write(rgb_w9)
+            # Place mask=0 inside [80:112, 64:96] so tile 10/164/396 (row 72..128, col 40..128) genuinely hits it!
+            ds.write_mask(np.where((xx9 >= 64) & (xx9 < 96) & (yy9 >= 80) & (yy9 < 112), 0, 255).astype(np.uint8))
+    out["w14_ext_mask"] = p_extmsk
+
+    p_pb = synth_dir / "w14_per_band_scale.tif"
+    pb3 = np.stack([(100 + xx9 * 2).astype(np.int16), (200 + yy9 * 3).astype(np.int16), (50 + xx9 + yy9).astype(np.int16)], axis=0)
+    pb3[:, 80:96, 64:80] = -32768
+    with rasterio.open(p_pb, "w", driver="GTiff", width=128, height=128, count=3, dtype="int16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-32768) as ds:
+        ds.write(pb3)
+        ds.scales = (0.1, 0.5, 2.0)
+        ds.offsets = (10.0, -20.0, 5.0)
+    out["w14_per_band_scale"] = p_pb
+
+    p_neg_s = synth_dir / "w14_neg_scale.tif"
+    u16_s = (1000 + xx9 * 20 + yy9 * 10).astype(np.uint16)
+    u16_s[80:96, 64:80] = 0
+    with rasterio.open(p_neg_s, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=0) as ds:
+        ds.write(u16_s[None])
+        ds.scales = (-0.01,)
+        ds.offsets = (100.0,)
+    out["w14_neg_scale"] = p_neg_s
+
+    p_6b = synth_dir / "w14_multispec_6b.tif"
+    b6 = np.stack([((bi + 1) * 500 + xx9 * (bi + 2) + yy9 * (7 - bi)).astype(np.uint16) for bi in range(6)], axis=0)
+    b6[:, 80:96, 64:80] = 0
+    with rasterio.open(p_6b, "w", driver="GTiff", width=128, height=128, count=6, dtype="uint16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=0) as ds:
+        ds.write(b6)
+    out["w14_6b"] = p_6b
+
+    p_ga = synth_dir / "w14_gray_alpha.tif"
+    with rasterio.open(p_ga, "w", driver="GTiff", width=128, height=128, count=2, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", photometric="minisblack", alpha="yes") as ds:
+        ds.write(np.stack([np.clip(40 + xx9 + yy9 // 2, 1, 255).astype(np.uint8), np.where((xx9 >= 64) & (xx9 < 96) & (yy9 >= 80) & (yy9 < 112), 0, 255).astype(np.uint8)], axis=0))
+        ds.colorinterp = (ColorInterp.gray, ColorInterp.alpha)
+    out["w14_gray_alpha"] = p_ga
+
+    p_rgba16 = synth_dir / "w14_rgba_u16.tif"
+    with rasterio.open(p_rgba16, "w", driver="GTiff", width=128, height=128, count=4, dtype="uint16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", photometric="rgb", alpha="yes") as ds:
+        ds.write(np.stack([(2000 + xx9 * 200).astype(np.uint16), (4000 + yy9 * 200).astype(np.uint16), (6000 + (xx9 + yy9) * 100).astype(np.uint16), np.where((xx9 >= 64) & (xx9 < 96) & (yy9 >= 80) & (yy9 < 112), 0, 65535).astype(np.uint16)], axis=0))
+        ds.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha)
+    out["w14_rgba_u16"] = p_rgba16
+
+    p_const = synth_dir / "w14_const_42.tif"
+    with rasterio.open(p_const, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-9999.0) as ds:
+        ds.write(np.full((1, 128, 128), 42.0, dtype=np.float32))
+    out["w14_const"] = p_const
+
+    p_allnd = synth_dir / "w14_all_nodata.tif"
+    with rasterio.open(p_allnd, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-9999.0) as ds:
+        ds.write(np.full((1, 128, 128), -9999.0, dtype=np.float32))
+    out["w14_allnd"] = p_allnd
+
+    p_inf = synth_dir / "w14_f32_inf.tif"
+    arr_inf = (100.0 + xx9.astype(np.float32) + yy9.astype(np.float32))
+    arr_inf[80:96, 64:80] = np.inf
+    arr_inf[96:112, 64:80] = -np.inf
+    with rasterio.open(p_inf, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(arr_inf[None])
+    out["w14_inf"] = p_inf
+
+    p_sp = synth_dir / "w14_south_pole_3031.tif"
+    with rasterio.open(p_sp, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:3031", transform=from_bounds(-500000.0, -500000.0, 500000.0, 500000.0, 128, 128), tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((1000.0 + xx9.astype(np.float32) * 5.0 + yy9.astype(np.float32) * 3.0)[None])
+    out["w14_south_pole"] = p_sp
+
+    p_am = synth_dir / "w14_antimeridian_170_190.tif"
+    with rasterio.open(p_am, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=from_bounds(170.0, -10.0, 190.0, 10.0, 128, 128), tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((100.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32))[None])
+    out["w14_antimeridian"] = p_am
 
     return out
 
@@ -1329,6 +1430,190 @@ def run_wave8_checks(
     return ran
 
 
+def run_wave14_fault_checks(
+    client: httpx.Client,
+    cw_base: str,
+    tmp_dir: Path,
+    s: dict[str, Path],
+    only_substr: str | None,
+    failures: list[dict],
+) -> int:
+    """Wave 14 operational fault-injection, secret redaction, cache invalidation & antimeridian bbox checks."""
+    def wants(label: str) -> bool:
+        return not only_substr or only_substr.lower() in label.lower()
+
+    all_labels = [
+        "W14 FAULT HTTP 403->403 + secret redacted",
+        "W14 FAULT HTTP 500->502 + secret redacted",
+        "W14 FAULT MOSAIC partial fail + redacted X-Failed-Assets",
+        "W14 MUTABLE local COG overwrite invalidates cache",
+        "W14 ZARR CFTime ISO-8601 sel=time=2024-06-02",
+        "W14 MUTABLE local Zarr ETag invalidation (200 not 304)",
+        "W14 ANTIMERIDIAN west>east /cog/bbox == unwrapped",
+    ]
+    if not any(wants(lb) for lb in all_labels):
+        return 0
+
+    ran = 0
+
+    def rec(label: str, path: str, kind: str, ok: bool, detail: str):
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": label, "method": "GET", "path": path, "kind": kind, "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {label:54s} | {detail}")
+
+    d = tmp_dir / "wave14_ops"
+    d.mkdir(parents=True, exist_ok=True)
+    tf = from_bounds(-122.5, 37.5, -122.0, 38.0, 128, 128)
+
+    # 1. Local HTTP fault-injection server (403, 500, and 206 Range OK)
+    if any(wants(lb) for lb in all_labels[:3]):
+        ok_bytes = s["w14_const"].read_bytes()
+        srv_port = pick_free_port()
+
+        class FaultHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_HEAD(self):
+                if self.path.startswith("/fail500"):
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                if self.path.startswith("/forbidden403"):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(ok_bytes)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", '"w14-ok"')
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path.startswith("/fail500"):
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"upstream boom")
+                    return
+                if self.path.startswith("/forbidden403"):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                rng = self.headers.get("Range")
+                if rng and rng.startswith("bytes="):
+                    s0, e0 = rng[6:].split("-", 1)
+                    start = int(s0)
+                    end = min(int(e0) if e0 else len(ok_bytes) - 1, len(ok_bytes) - 1)
+                    chunk = ok_bytes[start:end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{len(ok_bytes)}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.send_header("ETag", '"w14-ok"')
+                    self.end_headers()
+                    self.wfile.write(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(ok_bytes)))
+                    self.send_header("ETag", '"w14-ok"')
+                    self.end_headers()
+                    self.wfile.write(ok_bytes)
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", srv_port), FaultHandler)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            remote_ok = f"http://127.0.0.1:{srv_port}/ok.tif"
+            remote_500 = f"http://127.0.0.1:{srv_port}/fail500.tif?X-Amz-Signature=SUPERSECRET123"
+            remote_403 = f"http://127.0.0.1:{srv_port}/forbidden403.tif?token=TOPSECRET999"
+
+            for lb, u, exp_code, secret in [
+                ("W14 FAULT HTTP 403->403 + secret redacted", remote_403, 403, "TOPSECRET999"),
+                ("W14 FAULT HTTP 500->502 + secret redacted", remote_500, 502, "SUPERSECRET123"),
+            ]:
+                if wants(lb):
+                    path = f"/cog/info?url={qe(u)}"
+                    r = client.get(cw_base + path)
+                    rec(lb, path, "fault_http", r.status_code == exp_code and secret not in r.text, f"status={r.status_code} secret_redacted={secret not in r.text}")
+
+            lb_m = "W14 FAULT MOSAIC partial fail + redacted X-Failed-Assets"
+            if wants(lb_m):
+                qk = mercantile.quadkey(164, 396, 10)
+                mj = d / "mosaic_fault.json"
+                mj.write_text(json.dumps({"mosaicjson": "0.0.2", "minzoom": 10, "maxzoom": 10, "quadkey_zoom": 10, "bounds": [-122.5, 37.5, -122.0, 38.0], "tiles": {qk: [remote_500, remote_ok]}}))
+                path = f"/mosaicjson/tiles/WebMercatorQuad/10/164/396.npy?url={q(mj)}"
+                rm = client.get(cw_base + path)
+                xfa = rm.headers.get("x-failed-assets", "")
+                rec(lb_m, path, "fault_mosaic", rm.status_code == 200 and bool(xfa) and "SUPERSECRET123" not in xfa, f"status={rm.status_code} xfa={xfa!r}")
+        finally:
+            httpd.shutdown()
+            t.join(timeout=5)
+            httpd.server_close()
+
+    # 2. Mutable local COG overwrite invalidates cache immediately
+    lb_mut = "W14 MUTABLE local COG overwrite invalidates cache"
+    if wants(lb_mut):
+        p_mut = d / "mut_local.tif"
+        with rasterio.open(p_mut, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+            ds.write(np.full((1, 128, 128), 111.0, dtype=np.float32))
+        path = f"/cog/point/-122.25,37.75?url={q(p_mut)}"
+        r1 = client.get(cw_base + path)
+        v1 = r1.json().get("values", [None])[0] if r1.status_code == 200 else None
+        with rasterio.open(p_mut, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+            ds.write(np.full((1, 128, 128), 222.0, dtype=np.float32))
+        st = os.stat(p_mut)
+        os.utime(p_mut, (st.st_atime, st.st_mtime + 2))
+        r2 = client.get(cw_base + path)
+        v2 = r2.json().get("values", [None])[0] if r2.status_code == 200 else None
+        rec(lb_mut, path, "mutable_cog", r1.status_code == 200 and r2.status_code == 200 and v1 == 111.0 and v2 == 222.0, f"v1={v1} -> v2={v2}")
+
+    # 3. Zarr CFTime ISO-8601 + Mutable local Zarr ETag invalidation
+    if wants("W14 ZARR CFTime ISO-8601 sel=time=2024-06-02") or wants("W14 MUTABLE local Zarr ETag invalidation (200 not 304)"):
+        s_zmut = d / "zarr_mut_cftime.zarr"
+        s_zmut.mkdir(exist_ok=True)
+        (s_zmut / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+        (s_zmut / ".zattrs").write_text(json.dumps({"Conventions": "CF-1.8"}))
+        lat_z = np.linspace(38.0 - 0.5 / 64, 37.5 + 0.5 / 64, 64, dtype=np.float64)
+        lon_z = np.linspace(-122.5 + 0.5 / 64, -122.0 - 0.5 / 64, 64, dtype=np.float64)
+        _write_v2_zarr_array(s_zmut, "time", np.array([0, 1], dtype=np.int64), (2,), {"_ARRAY_DIMENSIONS": ["time"], "units": "days since 2024-06-01", "calendar": "standard"})
+        _write_v2_zarr_array(s_zmut, "lat", lat_z, (64,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+        _write_v2_zarr_array(s_zmut, "lon", lon_z, (64,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+        _write_v2_zarr_array(s_zmut, "v", np.stack([np.full((64, 64), 10.0, dtype=np.float32), np.full((64, 64), 77.0, dtype=np.float32)], axis=0), (1, 64, 64), {"_ARRAY_DIMENSIONS": ["time", "lat", "lon"]}, compressor={"id": "zlib", "level": 1})
+
+        if wants("W14 ZARR CFTime ISO-8601 sel=time=2024-06-02"):
+            path = f"/zarr/point/-122.25,37.75?url={q(s_zmut)}&variable=v&sel={qe('time=2024-06-02')}"
+            r = client.get(cw_base + path)
+            ok = r.status_code == 200 and r.json()["values"][0] == 77.0
+            rec("W14 ZARR CFTime ISO-8601 sel=time=2024-06-02", path, "zarr_cftime", ok, f"status={r.status_code} val={r.json().get('values') if r.status_code == 200 else r.text[:60]}")
+
+        if wants("W14 MUTABLE local Zarr ETag invalidation (200 not 304)"):
+            zu = f"/zarr/tiles/WebMercatorQuad/10/164/396.npy?url={q(s_zmut)}&variable=v&sel={qe('time=2024-06-01')}"
+            zr1 = client.get(cw_base + zu)
+            etag1 = zr1.headers.get("etag")
+            v1 = float(np.load(io.BytesIO(zr1.content))[0, 128, 128]) if zr1.status_code == 200 else None
+            (s_zmut / "v" / "0.0.0").write_bytes(zlib.compress(np.full((64, 64), 99.0, dtype=np.float32).tobytes(), 1))
+            for mf in (s_zmut / "v" / "0.0.0", s_zmut / "v" / ".zarray", s_zmut / ".zgroup"):
+                st = os.stat(mf)
+                os.utime(mf, (st.st_atime, st.st_mtime + 2))
+            zr2 = client.get(cw_base + zu, headers={"If-None-Match": etag1 or ""})
+            etag2 = zr2.headers.get("etag")
+            v2 = float(np.load(io.BytesIO(zr2.content))[0, 128, 128]) if zr2.status_code == 200 else None
+            ok_z = zr1.status_code == 200 and bool(etag1) and zr2.status_code == 200 and etag2 != etag1 and v1 == 10.0 and v2 == 99.0
+            rec("W14 MUTABLE local Zarr ETag invalidation (200 not 304)", zu, "mutable_zarr", ok_z, f"status={zr2.status_code} v1={v1} -> v2={v2} etag_changed={etag2 != etag1}")
+
+    # 4. Antimeridian west>east /cog/bbox equivalence
+    lb_am = "W14 ANTIMERIDIAN west>east /cog/bbox == unwrapped"
+    if wants(lb_am):
+        p_wrap = f"/cog/bbox/175,-10,-175,10/64x64.npy?url={q(s['w14_antimeridian'])}"
+        p_unwrap = f"/cog/bbox/175,-10,185,10/64x64.npy?url={q(s['w14_antimeridian'])}"
+        rw, ru = client.get(cw_base + p_wrap), client.get(cw_base + p_unwrap)
+        ok_am, det_am = compare_npy(rw.content, ru.content, check_values=True) if (rw.status_code == 200 and ru.status_code == 200) else (False, f"HTTP wrap={rw.status_code} unwrap={ru.status_code}")
+        rec(lb_am, p_wrap, "antimeridian_bbox", ok_am, det_am)
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -1723,6 +2008,29 @@ def main() -> int:
                 ("PARITY W13 TILESIZE=512 .png", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={q(sat)}&rescale=0,0.35&tilesize=512", None, "png"),
             ]
 
+            # --- 5i. Wave 14: Qualitative blind spots (Big-Endian, overview masks, .msk sidecar, per-band unscale, 6-band, Gray+Alpha, u16 RGBA, const/all-nodata/Inf, South Pole) ---
+            for name in ("w14_be_u16", "w14_be_i16", "w14_be_f32_p3", "w14_be_f64_p3"):
+                cases.append((f"PARITY W14 BE [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s[name])}", None, "npy"))
+            cases += [
+                ("PARITY W14 OVRMASK z=8 overview .npy", "GET", f"/cog/tiles/WebMercatorQuad/8/40/99.npy?url={q(s['w14_ovr_mask'])}", None, "npy"),
+                ("PARITY W14 OVRMASK z=8 overview .png", "GET", f"/cog/tiles/WebMercatorQuad/8/40/99.png?url={q(s['w14_ovr_mask'])}", None, "png"),
+                ("PARITY W14 EXT .msk sidecar .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_ext_mask'])}", None, "npy"),
+                ("PARITY W14 PER-BAND unscale .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_per_band_scale'])}&unscale=true", None, "npy"),
+                ("PARITY W14 PER-BAND unscale expr .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_per_band_scale'])}&unscale=true&expression={qe('b1+b2+b3')}", None, "npy"),
+                ("PARITY W14 NEG-SCALE unscale .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_neg_scale'])}&unscale=true", None, "npy"),
+                ("PARITY W14 6-BAND bidx=6,4,2 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_6b'])}&bidx=6&bidx=4&bidx=2", None, "npy"),
+                ("PARITY W14 6-BAND expr (b6-b2)/(b6+b2)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_6b'])}&expression={qe('(b6-b2)/(b6+b2)')}", None, "npy"),
+                ("PARITY W14 GRAY+ALPHA .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_gray_alpha'])}", None, "npy"),
+                ("PARITY W14 RGBA-U16 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_rgba_u16'])}", None, "npy"),
+                ("PARITY W14 CONST-42 rescale=42,42 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w14_const'])}&rescale=42,42", None, "png"),
+                ("PARITY W14 CONST-42 /statistics", "GET", f"/cog/statistics?url={q(s['w14_const'])}", None, "stats"),
+                ("PARITY W14 ALL-NODATA .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_allnd'])}", None, "npy"),
+                ("PARITY W14 ALL-NODATA /statistics", "GET", f"/cog/statistics?url={q(s['w14_allnd'])}", None, "stats"),
+                ("BETTER W14 F32 +/-Inf .npy (cw masks Inf, tt leaves Inf)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_inf'])}", None, "better_inf_masked"),
+                ("PARITY W14 F32 +/-Inf /statistics", "GET", f"/cog/statistics?url={q(s['w14_inf'])}", None, "stats"),
+                ("PARITY W14 SOUTH-POLE EPSG:3031 UPSAntarctic", "GET", f"/cog/tiles/UPSAntarcticWGS84Quad/2/1/1.npy?url={q(s['w14_south_pole'])}", None, "npy"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
                 ("BETTER W13 reproject=gauss (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&reproject=gauss", None, "better_cw200_tt422"),
@@ -1912,6 +2220,20 @@ def main() -> int:
                                 and abs(sc["mean"] - st["mean"]) < 0.02
                             )
                             detail = f"cw count={sc['count']:.1f} mean={sc['mean']:.4f} std={sc['std']:.4f} vs tt count={st['count']:.3f} mean={st['mean']:.4f}"
+                    elif kind == "better_inf_masked":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            at = np.load(io.BytesIO(r_tt.content))
+                            low = np.finfo(np.float32).min
+                            mc, mt = ac[1] > low, at[1] > low
+                            cw_all_finite = bool(np.isfinite(ac[0][mc]).all()) if mc.any() else False
+                            tt_has_inf = bool(np.isinf(at[0][mt]).any()) if mt.any() else False
+                            both_fin = mc & mt & np.isfinite(at[0])
+                            max_err = float(np.max(np.abs(ac[0][both_fin] - at[0][both_fin]))) if both_fin.any() else 999.0
+                            ok = ac.shape == (2, 256, 256) and cw_all_finite and tt_has_inf and max_err < 1e-3
+                            detail = f"cw_all_finite={cw_all_finite} tt_has_inf={tt_has_inf} finite_max_err={max_err:.5f}"
                     elif r_cw.status_code != 200 or r_tt.status_code != 200:
                         ok = False
                         detail = f"HTTP cw={r_cw.status_code} ({r_cw.text[:100]!r}) vs tt={r_tt.status_code} ({r_tt.text[:100]!r})"
@@ -1945,8 +2267,9 @@ def main() -> int:
 
                 w7_ran = run_wave7_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w8_ran = run_wave8_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+                w14_ran = run_wave14_fault_checks(client, cw_base, tmp_dir, s, args.only, failures)
 
-            total_checks = len(cases) + w7_ran + w8_ran
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
