@@ -2073,6 +2073,228 @@ def run_wave15_resilience_checks(
     return ran
 
 
+def run_wave17_zarr_deep_checks(
+    client: httpx.Client,
+    cw_base: str,
+    gpu_base: str | None,
+    tmp_dir: Path,
+    only_filter: str,
+    failures: list[dict],
+    gpu_diffs: list[dict],
+) -> int:
+    """Wave 17: Zarr v2 Fortran-order, Zarr v3 transpose codec, CF scale_factor/add_offset, POST /zarr/feature, cross-CRS multiscales overview selection, and styled tile CPU-vs-GPU parity."""
+    w17_dir = tmp_dir / "w17"
+    w17_dir.mkdir(parents=True, exist_ok=True)
+    lat = np.linspace(38.0 - 0.5 / 64, 37.0 + 0.5 / 64, 64, dtype=np.float64)
+    lon = np.linspace(-123.0 + 0.5 / 64, -122.0 - 0.5 / 64, 64, dtype=np.float64)
+    yy, xx = np.mgrid[0:64, 0:64]
+    grad = 10.0 + xx.astype(np.float32) * 10.0 + yy.astype(np.float32) * 0.25
+
+    # 1. Zarr v2 Fortran-order ("order": "F")
+    z_f = w17_dir / "v2_fortran.zarr"
+    z_f.mkdir()
+    (z_f / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    _write_v2_zarr_array(z_f, "lat", lat, (64,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+    _write_v2_zarr_array(z_f, "lon", lon, (64,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+    ad = z_f / "f_var"
+    ad.mkdir()
+    (ad / ".zarray").write_text(json.dumps({
+        "chunks": [64, 64], "compressor": None, "dtype": "<f4",
+        "fill_value": -9999.0, "filters": None, "order": "F", "shape": [64, 64], "zarr_format": 2,
+    }))
+    (ad / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": ["lat", "lon"]}))
+    (ad / "0.0").write_bytes(np.asfortranarray(grad).tobytes(order="F"))
+
+    # 2. Zarr v3 transpose codec (order: [1, 0])
+    z_v3t = w17_dir / "v3_transpose.zarr"
+    z_v3t.mkdir()
+    (z_v3t / "zarr.json").write_text(json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {"Conventions": "CF-1.8"}}))
+    for nm, arr, std in (("lat", lat, "latitude"), ("lon", lon, "longitude")):
+        vd = z_v3t / nm
+        vd.mkdir()
+        (vd / "zarr.json").write_text(json.dumps({
+            "zarr_format": 3, "node_type": "array", "shape": [64], "data_type": "float64",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64]}},
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+            "fill_value": "NaN", "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+            "dimension_names": [nm], "attributes": {"standard_name": std},
+        }))
+        (vd / "c").mkdir()
+        (vd / "c" / "0").write_bytes(np.ascontiguousarray(arr).tobytes())
+    vd = z_v3t / "t_var"
+    vd.mkdir()
+    (vd / "zarr.json").write_text(json.dumps({
+        "zarr_format": 3, "node_type": "array", "shape": [64, 64], "data_type": "float32",
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64, 64]}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": -9999.0,
+        "codecs": [
+            {"name": "transpose", "configuration": {"order": [1, 0]}},
+            {"name": "bytes", "configuration": {"endian": "little"}},
+        ],
+        "dimension_names": ["lat", "lon"], "attributes": {},
+    }))
+    (vd / "c" / "0").mkdir(parents=True)
+    (vd / "c" / "0" / "0").write_bytes(np.ascontiguousarray(grad.T).tobytes())
+
+    # 3. Zarr v2 CF scale_factor + add_offset + int16 _FillValue=-32768
+    z_cf = w17_dir / "v2_cf_scale.zarr"
+    z_cf.mkdir()
+    (z_cf / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    _write_v2_zarr_array(z_cf, "lat", lat, (64,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+    _write_v2_zarr_array(z_cf, "lon", lon, (64,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+    i16 = (100 + xx * 5 + yy * 2).astype(np.int16)
+    i16[0:16, 0:16] = -32768
+    _write_v2_zarr_array(
+        z_cf, "temp", i16, (64, 64),
+        {"_ARRAY_DIMENSIONS": ["lat", "lon"], "scale_factor": 0.01, "add_offset": 273.15, "_FillValue": -32768},
+        fill_value=-32768,
+    )
+
+    # 4. Zarr v2 multiscales pyramid (EPSG:4326 queried in WebMercatorQuad)
+    z_ms = w17_dir / "v2_multiscales.zarr"
+    z_ms.mkdir()
+    (z_ms / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    (z_ms / ".zattrs").write_text(json.dumps({
+        "multiscales": [{"datasets": [{"path": "0"}, {"path": "1"}], "name": "pyramid", "version": "0.4"}]
+    }))
+    for lvl, n, val in (("0", 128, 100.0), ("1", 32, 200.0)):
+        gd = z_ms / lvl
+        gd.mkdir()
+        (gd / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+        la = np.linspace(38.0 - 0.5 / n, 37.0 + 0.5 / n, n, dtype=np.float64)
+        lo = np.linspace(-123.0 + 0.5 / n, -122.0 - 0.5 / n, n, dtype=np.float64)
+        _write_v2_zarr_array(gd, "lat", la, (n,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+        _write_v2_zarr_array(gd, "lon", lo, (n,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+        _write_v2_zarr_array(gd, "v", np.full((n, n), val, dtype=np.float32), (n, n), {"_ARRAY_DIMENSIONS": ["lat", "lon"]})
+
+    ran = 0
+
+    def rec(lb: str, ok: bool, detail: str, path: str = "", method: str = "GET"):
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": lb, "method": method, "path": path, "kind": "w17", "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {lb:54s} | {detail}")
+
+    def wanted(lb: str) -> bool:
+        return not only_filter or only_filter.lower() in lb.lower()
+
+    # 1. Zarr v2 order=F
+    lb = "W17 ZARR v2 order=F /bbox .npy"
+    if wanted(lb):
+        p = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_f)}&variable=f_var"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            err = float(np.max(np.abs(arr[0] - grad)))
+            rec(lb, arr.shape == (2, 64, 64) and err < 1e-3, f"err={err:.5f}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    # 2. Zarr v3 transpose codec [1, 0]
+    lb = "W17 ZARR v3 transpose [1,0] /bbox .npy"
+    if wanted(lb):
+        p = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_v3t)}&variable=t_var"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            err = float(np.max(np.abs(arr[0] - grad)))
+            rec(lb, arr.shape == (2, 64, 64) and err < 1e-3, f"err={err:.5f}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    # 3. Zarr v2 CF scale_factor + add_offset + _FillValue=-32768
+    for unscale in (False, True):
+        lb = f"W17 ZARR CF int16 unscale={unscale}"
+        if wanted(lb):
+            p = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_cf)}&variable=temp&unscale={'true' if unscale else 'false'}"
+            r = client.get(cw_base + p)
+            if r.status_code == 200:
+                arr = np.load(io.BytesIO(r.content))
+                low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+                mask = arr[1] > low
+                exp_mask = i16 != -32768
+                exp_vals = i16.astype(np.float64) * (0.01 if unscale else 1.0) + (273.15 if unscale else 0.0)
+                both = mask & exp_mask
+                err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp_vals[both]))) if both.any() else 999.0
+                rec(lb, bool((mask == exp_mask).all()) and err < 1e-2, f"mask_eq={float((mask == exp_mask).mean()) * 100:.1f}% err={err:.5f}", p)
+            else:
+                rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    # 4. POST /zarr/feature GeoJSON triangle crop (verifies exterior polygon masking + cropped value range)
+    lb = "W17 ZARR POST /zarr/feature .npy"
+    if wanted(lb):
+        poly = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-122.75, 37.25], [-122.25, 37.25], [-122.75, 37.75], [-122.75, 37.25]]],
+            },
+            "properties": {},
+        }
+        p = f"/zarr/feature/64x64.npy?url={q(z_f)}&variable=f_var"
+        r = client.post(cw_base + p, json=poly)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            mask = arr[1] > np.finfo(np.float32).min
+            frac = float(mask.mean())
+            vals = arr[0][mask]
+            vmin = float(vals.min()) if vals.size else -1.0
+            vmax = float(vals.max()) if vals.size else -1.0
+            rec(
+                lb,
+                arr.shape == (2, 64, 64) and 0.35 < frac < 0.65 and vmin >= 165.0 and vmax <= 500.0,
+                f"shape={arr.shape} valid={frac * 100:.1f}% range=[{vmin:.1f}, {vmax:.1f}]",
+                p,
+                "POST",
+            )
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p, "POST")
+
+    # 5. Zarr multiscales cross-CRS (WebMercatorQuad over EPSG:4326): z10 -> level 0 (100.0), z5 -> level 1 (200.0)
+    lb = "W17 ZARR multiscales cross-CRS z10=lvl0 z5=lvl1"
+    if wanted(lb):
+        p_hi = f"/zarr/tiles/WebMercatorQuad/10/163/396.npy?url={q(z_ms)}&variable=v"
+        p_lo = f"/zarr/tiles/WebMercatorQuad/5/5/12.npy?url={q(z_ms)}&variable=v"
+        r_hi = client.get(cw_base + p_hi)
+        r_lo = client.get(cw_base + p_lo)
+        if r_hi.status_code == 200 and r_lo.status_code == 200:
+            ah = np.load(io.BytesIO(r_hi.content))
+            al = np.load(io.BytesIO(r_lo.content))
+            mh = ah[1] > np.finfo(np.float32).min
+            ml = al[1] > np.finfo(np.float32).min
+            vh = float(np.median(ah[0][mh])) if mh.any() else -1.0
+            vl = float(np.median(al[0][ml])) if ml.any() else -1.0
+            rec(lb, abs(vh - 100.0) < 1e-3 and abs(vl - 200.0) < 1e-3, f"z10={vh} (exp 100.0) z5={vl} (exp 200.0)", p_hi)
+        else:
+            rec(lb, False, f"HTTP z10={r_hi.status_code} z5={r_lo.status_code}", p_hi)
+
+    # 6. Zarr tile PNG with colormap_name + rescale + color_formula (CPU vs GPU)
+    lb = "W17 ZARR tile PNG colormap+formula"
+    if wanted(lb):
+        p = f"/zarr/tiles/WebMercatorQuad/8/41/99.png?url={q(z_f)}&variable=f_var&rescale=0,700&colormap_name=viridis&color_formula={qe('Gamma RGB 1.5')}"
+        rc = client.get(cw_base + p)
+        if rc.status_code == 200:
+            rgba = np.array(Image.open(io.BytesIO(rc.content)).convert("RGBA"))
+            valid = rgba[..., 3] > 0
+            non_gray = bool((rgba[valid, 0] != rgba[valid, 1]).any()) if valid.any() else False
+            ok = rgba.shape == (256, 256, 4) and bool(valid.any()) and non_gray
+            rec(lb, ok, f"shape={rgba.shape} valid={float(valid.mean()) * 100:.1f}% non_gray={non_gray}", p)
+            if gpu_base is not None:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"status cpu=200 gpu={rg.status_code}"})
+                else:
+                    gok, gd = compare_images(rc.content, rg.content)
+                    if not gok:
+                        gpu_diffs.append({"label": lb, "detail": gd})
+        else:
+            rec(lb, False, f"HTTP {rc.status_code} {rc.text[:80]!r}", p)
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -2736,8 +2958,9 @@ def main() -> int:
                 w8_ran = run_wave8_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w14_ran = run_wave14_fault_checks(client, cw_base, tmp_dir, s, args.only, failures)
                 w15_ran = run_wave15_resilience_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+                w17_ran = run_wave17_zarr_deep_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
