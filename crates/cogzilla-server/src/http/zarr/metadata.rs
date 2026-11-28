@@ -23,7 +23,7 @@ fn dtype_str(dt: SampleType) -> &'static str {
 }
 
 fn wgs84_bounds_for_geo(geo: &cogzilla_zarr::ZarrGeo, width: u32, height: u32) -> [f64; 4] {
-    geo.crs.model.wgs84_bounds(&geo.affine, width, height)
+    geo.crs.model.wgs84_bounds(&geo.affine, None, width, height)
 }
 
 pub(super) async fn handle_info(io: &Arc<cogzilla_io::CogStore>, q: &ZarrQuery, as_geojson: bool) -> Result<Response<Full<Bytes>>, ZarrError> {

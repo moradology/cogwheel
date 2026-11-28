@@ -118,7 +118,7 @@ pub fn build_cog_info(engine: &TileEngine, cog: &OpenedCog) -> Result<serde_json
         })
     } else {
         let crs = engine.get_or_build_crs(cog)?;
-        let bounds = crs.wgs84_bounds_with_gcp(
+        let bounds = crs.wgs84_bounds(
             &full.pixel_to_crs,
             full.gcp_poly.as_deref(),
             full.width,
@@ -417,7 +417,7 @@ pub fn build_cog_validate(
             .forward(full.width as f64, full.height as f64);
         let native_bounds = if is_user_defined_projected {
             cogzilla_proj::CrsModel::from_geo_keys(gk)
-                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height))
                 .unwrap_or([
                     x00.min(x10).min(x01).min(x11),
                     y00.min(y10).min(y01).min(y11),
@@ -781,7 +781,7 @@ pub fn build_tilejson(
 ) -> Result<serde_json::Value, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
-    let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+    let bounds = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
     let coarsest = cog.index.ifds.last().unwrap();
     let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
         .max(full.height as f64 / coarsest.height.max(1) as f64);

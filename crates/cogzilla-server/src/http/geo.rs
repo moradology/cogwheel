@@ -599,7 +599,7 @@ pub(super) fn tile_intersects_cog(
 ) -> Result<bool, EngineError> {
     let crs = engine.get_or_build_crs(cog)?;
     let full = cog.index.full_res();
-    let [cw, cs, ce, cn] = crs.wgs84_bounds_with_gcp(
+    let [cw, cs, ce, cn] = crs.wgs84_bounds(
         &full.pixel_to_crs,
         full.gcp_poly.as_deref(),
         full.width,

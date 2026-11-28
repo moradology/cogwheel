@@ -808,7 +808,7 @@ impl TileEngine {
                 };
                 let uv_bounds: Option<(Vec<f32>, Vec<f32>, f32, f32, f32, f32)> =
                     if req.tile_size == 256 {
-                        CoordPlan::<256>::build_with_gcp(
+                        CoordPlan::<256>::build(
                             &crs,
                             &ifd.crs_to_pixel,
                             ifd.gcp_poly.as_deref(),
@@ -833,7 +833,7 @@ impl TileEngine {
                             _ => None,
                         })
                     } else {
-                        CoordPlan::<512>::build_with_gcp(
+                        CoordPlan::<512>::build(
                             &crs,
                             &ifd.crs_to_pixel,
                             ifd.gcp_poly.as_deref(),
@@ -996,7 +996,7 @@ impl TileEngine {
             return Ok(bytes);
         }
 
-        let Some(plan) = CoordPlan::<N>::build_with_gcp(
+        let Some(plan) = CoordPlan::<N>::build(
             &crs,
             &ifd.crs_to_pixel,
             ifd.gcp_poly.as_deref(),

@@ -72,7 +72,7 @@ where
                 for cog in &cogs {
                     let crs = engine.get_or_build_crs(cog)?;
                     let full = cog.index.full_res();
-                    let b = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let b = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                     acc[0] = acc[0].min(b[0]);
                     acc[1] = acc[1].min(b[1]);
                     acc[2] = acc[2].max(b[2]);
@@ -104,7 +104,7 @@ where
                 if pq.bounds_crs.is_some() {
                     let crs = engine.get_or_build_crs(&cog)?;
                     let full = cog.index.full_res();
-                    let wgs84 = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let wgs84 = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                     apply_info_bounds_crs(&mut info, wgs84, pq.bounds_crs.as_ref())?;
                 }
                 map.insert(name, info);
@@ -124,7 +124,7 @@ where
                 if pq.bounds_crs.is_some() {
                     let crs = engine.get_or_build_crs(&cog)?;
                     let full = cog.index.full_res();
-                    let wgs84 = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                    let wgs84 = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                     apply_info_bounds_crs(&mut info, wgs84, pq.bounds_crs.as_ref())?;
                 }
                 props.insert(name, info);
@@ -228,7 +228,7 @@ where
                 let pq = &pq_dem;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                 let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
                 let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
                 let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
@@ -335,7 +335,7 @@ where
             if let Some(compiled) = expr_progs {
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                 let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
                 let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
                 let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
@@ -657,7 +657,7 @@ where
                                 && let Ok(crs) = eng.get_or_build_crs(first)
                             {
                                 let f = first.index.full_res();
-                                let b = crs.wgs84_bounds(&f.pixel_to_crs, f.width, f.height);
+                                let b = crs.wgs84_bounds(&f.pixel_to_crs, f.gcp_poly.as_deref(), f.width, f.height);
                                 (
                                     ((b[2] - b[0]).abs() / f.width.max(1) as f64).max(1e-6),
                                     ((b[3] - b[1]).abs() / f.height.max(1) as f64).max(1e-6),
@@ -986,7 +986,7 @@ where
                 }
             } else {
                 let wb = item.bbox.unwrap_or_else(|| {
-                    crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                    crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height)
                 });
                 normalize_render_bbox(reproject_wgs84_bounds(wb, &dst_crs)?, &dst_crs)?
             };
@@ -1039,7 +1039,7 @@ where
                 let full = cogs[0].index.full_res();
                 let bounds = item
                     .bbox
-                    .unwrap_or_else(|| crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height));
+                    .unwrap_or_else(|| crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height));
                 let coarsest = cogs[0].index.ifds.last().unwrap();
                 let ov_factor = (full.width as f64 / coarsest.width.max(1) as f64)
                     .max(full.height as f64 / coarsest.height.max(1) as f64);
@@ -1203,7 +1203,7 @@ where
                         let full = cogs[0].index.full_res();
                         let b = engine
                             .get_or_build_crs(&cogs[0])
-                            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height))
                             .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
                         return Err(EngineError::NotFound(format!(
                             "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
@@ -1618,7 +1618,7 @@ where
             let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, stac_prefix == "stac")?;
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
-            let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
             let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
             let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
             let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;
@@ -1706,7 +1706,7 @@ where
             let (cogs, slot_bands) = expand_stac_asset_bidx(&mut pq_stac, &names, cogs, rewritten_expr, stac_prefix == "stac")?;
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
-            let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
             let db = if cogs.len() > 1 { cogs.len() as u16 } else { data_band_count(full) };
             let ext = ext_opt.or(pq_stac.format_param.as_deref()).unwrap_or("png");
             let (fmt, ct) = parse_ext_format(ext, pq_stac.webp_quality, pq_stac.jpeg_quality)?;

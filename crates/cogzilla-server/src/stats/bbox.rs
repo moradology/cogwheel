@@ -1089,7 +1089,7 @@ async fn render_bbox_core(
         let (mut target_rx, mut target_ry) = probe_res(cx, cy);
         if !target_rx.is_finite() || !target_ry.is_finite() {
             let full = primary.index.full_res();
-            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
             let (mut rcx_raw, rcy_raw) =
                 dst_crs.from_lonlat_deg(0.5 * (rb[0] + rb[2]), 0.5 * (rb[1] + rb[3]));
             if dst_crs.is_geographic()
@@ -1798,7 +1798,7 @@ async fn render_bbox_core(
     let empty_but_overlapping = if !min_u.is_finite() {
         let full = primary.index.full_res();
         if !crate::http::tile_box_intersects_cog(&crs, full, dst_crs, bbox) {
-            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+            let rb = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
             return Err(EngineError::NotFound(format!(
                 "request is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
                 rb[0], rb[1], rb[2], rb[3]

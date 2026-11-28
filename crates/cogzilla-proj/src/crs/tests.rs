@@ -42,7 +42,7 @@ fn adaptive_low_zoom_matches_exact_projection_within_0_1_px() {
         };
         let crs = CrsModel::from_geo_keys(&gk).unwrap();
         let c2p = p2c.invert().unwrap();
-        let plan = CoordPlan::<256>::build(&crs, &c2p, w, h, tile)
+        let plan = CoordPlan::<256>::build(&crs, &c2p, None, w, h, tile)
             .unwrap_or_else(|| panic!("expected non-empty plan for EPSG:{epsg} z={}", tile.z));
         let CoordPlan::Exact2D { u, v, .. } = plan else {
             panic!("expected Exact2D for z <= 8");
@@ -227,6 +227,7 @@ fn coord_plan_high_res_low_zoom_does_not_overflow_i32() {
     let plan = CoordPlan::<256>::build(
         &CrsModel::Epsg3857,
         &crs_to_pixel,
+        None,
         1024,
         1024,
         TileCoord { z: 0, x: 0, y: 0 },
@@ -245,7 +246,7 @@ fn wgs84_bounds_does_not_expand_narrow_mercator_or_geographic_strips() {
         e: -1000.0,
         f: 20_037_508.342_789_244,
     };
-    let mb = CrsModel::Epsg3857.wgs84_bounds(&merc_aff, 200, 200);
+    let mb = CrsModel::Epsg3857.wgs84_bounds(&merc_aff, None, 200, 200);
     assert!(mb[0] > -2.0 && mb[2] < 2.0, "unexpected mercator bounds expansion: {mb:?}");
 
     // Narrow Geographic strip touching (0°, 90°)
@@ -257,7 +258,7 @@ fn wgs84_bounds_does_not_expand_narrow_mercator_or_geographic_strips() {
         e: -0.1,
         f: 90.0,
     };
-    let gb = CrsModel::Geographic.wgs84_bounds(&geo_aff, 100, 100);
+    let gb = CrsModel::Geographic.wgs84_bounds(&geo_aff, None, 100, 100);
     assert!(gb[0] >= -5.1 && gb[2] <= 5.1, "unexpected geographic bounds expansion: {gb:?}");
 }
 
@@ -324,7 +325,7 @@ fn antimeridian_utm_bounds_and_zoom_range_are_accurate() {
         e: -10.0,
         f: cy + 50_000.0,
     };
-    let b = crs.wgs84_bounds(&aff, 10_000, 10_000);
+    let b = crs.wgs84_bounds(&aff, None, 10_000, 10_000);
     assert_eq!(b[0], -180.0);
     assert_eq!(b[2], 180.0);
     let (_minz, maxz) = crs.web_mercator_zoom_range(&aff, 10_000, 10_000, 16.0);
@@ -416,12 +417,13 @@ fn geographic_0_360_wraps_western_hemisphere() {
     };
     let c2p = p2c.invert().unwrap();
     assert!(CrsModel::Geographic.is_geographic_0_360(&p2c, 360));
-    let wb = CrsModel::Geographic.wgs84_bounds(&p2c, 360, 180);
+    let wb = CrsModel::Geographic.wgs84_bounds(&p2c, None, 360, 180);
     assert_eq!(wb, [-180.0, -90.0, 180.0, 90.0]);
     // Western Hemisphere WebMercator tile (z=2, x=0, y=1 covers lon -180..-90, lat 0..66.5)
     let plan = CoordPlan::<256>::build(
         &CrsModel::Geographic,
         &c2p,
+        None,
         360,
         180,
         TileCoord { z: 2, x: 0, y: 1 },
@@ -459,7 +461,7 @@ fn laea_antipode_tile_does_not_interpolate_ghost_pixels() {
         TileCoord { z: 9, x: 14, y: 342 },
         TileCoord { z: 12, x: 113, y: 2743 },
     ] {
-        let plan = CoordPlan::<256>::build(&crs, &c2p, 4000, 4000, tile);
+        let plan = CoordPlan::<256>::build(&crs, &c2p, None, 4000, 4000, tile);
         assert!(
             plan.is_none(),
             "antipode tile {tile:?} in South Pacific must not intersect Europe EPSG:3035 COG"
@@ -479,7 +481,7 @@ fn geographic_antimeridian_preserves_native_bounds_and_west_tile_wrapping() {
         f: 0.0,
     };
     assert_eq!(
-        CrsModel::Geographic.wgs84_bounds(&p2c_east, 1024, 1024),
+        CrsModel::Geographic.wgs84_bounds(&p2c_east, None, 1024, 1024),
         [170.0, -20.0, 190.0, 0.0]
     );
     // Still serves tiles west of antimeridian (z=4/0/8 covers lon -180..-157.5, lat -21.9..0)
@@ -488,6 +490,7 @@ fn geographic_antimeridian_preserves_native_bounds_and_west_tile_wrapping() {
         CoordPlan::<256>::build(
             &CrsModel::Geographic,
             &c2p_east,
+            None,
             1024,
             1024,
             TileCoord { z: 4, x: 0, y: 8 },
@@ -506,7 +509,7 @@ fn geographic_antimeridian_preserves_native_bounds_and_west_tile_wrapping() {
         f: 0.0,
     };
     assert_eq!(
-        CrsModel::Geographic.wgs84_bounds(&p2c_west, 1024, 1024),
+        CrsModel::Geographic.wgs84_bounds(&p2c_west, None, 1024, 1024),
         [-190.0, -20.0, -170.0, 0.0]
     );
 }
@@ -645,7 +648,7 @@ fn ease_grid_6933_3410_and_equal_earth_8857_match_proj() {
         f: 7_314_540.0,
     };
     let c2p = p2c.invert().unwrap();
-    let plan = CoordPlan::<256>::build(&crs6933, &c2p, 1024, 512, TileCoord { z: 2, x: 3, y: 1 })
+    let plan = CoordPlan::<256>::build(&crs6933, &c2p, None, 1024, 512, TileCoord { z: 2, x: 3, y: 1 })
         .expect("dateline tile should intersect global EASE-2");
     assert!(matches!(plan, CoordPlan::Separable1D { .. }));
 }
@@ -667,6 +670,7 @@ fn west_antimeridian_neg190_geographic_raster_wraps_eastern_hemisphere_tiles() {
     let plan = CoordPlan::<256>::build(
         &CrsModel::Geographic,
         &c2p,
+        None,
         100,
         100,
         TileCoord { z: 4, x: 15, y: 8 },

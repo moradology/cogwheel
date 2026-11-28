@@ -47,10 +47,10 @@ pub enum CoordPlan<const N: usize> {
 }
 
 impl<const N: usize> CoordPlan<N> {
-    /// Build a `CoordPlan` for output XYZ `tile` into an IFD with `crs_to_pixel` affine.
-    /// Build a coordinate plan for a tile, using a nonlinear `GcpPoly` when present or delegating
-    /// directly to the zero-overhead `build()` path when `gcp_poly` is `None`.
-    pub fn build_with_gcp(
+    /// Build a coordinate plan for output XYZ `tile`, using a nonlinear `GcpPoly` when present
+    /// or delegating directly to the zero-overhead affine path when `gcp_poly` is `None`.
+    /// Returns `None` if the tile lies completely outside `[0..ifd_w, 0..ifd_h]`.
+    pub fn build(
         crs: &CrsModel,
         crs_to_pixel: &Affine2D,
         gcp_poly: Option<&cogzilla_tiff::GcpPoly>,
@@ -59,7 +59,7 @@ impl<const N: usize> CoordPlan<N> {
         tile: TileCoord,
     ) -> Option<Self> {
         let Some(poly) = gcp_poly else {
-            return Self::build(crs, crs_to_pixel, ifd_w, ifd_h, tile);
+            return Self::build_affine(crs, crs_to_pixel, ifd_w, ifd_h, tile);
         };
         let (min_x, min_y, max_x, max_y) = tile_bounds_3857(tile);
         let step_x = (max_x - min_x) / (N as f64);
@@ -116,8 +116,8 @@ impl<const N: usize> CoordPlan<N> {
         })
     }
 
-    /// Returns `None` if the tile lies completely outside `[0..ifd_w, 0..ifd_h]`.
-    pub fn build(
+    /// Affine-only fast path for [`Self::build`].
+    fn build_affine(
         crs: &CrsModel,
         crs_to_pixel: &Affine2D,
         ifd_w: u32,

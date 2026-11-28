@@ -178,7 +178,7 @@ fn derive_regular_geo_with_dtypes(
     };
 
     let bounds = if lon_0_360 && lon_wrap_shift > 0 {
-        crs.model.wgs84_bounds(&affine, x_vals.len() as u32, y_vals.len() as u32)
+        crs.model.wgs84_bounds(&affine, None, x_vals.len() as u32, y_vals.len() as u32)
     } else {
         let (x0, y0) = affine.forward(0.0, 0.0);
         let (x1, y1) = affine.forward(w, h);

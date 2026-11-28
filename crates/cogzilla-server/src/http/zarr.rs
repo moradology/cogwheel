@@ -1114,6 +1114,7 @@ async fn handle_tile(
                     CoordPlan::<256>::build(
                         &geo.crs.model,
                         &crs_to_pixel,
+                        None,
                         ifd_w,
                         ifd_h,
                         TileCoord { z, x, y },
