@@ -4,26 +4,30 @@ The headline numbers from the README, with where each came from and what it does
 
 ## Real COGs on S3
 
-Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with TiTiler tuned per its own guidance and given one worker per core. This is one run of `cogzilla` v0.1.0 on an Apple M5 over a home network, on 2026-11-22:
+Measured against real COGs on S3 (Sentinel-2, USGS 3DEP, Copernicus DEM), with TiTiler tuned per its own guidance and given one worker per core. This is one run of `cogzilla` v0.1.0 on an **Apple M5 (10-core CPU, 16 GiB RAM, macOS)** over a home network, on 2026-11-22:
 
-| Real S3 COGs, equal mix of five workloads | `cogzilla` | TiTiler | Gain |
+| Real S3 COGs, equal mix of five workloads (Apple M5, 10 cores) | `cogzilla` | TiTiler (10 workers) | Gain |
 | :--- | ---: | ---: | ---: |
-| CPU per 1,000 tiles, never seen before | **13.2 CPU-s** | 56.0 CPU-s | **4.3×** |
-| CPU per 1,000 tiles, source blocks cached | **1.7 CPU-s** | 55.3 CPU-s | **32×** |
-| Tiles per second per busy core, cached | **588** | 18 | **32×** |
+| CPU per 1,000 tiles, never seen before *(total CPU-s across all cores)* | **13.2 CPU-s** | 56.0 CPU-s | **4.3×** |
+| CPU per 1,000 tiles, source blocks cached *(total CPU-s across all cores)* | **1.7 CPU-s** | 55.3 CPU-s | **32×** |
+| Tiles per second per **1 busy core**, cached | **588** | 18 | **32×** |
 | Memory at idle | **4 MiB** | 1,112 MiB (10 workers) | **278×** |
-| Instances for 1,000 uncached tiles/s (modeled, `c7g.xlarge`) | **11** | 47 | **4.3×** |
+| Instances for 1,000 uncached tiles/s (modeled, `c7g.xlarge`, 4 vCPU each) | **11** | 47 | **4.3×** |
+
+<p align="center">
+  <img src="../assets/bench-s3-cache-scaling.png" alt="Real S3 COGs compute cost vs decoded block-cache hit rate: cogzilla vs TiTiler" width="100%" />
+</p>
 
 ## Local fixtures, warm cache
 
-The ceiling, with the network taken out entirely (local files, warm cache), on two machines:
+The ceiling, with the network taken out entirely (local files, warm block cache, CPU-only), on two machines. Single-tile rows measure **1 core** (one sequential request); HTTP throughput rows saturate **all cores** (`10 cores` on Apple M5, `4 vCPU` on AMD EPYC 9V45):
 
-| Local fixtures, warm cache | Apple M5, 10 cores | Linux x86-64, 4 vCPU |
+| Local fixtures, warm cache (CPU-only) | Apple M5 (`10 cores`) | Linux x86-64 (`4 vCPU` AMD EPYC 9V45) |
 | :--- | ---: | ---: |
-| HTTP throughput, Mercator PNG, 32 concurrent | 13,195 vs 180 tiles/s: **73.4×** | 3,363 vs 85 tiles/s: **39.8×** |
-| HTTP throughput, satellite RGB PNG, 32 concurrent | 5,728 vs 142 tiles/s: **40.2×** | 1,369 vs 62 tiles/s: **22.1×** |
-| Single Mercator PNG tile | 303 µs vs 16.6 ms: **54.7×** | 632 µs vs 21.4 ms: **33.9×** |
-| Landsat three-file RGB PNG tile | 1.36 ms vs 52.3 ms: **38.6×** | 2.62 ms vs 62.6 ms: **23.9×** |
+| HTTP throughput, Mercator PNG, 32 concurrent *(all cores)* | 13,195 vs 180 tiles/s: **73.4×** | 3,363 vs 85 tiles/s: **39.8×** |
+| HTTP throughput, satellite RGB PNG, 32 concurrent *(all cores)* | 5,728 vs 142 tiles/s: **40.2×** | 1,369 vs 62 tiles/s: **22.1×** |
+| Single Mercator PNG tile *(1 core)* | 303 µs vs 16.6 ms: **54.7×** | 632 µs vs 21.4 ms: **33.9×** |
+| Landsat three-file RGB PNG tile *(1 core)* | 1.36 ms vs 52.3 ms: **38.6×** | 2.62 ms vs 62.6 ms: **23.9×** |
 
 Each cell is `cogzilla` against TiTiler on the same machine. The two columns differ in more than hardware:
 
@@ -56,7 +60,7 @@ This is `cogzilla` alone: TiTiler was not run on this workload, so there is no m
 
 ## Live TiTiler 2.4 differential oracle (endpoint latency & parity)
 
-Single-request warm loopback HTTP measurements from [benches/titiler_diff_oracle.py](../benches/titiler_diff_oracle.py) against a live TiTiler 2.4 instance on Apple M5 at commit `2bc38e1` (**39/39 checks passed**, local fixtures, no network):
+Single-request (**1 core**) warm loopback HTTP measurements from [benches/titiler_diff_oracle.py](../benches/titiler_diff_oracle.py) against a live TiTiler 2.4 instance on Apple M5 (`10-core CPU`) at commit `2bc38e1` (**39/39 checks passed**, local fixtures, no network):
 
 | Endpoint | `cogzilla` | TiTiler 2.4 | Gain | Parity |
 | :--- | ---: | ---: | ---: | :--- |
