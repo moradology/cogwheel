@@ -21,19 +21,19 @@ All benchmarks in this document were measured on two hardware configurations (no
 
 | Configuration | CPU | GPU | API / Memory Model |
 | :--- | :--- | :--- | :--- |
-| **Linux x86-64 workstation** | AMD Ryzen Threadripper 3960X (`24 cores / 48 threads`) | NVIDIA GeForce RTX 3090 Ti (`24 GiB`) | Vulkan 1.4 (`wgpu`), discrete PCIe, measured dispatch floor `83.9 µs` |
-| **macOS arm64 laptop** | Apple M5 (`10-core CPU`) | Apple M5 GPU (`10-core GPU`) | Metal (`wgpu`), unified memory, measured dispatch floor `1,542.1 µs` |
+| **Linux x86-64 workstation** | AMD Ryzen Threadripper 3960X (`24 cores / 48 threads`) | NVIDIA GeForce RTX 3090 Ti (`24 GiB`) | Vulkan 1.4 (`wgpu`), discrete PCIe, measured dispatch floor `50.0 µs` |
+| **macOS arm64 laptop** | Apple M5 (`10-core CPU`: 4P + 6E, `16 GiB` unified RAM) | Apple M5 GPU (`10-core GPU`) | Metal (`wgpu`), unified memory, measured dispatch floor `1,518.8 µs` |
 
 - **CPU threading:** In the **Concurrency Scaling** tables, `1 client` reflects **1 busy CPU core** (single-threaded per-request render); `4`–`128 clients` scale across **all available CPU cores** (`24C/48T` on Threadripper 3960X, `10 cores` on Apple M5). In the **Targeted Single-Endpoint Highlights** table, every CPU baseline is a **single-request (`1 core`)** measurement unless noted otherwise.
 
 ## Performance Scaling Overview
 
 <p align="center">
-  <img src="../assets/bench-concurrency-overload.png" alt="Concurrency scaling from 1 to 2,048 clients and AIMD overload p99 tail latency across CPU and GPU" width="100%" />
+  <img src="../assets/bench-concurrency-overload.png" alt="Apples-to-apples 512x512 RGB Lanczos3 JPEG concurrency scaling (cogzilla vs TiTiler 2.4) and live HTTP AIMD overload tail latency across Apple M5 and Threadripper 3960X + RTX 3090 Ti" width="100%" />
 </p>
 
 <p align="center">
-  <img src="../assets/bench-workload-contention.png" alt="Heavy single-request endpoint latency (1-core CPU vs Metal vs Vulkan) and noisy-neighbor live-tile contention isolation" width="100%" />
+  <img src="../assets/bench-workload-contention.png" alt="HTTP 256x256 RGB Bilinear PNG core/worker scaling (cogzilla vs TiTiler 2.4) and noisy-neighbor live-tile plus 2048x2048 analytics contention isolation" width="100%" />
 </p>
 
 *(Reproduce all charts with zero global installs via `uv run benches/plot_benchmarks.py`.)*
@@ -42,59 +42,59 @@ All benchmarks in this document were measured on two hardware configurations (no
 
 ## Sustained Realistic Map-Server Soak (`e2e_realistic_workload_bench`)
 
-Measured at commit `f01a5a6` (`gpu-impl`) using [e2e_realistic_workload_bench.rs](../crates/cogzilla-server/examples/e2e_realistic_workload_bench.rs) against the real `TileEngine` with a tiled `2048×2048` 3-band F32 GeoTIFF COG on disk, **encoded-tile cache disabled** (so every request executes a full render + encode), and a 726-tile `z=9..12` Web Mercator viewport pool.
+Measured as **3-run medians** at commit `3787b88` (`main`, post-PR #571 separable SIMD Lanczos3 + PR #576 recalibrated `DispatchPolicy`) using [e2e_realistic_workload_bench.rs](../crates/cogzilla-server/examples/e2e_realistic_workload_bench.rs) against the real `TileEngine` with a tiled `2048×2048` 3-band F32 GeoTIFF COG on disk, **encoded-tile cache disabled** (so every request executes a full render + encode), and a 726-tile `z=9..12` Web Mercator viewport pool.
 
 Traffic mix in Scenarios 1–3: **40%** `512×512` RGB Lanczos3 JPEG (`q=85`), **25%** `256×256` DEM Horn Hillshade Lanczos3 PNG, **20%** `512×512` NDVI Expression Cubic + Viridis PNG, **15%** `256×256` Single-band Lanczos3 + Viridis PNG.
 
-### Linux x86-64: Threadripper 3960X (`24C/48T`) + NVIDIA GeForce RTX 3090 Ti (`24 GiB`, Vulkan, `floor = 83.9 µs`)
+### Linux x86-64: Threadripper 3960X (`24C/48T`) + NVIDIA GeForce RTX 3090 Ti (`24 GiB`, Vulkan, `floor = 50.0 µs`)
 
-#### Sustained Mixed Map Traffic (`8s` each)
-| Workload | CPU-Only (`24C/48T`) | GPU Continuous Batching | Throughput Speedup |
+#### Sustained Mixed Map Traffic (`8s` each, 3× medians)
+| Workload | CPU-Only (`24C/48T`) | GPU `auto` (Continuous Batching) | Throughput Speedup |
 | :--- | :--- | :--- | ---: |
-| **Pan & Zoom** (16 clients, 0–6 ms jitter) | 155 req/s (p50=21.4, p95=244.8, p99=275.8 ms) | **2,484 req/s** (p50=**2.2**, p95=**4.5**, p99=**10.5 ms**) | **16.1×** |
-| **Mixed Tile Flood** (32 clients, 0 ms think) | 232 req/s (p50=29.5, p95=352.1, p99=356.2 ms) | **3,490 req/s** (p50=**8.9**, p95=**11.9**, p99=**19.9 ms**) | **15.1×** |
+| **Pan & Zoom** (16 clients, 0–6 ms jitter) | 2,215 req/s (p50=2.8, p95=6.8, p99=9.2 ms) | **2,560 req/s** (p50=**2.3**, p95=**4.4**, p99=**9.1 ms**) | **1.2×** |
+| **Mixed Tile Flood** (32 clients, 0 ms think) | 8,400 req/s (p50=3.0, p95=9.0, p99=12.2 ms) | **11,197 req/s** (p50=**2.5**, p95=**5.1**, p99=**12.1 ms**) | **1.3×** |
 
-#### Live Tiles + Heavy Analytics Contention (12 live tile clients + 2 heavy `2048²` clients, `8s`)
-| Stream | CPU-Only (`24C/48T`) | GPU Continuous Batching | Speedup |
+#### Live Tiles + Heavy Analytics Contention (12 live tile clients + 2 heavy `2048²` clients, `8s`, 3× medians)
+| Stream | CPU-Only (`24C/48T`) | GPU `auto` (Continuous Batching) | Speedup |
 | :--- | :--- | :--- | ---: |
-| **Live Tiles** (12 clients, 2 ms pacing) | 94 req/s (p50=20.1, p95=238.3, p99=254.2 ms) | **1,170 req/s** (p50=**6.0**, p95=**14.8**, p99=**19.6 ms**) | **12.4×** |
-| **Heavy Analytics** (`2048²` bbox/stats + `1024²` zonal) | 1 req/s (p50=2,782.7, p95=3,564.3 ms) | **106 req/s** (p50=**13.0**, p95=**41.6**, p99=**49.1 ms**) | **127.0×** |
+| **Live Tiles** (12 clients, 2 ms pacing) | 1,828 req/s (p50=2.8, p95=6.9, p99=8.9 ms) | **2,183 req/s** (p50=**2.4**, p95=**5.3**, p99=**9.2 ms**) | **1.2×** |
+| **Heavy Analytics** (`2048²` bbox/stats + `1024²` zonal) | 7 req/s (p50=237.7, p95=549.9, p99=556.1 ms) | **45 req/s** (p50=**46.4**, p95=**84.5**, p99=**87.1 ms**) | **6.7×** |
 
-#### Concurrency Scaling (`512×512` RGB Lanczos3 JPEG, `4s` each)
-| Concurrency | CPU-Only (`1 core` at c=1 → `24C/48T`) | GPU Continuous Batching | Throughput Speedup |
-| :--- | :--- | :--- | ---: |
-| **1 client (1 core CPU)** | 5 req/s (p50=201.9, p99=208.9 ms) | **1,149 req/s** (p50=**0.7**, p95=**1.9**, p99=**3.3 ms**) | **228.8×** |
-| **4 clients** | 20 req/s (p50=203.6, p99=212.9 ms) | **1,711 req/s** (p50=**2.1**, p95=**4.1**, p99=**6.1 ms**) | **87.4×** |
-| **16 clients** | 72 req/s (p50=209.0, p99=287.1 ms) | **2,036 req/s** (p50=**7.4**, p95=**10.7**, p99=**19.1 ms**) | **28.3×** |
-| **32 clients** | 103 req/s (p50=343.1, p99=365.7 ms) | **2,091 req/s** (p50=**14.7**, p95=**17.5**, p99=**39.5 ms**) | **20.3×** |
+#### Concurrency Scaling (`512×512` RGB Lanczos3 JPEG, `4s` each, 3× medians)
+| Concurrency | CPU-Only (`1 core` at c=1 → `24C/48T`) | GPU `auto` | TiTiler 2.4 (`48` workers) | `cogzilla` vs TiTiler |
+| :--- | :--- | :--- | :--- | ---: |
+| **1 client (1 core CPU)** | **349 req/s** (p50=2.6, p99=8.1 ms) | **349 req/s** (p50=2.6, p99=8.2 ms) | 12.9 req/s (p50=89.0 ms) | **27.1×** |
+| **4 clients** | **1,381 req/s** (p50=2.6, p99=8.2 ms) | **1,386 req/s** (p50=2.6, p99=8.2 ms) | 44.8 req/s (p50=91.6 ms) | **30.8×** |
+| **16 clients** | **5,299 req/s** (p50=2.7, p99=8.7 ms) | **5,310 req/s** (p50=2.6, p99=8.7 ms) | 155.6 req/s (p50=101.1 ms) | **34.1×** |
+| **32 clients** | **7,908 req/s** (p50=4.2, p99=12.8 ms) | **7,874 req/s** (p50=4.2, p99=13.0 ms) | 239.9 req/s (p50=129.6 ms) | **33.0×** |
 
-- **Coalescer & Cache Telemetry**: **85,722** coalesced jobs across **17,572** batches (avg batch = `4.88`, max = `32`); slab cache hit rate **99.7%** single-band / **83.9%** multi-band.
+- **Coalescer & Cache Telemetry**: **72,021** coalesced jobs across **23,053** batches (avg batch = `3.12`, max = `22`); single-band slab cache hit rate **99.8%**. With `DispatchPolicy` recalibrated for separable AVX2+FMA Lanczos3, `512²` RGB tiles stay on CPU (`7,908 req/s`) while DEM Horn hillshade and heavy `2048²` analytics offload to RTX 3090 Ti (**6.7×** faster).
 
 ---
 
-### macOS arm64: Apple M5 (`10C CPU / 10C GPU`, Metal, unified memory, `floor = 1,542.1 µs`)
+### macOS arm64: Apple M5 (`10C CPU / 10C GPU`, Metal, unified memory, `floor = 1,518.8 µs`)
 
-#### Sustained Mixed Map Traffic (`8s` each)
-| Workload | CPU-Only (`10 cores`) | GPU Continuous Batching | Throughput Speedup |
+#### Sustained Mixed Map Traffic (`8s` each, 3× medians)
+| Workload | CPU-Only (`10 cores`) | GPU `auto` (Continuous Batching) | Notes |
+| :--- | :--- | :--- | :--- |
+| **Pan & Zoom** (16 clients, 0–6 ms jitter) | **2,586 req/s** (p50=2.1, p95=4.0, p99=5.7 ms) | 1,952 req/s (p50=2.2, p95=12.4, p99=16.5 ms) | DEM Horn offloaded to Metal (`1.5 ms` floor) |
+| **Mixed Tile Flood** (32 clients, 0 ms think) | **3,770 req/s** (p50=2.5, p95=40.0, p99=58.4 ms) | 3,256 req/s (p50=7.9, p95=24.4, p99=31.1 ms) | Tighter p99 (`31.1` vs `58.4 ms`) under flood |
+
+#### Live Tiles + Heavy Analytics Contention (12 live tile clients + 2 heavy `2048²` clients, `8s`, 3× medians)
+| Stream | CPU-Only (`10 cores`) | GPU `auto` (Continuous Batching) | Speedup |
 | :--- | :--- | :--- | ---: |
-| **Pan & Zoom** (16 clients, 0–6 ms jitter) | 140 req/s (p50=16.2, p95=196.1, p99=228.4 ms) | **940 req/s** (p50=**12.6**, p95=**21.4**, p99=**24.9 ms**) | **6.7×** |
-| **Mixed Tile Flood** (32 clients, 0 ms think) | 136 req/s (p50=16.0, p95=204.3, p99=267.0 ms) | **1,426 req/s** (p50=**22.4**, p95=**36.3**, p99=**45.0 ms**) | **10.5×** |
+| **Live Tiles** (12 clients, 2 ms pacing) | **1,958 req/s** (p50=2.7, p95=5.0, p99=7.4 ms) | 1,355 req/s (p50=2.3, p95=24.1, p99=28.5 ms) | — |
+| **Heavy Analytics** (`2048²` bbox/stats + `1024²` zonal) | 11 req/s (p50=120.2, p95=404.0, p99=503.7 ms) | **56 req/s** (p50=**34.6**, p95=**52.5**, p99=**62.6 ms**) | **5.2×** |
 
-#### Live Tiles + Heavy Analytics Contention (12 live tile clients + 2 heavy `2048²` clients, `8s`)
-| Stream | CPU-Only (`10 cores`) | GPU Continuous Batching | Speedup |
-| :--- | :--- | :--- | ---: |
-| **Live Tiles** (12 clients, 2 ms pacing) | 89 req/s (p50=22.4, p95=260.7, p99=321.5 ms) | **302 req/s** (p50=**36.9**, p95=**60.1**, p99=**73.8 ms**) | **3.4×** |
-| **Heavy Analytics** (`2048²` bbox/stats + `1024²` zonal) | 1 req/s (p50=2,426.4, p95=3,830.3 ms) | **60 req/s** (p50=**31.1**, p95=**53.5**, p99=**62.5 ms**) | **66.3×** |
+#### Concurrency Scaling (`512×512` RGB Lanczos3 JPEG, `4s` each, 3× medians)
+| Concurrency | CPU-Only (`1 core` at c=1 → `10 cores`) | GPU `auto` | TiTiler 2.4 (`10` workers) | `cogzilla` vs TiTiler |
+| :--- | :--- | :--- | :--- | ---: |
+| **1 client (1 core CPU)** | **675 req/s** (p50=1.3, p99=3.9 ms) | **669 req/s** (p50=1.4, p99=3.9 ms) | 26.2 req/s (p50=42.1 ms) | **25.8×** |
+| **4 clients** | **2,063 req/s** (p50=1.8, p99=5.1 ms) | **1,963 req/s** (p50=1.8, p99=5.3 ms) | 72.7 req/s (p50=57.2 ms) | **28.4×** |
+| **16 clients** | **3,321 req/s** (p50=3.1, p99=19.7 ms) | **3,230 req/s** (p50=3.1, p99=21.5 ms) | 99.5 req/s (p50=166.9 ms) | **33.4×** |
+| **32 clients** | **3,288 req/s** (p50=3.1, p99=56.5 ms) | **3,200 req/s** (p50=3.1, p99=57.8 ms) | 103.8 req/s (p50=309.7 ms) | **31.7×** |
 
-#### Concurrency Scaling (`512×512` RGB Lanczos3 JPEG, `4s` each)
-| Concurrency | CPU-Only (`1 core` at c=1 → `10 cores`) | GPU Continuous Batching | Throughput Speedup |
-| :--- | :--- | :--- | ---: |
-| **1 client (1 core CPU)** | 12 req/s (p50=86.3, p99=98.1 ms) | **218 req/s** (p50=**4.5**, p95=**7.0**, p99=**8.1 ms**) | **18.5×** |
-| **4 clients** | 38 req/s (p50=107.0, p99=122.3 ms) | **316 req/s** (p50=**13.2**, p95=**16.3**, p99=**19.0 ms**) | **8.3×** |
-| **16 clients** | 48 req/s (p50=200.7, p99=332.5 ms) | **606 req/s** (p50=**25.0**, p95=**38.4**, p99=**54.6 ms**) | **12.5×** |
-| **32 clients** | 49 req/s (p50=199.9, p99=273.2 ms) | **654 req/s** (p50=**48.7**, p95=**68.1**, p99=**100.2 ms**) | **13.2×** |
-
-- **Coalescer & Cache Telemetry**: **27,562** coalesced jobs across **4,586** batches (avg batch = `6.01`, max = `31`); slab cache hit rate **99.2%** single-band / **84.9%** multi-band.
+- **Coalescer & Cache Telemetry**: **23,118** coalesced jobs across **4,280** batches (avg batch = `5.40`, max = `28`); single-band slab cache hit rate **99.6%**.
 
 ---
 
@@ -156,14 +156,14 @@ Live HTTP overload benchmarks via [e2e_aimd_overload_bench.rs](../crates/cogzill
 
 | Host & Backend | Clients | AIMD | `200 OK` Goodput | `200 OK` p50 | `200 OK` p99 | `429` Shed (p50) | `/healthz` p99 | Converged `limit` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Apple M5 CPU-only (10 cores)** | 128 | OFF | 63.7 req/s | 1,949.1 ms | 2,362.2 ms | 0 | 0.5 ms | — |
-| **Apple M5 CPU-only (10 cores)** | 128 | **ON** | 56.4 req/s | **180.1 ms (10.8×)** | **728.6 ms (3.2×)** | 37,863 (**0.6 ms**) | **6.9 ms** | `10` |
-| **Apple M5 GPU (Metal)** | 256 | OFF | 824.5 req/s | 307.4 ms | 356.2 ms | 0 | 5.9 ms | — |
-| **Apple M5 GPU (Metal)** | 256 | **ON** | **794.0 req/s** | **117.5 ms (2.6×)** | **222.1 ms (1.6×)** | 50,924 (**0.7 ms**) | **4.6 ms** | `91` |
-| **Threadripper 3960X CPU-only (24C/48T)** | 128 | OFF | 116.4 req/s | 935.0 ms | 2,601.8 ms | 0 | 2.2 ms | — |
-| **Threadripper 3960X CPU-only (24C/48T)** | 128 | **ON** | 105.1 req/s | **316.9 ms (3.0×)** | **987.2 ms (2.6×)** | 31,539 (**0.3 ms**) | **0.6 ms** | `32` |
-| **RTX 3090 Ti (Vulkan, 24 GiB)** | 256 | OFF | 3,495.7 req/s | 73.1 ms | 257.5 ms | 0 | 0.6 ms | — |
-| **RTX 3090 Ti (Vulkan, 24 GiB)** | 256 | **ON** | **3,807.2 req/s (+8.9%)** | **63.4 ms** | **97.2 ms (2.6×)** | 2,580 (**0.2 ms**) | **0.5 ms** | `538` |
+| **Apple M5 CPU-only (10 cores)** | 128 | OFF | 3,657.4 req/s | 10.9 ms | 290.3 ms | 0 | 33.4 ms | — |
+| **Apple M5 CPU-only (10 cores)** | 128 | **ON** | **3,619.2 req/s** | **5.5 ms (2.0×)** | **97.5 ms (3.0×)** | 27,324 (**1.8 ms**) | **16.8 ms** | `17` |
+| **Apple M5 GPU `auto` (Metal)** | 256 | OFF | 3,711.8 req/s | 26.3 ms | 448.9 ms | 0 | 148.8 ms | — |
+| **Apple M5 GPU `auto` (Metal)** | 256 | **ON** | **3,508.0 req/s** | **10.5 ms (2.5×)** | **181.0 ms (2.5×)** | 43,355 (**3.4 ms**) | **40.1 ms** | `32` |
+| **Threadripper 3960X CPU-only (24C/48T)** | 128 | OFF | 7,934.2 req/s | 17.1 ms | 33.4 ms | 0 | 2.8 ms | — |
+| **Threadripper 3960X CPU-only (24C/48T)** | 128 | **ON** | **7,834.3 req/s** | **17.4 ms** | **33.8 ms** | 0 | **1.9 ms** | `258` |
+| **RTX 3090 Ti + 3960X (Vulkan, 24 GiB)** | 256 | OFF | 8,034.0 req/s | 35.2 ms | 69.9 ms | 0 | 3.2 ms | — |
+| **RTX 3090 Ti + 3960X (Vulkan, 24 GiB)** | 256 | **ON** | **7,675.1 req/s** | **26.9 ms (1.3×)** | **56.8 ms (1.2×)** | 24,644 (**0.3 ms**) | **2.5 ms** | `194` |
 
 > **Configuration & Telemetry**: Enabled by default (`COGZILLA_AIMD=off` disables; `COGZILLA_AIMD_TARGET_MS=150`, `COGZILLA_AIMD_MIN_LIMIT`, `COGZILLA_AIMD_MAX_LIMIT=4096`). `/healthz`, `/metrics`, and `OPTIONS` bypass admission control; `4xx` responses call `permit.ignore_rtt()`. Exported in `/metrics` as `cogzilla_aimd_limit`, `cogzilla_aimd_in_flight`, and `cogzilla_aimd_rejected_429_total`.
 
@@ -188,5 +188,5 @@ cargo run --release -p cogzilla-server --example e2e_realistic_workload_bench
 COGZILLA_GPU_INDEX=0 cargo run --release -p cogzilla-server --example e2e_realistic_workload_bench
 
 # Disable GPU at runtime on any server binary
-COGZILLA_GPU=never cogzilla-server --port 8080
+COGZILLA_GPU_POLICY=never cogzilla-server --port 8080
 ```

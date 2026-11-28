@@ -58,6 +58,32 @@ Serving on-the-fly hillshade tiles (cubic resampling, Horn 3×3, PNG encode per 
 
 This is `cogzilla` alone: TiTiler was not run on this workload, so there is no multiple to quote.
 
+## Live HTTP Core / Worker Scaling (`cogzilla` vs. TiTiler 2.4)
+
+Measured as **3-run medians** at commit `3787b88` on the exact same `2048×2048` 3-band F32 EPSG:4326 tiled COG (`726`-tile `z=9..12` Web Mercator pool, `--tile-cache-mb 0` on `cogzilla`, TiTiler 2.4 with `uvicorn --loop uvloop --workers W`):
+
+### Apple M5 (`10 cores`: 4P + 6E, `16 GiB` unified RAM)
+| Concurrency / Workers | `256²` RGB Bilinear PNG (`cogzilla` vs TiTiler) | `512²` RGB Lanczos3 JPEG (`cogzilla` vs TiTiler) | RSS (`cogzilla` vs TiTiler) |
+| ---: | ---: | ---: | ---: |
+| `1` | **1,563** vs 119 req/s (**13.2×**) | **663** vs 26 req/s (**25.3×**) | **192** vs 174 MiB |
+| `2` | **3,000** vs 236 req/s (**12.7×**) | **1,000** vs 49 req/s (**20.4×**) | **192** vs 338 MiB |
+| `4` | **4,080** vs 246 req/s (**16.6×**) | **1,191** vs 73 req/s (**16.4×**) | **168** vs 647 MiB |
+| `8` | **5,450** vs 373 req/s (**14.6×**) | **2,272** vs 92 req/s (**24.7×**) | **220** vs 1,246 MiB |
+| `10` | **7,298** vs 419 req/s (**17.4×**) | **2,805** vs 100 req/s (**28.1×**) | **357** vs 1,543 MiB (**4.3× less**) |
+
+### Linux x86-64: AMD Ryzen Threadripper 3960X (`24 cores / 48 threads`)
+| Concurrency / Workers | `256²` RGB Bilinear PNG (`cogzilla` vs TiTiler) | `512²` RGB Lanczos3 JPEG (`cogzilla` vs TiTiler) | RSS (`cogzilla` vs TiTiler) |
+| ---: | ---: | ---: | ---: |
+| `1` | **547** vs 46 req/s (**11.9×**) | **263** vs 13 req/s (**20.2×**) | **185** vs 154 MiB |
+| `2` | **1,045** vs 70 req/s (**14.9×**) | **497** vs 24 req/s (**20.5×**) | **185** vs 349 MiB |
+| `4` | **1,939** vs 207 req/s (**9.4×**) | **944** vs 45 req/s (**20.9×**) | **185** vs 644 MiB |
+| `8` | **3,421** vs 267 req/s (**12.8×**) | **1,708** vs 85 req/s (**20.1×**) | **187** vs 1,186 MiB |
+| `16` | **5,552** vs 407 req/s (**13.6×**) | **2,935** vs 157 req/s (**18.8×**) | **223** vs 2,328 MiB |
+| `24` | **6,985** vs 545 req/s (**12.8×**) | **4,090** vs 203 req/s (**20.1×**) | **284** vs 3,490 MiB |
+| `48` | **7,622** vs 952 req/s (**8.0×**) | **5,685** vs 271 req/s (**20.9×**) | **428** vs 7,021 MiB (**16.4× less**) |
+
+*(On the native Rust `e2e_realistic_workload_bench` harness without Python HTTP client overhead, `cogzilla` reaches **7,908 req/s** on `512²` RGB Lanczos3 JPEG at `c=32` on Threadripper 3960X and **3,288 req/s** on Apple M5.)*
+
 ## Live TiTiler 2.4 differential oracle (endpoint latency & parity)
 
 Single-request (**1 core**) warm loopback HTTP measurements from [benches/titiler_diff_oracle.py](../benches/titiler_diff_oracle.py) against a live TiTiler 2.4 instance on Apple M5 (`10-core CPU`) at commit `2bc38e1` (**39/39 checks passed**, local fixtures, no network):
