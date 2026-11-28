@@ -1359,6 +1359,31 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(arr50, 1)
     out["w50_donut"] = p_w50_donut
 
+    # Wave 51: Big-Endian (MM) int16 Predictor=2 & float32 Predictor=3 COGs (with interior nodata holes)
+    p_w51_be_i16 = synth_dir / "w51_be_i16_p2.tif"
+    i16_51 = (-1000 + xx9.astype(np.int32) * 30 + yy9.astype(np.int32) * 20).astype(np.int16)
+    i16_51[80:110, 60:90] = -32768
+    with rasterio.open(
+        p_w51_be_i16, "w", driver="GTiff", width=128, height=128, count=1, dtype="int16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", predictor=2, nodata=-32768, endianness="BIG",
+    ) as ds:
+        ds.write(i16_51, 1)
+    assert p_w51_be_i16.read_bytes()[:2] == b"MM", "w51_be_i16_p2 must be Big-Endian MM"
+    out["w51_be_i16_p2"] = p_w51_be_i16
+
+    p_w51_be_f32 = synth_dir / "w51_be_f32_p3.tif"
+    f32_51 = (100.5 + xx9 * 2.5 + yy9 * 1.25).astype(np.float32)
+    f32_51[80:110, 60:90] = -9999.0
+    with rasterio.open(
+        p_w51_be_f32, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", predictor=3, nodata=-9999.0, endianness="BIG",
+    ) as ds:
+        ds.write(f32_51, 1)
+    assert p_w51_be_f32.read_bytes()[:2] == b"MM", "w51_be_f32_p3 must be Big-Endian MM"
+    out["w51_be_f32_p3"] = p_w51_be_f32
+
     return out
 
 
@@ -5250,6 +5275,14 @@ def main() -> int:
                 ("PARITY W50 MultiPolygon (2 disjoint) POST /statistics", "POST", f"/cog/statistics?url={q(s['w50_donut'])}", {"type": "Feature", "properties": {}, "geometry": {"type": "MultiPolygon", "coordinates": [[[[-122.46, 37.54], [-122.36, 37.54], [-122.36, 37.64], [-122.46, 37.64], [-122.46, 37.54]]], [[[-122.14, 37.86], [-122.04, 37.86], [-122.04, 37.96], [-122.14, 37.96], [-122.14, 37.86]]]]}}, "post_stats"),
                 ("PARITY W50 MultiPolygon (2 disjoint) POST /feature .npy", "POST", f"/cog/feature/64x64.npy?url={q(s['w50_donut'])}", {"type": "Feature", "properties": {}, "geometry": {"type": "MultiPolygon", "coordinates": [[[[-122.46, 37.54], [-122.36, 37.54], [-122.36, 37.64], [-122.46, 37.64], [-122.46, 37.54]]], [[[-122.14, 37.86], [-122.04, 37.86], [-122.04, 37.96], [-122.14, 37.96], [-122.14, 37.86]]]]}}, "npy"),
                 ("PARITY W50 POST /statistics p=25,75 & histogram_bins=6", "POST", f"/cog/statistics?url={q(s['w50_donut'])}&p=25&p=75&histogram_bins=6", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.05, 37.95], [-122.45, 37.95], [-122.45, 37.55]], [[-122.33, 37.67], [-122.33, 37.83], [-122.17, 37.83], [-122.17, 37.67], [-122.33, 37.67]]]}}, "post_stats"),
+                # --- Wave 51: Big-Endian (MM) Predictor=2/3, all_touched=true exact coverage, per-band rescale + color_formula on /bbox & /feature ---
+                ("PARITY W51 Big-Endian int16 Predictor=2 + hole .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w51_be_i16_p2'])}", None, "npy"),
+                ("PARITY W51 Big-Endian int16 Predictor=2 /statistics", "GET", f"/cog/statistics?url={q(s['w51_be_i16_p2'])}", None, "stats"),
+                ("PARITY W51 Big-Endian float32 Predictor=3 + hole .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w51_be_f32_p3'])}", None, "npy"),
+                ("PARITY W51 Big-Endian float32 Predictor=3 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w51_be_f32_p3'])}", None, "point"),
+                ("PARITY W51 POST /statistics all_touched=true", "POST", f"/cog/statistics?url={q(s['w51_be_f32_p3'])}&all_touched=true", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.40, 37.60], [-122.10, 37.60], [-122.10, 37.90], [-122.40, 37.90], [-122.40, 37.60]]]}}, "post_stats"),
+                ("PARITY W51 GET /bbox per-band rescale + color_formula .png", "GET", f"/cog/bbox/-122.4,37.6,-122.1,37.9/64x64.png?url={q(s['w43_rgb_nodata'])}&rescale=0,200&rescale=0,220&rescale=0,240&color_formula={qe('Gamma RGB 1.4 Saturation 1.2')}", None, "png"),
+                ("PARITY W51 POST /feature per-band rescale + color_formula .png", "POST", f"/cog/feature/64x64.png?url={q(s['w43_rgb_nodata'])}&rescale=0,200&rescale=0,220&rescale=0,240&color_formula={qe('Gamma RGB 1.4 Saturation 1.2')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.40, 37.60], [-122.10, 37.60], [-122.10, 37.90], [-122.40, 37.90], [-122.40, 37.60]]]}}, "png"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
