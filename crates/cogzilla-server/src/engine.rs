@@ -683,6 +683,11 @@ impl TileEngine {
                 .await;
             }
         }
+        let has_alpha_channel = {
+            let full = cog.index.full_res();
+            cogzilla_codec::alpha_channel_index(full.samples_per_pixel as usize, &full.extra_samples)
+                .is_some()
+        };
         if req.format == OutputFormat::Npy {
             let mut raw_req = req.clone();
             raw_req.format = OutputFormat::RawF32;
@@ -695,6 +700,15 @@ impl TileEngine {
                     )));
                 }
             };
+            let continuous_alpha = if has_alpha_channel {
+                match req.tile_size {
+                    256 => Box::pin(self.sample_continuous_alpha_tile::<256>(cog, req)).await?,
+                    512 => Box::pin(self.sample_continuous_alpha_tile::<512>(cog, req)).await?,
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let nb = match req.bands {
                 BandRequest::Rgb { .. }
                 | BandRequest::SarRgb { .. }
@@ -704,13 +718,49 @@ impl TileEngine {
                 BandRequest::CustomExprMulti { ref progs } => progs.len().max(1),
                 _ => 1,
             };
-            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+            return Ok(cogzilla_kernel::wrap_raw_f32_as_npy_with_alpha_mask(
                 raw,
                 nb,
                 req.tile_size,
                 req.tile_size,
+                continuous_alpha.as_deref(),
                 true,
             ));
+        }
+        if has_alpha_channel
+            && matches!(
+                req.format,
+                OutputFormat::Png | OutputFormat::Webp { .. } | OutputFormat::RawRgba
+            )
+        {
+            let continuous_alpha = match req.tile_size {
+                256 => Box::pin(self.sample_continuous_alpha_tile::<256>(cog, req)).await?,
+                512 => Box::pin(self.sample_continuous_alpha_tile::<512>(cog, req)).await?,
+                other => {
+                    return Err(EngineError::BadRequest(format!(
+                        "unsupported tile_size={other}, expected 256 or 512"
+                    )));
+                }
+            };
+            if let Some(alpha) = continuous_alpha {
+                let mut rgba_req = req.clone();
+                rgba_req.format = OutputFormat::RawRgba;
+                let raw = match rgba_req.tile_size {
+                    256 => Box::pin(self.render_tile_sized::<256>(cog, &rgba_req)).await?,
+                    512 => Box::pin(self.render_tile_sized::<512>(cog, &rgba_req)).await?,
+                    _ => unreachable!(),
+                };
+                let mut rgba = raw.to_vec();
+                cogzilla_kernel::apply_continuous_alpha_to_rgba(&mut rgba, &alpha);
+                let dim = req.tile_size as usize;
+                return Ok(crate::stats::encode_rgba_output(
+                    dim,
+                    dim,
+                    &rgba,
+                    req.format,
+                    true,
+                ));
+            }
         }
         match req.tile_size {
             256 => Box::pin(self.render_tile_sized::<256>(cog, req)).await,
@@ -719,6 +769,87 @@ impl TileEngine {
                 "unsupported tile_size={other}, expected 256 or 512"
             ))),
         }
+    }
+
+    /// Resample an RGBA / Gray+Alpha COG's `ExtraSamples` alpha band onto the tile's
+    /// `CoordPlan` when any intersecting block contains intermediate translucency values
+    /// (`0 < alpha < full_opaque`). Returns `Ok(None)` in O(blocks) for opaque or binary
+    /// `0/255` alpha tiles so they stay on the fast path.
+    async fn sample_continuous_alpha_tile<const N: usize>(
+        &self,
+        cog: &OpenedCog,
+        req: &TileRequest,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let crs = self.get_or_build_crs(cog)?;
+        let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, N as u32);
+        let ifd_idx = cog.index.select_ifd(target_rx, target_ry);
+        let ifd = &cog.index.ifds[ifd_idx];
+        let Some(alpha_idx) =
+            cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples)
+        else {
+            return Ok(None);
+        };
+        let Some(plan) = CoordPlan::<N>::build(
+            &crs,
+            &ifd.crs_to_pixel,
+            ifd.gcp_poly.as_deref(),
+            ifd.width,
+            ifd.height,
+            req.tile,
+        ) else {
+            return Ok(None);
+        };
+        let (tx0, tx1, ty0, ty1) = tile_fetch_range_for_plan(&plan, req.resample, false, ifd);
+        let grid_w = tx1 - tx0 + 1;
+        let grid_h = ty1 - ty0 + 1;
+        let fetch_band = match ifd.planar_config {
+            PlanarConfig::Chunky => 0u16,
+            PlanarConfig::Planar => alpha_idx as u16,
+        };
+        let mut indices = Vec::with_capacity((grid_w * grid_h) as usize);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                indices.push(Some(ifd.tile_index(tx, ty, fetch_band) as u32));
+            }
+        }
+        let tiles = self.store.get_blocks(cog, ifd_idx, &indices).await?;
+        let band_in_decoded = match ifd.planar_config {
+            PlanarConfig::Chunky => alpha_idx,
+            PlanarConfig::Planar => 0,
+        };
+        let block_refs: Vec<Option<&cogzilla_codec::DecodedBand>> = tiles
+            .iter()
+            .map(|opt| opt.as_ref().and_then(|t| t.bands.get(band_in_decoded)))
+            .collect();
+        let full_opaque = cogzilla_kernel::alpha_full_opaque(ifd.sample_type);
+        let alpha_src = BandSource::new(
+            ifd.width,
+            ifd.height,
+            ifd.tile_width,
+            ifd.tile_height,
+            tx0,
+            ty0,
+            grid_w,
+            grid_h,
+            &block_refs,
+        )
+        .with_scale_offset(255.0 / full_opaque, 0.0);
+        if !cogzilla_kernel::has_intermediate_alpha(&alpha_src, full_opaque) {
+            return Ok(None);
+        }
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 255.0,
+            colormap: ColormapName::Grayscale,
+            resample: req.resample,
+            format: OutputFormat::RawF32,
+        };
+        let raw = render_single_band::<N>(&plan, &alpha_src, &style);
+        let mut alpha = Vec::with_capacity(N * N);
+        for chunk in raw.chunks_exact(4) {
+            alpha.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        Ok(Some(alpha))
     }
 
     /// Render a batch of XYZ tiles for a single COG (e.g. a map viewport burst or pyramid
@@ -796,6 +927,14 @@ impl TileEngine {
                 let (target_rx, target_ry) = crs.target_resolution_for_tile(req.tile, req.tile_size);
                 let ifd_idx = cog.index.select_ifd(target_rx, target_ry);
                 let ifd = &cog.index.ifds[ifd_idx];
+                if cogzilla_codec::alpha_channel_index(
+                    ifd.samples_per_pixel as usize,
+                    &ifd.extra_samples,
+                )
+                .is_some()
+                {
+                    continue;
+                }
                 let band0 = band_1based.saturating_sub(1);
                 if band0 >= ifd.samples_per_pixel {
                     continue;

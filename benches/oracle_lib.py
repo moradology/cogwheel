@@ -80,10 +80,15 @@ def compare_images(
         mae = float(np.mean(np.abs(diff)))
         mse = float(np.mean(diff * diff))
         psnr = 99.0 if mse < 1e-9 else 20.0 * math.log10(255.0 / math.sqrt(mse))
+        adiff = im_a[:, :, 3][both] - im_b[:, :, 3][both]
+        amae = float(np.mean(np.abs(adiff)))
+        amse = float(np.mean(adiff * adiff))
+        apsnr = 99.0 if amse < 1e-9 else 20.0 * math.log10(255.0 / math.sqrt(amse))
     else:
-        mae, psnr = 0.0, 99.0
-    ok = mask_pct >= min_mask_pct and psnr >= min_psnr
-    return ok, f"shape={im_a.shape[:2]} mask={mask_pct:.2f}% MAE={mae:.2f} PSNR={psnr:.1f}dB"
+        mae, psnr, amae, apsnr = 0.0, 99.0, 0.0, 99.0
+    ok = mask_pct >= min_mask_pct and psnr >= min_psnr and apsnr >= min_psnr
+    alpha_note = f" aMAE={amae:.2f} aPSNR={apsnr:.1f}dB" if amae > 0.0 else ""
+    return ok, f"shape={im_a.shape[:2]} mask={mask_pct:.2f}% MAE={mae:.2f} PSNR={psnr:.1f}dB{alpha_note}"
 
 
 def compare_arrays(

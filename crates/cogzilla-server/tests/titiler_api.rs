@@ -7113,3 +7113,292 @@ async fn multi_url_cog_point_stacks_bands_and_evaluates_expression() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn rgba_and_gray_alpha_preserve_continuous_alpha_across_png_and_npy() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_cont_alpha_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Minimal PNG RGBA8 / Gray+Alpha8 decoder using libdeflater.
+    let decode_png_alpha = |png: &[u8]| -> (u32, u32, Vec<u8>) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let mut pos = 8usize;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        let mut color_type = 0u8;
+        let mut idat = Vec::new();
+        while pos + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+            let ctype = &png[pos + 4..pos + 8];
+            let data = &png[pos + 8..pos + 8 + len];
+            if ctype == b"IHDR" {
+                w = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                h = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                color_type = data[9];
+            } else if ctype == b"IDAT" {
+                idat.extend_from_slice(data);
+            }
+            pos += 12 + len;
+        }
+        let bpp: usize = match color_type {
+            6 => 4, // RGBA8
+            4 => 2, // Gray+Alpha8
+            other => panic!("expected PNG with alpha channel (color_type 4 or 6), got {other}"),
+        };
+        let stride = (w as usize) * bpp;
+        let mut raw = vec![0u8; (h as usize) * (1 + stride)];
+        let n = libdeflater::Decompressor::new()
+            .zlib_decompress(&idat, &mut raw)
+            .expect("zlib decompress PNG IDAT");
+        assert_eq!(n, raw.len());
+        let mut unfilt = vec![0u8; (h as usize) * stride];
+        for y in 0..h as usize {
+            let filter = raw[y * (1 + stride)];
+            let src = &raw[y * (1 + stride) + 1..(y + 1) * (1 + stride)];
+            for x in 0..stride {
+                let left = if x >= bpp { unfilt[y * stride + x - bpp] } else { 0 };
+                let up = if y > 0 { unfilt[(y - 1) * stride + x] } else { 0 };
+                let up_left = if x >= bpp && y > 0 {
+                    unfilt[(y - 1) * stride + x - bpp]
+                } else {
+                    0
+                };
+                unfilt[y * stride + x] = match filter {
+                    0 => src[x],
+                    1 => src[x].wrapping_add(left),
+                    2 => src[x].wrapping_add(up),
+                    3 => src[x].wrapping_add(((u16::from(left) + u16::from(up)) / 2) as u8),
+                    4 => {
+                        let p = i32::from(left) + i32::from(up) - i32::from(up_left);
+                        let pa = (p - i32::from(left)).abs();
+                        let pb = (p - i32::from(up)).abs();
+                        let pc = (p - i32::from(up_left)).abs();
+                        let pr = if pa <= pb && pa <= pc {
+                            left
+                        } else if pb <= pc {
+                            up
+                        } else {
+                            up_left
+                        };
+                        src[x].wrapping_add(pr)
+                    }
+                    other => panic!("unexpected PNG filter {other}"),
+                };
+            }
+        }
+        let alphas: Vec<u8> = unfilt
+            .chunks_exact(bpp)
+            .map(|px| px[bpp - 1])
+            .collect();
+        (w, h, alphas)
+    };
+
+    // Helper: write a minimal uncompressed EPSG:4326 RGBA (spp=4) or Gray+Alpha (spp=2) GeoTIFF
+    // with ExtraSamples = [2] (UnassociatedAlpha).
+    let write_alpha_geotiff = |path: &std::path::Path, spp: u16, pixels: &[u8]| {
+        let w = 16u32;
+        let h = 16u32;
+        // Covers WebMercator tile (6, 33, 24) around lon [5.625..11.25], lat [36.6..40.98]
+        let bounds = [5.0f64, 36.0, 12.0, 42.0];
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        let num_entries: u16 = 14;
+        let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+        let data_start = 8 + ifd_size;
+        let bps_off = data_start as u32;
+        let bps_bytes = if spp > 2 { (spp as u32) * 2 } else { 0 };
+        let scale_off = bps_off + bps_bytes;
+        let tiepoint_off = scale_off + 24;
+        let geokey_off = tiepoint_off + 48;
+        let pixel_off = geokey_off + 24;
+
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w); // ImageWidth
+        push_entry(&mut buf, 257, 4, 1, h); // ImageLength
+        if spp > 2 {
+            push_entry(&mut buf, 258, 3, spp as u32, bps_off); // BitsPerSample
+        } else {
+            // 2 inline u16 = [8, 8]
+            push_entry(&mut buf, 258, 3, 2, 8u32 | (8u32 << 16));
+        }
+        push_entry(&mut buf, 259, 3, 1, 1); // Compression = None
+        push_entry(&mut buf, 262, 3, 1, if spp == 4 { 2 } else { 1 }); // Photometric RGB / MinIsBlack
+        push_entry(&mut buf, 273, 4, 1, pixel_off); // StripOffsets
+        push_entry(&mut buf, 277, 3, 1, spp as u32); // SamplesPerPixel
+        push_entry(&mut buf, 278, 4, 1, h); // RowsPerStrip
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32); // StripByteCounts
+        push_entry(&mut buf, 284, 3, 1, 1); // PlanarConfiguration = Chunky
+        push_entry(&mut buf, 338, 3, 1, 2); // ExtraSamples = UnassociatedAlpha
+        push_entry(&mut buf, 33550, 12, 3, scale_off); // ModelPixelScaleTag
+        push_entry(&mut buf, 33922, 12, 6, tiepoint_off); // ModelTiepointTag
+        push_entry(&mut buf, 34735, 3, 12, geokey_off); // GeoKeyDirectoryTag
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        if spp > 2 {
+            for _ in 0..spp {
+                buf.extend_from_slice(&8u16.to_le_bytes());
+            }
+        }
+        let sx = (bounds[2] - bounds[0]) / w as f64;
+        let sy = (bounds[3] - bounds[1]) / h as f64;
+        for v in [sx, sy, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.extend_from_slice(pixels);
+        std::fs::write(path, buf).unwrap();
+    };
+
+    // 16x16 RGBA GeoTIFF:
+    // - top half (rows 0..8): alpha = 128 (translucent)
+    // - bottom-left quadrant (rows 8..16, cols 0..8): alpha = 0 (transparent)
+    // - bottom-right quadrant (rows 8..16, cols 8..16): alpha = 255 (opaque)
+    let mut rgba_px = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let a = if y < 8 {
+                128u8
+            } else if x < 8 {
+                0u8
+            } else {
+                255u8
+            };
+            rgba_px.extend_from_slice(&[200u8, 100, 50, a]);
+        }
+    }
+    let rgba_path = tmp.join("translucent_rgba.tif");
+    write_alpha_geotiff(&rgba_path, 4, &rgba_px);
+
+    // 16x16 Gray+Alpha GeoTIFF: constant gray=180, alpha=64.
+    let mut ga_px = Vec::with_capacity(16 * 16 * 2);
+    for _ in 0..(16 * 16) {
+        ga_px.extend_from_slice(&[180u8, 64]);
+    }
+    let ga_path = tmp.join("translucent_ga.tif");
+    write_alpha_geotiff(&ga_path, 2, &ga_px);
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. /cog/tiles/WebMercatorQuad/6/33/24.png (nearest) must preserve alpha=128 (not 255).
+    let r_tile_png = client
+        .get(format!(
+            "{base}/cog/tiles/WebMercatorQuad/6/33/24.png?url={}&resampling=nearest",
+            rgba_path.display()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_tile_png.status(), 200);
+    let tile_png_bytes = r_tile_png.bytes().await.unwrap();
+    let (tw, th, tile_alphas) = decode_png_alpha(&tile_png_bytes);
+    assert_eq!((tw, th), (256, 256));
+    assert!(
+        tile_alphas.contains(&128),
+        "expected continuous alpha=128 in /cog/tiles PNG, unique alphas={:?}",
+        tile_alphas
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(tile_alphas.contains(&0), "expected masked alpha=0 in /cog/tiles PNG");
+    assert!(tile_alphas.contains(&255), "expected opaque alpha=255 in /cog/tiles PNG");
+
+    // 2. /cog/tiles/WebMercatorQuad/6/33/24.npy (nearest) must preserve uint8 mask=128.
+    let r_tile_npy = client
+        .get(format!(
+            "{base}/cog/tiles/WebMercatorQuad/6/33/24.npy?url={}&resampling=nearest",
+            rgba_path.display()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_tile_npy.status(), 200);
+    let npy_bytes = r_tile_npy.bytes().await.unwrap();
+    assert_eq!(&npy_bytes[..8], b"\x93NUMPY\x01\x00");
+    let hdr_len = usize::from(u16::from_le_bytes([npy_bytes[8], npy_bytes[9]]));
+    let hdr = std::str::from_utf8(&npy_bytes[10..10 + hdr_len]).unwrap();
+    assert!(hdr.contains("'|u1'"), "expected uint8 .npy, got {hdr}");
+    let body = &npy_bytes[10 + hdr_len..];
+    assert_eq!(body.len(), 4 * 256 * 256);
+    let mask_plane = &body[3 * 256 * 256..];
+    assert!(mask_plane.contains(&128), "expected mask=128 in /cog/tiles .npy");
+    assert!(mask_plane.contains(&0), "expected mask=0 in /cog/tiles .npy");
+    assert!(mask_plane.contains(&255), "expected mask=255 in /cog/tiles .npy");
+
+    // 3. /cog/preview.png and /cog/preview.npy on RGBA (nearest) preserve alpha=128.
+    let r_prev_png = client
+        .get(format!(
+            "{base}/cog/preview.png?url={}&resampling=nearest",
+            rgba_path.display()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_prev_png.status(), 200);
+    let (_, _, prev_alphas) = decode_png_alpha(&r_prev_png.bytes().await.unwrap());
+    assert!(prev_alphas.contains(&128), "expected alpha=128 in /cog/preview.png");
+    assert!(prev_alphas.contains(&0), "expected alpha=0 in /cog/preview.png");
+    assert!(prev_alphas.contains(&255), "expected alpha=255 in /cog/preview.png");
+
+    // 4. Gray+Alpha /cog/preview.png preserves alpha=64.
+    let r_ga_png = client
+        .get(format!(
+            "{base}/cog/preview.png?url={}&resampling=nearest",
+            ga_path.display()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_ga_png.status(), 200);
+    let (_, _, ga_alphas) = decode_png_alpha(&r_ga_png.bytes().await.unwrap());
+    assert!(
+        ga_alphas.iter().all(|&a| a == 64),
+        "expected all alpha=64 in Gray+Alpha /cog/preview.png, got {:?}",
+        ga_alphas
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+
+    // 5. /cog/statistics still treats alpha=128 as valid (75% valid = 192 / 256 pixels).
+    let r_stats = client
+        .get(format!("{base}/cog/statistics?url={}", rgba_path.display()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_stats.status(), 200);
+    let stats_json: serde_json::Value = serde_json::from_str(&r_stats.text().await.unwrap()).unwrap();
+    assert_eq!(stats_json["b1"]["count"].as_f64().unwrap(), 192.0);
+    assert_eq!(stats_json["b1"]["mean"].as_f64().unwrap(), 200.0);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

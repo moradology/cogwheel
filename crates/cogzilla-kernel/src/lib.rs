@@ -23,9 +23,10 @@ pub use render::{
     kernel_widens, sample_f64_general, sample_f64_kernel_widened, sample_general, sample_general_scaled,
     sample_general_unwidened, sample_kernel_widened, widened_kernel_radius, wrap_raw_f32_as_npy,
     WidenedSampler, separable_axes,
-    wrap_raw_f32_as_npy_with_mask,
+    wrap_raw_f32_as_npy_with_alpha_mask, wrap_raw_f32_as_npy_with_mask,
 };
 pub use source::{
-    BandSource, band_math_blocks, band_math_nan_to_num, band_math_nan_to_num_f64,
-    copy_band_data_rect_to_f32,
+    BandSource, alpha_full_opaque, apply_continuous_alpha_to_rgba, band_math_blocks,
+    band_math_nan_to_num, band_math_nan_to_num_f64, copy_band_data_rect_to_f32,
+    has_intermediate_alpha,
 };
