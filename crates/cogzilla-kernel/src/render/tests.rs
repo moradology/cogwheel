@@ -1,4 +1,4 @@
-//! Unit tests for `cogzilla_kernel::kernel`.
+//! Unit tests for `cogzilla_kernel::render`.
 
 use cogzilla_raster::SampleType;
 

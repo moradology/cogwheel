@@ -4,8 +4,8 @@ pub mod colormap;
 pub mod colormap_catalog;
 pub mod expr_vm;
 pub mod jpeg_fast;
-pub mod kernel;
 pub mod png_fast;
+pub mod render;
 pub mod source;
 pub mod webp_fast;
 
@@ -13,7 +13,7 @@ pub use bandmath::{SpectralExpr, fast_db_from_power};
 pub use color_formula::ColorFormula;
 pub use colormap::{ColormapLut, ColormapName, CustomColormap};
 pub use expr_vm::ExprProgram;
-pub use kernel::{
+pub use render::{
     DemAlgorithm, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle,
     coord_plan_scale, exact_coord_scale, grid_coord_scale, separable_coord_scale, empty_tile_bytes, encode_npy_f32_header, encode_npy_header, encode_npy_typed, encode_npy_typed_f64, f32_npy_shape, is_valid_mask_sample, retype_f32_npy, retype_f32_npy_with, retype_value_with_mask,
     encode_grey_rgba_tile, encode_rgba_tile, encode_terrain_pixel, encode_terrain_rgb,
