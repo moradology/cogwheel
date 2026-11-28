@@ -3,8 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["matplotlib>=3.9", "numpy>=1.26"]
 # ///
-"""Generate reproducible multi-line benchmark scaling charts for docs/benchmarks.md
-and docs/gpu-benchmarks.md.
+"""Generate 3 publication-grade benchmark charts for docs/benchmarks.md and docs/gpu-benchmarks.md.
 
 Run with zero global installs:
     uv run benches/plot_benchmarks.py
@@ -17,124 +16,312 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 
+BG = "#0d1117"
+PANEL = "#131922"
+SPINE = "#30363d"
+GRID = "#21262d"
+TEXT = "#e6edf3"
+TITLE = "#f0f6fc"
+MUTED = "#8b949e"
+
+# Colorblind-safe, high-contrast dark-mode palette
+C_BLUE   = "#58a6ff"   # cogzilla — Threadripper 3960X / RTX 3090 Ti
+C_GREEN  = "#3fb950"   # cogzilla — Apple M5 (CPU / Metal)
+C_AMBER  = "#f0883e"   # TiTiler 2.4 — Threadripper 3960X / CPU baseline
+C_RED    = "#f85149"   # TiTiler 2.4 — Apple M5 / AIMD OFF
+C_PURPLE = "#bc8cff"   # Apple M5 1-core CPU baseline
+C_GRAY   = "#6e7681"   # Neutral baseline
+
 plt.rcParams.update({
-    "figure.facecolor": "#0d1117",
-    "axes.facecolor": "#161b22",
-    "axes.edgecolor": "#30363d",
-    "axes.labelcolor": "#e6edf3",
-    "axes.titlecolor": "#f0f6fc",
-    "xtick.color": "#8b949e",
-    "ytick.color": "#8b949e",
-    "text.color": "#e6edf3",
-    "grid.color": "#21262d",
+    "figure.facecolor": BG,
+    "axes.facecolor": PANEL,
+    "axes.edgecolor": SPINE,
+    "axes.linewidth": 0.9,
+    "axes.labelcolor": TEXT,
+    "axes.titlecolor": TITLE,
+    "axes.titlepad": 10,
+    "xtick.color": MUTED,
+    "ytick.color": MUTED,
+    "xtick.major.size": 4,
+    "ytick.major.size": 4,
+    "xtick.minor.size": 0,
+    "ytick.minor.size": 0,
+    "text.color": TEXT,
+    "grid.color": GRID,
     "grid.linewidth": 0.8,
-    "legend.facecolor": "#161b22",
-    "legend.edgecolor": "#30363d",
+    "legend.facecolor": BG,
+    "legend.edgecolor": SPINE,
     "font.family": "DejaVu Sans",
     "font.size": 10,
-    "axes.titlesize": 12,
+    "axes.titlesize": 11.5,
     "axes.titleweight": "bold",
-    "axes.labelsize": 10.5,
+    "axes.labelsize": 10,
 })
 
-C_RTX = "#58a6ff"    # Blue: RTX 3090 Ti (Vulkan)
-C_M5G = "#3fb950"    # Green: Apple M5 GPU (Metal)
-C_TR  = "#f0883e"    # Orange: Threadripper 3960X CPU (24C/48T)
-C_M5C = "#d2a8ff"    # Purple: Apple M5 CPU (10C)
-C_TT  = "#f85149"    # Red: TiTiler 2.4
-C_MUTED = "#8b949e"
+
+def style_ax(ax: plt.Axes, grid_axis: str = "y") -> None:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, axis=grid_axis, which="major", alpha=0.45)
+    ax.set_axisbelow(True)
 
 
-def render_concurrency_overload() -> None:
-    """Graph 1 (2x2): 512x512 RGB Lanczos3 JPEG throughput + latency (cogzilla vs TiTiler 2.4)
-    and live HTTP AIMD overload goodput + tail latency (3x medians at commit 3787b88)."""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14.5, 9.8), dpi=200)
+def render_titiler_scaling() -> None:
+    """Chart 1 (2x2): Apples-to-apples cogzilla vs TiTiler 2.4 throughput & latency scaling
+    on 256x256 RGB Bilinear PNG (top) and 512x512 RGB Lanczos3 JPEG (bottom).
+    All numbers are 3-run medians at commit 3787b88 with encoded-tile cache disabled."""
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14.2, 9.6), dpi=220)
     fig.suptitle(
-        "Concurrency & Overload Scaling — 512×512 RGB Lanczos3 JPEG (3× Medians, Tile Cache Off)",
-        fontsize=14, fontweight="bold", y=0.985, color="#f0f6fc",
+        "cogzilla vs. TiTiler 2.4 — Throughput & Latency Scaling",
+        fontsize=15, fontweight="bold", y=0.975, color=TITLE,
+    )
+    fig.text(
+        0.5, 0.942,
+        "Same 2048×2048 3-band F32 COG, 726-tile Web Mercator pool, encoded-tile cache OFF, 3-run medians (commit 3787b88)",
+        ha="center", fontsize=9.8, color=MUTED,
     )
 
-    # Top-Left (A): Throughput (req/s) vs Concurrency
-    c_cz = np.array([1, 4, 16, 32, 128, 256])
-    tr_cz_rps = np.array([349, 1381, 5299, 7908, 7934, 8034])
-    m5_cz_rps = np.array([675, 2063, 3321, 3288, 3657, 3712])
+    # Shared legend cleanly placed above the 2x2 grid
+    handles = [
+        Line2D([0], [0], color=C_BLUE,  marker="o", lw=2.5, ms=6.5, label="cogzilla — Threadripper 3960X 24C/48T (185–428 MiB RSS)"),
+        Line2D([0], [0], color=C_GREEN, marker="s", lw=2.5, ms=6.5, label="cogzilla — Apple M5 10C (168–357 MiB RSS)"),
+        Line2D([0], [0], color=C_AMBER, marker="^", lw=2.2, ms=6.5, ls="--", label="TiTiler 2.4 — Threadripper 3960X 1–48w (154–7,021 MiB RSS)"),
+        Line2D([0], [0], color=C_RED,   marker="D", lw=2.2, ms=6.0, ls="--", label="TiTiler 2.4 — Apple M5 1–10w (174–1,543 MiB RSS)"),
+    ]
+    fig.legend(
+        handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.922),
+        ncol=2, frameon=True, fontsize=8.8, handlelength=2.4, columnspacing=1.8,
+    )
 
-    c_tt_tr = np.array([1, 4, 16, 32, 48])
-    tt_tr_rps = np.array([12.9, 44.8, 155.6, 239.9, 269.9])
+    # --- Top row: HTTP 256x256 RGB Bilinear PNG (1..48 cores/workers) ---
+    w_tr = np.array([1, 2, 4, 8, 16, 24, 32, 48])
+    cz_tr_rps = np.array([547.4, 1044.9, 1939.2, 3421.4, 5551.8, 6985.4, 7784.4, 7622.1])
+    cz_tr_p50 = np.array([1.48,  1.60,   1.80,   2.11,   2.67,   3.24,   3.87,   5.31])
 
-    c_tt_m5 = np.array([1, 4, 16, 32])
-    tt_m5_rps = np.array([26.2, 72.7, 99.5, 103.8])
+    w_tt_tr = np.array([1, 2, 4, 8, 16, 24, 48])
+    tt_tr_rps = np.array([45.9,  69.9,  206.5, 267.4, 407.4, 544.5, 951.8])
+    tt_tr_p50 = np.array([19.31, 27.23, 17.77, 26.80, 36.29, 40.35, 36.18])
 
-    ax1.plot(c_cz, tr_cz_rps, "-o", color=C_RTX, lw=2.6, ms=6.5,
-             label="cogzilla — Threadripper 3960X (24C/48T) + RTX 3090 Ti")
-    ax1.plot(c_cz, m5_cz_rps, "-s", color=C_M5G, lw=2.5, ms=6.5,
-             label="cogzilla — Apple M5 (10C CPU + Metal GPU)")
-    ax1.plot(c_tt_tr, tt_tr_rps, "--^", color=C_TR, lw=2.2, ms=6.5,
-             label="TiTiler 2.4 — Threadripper 3960X (48w, 7.7 GiB RSS)")
-    ax1.plot(c_tt_m5, tt_m5_rps, "--D", color=C_TT, lw=2.2, ms=6.0,
-             label="TiTiler 2.4 — Apple M5 (10w, 1.5 GiB RSS)")
+    w_m5 = np.array([1, 2, 4, 8, 10])
+    cz_m5_rps = np.array([1563.0, 2999.7, 4080.3, 5450.3, 7298.0])
+    cz_m5_p50 = np.array([0.56,   0.59,   0.89,   1.22,   1.20])
+    tt_m5_rps = np.array([118.8,  236.4,  245.5,  373.0,  418.6])
+    tt_m5_p50 = np.array([7.69,   18.98,  29.23,  34.85,  50.44])
 
+    # Panel A: 256^2 Throughput
+    ax1.plot(w_tr,    cz_tr_rps, "-o",  color=C_BLUE,  lw=2.5, ms=6)
+    ax1.plot(w_m5,    cz_m5_rps, "-s",  color=C_GREEN, lw=2.5, ms=6)
+    ax1.plot(w_tt_tr, tt_tr_rps, "--^", color=C_AMBER, lw=2.1, ms=6)
+    ax1.plot(w_m5,    tt_m5_rps, "--D", color=C_RED,   lw=2.1, ms=5.5)
     ax1.set_xscale("log", base=2)
     ax1.set_yscale("log")
-    ax1.set_xticks([1, 4, 16, 32, 48, 128, 256])
+    ax1.set_xticks([1, 2, 4, 8, 10, 16, 24, 32, 48])
     ax1.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
-    ax1.set_ylim(8, 22000)
-    ax1.set_xlabel("Concurrent Clients (log₂)")
-    ax1.set_ylabel("Throughput (req/s, log₁₀, higher is better)")
-    ax1.set_title("A. 512² Lanczos3 Throughput: cogzilla vs. TiTiler 2.4")
-    ax1.grid(True, which="both", alpha=0.4)
-    ax1.annotate(
-        "c = 32: 7,908 vs. 240 r/s (33×)\nM5 c = 32: 3,288 vs. 104 r/s (32×)",
-        xy=(32, 7908), xytext=(2.2, 9500),
-        arrowprops=dict(arrowstyle="->", color=C_RTX, lw=1.2),
-        fontsize=8.2, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.32", fc="#0d1117", ec=C_RTX, alpha=0.92),
-    )
-    ax1.legend(loc="lower right", fontsize=7.8, framealpha=0.92)
+    ax1.set_xlim(0.85, 76)
+    ax1.set_ylim(30, 16000)
+    ax1.set_xlabel("Concurrency / TiTiler Worker Processes")
+    ax1.set_ylabel("Throughput (req/s, higher is better)")
+    ax1.set_title("A. 256×256 RGB Bilinear PNG — Throughput")
+    style_ax(ax1, "both")
+    ax1.text(48 * 1.08, 7622, "7,622 r/s\n(8.0×)", color=C_BLUE,  fontsize=8.3, fontweight="bold", va="center")
+    ax1.text(10 * 1.12, 7298, "7,298 r/s (17.4×)",  color=C_GREEN, fontsize=8.3, fontweight="bold", va="bottom")
+    ax1.text(48 * 1.08, 952,  "952 r/s",            color=C_AMBER, fontsize=8.2, va="center")
+    ax1.text(10 * 1.12, 419,  "419 r/s",            color=C_RED,   fontsize=8.2, va="center")
 
-    # Top-Right (B): Latency (p50 solid, p99 dotted) vs Concurrency
-    c_lat = np.array([1, 4, 16, 32])
-    tr_cz_p50 = np.array([2.6, 2.6, 2.7, 4.2])
-    tr_cz_p99 = np.array([8.1, 8.2, 8.7, 12.8])
-    m5_cz_p50 = np.array([1.3, 1.8, 3.1, 3.1])
-    m5_cz_p99 = np.array([3.9, 5.1, 19.7, 56.5])
-    tt_tr_p50 = np.array([89.0, 91.6, 101.1, 129.6])
-    tt_tr_p99 = np.array([126.3, 121.8, 137.1, 194.3])
-    tt_m5_p50 = np.array([42.1, 59.0, 158.2, 309.7])
-    tt_m5_p99 = np.array([53.2, 72.1, 245.0, 415.3])
-
-    ax2.plot(c_lat, tt_m5_p50, "--D", color=C_TT,  lw=2.2, ms=6.0, label="TiTiler 2.4 — Apple M5 10w (p50)")
-    ax2.plot(c_lat, tt_m5_p99, ":",   color=C_TT,  lw=1.3, alpha=0.65)
-    ax2.plot(c_lat, tt_tr_p50, "--^", color=C_TR,  lw=2.2, ms=6.5, label="TiTiler 2.4 — 3960X 48w (p50)")
-    ax2.plot(c_lat, tt_tr_p99, ":",   color=C_TR,  lw=1.3, alpha=0.65)
-    ax2.plot(c_lat, tr_cz_p50, "-o",  color=C_RTX, lw=2.5, ms=6.5, label="cogzilla — 3960X (p50; dotted = p99)")
-    ax2.plot(c_lat, tr_cz_p99, ":",   color=C_RTX, lw=1.5, alpha=0.75)
-    ax2.plot(c_lat, m5_cz_p50, "-s",  color=C_M5G, lw=2.5, ms=6.5, label="cogzilla — Apple M5 (p50; dotted = p99)")
-    ax2.plot(c_lat, m5_cz_p99, ":",   color=C_M5G, lw=1.5, alpha=0.75)
-
+    # Panel B: 256^2 Median Latency
+    ax2.plot(w_tt_tr, tt_tr_p50, "--^", color=C_AMBER, lw=2.1, ms=6)
+    ax2.plot(w_m5,    tt_m5_p50, "--D", color=C_RED,   lw=2.1, ms=5.5)
+    ax2.plot(w_tr,    cz_tr_p50, "-o",  color=C_BLUE,  lw=2.5, ms=6)
+    ax2.plot(w_m5,    cz_m5_p50, "-s",  color=C_GREEN, lw=2.5, ms=6)
     ax2.set_xscale("log", base=2)
     ax2.set_yscale("log")
-    ax2.set_xticks([1, 4, 16, 32])
+    ax2.set_xticks([1, 2, 4, 8, 10, 16, 24, 32, 48])
     ax2.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
-    ax2.set_ylim(0.8, 900)
-    ax2.set_xlabel("Concurrent Clients (log₂)")
-    ax2.set_ylabel("Latency (ms, log₁₀, lower is better)")
-    ax2.set_title("B. 512² Lanczos3 Latency (p50 Solid, p99 Dotted)")
-    ax2.grid(True, which="both", alpha=0.4)
-    ax2.annotate(
-        "c = 32 p50:\ncogzilla: 3.1 ms (M5) · 4.2 ms (3960X)\nTiTiler: 310 ms (M5) · 130 ms (3960X)",
-        xy=(32, 3.1), xytext=(1.3, 10.5),
-        arrowprops=dict(arrowstyle="->", color=C_M5G, lw=1.2),
-        fontsize=8.0, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.32", fc="#0d1117", ec=C_M5G, alpha=0.92),
-    )
-    ax2.legend(loc="upper left", fontsize=7.8, framealpha=0.92)
+    ax2.set_xlim(0.85, 76)
+    ax2.set_ylim(0.35, 95)
+    ax2.set_xlabel("Concurrency / TiTiler Worker Processes")
+    ax2.set_ylabel("Median Latency p50 (ms, lower is better)")
+    ax2.set_title("B. 256×256 RGB Bilinear PNG — Median Latency")
+    style_ax(ax2, "both")
+    ax2.text(10 * 1.12, 50.4, "50.4 ms",            color=C_RED,   fontsize=8.2, va="center")
+    ax2.text(48 * 1.08, 36.2, "36.2 ms",            color=C_AMBER, fontsize=8.2, va="center")
+    ax2.text(48 * 1.08, 5.31, "5.3 ms\n(6.8×)",     color=C_BLUE,  fontsize=8.3, fontweight="bold", va="center")
+    ax2.text(10 * 1.12, 1.20, "1.2 ms (42× lower)", color=C_GREEN, fontsize=8.3, fontweight="bold", va="center")
 
-    # Bottom-Left (C): Live HTTP AIMD Overload — 200 OK Goodput (req/s)
+    # --- Bottom row: 512x512 RGB Lanczos3 JPEG (c = 1, 4, 16, 32 — single harness, zero mixing) ---
+    c4 = np.array([1, 4, 16, 32])
+    tr_512_rps = np.array([349, 1381, 5299, 7908])
+    m5_512_rps = np.array([675, 2063, 3321, 3288])
+    tt_tr_512_rps = np.array([12.9, 44.8, 155.6, 239.9])
+    tt_m5_512_rps = np.array([26.2, 72.7, 99.5,  103.8])
+
+    tr_512_p50 = np.array([2.6, 2.6, 2.7, 4.2])
+    tr_512_p99 = np.array([8.1, 8.2, 8.7, 12.8])
+    m5_512_p50 = np.array([1.3, 1.8, 3.1, 3.1])
+    m5_512_p99 = np.array([3.9, 5.1, 19.7, 56.5])
+    tt_tr_512_p50 = np.array([89.0, 91.6, 101.1, 129.6])
+    tt_tr_512_p99 = np.array([126.3, 121.8, 137.1, 194.3])
+    tt_m5_512_p50 = np.array([42.1, 59.0, 158.2, 309.7])
+    tt_m5_512_p99 = np.array([53.2, 72.1, 245.0, 415.3])
+
+    # Panel C: 512^2 Lanczos3 Throughput
+    ax3.plot(c4, tr_512_rps,    "-o",  color=C_BLUE,  lw=2.5, ms=6.5)
+    ax3.plot(c4, m5_512_rps,    "-s",  color=C_GREEN, lw=2.5, ms=6.5)
+    ax3.plot(c4, tt_tr_512_rps, "--^", color=C_AMBER, lw=2.1, ms=6.5)
+    ax3.plot(c4, tt_m5_512_rps, "--D", color=C_RED,   lw=2.1, ms=6.0)
+    ax3.set_xscale("log", base=2)
+    ax3.set_yscale("log")
+    ax3.set_xticks([1, 4, 16, 32])
+    ax3.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
+    ax3.set_xlim(0.85, 58)
+    ax3.set_ylim(8, 18000)
+    ax3.set_xlabel("Concurrent Clients (1 = single core)")
+    ax3.set_ylabel("Throughput (req/s, higher is better)")
+    ax3.set_title("C. 512×512 RGB Lanczos3 JPEG — Throughput")
+    style_ax(ax3, "both")
+    ax3.text(32 * 1.08, 7908, "7,908 r/s\n(33×)", color=C_BLUE,  fontsize=8.3, fontweight="bold", va="center")
+    ax3.text(32 * 1.08, 3288, "3,288 r/s\n(32×)", color=C_GREEN, fontsize=8.3, fontweight="bold", va="center")
+    ax3.text(32 * 1.08, 240,  "240 r/s",          color=C_AMBER, fontsize=8.2, va="center")
+    ax3.text(32 * 1.08, 104,  "104 r/s",          color=C_RED,   fontsize=8.2, va="center")
+
+    # Panel D: 512^2 Lanczos3 Latency (p50 solid + shaded p50->p99 band)
+    for x, p50, p99, col, sty, mk in [
+        (c4, tt_m5_512_p50, tt_m5_512_p99, C_RED,   "--", "D"),
+        (c4, tt_tr_512_p50, tt_tr_512_p99, C_AMBER, "--", "^"),
+        (c4, tr_512_p50,    tr_512_p99,    C_BLUE,  "-",  "o"),
+        (c4, m5_512_p50,    m5_512_p99,    C_GREEN, "-",  "s"),
+    ]:
+        ax4.fill_between(x, p50, p99, color=col, alpha=0.14)
+        ax4.plot(x, p50, linestyle=sty, marker=mk, color=col, lw=2.4 if sty == "-" else 2.1, ms=6)
+    ax4.set_xscale("log", base=2)
+    ax4.set_yscale("log")
+    ax4.set_xticks([1, 4, 16, 32])
+    ax4.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
+    ax4.set_xlim(0.85, 58)
+    ax4.set_ylim(0.8, 700)
+    ax4.set_xlabel("Concurrent Clients (1 = single core)")
+    ax4.set_ylabel("Latency (ms, lower is better)")
+    ax4.set_title("D. 512×512 RGB Lanczos3 JPEG — Latency (p50 Line, p99 Shaded)")
+    style_ax(ax4, "both")
+    ax4.text(32 * 1.08, 310, "310 ms",         color=C_RED,   fontsize=8.2, va="center")
+    ax4.text(32 * 1.08, 130, "130 ms",         color=C_AMBER, fontsize=8.2, va="center")
+    ax4.text(32 * 1.08, 4.7, "4.2 ms",         color=C_BLUE,  fontsize=8.3, fontweight="bold", va="bottom")
+    ax4.text(32 * 1.08, 2.7, "3.1 ms (100×)",  color=C_GREEN, fontsize=8.3, fontweight="bold", va="top")
+
+    fig.text(
+        0.5, 0.012,
+        "TiTiler 2.4 uses uvicorn + uvloop (10w on M5 = 1.5 GiB RSS; 48w on 3960X = 7.0–7.7 GiB RSS). "
+        "cogzilla uses a single process (168–428 MiB RSS — up to 16.4× less RAM).",
+        ha="center", fontsize=8.6, color=MUTED,
+    )
+    fig.tight_layout(rect=[0, 0.032, 1, 0.855])
+    fig.savefig(ASSETS / "bench-concurrency-overload.png", dpi=220)
+    plt.close(fig)
+
+
+def render_gpu_and_overload() -> None:
+    """Chart 2 (2x2): GPU acceleration (horizontal dumbbell for heavy endpoints + p50 soak
+    comparison) and live HTTP AIMD overload protection (goodput preserved + tail latency)."""
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14.4, 9.8), dpi=220)
+    fig.suptitle(
+        "GPU Acceleration (wgpu Metal & Vulkan) & Live HTTP AIMD Overload Protection",
+        fontsize=15, fontweight="bold", y=0.978, color=TITLE,
+    )
+    fig.text(
+        0.5, 0.946,
+        "Heavy single-request GPU endpoints (1-core CPU vs. GPU), sustained soak p50 latency, and 128–256c HTTP overload (3-run medians at 3787b88)",
+        ha="center", fontsize=9.6, color=MUTED,
+    )
+
+    # --- Panel A (Top-Left): Horizontal Dumbbell — Heavy Single-Request Endpoints ---
+    # Sorted by RTX 3090 Ti latency; excludes pre-PR#571 4096^2 RGB Lanczos3 baseline.
+    endpoints = [
+        "4096² UTM→WGS84\nGrid2D Stats",
+        "2048² 4-Band F32\n/cog/statistics",
+        "4096² Polygon\nMasked Stats",
+        "2048²×12 Median\nMosaic → JPEG",
+        "2048² Exact\n4-Band Zonal",
+    ]
+    rtx_ms    = np.array([1.33, 1.37, 4.36, 31.12, 36.29])
+    tr_cpu_ms = np.array([934.3, 581.6, 372.8, 239.6, 341.1])
+    m5g_ms    = np.array([8.93, 5.28, 7.64, 33.12, 17.66])
+    m5_cpu_ms = np.array([379.5, 251.9, 180.3, 145.7, 102.4])
+
+    y = np.arange(len(endpoints))
+    dy = 0.17
+
+    for i in range(len(endpoints)):
+        # Top track: 3960X CPU -> RTX 3090 Ti
+        ax1.plot([rtx_ms[i], tr_cpu_ms[i]], [y[i] - dy, y[i] - dy], color=C_BLUE, lw=2.2, alpha=0.75)
+        # Bottom track: M5 CPU -> M5 Metal
+        ax1.plot([m5g_ms[i], m5_cpu_ms[i]], [y[i] + dy, y[i] + dy], color=C_GREEN, lw=2.2, alpha=0.75)
+
+    ax1.scatter(tr_cpu_ms, y - dy, color=C_AMBER,  s=52, zorder=4, marker="^", label="3960X CPU (1 core)")
+    ax1.scatter(rtx_ms,    y - dy, color=C_BLUE,   s=58, zorder=5, marker="o", label="RTX 3090 Ti (Vulkan)")
+    ax1.scatter(m5_cpu_ms, y + dy, color=C_PURPLE, s=48, zorder=4, marker="D", label="Apple M5 CPU (1 core)")
+    ax1.scatter(m5g_ms,    y + dy, color=C_GREEN,  s=56, zorder=5, marker="s", label="Apple M5 GPU (Metal)")
+
+    for i in range(len(endpoints)):
+        sp_rtx = tr_cpu_ms[i] / rtx_ms[i]
+        sp_m5  = m5_cpu_ms[i] / m5g_ms[i]
+        mid_rtx = np.sqrt(rtx_ms[i] * tr_cpu_ms[i])
+        mid_m5  = np.sqrt(m5g_ms[i] * m5_cpu_ms[i])
+        lbl_rtx = f"{sp_rtx:.0f}×" if sp_rtx >= 10 else f"{sp_rtx:.1f}×"
+        lbl_m5  = f"{sp_m5:.0f}×" if sp_m5 >= 10 else f"{sp_m5:.1f}×"
+        ax1.text(mid_rtx, y[i] - dy - 0.08, lbl_rtx, ha="center", va="bottom",
+                 fontsize=7.8, color="#79c0ff", fontweight="bold")
+        ax1.text(mid_m5,  y[i] + dy + 0.09, lbl_m5,  ha="center", va="top",
+                 fontsize=7.6, color="#7ee787", fontweight="bold")
+
+    ax1.set_xscale("log")
+    ax1.set_xlim(0.7, 2200)
+    ax1.set_ylim(4.65, -0.55)
+    ax1.set_yticks(y)
+    ax1.set_yticklabels(endpoints, fontsize=8.5)
+    ax1.set_xlabel("Single-Request Latency (ms, log₁₀, lower is better)")
+    ax1.set_title("A. Heavy Endpoints: 1-Core CPU → GPU Speedup")
+    style_ax(ax1, "x")
+    ax1.legend(loc="lower left", fontsize=7.6, ncol=1, framealpha=0.92)
+
+    # --- Panel B (Top-Right): Sustained Soak p50 Latency ONLY (consistent metric!) ---
+    soak_cases = [
+        "Apple M5\nHeavy 2048²\n(under 12c load)",
+        "3960X + 3090 Ti\nHeavy 2048²\n(under 12c load)",
+        "3960X + 3090 Ti\nMixed Flood\n(32c, 0ms think)",
+        "3960X + 3090 Ti\nPan & Zoom\n(16c mixed)",
+    ]
+    soak_cpu_p50 = [120.2, 237.7, 3.0, 2.8]
+    soak_gpu_p50 = [34.6,  46.4,  2.5, 2.3]
+    soak_gpu_rps = ["56 vs 11 r/s", "45 vs 7 r/s", "11,197 vs 8,400", "2,560 vs 2,215"]
+
+    xb = np.arange(len(soak_cases))
+    wb = 0.34
+    ax2.bar(xb - wb / 2, soak_cpu_p50, width=wb, color=C_AMBER, alpha=0.88, label="CPU-Only (all cores) — p50")
+    ax2.bar(xb + wb / 2, soak_gpu_p50, width=wb, color=C_BLUE,  alpha=0.92, label="GPU auto (coalesced) — p50")
+    ax2.set_yscale("log")
+    ax2.set_ylim(1, 700)
+    ax2.set_xticks(xb)
+    ax2.set_xticklabels(soak_cases, fontsize=8.3)
+    ax2.set_ylabel("Median Latency p50 (ms, log₁₀, lower is better)")
+    ax2.set_title("B. Sustained Map-Server Soak — Median Latency (p50)")
+    style_ax(ax2, "y")
+
+    for i in range(len(soak_cases)):
+        ax2.text(xb[i] - wb / 2, soak_cpu_p50[i] * 1.12, f"{soak_cpu_p50[i]:.1f}ms",
+                 ha="center", va="bottom", fontsize=8.0, color="#ffa657")
+        gain = soak_cpu_p50[i] / soak_gpu_p50[i]
+        ax2.text(xb[i] + wb / 2, soak_gpu_p50[i] * 1.12, f"{soak_gpu_p50[i]:.1f}ms\n({gain:.1f}×)",
+                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
+        ax2.text(xb[i], 1.25, soak_gpu_rps[i], ha="center", va="bottom",
+                 fontsize=7.4, color=MUTED, bbox=dict(boxstyle="round,pad=0.18", fc=BG, ec=SPINE, alpha=0.9))
+    ax2.legend(loc="upper right", fontsize=8.2, framealpha=0.92)
+
+    # --- Panel C (Bottom-Left): Live HTTP AIMD Overload — 200 OK Goodput Preserved ---
     hosts = [
         "Apple M5\nCPU (10C)\n128 clients",
         "Apple M5\nGPU auto\n256 clients",
@@ -144,403 +331,161 @@ def render_concurrency_overload() -> None:
     goodput_off = [3657.4, 3711.8, 7934.2, 8034.0]
     goodput_on  = [3619.2, 3508.0, 7834.3, 7675.1]
 
-    x = np.arange(len(hosts))
-    w = 0.34
-    ax3.bar(x - w / 2, goodput_off, width=w, color="#8b949e", alpha=0.82, label="AIMD OFF — 200 OK Goodput")
-    ax3.bar(x + w / 2, goodput_on,  width=w, color=C_M5G,     alpha=0.92, label="AIMD ON — 200 OK Goodput")
-
+    xh = np.arange(len(hosts))
+    ax3.bar(xh - wb / 2, goodput_off, width=wb, color=C_GRAY,  alpha=0.85, label="AIMD OFF — 200 OK Goodput")
+    ax3.bar(xh + wb / 2, goodput_on,  width=wb, color=C_GREEN, alpha=0.92, label="AIMD ON — 200 OK Goodput")
     ax3.set_ylim(0, 10200)
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(hosts, fontsize=8.6)
+    ax3.set_xticks(xh)
+    ax3.set_xticklabels(hosts, fontsize=8.5)
     ax3.set_ylabel("Goodput (200 OK req/s, higher is better)")
-    ax3.set_title("C. Overload Goodput Preserved: AIMD ON vs. OFF")
-    ax3.grid(True, axis="y", alpha=0.4)
+    ax3.set_title("C. Live HTTP Overload — Goodput Preserved (95–99%)")
+    style_ax(ax3, "y")
 
     for i in range(len(hosts)):
         pct = 100.0 * goodput_on[i] / goodput_off[i]
-        ax3.text(x[i] - w / 2, goodput_off[i] + 150, f"{goodput_off[i]:,.0f}",
+        ax3.text(xh[i] - wb / 2, goodput_off[i] + 160, f"{goodput_off[i]:,.0f}",
                  ha="center", va="bottom", fontsize=8.0, color="#c9d1d9")
-        ax3.text(x[i] + w / 2, goodput_on[i] + 150, f"{goodput_on[i]:,.0f}\n({pct:.0f}%)",
+        ax3.text(xh[i] + wb / 2, goodput_on[i] + 160, f"{goodput_on[i]:,.0f}\n({pct:.0f}%)",
                  ha="center", va="bottom", fontsize=8.0, color="#7ee787", fontweight="bold")
     ax3.legend(loc="upper left", fontsize=8.2, framealpha=0.92)
 
-    # Bottom-Right (D): Live HTTP AIMD Overload — Latency (p99 OFF vs p99 ON vs p50 ON)
+    # --- Panel D (Bottom-Right): Live HTTP AIMD Overload — Latency (zero box over bars!) ---
     p99_off = [290.3, 448.9, 33.4, 69.9]
     p99_on  = [97.5,  181.0, 33.8, 56.8]
     p50_on  = [5.5,   10.5,  17.4, 26.9]
 
-    w2 = 0.27
-    ax4.bar(x - w2, p99_off, width=w2, color="#f85149", alpha=0.85, label="AIMD OFF — 200 OK p99")
-    ax4.bar(x,      p99_on,  width=w2, color="#58a6ff", alpha=0.92, label="AIMD ON — 200 OK p99")
-    ax4.bar(x + w2, p50_on,  width=w2, color="#3fb950", alpha=0.92, label="AIMD ON — 200 OK p50")
+    w3 = 0.26
+    ax4.bar(xh - w3, p99_off, width=w3, color=C_RED,   alpha=0.85, label="AIMD OFF — 200 OK p99")
+    ax4.bar(xh,      p99_on,  width=w3, color=C_BLUE,  alpha=0.92, label="AIMD ON — 200 OK p99")
+    ax4.bar(xh + w3, p50_on,  width=w3, color=C_GREEN, alpha=0.92, label="AIMD ON — 200 OK p50")
+    ax4.axhline(100.0, color=MUTED, ls=":", lw=1.1, alpha=0.7)
+    ax4.text(2.42, 110, "100 ms target", ha="center", va="bottom", fontsize=7.6, color=MUTED)
 
     ax4.set_yscale("log")
-    ax4.set_ylim(2, 1400)
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(hosts, fontsize=8.6)
+    ax4.set_ylim(2, 1300)
+    ax4.set_xticks(xh)
+    ax4.set_xticklabels(hosts, fontsize=8.5)
     ax4.set_ylabel("Latency (ms, log₁₀, lower is better)")
-    ax4.set_title("D. Overload Tail Latency: AIMD ON vs. OFF (target = 100 ms)")
-    ax4.grid(True, axis="y", which="both", alpha=0.4)
+    ax4.set_title("D. Live HTTP Overload — Tail (p99) & Median (p50) Latency")
+    style_ax(ax4, "y")
 
     for i in range(len(hosts)):
         gain = p99_off[i] / p99_on[i]
         lbl = f"{p99_on[i]:.0f}ms\n({gain:.1f}×)" if gain >= 1.15 else f"{p99_on[i]:.0f}ms"
-        ax4.text(x[i], p99_on[i] * 1.14, lbl,
+        ax4.text(xh[i], p99_on[i] * 1.14, lbl,
                  ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
-        ax4.text(x[i] - w2, p99_off[i] * 1.08, f"{p99_off[i]:.0f}ms",
+        ax4.text(xh[i] - w3, p99_off[i] * 1.09, f"{p99_off[i]:.0f}ms",
                  ha="center", va="bottom", fontsize=7.8, color="#ffa198")
-        ax4.text(x[i] + w2, p50_on[i] * 1.10, f"{p50_on[i]:.1f}ms",
+        ax4.text(xh[i] + w3, p50_on[i] * 1.10, f"{p50_on[i]:.1f}ms",
                  ha="center", va="bottom", fontsize=7.8, color="#7ee787")
-
-    ax4.text(
-        0.5, 0.04,
-        "AIMD 429 shed latency: 0.3–3.4 ms  |  /healthz p99 under overload: 1.9–40.1 ms",
-        transform=ax4.transAxes, ha="center", fontsize=8.1, color="#c9d1d9",
-        bbox=dict(boxstyle="round,pad=0.3", fc="#0d1117", ec="#30363d"),
-    )
     ax4.legend(loc="upper right", fontsize=8.2, framealpha=0.92)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.955])
-    fig.savefig(ASSETS / "bench-concurrency-overload.png", dpi=200)
-    plt.close(fig)
-
-
-def render_workload_contention() -> None:
-    """Graph 2 (2x2): Core/worker scaling (256x256 RGB Bilinear PNG throughput + latency) and
-    live-tile + heavy 2048x2048 contention isolation (throughput + latency, 3x medians at 3787b88)."""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14.5, 9.8), dpi=200)
-    fig.suptitle(
-        "Core / Worker Scaling (256×256 RGB PNG) & Heavy 2048² Contention Isolation (3× Medians)",
-        fontsize=14, fontweight="bold", y=0.985, color="#f0f6fc",
+    fig.text(
+        0.5, 0.012,
+        "AIMD sheds excess overload with HTTP 429 in 0.3–3.4 ms while keeping /healthz p99 at 1.9–40.1 ms. "
+        "All soak & AIMD rows are 3-run medians on 512² Lanczos3 / mixed map traffic (tile cache OFF).",
+        ha="center", fontsize=8.6, color=MUTED,
     )
-
-    # Top-Left (A): HTTP 256x256 RGB Bilinear PNG Throughput (req/s)
-    w_tr = np.array([1, 2, 4, 8, 16, 24, 32, 48])
-    cz_tr_256 = np.array([547.4, 1044.9, 1939.2, 3421.4, 5551.8, 6985.4, 7784.4, 7622.1])
-    w_tt_tr = np.array([1, 2, 4, 8, 16, 24, 48])
-    tt_tr_256 = np.array([45.9, 69.9, 206.5, 267.4, 407.4, 544.5, 951.8])
-    w_m5 = np.array([1, 2, 4, 8, 10])
-    cz_m5_256 = np.array([1563.0, 2999.7, 4080.3, 5450.3, 7298.0])
-    tt_m5_256 = np.array([118.8, 236.4, 245.5, 373.0, 418.6])
-
-    ax1.plot(w_tr, cz_tr_256, "-o", color=C_RTX, lw=2.5, ms=6.5,
-             label="cogzilla — Threadripper 3960X (185–428 MiB RSS)")
-    ax1.plot(w_m5, cz_m5_256, "-s", color=C_M5G, lw=2.5, ms=6.5,
-             label="cogzilla — Apple M5 10C (168–357 MiB RSS)")
-    ax1.plot(w_tt_tr, tt_tr_256, "--^", color=C_TR, lw=2.2, ms=6.5,
-             label="TiTiler 2.4 — Threadripper 3960X (154–7,021 MiB RSS)")
-    ax1.plot(w_m5, tt_m5_256, "--D", color=C_TT, lw=2.2, ms=6.0,
-             label="TiTiler 2.4 — Apple M5 (174–1,543 MiB RSS)")
-
-    ax1.set_xscale("log", base=2)
-    ax1.set_yscale("log")
-    ax1.set_xticks([1, 2, 4, 8, 10, 16, 24, 32, 48])
-    ax1.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
-    ax1.set_ylim(30, 22000)
-    ax1.set_xlabel("Concurrency / TiTiler Worker Processes (log₂)")
-    ax1.set_ylabel("Throughput (req/s, log₁₀, higher is better)")
-    ax1.set_title("A. 256² RGB PNG Throughput Scaling (Tile Cache Off)")
-    ax1.grid(True, which="both", alpha=0.4)
-    ax1.annotate(
-        "M5 10C: 7,298 vs. 419 r/s (17.4×)\n3960X 48w: 7,622 vs. 952 r/s (8.0×)\n16.4× less RAM (428 MiB vs. 7.0 GiB)",
-        xy=(10, 7298), xytext=(1.3, 9200),
-        arrowprops=dict(arrowstyle="->", color=C_M5G, lw=1.2),
-        fontsize=8.0, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.32", fc="#0d1117", ec=C_M5G, alpha=0.92),
-    )
-    ax1.legend(loc="lower right", fontsize=7.7, framealpha=0.92)
-
-    # Top-Right (B): HTTP 256x256 RGB Bilinear PNG Median Latency (p50 ms)
-    cz_tr_p50 = np.array([1.48, 1.60, 1.80, 2.11, 2.67, 3.24, 3.87, 5.31])
-    tt_tr_p50 = np.array([19.31, 27.23, 17.77, 26.80, 36.29, 40.35, 36.18])
-    cz_m5_p50 = np.array([0.56, 0.59, 0.89, 1.22, 1.20])
-    tt_m5_p50 = np.array([7.69, 18.98, 29.23, 34.85, 50.44])
-
-    ax2.plot(w_tt_tr, tt_tr_p50, "--^", color=C_TR,  lw=2.2, ms=6.5, label="TiTiler 2.4 — Threadripper 3960X (p50)")
-    ax2.plot(w_m5,    tt_m5_p50, "--D", color=C_TT,  lw=2.2, ms=6.0, label="TiTiler 2.4 — Apple M5 (p50)")
-    ax2.plot(w_tr,    cz_tr_p50, "-o",  color=C_RTX, lw=2.5, ms=6.5, label="cogzilla — Threadripper 3960X (p50)")
-    ax2.plot(w_m5,    cz_m5_p50, "-s",  color=C_M5G, lw=2.5, ms=6.5, label="cogzilla — Apple M5 10C (p50)")
-
-    ax2.set_xscale("log", base=2)
-    ax2.set_yscale("log")
-    ax2.set_xticks([1, 2, 4, 8, 10, 16, 24, 32, 48])
-    ax2.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
-    ax2.set_ylim(0.35, 110)
-    ax2.set_xlabel("Concurrency / TiTiler Worker Processes (log₂)")
-    ax2.set_ylabel("Median Latency p50 (ms, log₁₀, lower is better)")
-    ax2.set_title("B. 256² RGB PNG Median Latency (p50) Scaling")
-    ax2.grid(True, which="both", alpha=0.4)
-    ax2.annotate(
-        "M5 10C: 1.2 ms vs. 50.4 ms (42× lower)\n3960X 48w: 5.3 ms vs. 36.2 ms (6.8× lower)",
-        xy=(10, 1.20), xytext=(1.3, 4.4),
-        arrowprops=dict(arrowstyle="->", color=C_M5G, lw=1.2),
-        fontsize=8.0, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.32", fc="#0d1117", ec=C_M5G, alpha=0.92),
-    )
-    ax2.legend(loc="upper left", fontsize=7.8, framealpha=0.92)
-
-    # Bottom-Left (C): Contention Isolation — Throughput (req/s)
-    configs = [
-        "Apple M5\nCPU-only (10C)",
-        "Apple M5\nGPU (Metal)",
-        "Threadripper 3960X\nCPU-only (24C/48T)",
-        "RTX 3090 Ti\nGPU (Vulkan)",
-    ]
-    tile_rps  = [1958, 1355, 1828, 2183]
-    heavy_rps = [11,   56,   7,    45]
-
-    x2 = np.arange(len(configs))
-    w = 0.34
-    ax3.bar(x2 - w / 2, tile_rps,  width=w, color=C_RTX, alpha=0.9, label="Live Map Tiles (12c) — req/s")
-    ax3.bar(x2 + w / 2, heavy_rps, width=w, color=C_TR,  alpha=0.9, label="Heavy 2048² Analytics (2c) — req/s")
-
-    ax3.set_yscale("log")
-    ax3.set_ylim(2, 9000)
-    ax3.set_xticks(x2)
-    ax3.set_xticklabels(configs, fontsize=8.5)
-    ax3.set_ylabel("Throughput (req/s, log₁₀, higher is better)")
-    ax3.set_title("C. Contention Isolation Throughput (12 Live + 2× 2048²)")
-    ax3.grid(True, axis="y", which="both", alpha=0.35)
-
-    for i in range(len(configs)):
-        ax3.text(x2[i] - w / 2, tile_rps[i] * 1.12, f"{tile_rps[i]:,} r/s",
-                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
-        gain_lbl = {1: "\n(5.2×)", 3: "\n(6.7×)"}.get(i, "")
-        ax3.text(x2[i] + w / 2, heavy_rps[i] * 1.15, f"{heavy_rps[i]} r/s{gain_lbl}",
-                 ha="center", va="bottom", fontsize=8.0, color="#ffa657", fontweight="bold")
-    ax3.legend(loc="upper right", fontsize=8.2, framealpha=0.92)
-
-    # Bottom-Right (D): Contention Isolation — Latency (ms)
-    tile_p99  = [7.4,   28.5, 9.0,   9.2]
-    heavy_p50 = [120.2, 34.6, 237.7, 46.4]
-
-    ax4.bar(x2 - w / 2, tile_p99,  width=w, color=C_RTX, alpha=0.9, label="Live Map Tiles (12c) — p99 latency")
-    ax4.bar(x2 + w / 2, heavy_p50, width=w, color=C_TR,  alpha=0.9, label="Heavy 2048² Analytics (2c) — p50 latency")
-
-    ax4.set_yscale("log")
-    ax4.set_ylim(2, 1200)
-    ax4.set_xticks(x2)
-    ax4.set_xticklabels(configs, fontsize=8.5)
-    ax4.set_ylabel("Latency (ms, log₁₀, lower is better)")
-    ax4.set_title("D. Contention Isolation Latency (12 Live + 2× 2048²)")
-    ax4.grid(True, axis="y", which="both", alpha=0.35)
-
-    for i in range(len(configs)):
-        ax4.text(x2[i] - w / 2, tile_p99[i] * 1.12, f"{tile_p99[i]:.1f}ms",
-                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
-        lat_lbl = {1: "\n(3.5×)", 3: "\n(5.1×)"}.get(i, "")
-        ax4.text(x2[i] + w / 2, heavy_p50[i] * 1.12, f"{heavy_p50[i]:.0f}ms{lat_lbl}",
-                 ha="center", va="bottom", fontsize=8.0, color="#ffa657", fontweight="bold")
-    ax4.legend(loc="upper right", fontsize=8.2, framealpha=0.92)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.955])
-    fig.savefig(ASSETS / "bench-workload-contention.png", dpi=200)
+    fig.tight_layout(rect=[0, 0.032, 1, 0.928])
+    fig.savefig(ASSETS / "bench-workload-contention.png", dpi=220)
     plt.close(fig)
 
 
 def render_s3_cache_scaling() -> None:
-    """Graph 3: Real S3 COGs compute cost vs decoded block-cache hit rate (cogzilla vs TiTiler)."""
-    fig, ax1 = plt.subplots(figsize=(11.8, 6.2), dpi=200)
+    """Chart 3 (1x2): Real S3 COGs measured cold vs warm CPU cost (left) and controlled
+    HTTP Range origin verification of GDAL/TiTiler caching vs cogzilla (right)."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14.2, 5.8), dpi=220, gridspec_kw={"width_ratios": [1.22, 1.0]})
     fig.suptitle(
-        "Real S3 COGs: Compute Cost vs. Block-Cache Hit Rate (Apple M5, 10 Cores)",
-        fontsize=13.5, fontweight="bold", y=0.98, color="#f0f6fc",
+        "Cloud Storage Caching — Real S3 COGs & Verified GDAL Range-Request Behavior",
+        fontsize=14.5, fontweight="bold", y=0.975, color=TITLE,
+    )
+    fig.text(
+        0.5, 0.925,
+        "Apple M5 (10 cores) — TiTiler tuned with GDAL_CACHEMAX=200, CPL_VSIL_CURL_CACHE_SIZE=200MB, VSI_CACHE=TRUE",
+        ha="center", fontsize=9.4, color=MUTED,
     )
 
-    hit = np.linspace(0.0, 1.0, 21)
-    pct = hit * 100.0
-
-    def blend(miss: float, hot: float) -> np.ndarray:
-        return (1.0 - hit) * miss + hit * hot
-
-    tt_mix  = blend(56.0, 55.3)
-    tt_stac = blend(116.0, 120.0)
-
-    cz_mix  = blend(13.2, 1.7)
-    cz_stac = blend(25.4, 2.8)
-    cz_tci  = blend(14.4, 2.1)
-    cz_3dep = blend(13.7, 1.1)
-    cz_s2   = blend(8.6,  1.6)
-
-    ax1.plot(pct, tt_stac, ":",  color="#ffa198", lw=1.6, alpha=0.85, label="TiTiler — 3-asset STAC RGB (116 → 120 CPU-s)")
-    ax1.plot(pct, tt_mix,  "--", color=C_TT,      lw=2.8,             label="TiTiler — Equal Mix (56.0 → 55.3 CPU-s)")
-
-    ax1.plot(pct, cz_stac, "-s", color=C_TR,      lw=1.9, ms=4.5, markevery=4, label="cogzilla — 3-asset STAC RGB (25.4 → 2.8 CPU-s)")
-    ax1.plot(pct, cz_tci,  "-^", color=C_M5C,     lw=1.8, ms=4.5, markevery=4, label="cogzilla — Sentinel-2 TCI JPEG (14.4 → 2.1 CPU-s)")
-    ax1.plot(pct, cz_3dep, "-D", color="#39d353", lw=1.8, ms=4.2, markevery=4, label="cogzilla — USGS 3DEP LZW DEM (13.7 → 1.1 CPU-s)")
-    ax1.plot(pct, cz_s2,   "-v", color="#79c0ff", lw=1.8, ms=4.5, markevery=4, label="cogzilla — Sentinel-2 B08 Viridis (8.6 → 1.6 CPU-s)")
-    ax1.plot(pct, cz_mix,  "-o", color=C_RTX,     lw=3.0, ms=6.0, markevery=4, label="cogzilla — Equal Mix (13.2 → 1.7 CPU-s)")
-
-    ax1.fill_between(pct, cz_mix, tt_mix, color=C_RTX, alpha=0.10)
-
-    ax1.set_yscale("log")
-    ax1.set_ylim(0.7, 200)
-    ax1.set_xlim(-2, 102)
-    ax1.set_xlabel("Decoded Block-Cache Hit Rate (%)   [0% = Cold CDN Origin  →  100% = Warm Working Set]")
-    ax1.set_ylabel("CPU-Seconds per 1,000 Tiles (log₁₀, lower is better)")
-    ax1.grid(True, which="both", alpha=0.35)
-
-    ax2 = ax1.twinx()
-    ax2.set_yscale("log")
-    ax2.set_ylim(1000.0 / 0.7, 1000.0 / 200.0)
-    ax2.set_ylabel("Max Throughput per 1 Busy Core (tiles/s, higher is better)", color="#8b949e")
-    ax2.yaxis.set_major_formatter(ticker.FuncFormatter(lambda y, _: f"{y:.0f}"))
-
-    ax1.annotate(
-        "4.3× less CPU (0% cache hit / cold CDN origin)\n11 vs 47 c7g.xlarge for 1,000 tiles/s",
-        xy=(0, 13.2), xytext=(10, 26),
-        arrowprops=dict(arrowstyle="->", color=C_RTX, lw=1.4),
-        fontsize=8.6, fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=C_RTX, alpha=0.92),
-    )
-    ax1.annotate(
-        "Why TiTiler stays flat (even with GDAL_CACHEMAX=200 &\nCPL_VSIL_CURL_CACHE_SIZE=200MB): rio-tiler closes the\ndataset per request (flushing GDAL_CACHEMAX/VSI_CACHE)\n& GTiff multi-range reads bypass /vsicurl/ (4.2 origin reqs/tile)",
-        xy=(65, 55.5), xytext=(28, 86),
-        arrowprops=dict(arrowstyle="->", color=C_TT, lw=1.2),
-        fontsize=7.9, color="#ffa198",
-        bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=C_TT, alpha=0.92),
-    )
-    ax1.annotate(
-        "32× less CPU (588 vs 18 tiles/s per core)\n(100% block-cache hit)",
-        xy=(100, 1.7), xytext=(52, 0.9),
-        arrowprops=dict(arrowstyle="->", color=C_M5G, lw=1.4),
-        fontsize=8.6, fontweight="bold", color="#7ee787",
-        bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=C_M5G, alpha=0.92),
-    )
-
-    ax1.legend(
-        loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2,
-        fontsize=8.3, framealpha=0.95,
-    )
-    fig.tight_layout(rect=[0, 0.08, 1, 0.94])
-    fig.savefig(ASSETS / "bench-s3-cache-scaling.png", dpi=200)
-    plt.close(fig)
-
-
-def render_gpu_scaling() -> None:
-    """Graph 4 (2x2): Dedicated GPU acceleration overview — heavy single-request endpoints
-    (1-core CPU vs Metal vs Vulkan latency & speedup) and sustained map-server soak
-    (CPU-only vs GPU auto continuous batching throughput & latency, 3x medians at 3787b88)."""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14.5, 9.8), dpi=200)
-    fig.suptitle(
-        "GPU Acceleration (wgpu Metal & Vulkan) — Heavy Endpoints & Sustained Map-Server Soak",
-        fontsize=14, fontweight="bold", y=0.985, color="#f0f6fc",
-    )
-
+    # --- Panel A (Left): Measured Real S3 COGs Cold Miss vs Warm Cache (Horizontal Grouped Bars) ---
     workloads = [
-        "4096² UTM→WGS84\nGrid2D Stats",
-        "2048² 4-Band\n/cog/statistics",
-        "4096² Polygon\nMasked Stats",
-        "4096² RGB\nLanczos3 JPEG",
-        "2048² Exact\n4-Band Zonal",
-        "2048²×12 Median\nMosaic → JPEG",
+        "Equal Mix\n(5 S3 COGs)",
+        "3-Asset STAC\nRGB Composite",
+        "USGS 3DEP\nLZW DEM",
+        "Sentinel-2\nB08 Viridis",
+        "Sentinel-2\nTCI JPEG",
     ]
-    rtx_ms = np.array([1.33, 1.37, 4.36, 32.26, 36.29, 31.12])
-    m5g_ms = np.array([8.93, 5.28, 7.64, 56.53, 17.66, 33.12])
-    rtx_sp = np.array([702.5, 424.5, 85.5, 405.3, 9.4, 7.7])
-    m5g_sp = np.array([42.5, 47.7, 23.6, 85.7, 5.8, 4.4])
-    tr_cpu_ms = rtx_ms * rtx_sp
-    m5_cpu_ms = m5g_ms * m5g_sp
+    tt_miss = [56.0, 116.0, 66.0, 36.3, 30.8]
+    tt_hot  = [55.3, 120.0, 70.0, 32.8, 26.5]
+    cz_miss = [13.2, 25.4,  13.7, 8.6,  14.4]
+    cz_hot  = [1.7,  2.8,   1.1,  1.6,  2.1]
 
-    # Top-Left (A): Heavy Endpoints Latency (ms, log10)
-    x = np.arange(len(workloads))
-    ax1.plot(x, tr_cpu_ms, "-^", color=C_TR,  lw=2.2, ms=7.0, label="Threadripper 3960X CPU (1 core)")
-    ax1.plot(x, m5_cpu_ms, "-D", color=C_M5C, lw=2.2, ms=6.5, label="Apple M5 CPU (1 core)")
-    ax1.plot(x, m5g_ms,    "-s", color=C_M5G, lw=2.5, ms=7.0, label="Apple M5 GPU (Metal, floor ≈ 1.5 ms)")
-    ax1.plot(x, rtx_ms,    "-o", color=C_RTX, lw=2.5, ms=7.0, label="RTX 3090 Ti (Vulkan, floor ≈ 50 µs)")
+    y = np.arange(len(workloads))
+    h = 0.20
+    ax1.barh(y - 1.5 * h, tt_miss, height=h, color=C_RED,   alpha=0.55, label="TiTiler — Cold Miss (0% cache)")
+    ax1.barh(y - 0.5 * h, tt_hot,  height=h, color=C_RED,   alpha=0.92, label="TiTiler — Repeated Tiles (hot)")
+    ax1.barh(y + 0.5 * h, cz_miss, height=h, color=C_BLUE,  alpha=0.60, label="cogzilla — Cold Miss (0% cache)")
+    ax1.barh(y + 1.5 * h, cz_hot,  height=h, color=C_GREEN, alpha=0.95, label="cogzilla — Cached Blocks (hot)")
 
-    ax1.set_yscale("log")
-    ax1.set_ylim(0.5, 40000)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(workloads, fontsize=8.0)
-    ax1.set_ylabel("Single-Request Latency (ms, log₁₀, lower is better)")
-    ax1.set_title("A. Heavy Endpoints: 1-Core CPU vs. Metal vs. Vulkan")
-    ax1.grid(True, axis="y", which="both", alpha=0.35)
-    ax1.legend(loc="upper right", fontsize=7.9, framealpha=0.92)
+    ax1.set_xscale("log")
+    ax1.set_xlim(0.7, 320)
+    ax1.set_yticks(y)
+    ax1.set_yticklabels(workloads, fontsize=8.8)
+    ax1.invert_yaxis()
+    ax1.set_xlabel("CPU-Seconds per 1,000 Tiles (log₁₀, lower is better)")
+    ax1.set_title("A. Real S3 COGs: Measured Cold Miss vs. Warm Cache")
+    style_ax(ax1, "x")
 
-    # Top-Right (B): Heavy Endpoints GPU Speedup (vs 1-core CPU)
-    w = 0.36
-    ax2.bar(x - w / 2, rtx_sp, width=w, color=C_RTX, alpha=0.92, label="RTX 3090 Ti (Vulkan) vs 1-core 3960X")
-    ax2.bar(x + w / 2, m5g_sp, width=w, color=C_M5G, alpha=0.92, label="Apple M5 (Metal) vs 1-core M5")
-
-    ax2.set_yscale("log")
-    ax2.set_ylim(1, 2200)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(workloads, fontsize=8.0)
-    ax2.set_ylabel("Speedup vs. 1-Core CPU (×, log₁₀, higher is better)")
-    ax2.set_title("B. Heavy Endpoints: GPU Speedup Factor")
-    ax2.grid(True, axis="y", which="both", alpha=0.35)
     for i in range(len(workloads)):
-        ax2.text(x[i] - w / 2, rtx_sp[i] * 1.12, f"{rtx_sp[i]:.0f}×" if rtx_sp[i] >= 10 else f"{rtx_sp[i]:.1f}×",
-                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
-        ax2.text(x[i] + w / 2, m5g_sp[i] * 1.12, f"{m5g_sp[i]:.0f}×" if m5g_sp[i] >= 10 else f"{m5g_sp[i]:.1f}×",
-                 ha="center", va="bottom", fontsize=8.0, color="#7ee787", fontweight="bold")
+        ratio_hot = tt_hot[i] / cz_hot[i]
+        ax1.text(tt_hot[i] * 1.09, y[i] - 0.5 * h, f"{tt_hot[i]:.1f}", va="center", fontsize=7.8, color="#ffa198")
+        ax1.text(cz_miss[i] * 1.09, y[i] + 0.5 * h, f"{cz_miss[i]:.1f}", va="center", fontsize=7.8, color="#79c0ff")
+        ax1.text(cz_hot[i] * 1.12, y[i] + 1.5 * h, f"{cz_hot[i]:.1f} ({ratio_hot:.0f}× less)",
+                 va="center", fontsize=8.0, color="#7ee787", fontweight="bold")
+    ax1.legend(loc="lower right", fontsize=7.8, framealpha=0.92)
+
+    # --- Panel B (Right): Controlled HTTP Range Origin Verification (3.12 MiB DEFLATE COG, c=8) ---
+    cfgs = [
+        "TiTiler 2.4\nMERGE_RANGES=YES\n(docs default)",
+        "TiTiler 2.4\nMERGE_RANGES=NO\n(/vsicurl/ cache)",
+        "cogzilla CPU\n--cache-mb 512\n(tile-cache=0)",
+    ]
+    hot_cpu  = [25.0, 25.9, 0.7]
+    hot_reqs = [4.19, 4.17, 0.007]
+
+    xr = np.arange(len(cfgs))
+    w = 0.34
+    ax2.bar(xr - w / 2, hot_cpu,  width=w, color=C_BLUE,  alpha=0.92, label="Hot CPU-s / 1,000 tiles")
+    ax2.bar(xr + w / 2, hot_reqs, width=w, color=C_AMBER, alpha=0.92, label="Origin HTTP Range Reqs / tile (hot)")
+    ax2.set_yscale("log")
+    ax2.set_ylim(0.004, 110)
+    ax2.set_xticks(xr)
+    ax2.set_xticklabels(cfgs, fontsize=8.4)
+    ax2.set_ylabel("Value (log₁₀, lower is better)")
+    ax2.set_title("B. Counting Origin Proof (3.12 MiB DEFLATE COG)")
+    style_ax(ax2, "y")
+
+    for i in range(len(cfgs)):
+        cpu_lbl = f"{hot_cpu[i]:.1f}\n(36× less)" if i == 2 else f"{hot_cpu[i]:.1f}"
+        req_lbl = f"{hot_reqs[i]:.3f}" if i == 2 else f"{hot_reqs[i]:.2f}"
+        ax2.text(xr[i] - w / 2, hot_cpu[i] * 1.15, cpu_lbl, ha="center", va="bottom",
+                 fontsize=8.2, color="#79c0ff", fontweight="bold")
+        ax2.text(xr[i] + w / 2, hot_reqs[i] * 1.18, f"{req_lbl}\nreqs/tile", ha="center", va="bottom",
+                 fontsize=8.0, color="#ffa657", fontweight="bold")
     ax2.legend(loc="upper right", fontsize=8.0, framealpha=0.92)
 
-    # Bottom-Left (C): Sustained Map-Server Soak Throughput (RTX 3090 Ti vs 3960X 24C/48T, 3x med)
-    soak_lbls = [
-        "Pan & Zoom\n(16c mixed)",
-        "Mixed Tile Flood\n(32c, 0ms think)",
-        "Contention:\nLive Tiles (12c)",
-        "Contention:\nHeavy 2048² (2c)",
-    ]
-    tr_cpu_soak = [2215, 8400, 1828, 7]
-    rtx_soak    = [2560, 11197, 2183, 45]
-    xs = np.arange(len(soak_lbls))
-    ax3.bar(xs - w / 2, tr_cpu_soak, width=w, color=C_TR,  alpha=0.88, label="Threadripper 3960X CPU-only (24C/48T)")
-    ax3.bar(xs + w / 2, rtx_soak,    width=w, color=C_RTX, alpha=0.92, label="RTX 3090 Ti GPU auto (Vulkan coalesced)")
-
-    ax3.set_yscale("log")
-    ax3.set_ylim(2, 35000)
-    ax3.set_xticks(xs)
-    ax3.set_xticklabels(soak_lbls, fontsize=8.5)
-    ax3.set_ylabel("Throughput (req/s, log₁₀, higher is better)")
-    ax3.set_title("C. Sustained Soak Throughput (3960X + RTX 3090 Ti, 3× Medians)")
-    ax3.grid(True, axis="y", which="both", alpha=0.35)
-    for i in range(len(soak_lbls)):
-        ax3.text(xs[i] - w / 2, tr_cpu_soak[i] * 1.12, f"{tr_cpu_soak[i]:,}",
-                 ha="center", va="bottom", fontsize=8.0, color="#ffa657")
-        ratio = rtx_soak[i] / tr_cpu_soak[i]
-        ax3.text(xs[i] + w / 2, rtx_soak[i] * 1.12, f"{rtx_soak[i]:,}\n({ratio:.1f}×)",
-                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
-    ax3.legend(loc="upper right", fontsize=8.0, framealpha=0.92)
-
-    # Bottom-Right (D): Sustained Soak Latency (Heavy 2048^2 p50 & Mixed Flood p99 across both hosts)
-    lat_lbls = [
-        "Apple M5\nMixed Flood\n(p99)",
-        "Apple M5\nHeavy 2048²\n(p50)",
-        "3960X + 3090 Ti\nMixed Flood\n(p50)",
-        "3960X + 3090 Ti\nHeavy 2048²\n(p50)",
-    ]
-    cpu_lat = [58.4, 120.2, 3.0, 237.7]
-    gpu_lat = [31.1, 34.6,  2.5, 46.4]
-    xl = np.arange(len(lat_lbls))
-    ax4.bar(xl - w / 2, cpu_lat, width=w, color=C_TR,  alpha=0.88, label="CPU-Only (all cores)")
-    ax4.bar(xl + w / 2, gpu_lat, width=w, color=C_M5G, alpha=0.92, label="GPU auto (Metal / Vulkan)")
-
-    ax4.set_yscale("log")
-    ax4.set_ylim(1, 600)
-    ax4.set_xticks(xl)
-    ax4.set_xticklabels(lat_lbls, fontsize=8.5)
-    ax4.set_ylabel("Latency (ms, log₁₀, lower is better)")
-    ax4.set_title("D. Sustained Soak Latency: CPU-Only vs. GPU Continuous Batching")
-    ax4.grid(True, axis="y", which="both", alpha=0.35)
-    for i in range(len(lat_lbls)):
-        ax4.text(xl[i] - w / 2, cpu_lat[i] * 1.12, f"{cpu_lat[i]:.1f}ms",
-                 ha="center", va="bottom", fontsize=8.0, color="#ffa657")
-        gain = cpu_lat[i] / gpu_lat[i]
-        ax4.text(xl[i] + w / 2, gpu_lat[i] * 1.12, f"{gpu_lat[i]:.1f}ms\n({gain:.1f}×)",
-                 ha="center", va="bottom", fontsize=8.0, color="#7ee787", fontweight="bold")
-    ax4.legend(loc="upper left", fontsize=8.2, framealpha=0.92)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.955])
-    fig.savefig(ASSETS / "bench-gpu-scaling.png", dpi=200)
+    fig.text(
+        0.5, 0.015,
+        "GDAL caches COG headers (miss→hot drops 36.9→25.0 CPU-s/1k on the 3.12 MiB COG), but rio-tiler closes rasterio.open() per request "
+        "(flushing GDAL_CACHEMAX & per-handle VSI_CACHE) and GTiff multi-range reads bypass /vsicurl/.",
+        ha="center", fontsize=8.3, color=MUTED,
+    )
+    fig.tight_layout(rect=[0, 0.045, 1, 0.895])
+    fig.savefig(ASSETS / "bench-s3-cache-scaling.png", dpi=220)
     plt.close(fig)
 
 
 if __name__ == "__main__":
     ASSETS.mkdir(parents=True, exist_ok=True)
-    render_concurrency_overload()
-    render_workload_contention()
+    render_titiler_scaling()
+    render_gpu_and_overload()
     render_s3_cache_scaling()
-    render_gpu_scaling()
-    print(f"Wrote 4 benchmark charts to {ASSETS}")
+    print(f"Wrote 3 publication-grade benchmark charts to {ASSETS}")

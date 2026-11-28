@@ -29,15 +29,11 @@ All benchmarks in this document were measured on two hardware configurations (no
 ## Performance Scaling Overview
 
 <p align="center">
-  <img src="../assets/bench-gpu-scaling.png" alt="GPU acceleration across heavy single-request endpoints (1-core CPU vs Apple M5 Metal vs RTX 3090 Ti Vulkan) and sustained map-server soak throughput and latency" width="100%" />
+  <img src="../assets/bench-concurrency-overload.png" alt="cogzilla vs TiTiler 2.4 throughput and latency scaling on 256x256 RGB Bilinear PNG and 512x512 RGB Lanczos3 JPEG across Apple M5 and Threadripper 3960X" width="100%" />
 </p>
 
 <p align="center">
-  <img src="../assets/bench-concurrency-overload.png" alt="Apples-to-apples 512x512 RGB Lanczos3 JPEG concurrency scaling (cogzilla vs TiTiler 2.4) and live HTTP AIMD overload tail latency across Apple M5 and Threadripper 3960X + RTX 3090 Ti" width="100%" />
-</p>
-
-<p align="center">
-  <img src="../assets/bench-workload-contention.png" alt="HTTP 256x256 RGB Bilinear PNG core/worker scaling (cogzilla vs TiTiler 2.4) and noisy-neighbor live-tile plus 2048x2048 analytics contention isolation" width="100%" />
+  <img src="../assets/bench-workload-contention.png" alt="GPU acceleration across heavy single-request endpoints (1-core CPU vs Apple M5 Metal vs RTX 3090 Ti Vulkan), sustained soak p50 latency, and live HTTP AIMD overload goodput and latency" width="100%" />
 </p>
 
 *(Reproduce all charts with zero global installs via `uv run benches/plot_benchmarks.py`.)*
