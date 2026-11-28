@@ -178,10 +178,12 @@ impl CrsModel {
         matches!(self.unshifted(), Self::Geographic)
     }
 
-    /// Returns `true` for degree-based CRSes (currently identical to [`Self::is_geographic`]).
+    /// Returns `true` only for unshifted WGS84 degrees, i.e. coordinates that need no datum
+    /// transform to become WGS84 lon/lat. Datum-shifted geographic CRSes (such as NAD27,
+    /// OSGB36, Amersfoort, and CH1903) return `false`.
     #[inline]
-    pub fn is_degree_based(&self) -> bool {
-        self.is_geographic()
+    pub fn is_wgs84_degrees(&self) -> bool {
+        matches!(self, Self::Geographic)
     }
 
     /// Returns `true` for Web Mercator (`EPSG:3857`), including any datum-shifted wrapper.
@@ -940,7 +942,7 @@ impl CrsModel {
     pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
         let w = width as f64;
         let h = height as f64;
-        if matches!(self, Self::Geographic) {
+        if self.is_wgs84_degrees() {
             let mut min_lon = f64::INFINITY;
             let mut min_lat = f64::INFINITY;
             let mut max_lon = f64::NEG_INFINITY;
@@ -1272,7 +1274,7 @@ impl CrsModel {
         let wf = (width.max(1)) as f64;
         let hf = (height.max(1)) as f64;
 
-        let (res, warp_w, warp_h) = if matches!(self, Self::Geographic) {
+        let (res, warp_w, warp_h) = if self.is_wgs84_degrees() {
             let dx = pixel_to_crs.a.hypot(pixel_to_crs.d);
             let dy = pixel_to_crs.b.hypot(pixel_to_crs.e);
             (dx.max(dy).max(1e-8), wf, hf)

@@ -900,7 +900,7 @@ fn build_general_tile_plan<const N: usize>(
     let fh = ifd_h as f32;
 
     let same_3857 = matches!(dst_crs, CrsModel::Epsg3857) && matches!(geo.crs.model, CrsModel::Epsg3857);
-    let same_geo = matches!(dst_crs, CrsModel::Geographic) && matches!(geo.crs.model, CrsModel::Geographic);
+    let same_geo = dst_crs.is_wgs84_degrees() && geo.crs.model.is_wgs84_degrees();
 
     for py in 0..N {
         let dy = max_y - (py as f64 + 0.5) * step_y;
@@ -976,7 +976,7 @@ fn multiscale_downsample_factor(
     let step_y = (tile_bounds[3] - tile_bounds[1]).abs() / denom;
     let same_crs = (matches!(dst_crs, CrsModel::Epsg3857)
         && matches!(base_crs, CrsModel::Epsg3857))
-        || (matches!(dst_crs, CrsModel::Geographic) && matches!(base_crs, CrsModel::Geographic));
+        || (dst_crs.is_wgs84_degrees() && base_crs.is_wgs84_degrees());
     if same_crs {
         return step_x.min(step_y) / base_res;
     }
@@ -995,7 +995,7 @@ fn multiscale_downsample_factor(
         project(cx + step_x, cy),
         project(cx, cy + step_y),
     ) {
-        let is_geo = matches!(base_crs, CrsModel::Geographic);
+        let is_geo = base_crs.is_geographic();
         let wrap_dx = |d: f64| {
             if is_geo && d.abs() > 180.0 {
                 d - 360.0 * d.signum()
@@ -1239,7 +1239,7 @@ async fn render_zarr_rect_bytes(
     let step_x = (max_x - min_x) / (out_w as f64);
     let step_y = (max_y - min_y) / (out_h as f64);
     let same_3857 = matches!(dst_crs, CrsModel::Epsg3857) && matches!(geo.crs.model, CrsModel::Epsg3857);
-    let same_geo = matches!(dst_crs, CrsModel::Geographic) && matches!(geo.crs.model, CrsModel::Geographic);
+    let same_geo = dst_crs.is_wgs84_degrees() && geo.crs.model.is_wgs84_degrees();
 
     let n_px = (out_w as usize) * (out_h as usize);
     let mut u_coords = vec![f32::NAN; n_px];
