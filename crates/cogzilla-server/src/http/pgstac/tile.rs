@@ -652,18 +652,20 @@ pub(super) async fn tile(
                 treq.format = OutputFormat::RawF32;
                 let raw = engine.render_mosaic_scenes_ahead(&scenes, &treq, MOSAIC_SCENES_AHEAD).await?;
                 if raw.len() == bands * dim * dim * 4 {
-                    // Several assets read as bands: the type that holds them all.
-                    let mut kind = full.sample_type;
+                    // Several assets read as bands: resolve through the shared ArrayRule so
+                    // `/searches` makes the same dtype promise as `/cog`, `/stac`, and `/mosaicjson` (#538).
+                    let mut reads = Vec::with_capacity(scenes[0].len());
+                    reads.push(full.sample_type);
                     for uri in scenes[0].iter().skip(1) {
-                        kind = wider_type(kind, engine.store.open_uri(uri).await?.index.full_res().sample_type);
+                        reads.push(engine.store.open_uri(uri).await?.index.full_res().sample_type);
                     }
-                    let kind = if pq.unscale { SampleType::Float32 } else { kind };
-                    // Where the math makes doubles the values are still the renderer's 32-bit
-                    // ones: written as float32, half the bytes of TiTiler's float64 and no less told.
-                    let kind = band_math.map_or(kind, |math| match band_math_type(std::iter::once(math), kind) {
-                        SampleType::Float64 => SampleType::Float32,
-                        other => other,
-                    });
+                    let rule = match band_math {
+                        Some(_) => ArrayRule::Math { unscale: pq.unscale },
+                        None => ArrayRule::Data { unscale: pq.unscale, resampled: false },
+                    };
+                    let kind = rule
+                        .kind(&reads, band_math.map(String::as_str))
+                        .unwrap_or(full.sample_type);
                     let whole = band_math.is_none() && !matches!(kind, SampleType::Float32 | SampleType::Float64);
                     // A whole-number raster's values between pixels are rounded to its type.
                     let read = raw

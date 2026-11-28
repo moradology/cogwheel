@@ -220,7 +220,8 @@ fn round_into(kind: SampleType) -> fn(f64) -> f64 {
     }
 }
 
-/// What decides the type of a `/cog` or `/stac` array, read from the request.
+/// What decides the type of an array across `/cog`, `/stac`, `/mosaicjson`, and `/searches`,
+/// read from the request.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ArrayRule {
     /// The bands as they were read, in the type that holds them all; float32 once unscaled.
@@ -232,6 +233,13 @@ pub(super) enum ArrayRule {
     /// An algorithm's output, typed as TiTiler's algorithm types it: its name, lowercase,
     /// and for `cast` the type asked (`None` when what was asked is not a type).
     Algorithm { name: String, cast: Option<SampleType>, unscale: bool, resampled: bool },
+    /// A `/searches` pixel-selection mosaic fold (`stdev` → float64, `count` → uint8,
+    /// named spectral index → float32, else band math or widened read type).
+    Selection {
+        unscale: bool,
+        selection: super::pixel_selection::Selection,
+        index: bool,
+    },
 }
 
 impl ArrayRule {
@@ -256,36 +264,61 @@ impl ArrayRule {
     /// Whether the rule reads the bands with their scale and offset applied.
     pub(super) fn unscales(&self) -> bool {
         match self {
-            Self::Data { unscale, .. } | Self::Math { unscale } | Self::Algorithm { unscale, .. } => *unscale,
+            Self::Data { unscale, .. }
+            | Self::Math { unscale }
+            | Self::Algorithm { unscale, .. }
+            | Self::Selection { unscale, .. } => *unscale,
         }
     }
 
     /// The type for bands read as `reads`, with `expression` the band math as worked on
     /// (`b1`, `b2`, ... after any asset names are rewritten), several separated by `;`.
     pub(super) fn kind(&self, reads: &[SampleType], expression: Option<&str>) -> Option<SampleType> {
-        let (unscale, math) = match self {
-            Self::Data { unscale, .. } => (*unscale, false),
-            Self::Math { unscale } => (*unscale, true),
-            Self::Algorithm { unscale, .. } => (*unscale, false),
-        };
+        let parts: Option<Vec<String>> =
+            expression.map(|e| e.split(';').map(str::to_string).collect());
+        self.kind_with_exprs(reads, parts.as_ref().map(|p| p.iter()))
+    }
+
+    /// Like [`Self::kind`], taking pre-split expression strings directly (zero extra allocation
+    /// for callers that already hold expression slices or iterators).
+    pub(super) fn kind_with_exprs<'a>(
+        &self,
+        reads: &[SampleType],
+        expressions: Option<impl Iterator<Item = &'a String>>,
+    ) -> Option<SampleType> {
         let first = *reads.first()?;
-        let read = if unscale { SampleType::Float32 } else { reads[1..].iter().fold(first, |a, b| wider_type(a, *b)) };
-        if let Self::Algorithm { name, cast, .. } = self {
-            // Over band math, the algorithm works on the expression's outputs, in their type.
-            let read = match expression {
-                Some(expression) => {
-                    let parts: Vec<String> = expression.split(';').map(str::to_string).collect();
-                    band_math_type(parts.iter(), read)
+        let read = if self.unscales() {
+            SampleType::Float32
+        } else {
+            reads[1..].iter().fold(first, |a, b| wider_type(a, *b))
+        };
+        match self {
+            Self::Data { .. } => Some(read),
+            Self::Math { .. } => Some(band_math_type(expressions?, read)),
+            Self::Algorithm { name, cast, .. } => {
+                // Over band math, the algorithm works on the expression's outputs, in their type.
+                let read = match expressions {
+                    Some(exprs) => band_math_type(exprs, read),
+                    None => read,
+                };
+                algorithm_type(name, *cast, read)
+            }
+            Self::Selection { selection, index, .. } => {
+                use super::pixel_selection::Selection;
+                if matches!(selection, Selection::Stdev) {
+                    Some(SampleType::Float64)
+                } else if matches!(selection, Selection::Count) {
+                    Some(SampleType::Uint8)
+                } else if *index {
+                    Some(SampleType::Float32)
+                } else {
+                    match expressions {
+                        Some(exprs) => Some(band_math_type(exprs, read)),
+                        None => Some(read),
+                    }
                 }
-                None => read,
-            };
-            return algorithm_type(name, *cast, read);
+            }
         }
-        if !math {
-            return Some(read);
-        }
-        let expressions: Vec<String> = expression?.split(';').map(str::to_string).collect();
-        Some(band_math_type(expressions.iter(), read))
     }
 
     /// Staged typing for per-asset band math (`own` per asset in `reads`), stacked via numpy
@@ -548,5 +581,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn selection_and_math_dtype_matrix_is_uniform_across_families() {
+        use super::super::pixel_selection::Selection;
+        use SampleType as T;
+
+        // Every family agrees on int32 / float32 / float64 band-math expressions.
+        for (expr, unscale, expected) in [
+            ("b1+b2", false, T::Int32),
+            ("b1+b2", true, T::Float32),
+            ("b1/b2", false, T::Float64),
+            ("b1/b2", true, T::Float32),
+            ("b1*0.5", false, T::Float64),
+            ("b1*0.5", true, T::Float64),
+        ] {
+            assert_eq!(
+                ArrayRule::Math { unscale }.kind(&[T::Uint16], Some(expr)),
+                Some(expected),
+                "Math ({expr}, unscale={unscale})"
+            );
+            assert_eq!(
+                ArrayRule::Selection {
+                    unscale,
+                    selection: Selection::First,
+                    index: false,
+                }
+                .kind(&[T::Uint16], Some(expr)),
+                Some(expected),
+                "Selection::First ({expr}, unscale={unscale})"
+            );
+        }
+
+        // Selection precedence: Stdev -> Float64, Count -> Uint8, named index -> Float32.
+        assert_eq!(
+            ArrayRule::Selection { unscale: false, selection: Selection::Stdev, index: false }
+                .kind(&[T::Uint16], Some("b1+b2")),
+            Some(T::Float64)
+        );
+        assert_eq!(
+            ArrayRule::Selection { unscale: true, selection: Selection::Count, index: true }
+                .kind(&[T::Float32], Some("b1/b2")),
+            Some(T::Uint8)
+        );
+        assert_eq!(
+            ArrayRule::Selection { unscale: false, selection: Selection::First, index: true }
+                .kind(&[T::Uint16], None),
+            Some(T::Float32)
+        );
+        assert_eq!(
+            ArrayRule::Selection { unscale: false, selection: Selection::First, index: false }
+                .kind(&[T::Uint16], None),
+            Some(T::Uint16)
+        );
+        assert_eq!(
+            ArrayRule::Selection { unscale: true, selection: Selection::First, index: false }
+                .kind(&[T::Uint16], None),
+            Some(T::Float32)
+        );
     }
 }

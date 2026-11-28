@@ -30,7 +30,7 @@ use super::{
     parse_ext_format, parse_y_scale_ext, percent_decode, read_limited_body,
     to_http_response_cached,
 };
-use super::array_type::{band_math_type, wider_type};
+use super::array_type::{ArrayRule, wider_type};
 use super::paint::{Paint, formula_levels, rescale_byte};
 use super::pixel_selection::{Fold, Selected, Selection};
 use super::point_expr::{Kind, Program};
@@ -2607,22 +2607,20 @@ impl PlanesTile {
                 // An array of the values as they are, when nothing was asked that turns
                 // them into a picture's bytes.
                 let shown = !look.rescale.is_empty() || look.mapped || look.custom.is_some() || look.formula.is_some();
-                // The type those values are in.
+                // The type those values are in, resolved through the shared ArrayRule (#538).
                 let kind = || {
-                    let math_of = || self.expression.iter().chain(self.assets.iter().filter_map(|a| a.expression.as_ref()));
-                    // What the bands are before any math: floats once unscaled.
-                    let read = if self.window.unscale() { SampleType::Float32 } else { widest };
-                    if matches!(self.selection, Selection::Stdev) {
-                        SampleType::Float64
-                    } else if matches!(self.selection, Selection::Count) {
-                        SampleType::Uint8
-                    } else if self.index {
-                        SampleType::Float32
-                    } else if !math {
-                        read
-                    } else {
-                        band_math_type(math_of(), read)
+                    let math_of = || {
+                        self.expression
+                            .iter()
+                            .chain(self.assets.iter().filter_map(|a| a.expression.as_ref()))
+                    };
+                    ArrayRule::Selection {
+                        unscale: self.window.unscale(),
+                        selection: self.selection,
+                        index: self.index,
                     }
+                    .kind_with_exprs(&[widest], math.then(math_of))
+                    .unwrap_or(widest)
                 };
                 // A PNG holds 16 bits as well as 8: bands of 16-bit whole numbers, asked for
                 // as a PNG and as they are, are written so, as GDAL writes them for TiTiler.

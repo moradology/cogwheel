@@ -1358,8 +1358,8 @@ fn band_math_output_type(
     read: Option<cogzilla_raster::SampleType>,
 ) -> Option<cogzilla_raster::SampleType> {
     pq.band_math_type.or_else(|| {
-        let read = if pq.unscale { cogzilla_raster::SampleType::Float32 } else { read? };
-        Some(array_type::band_math_type(parts.iter().map(|(_, text)| text), read))
+        array_type::ArrayRule::Math { unscale: pq.unscale }
+            .kind_with_exprs(&[read?], Some(parts.iter().map(|(_, text)| text)))
     })
 }
 
