@@ -7040,3 +7040,76 @@ async fn unsupported_tiff_compression_returns_501_across_cog_stac_and_mosaicjson
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn multi_url_cog_point_stacks_bands_and_evaluates_expression() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_multiurl_pt_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cog1 = tmp.join("b1.tif");
+    let cog2 = tmp.join("b2.tif");
+    let cog_far = tmp.join("far.tif");
+    write_synthetic_u16_2band_4326_geotiff(&cog1, 32, 32, [10.0, 40.0, 11.0, 41.0], 100, 999, None);
+    write_synthetic_u16_2band_4326_geotiff(&cog2, 32, 32, [10.0, 40.0, 11.0, 41.0], 300, 888, None);
+    write_synthetic_u16_2band_4326_geotiff(&cog_far, 32, 32, [20.0, 50.0, 21.0, 51.0], 500, 777, None);
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. Stacked multi-URL /cog/point returns band 1 of each URL as b1, b2
+    let r1 = client
+        .get(format!("{base}/cog/point/10.5,40.5?url={}&url={}", cog1.display(), cog2.display()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let j1: serde_json::Value = serde_json::from_str(&r1.text().await.unwrap()).unwrap();
+    assert_eq!(j1["band_names"], serde_json::json!(["b1", "b2"]));
+    assert_eq!(j1["values"], serde_json::json!([100.0, 300.0]));
+
+    // 2. Multi-URL /cog/point with expression=(b2-b1)/(b2+b1) -> (300-100)/(300+100) = 0.5
+    let r2 = client
+        .get(format!(
+            "{base}/cog/point/10.5,40.5?url={}&url={}&expression=(b2-b1)/(b2%2Bb1)",
+            cog1.display(),
+            cog2.display()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let j2: serde_json::Value = serde_json::from_str(&r2.text().await.unwrap()).unwrap();
+    let v = j2["values"][0].as_f64().unwrap();
+    assert!((v - 0.5).abs() < 1e-6, "expected 0.5, got {v}");
+
+    // 3. Partial OOB (cog1 in-bounds, cog_far out-of-bounds) -> [100.0, null]
+    let r3 = client
+        .get(format!("{base}/cog/point/10.5,40.5?url={}&url={}", cog1.display(), cog_far.display()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), 200);
+    let j3: serde_json::Value = serde_json::from_str(&r3.text().await.unwrap()).unwrap();
+    assert_eq!(j3["values"], serde_json::json!([100.0, null]));
+
+    // 4. All OOB -> 404
+    let r4 = client
+        .get(format!("{base}/cog/point/0.0,0.0?url={}&url={}", cog1.display(), cog2.display()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), 404);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

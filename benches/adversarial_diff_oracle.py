@@ -3282,6 +3282,234 @@ def run_wave29_http_protocol_checks(
     return ran
 
 
+def run_wave30_zarr_codecs_multiurl_rpc_checks(
+    client: httpx.Client,
+    cw_base: str,
+    gpu_base: str | None,
+    tmp_dir: Path,
+    only_filter: str | None,
+    failures: list[dict],
+    gpu_diffs: list[dict],
+) -> int:
+    """Wave 30: Zarr v2 codecs (Gzip, LZ4 numcodecs block, Blosc zlib+byte-shuffle, Blosc zlib+bit-shuffle,
+    Blosc memcpy), multi-URL COG /point & /bbox stacking, and RPC-only / ungeoreferenced TIFF diagnostics."""
+    ran = 0
+
+    def wanted(lb: str) -> bool:
+        return not only_filter or only_filter.lower() in lb.lower()
+
+    def rec(lb: str, ok: bool, detail: str, path: str, method: str = "GET") -> None:
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": lb, "method": method, "path": path, "kind": "w30", "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {lb:54s} | {detail}")
+
+    labels = [
+        "W30 ZARR v2 Gzip /bbox .npy",
+        "W30 ZARR v2 LZ4 raw block /bbox .npy",
+        "W30 ZARR v2 Blosc zlib+byte-shuffle /bbox .npy",
+        "W30 ZARR v2 Blosc zlib+bit-shuffle /bbox .npy",
+        "W30 ZARR v2 Blosc memcpy /bbox .npy",
+        "W30 MULTI-URL /cog/point 2-band stack",
+        "W30 MULTI-URL /cog/point expr (b2-b1)/(b2+b1)",
+        "W30 MULTI-URL /cog/bbox b1+b2 .npy",
+        "W30 TIFF ungeoreferenced -> 400 tile & 200 validate",
+        "W30 TIFF RPC-only (tag 50844) -> 400 RPC msg & 200 validate",
+    ]
+    if not any(wanted(lb) for lb in labels):
+        return 0
+
+    w30_dir = tmp_dir / "w30"
+    w30_dir.mkdir(parents=True, exist_ok=True)
+    tf = from_bounds(-122.5, 37.5, -122.0, 38.0, 64, 64)
+    yy, xx = np.mgrid[0:64, 0:64]
+    grad = (xx * 3.25 + yy * 1.75 - 50.0).astype(np.float32)
+
+    def _byte_shuffle(raw: bytes, typesize: int) -> bytes:
+        n = len(raw) // typesize
+        return np.frombuffer(raw, dtype=np.uint8).reshape(n, typesize).T.tobytes()
+
+    def _bit_shuffle(raw: bytes, typesize: int) -> bytes:
+        n_elems = len(raw) // typesize
+        n_groups = n_elems // 8
+        block_elems = n_groups * 8
+        arr = np.frombuffer(raw[:block_elems * typesize], dtype=np.uint8).reshape(block_elems, typesize)
+        bits = np.unpackbits(arr, axis=1, bitorder="little")  # (block_elems, typesize*8)
+        packed = np.packbits(bits.T.reshape(typesize * 8, n_groups, 8), axis=2, bitorder="little")
+        return packed.tobytes() + raw[block_elems * typesize:]
+
+    def _encode_blosc1(raw: bytes, typesize: int, shuffle: int = 1, use_zlib: bool = True) -> bytes:
+        # Blosc 1.x header: version=2, versionlz=1, flags, typesize, nbytes, blocksize, cbytes
+        # flags: 0x01=DOSHUFFLE, 0x02=MEMCPYED, 0x04=DOBITSHUFFLE, 0x10=NON_SPLIT, (3<<5)=COMP_ZLIB
+        nbytes = len(raw)
+        if not use_zlib:
+            flags = 0x02  # BLOSC_MEMCPYED
+            hdr = struct.pack("<BBBBIII", 2, 1, flags, typesize, nbytes, nbytes, 16 + nbytes)
+            return hdr + raw
+        if shuffle == 1:
+            data = _byte_shuffle(raw, typesize)
+            flags = 0x01 | 0x10 | (3 << 5)
+        elif shuffle == 2:
+            data = _bit_shuffle(raw, typesize)
+            flags = 0x04 | 0x10 | (3 << 5)
+        else:
+            data = raw
+            flags = 0x10 | (3 << 5)
+        comp = zlib.compress(data, 6)
+        bstarts = struct.pack("<I", 20)
+        blk = struct.pack("<I", len(comp)) + comp
+        cbytes = 16 + 4 + len(blk)
+        hdr = struct.pack("<BBBBIII", 2, 1, flags, typesize, nbytes, nbytes, cbytes)
+        return hdr + bstarts + blk
+
+    def _encode_lz4_numcodecs(raw: bytes) -> bytes:
+        n = len(raw)
+        out = bytearray(struct.pack("<I", n))
+        if n < 15:
+            out.append(n << 4)
+        else:
+            out.append(0xF0)
+            rem = n - 15
+            while rem >= 255:
+                out.append(255)
+                rem -= 255
+            out.append(rem)
+        out.extend(raw)
+        return bytes(out)
+
+    z_root = w30_dir / "w30_codecs.zarr"
+    z_root.mkdir()
+    (z_root / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    lon = np.linspace(-122.5, -122.0, 64, dtype=np.float64)
+    lat = np.linspace(38.0, 37.5, 64, dtype=np.float64)
+
+    def _write_zarr_var(name: str, data: np.ndarray, chunks: tuple[int, ...], dims: list[str], comp: dict | None, enc):
+        d = z_root / name
+        d.mkdir()
+        (d / ".zarray").write_text(json.dumps({
+            "zarr_format": 2, "shape": list(data.shape), "chunks": list(chunks),
+            "dtype": data.dtype.str, "compressor": comp, "fill_value": None, "order": "C", "filters": None,
+        }))
+        (d / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": dims}))
+        key = "0" if data.ndim == 1 else "0.0"
+        (d / key).write_bytes(enc(np.ascontiguousarray(data).tobytes()))
+
+    _write_zarr_var("lon", lon, (64,), ["lon"], None, lambda b: b)
+    _write_zarr_var("lat", lat, (64,), ["lat"], None, lambda b: b)
+    _write_zarr_var("v_gzip", grad, (64, 64), ["lat", "lon"], {"id": "gzip", "level": 6}, lambda b: gzip.compress(b))
+    _write_zarr_var("v_lz4", grad, (64, 64), ["lat", "lon"], {"id": "lz4", "acceleration": 1}, _encode_lz4_numcodecs)
+    _write_zarr_var("v_blosc_shuf", grad, (64, 64), ["lat", "lon"], {"id": "blosc", "cname": "zlib", "clevel": 6, "shuffle": 1}, lambda b: _encode_blosc1(b, 4, shuffle=1, use_zlib=True))
+    _write_zarr_var("v_blosc_bitshuf", grad, (64, 64), ["lat", "lon"], {"id": "blosc", "cname": "zlib", "clevel": 6, "shuffle": 2}, lambda b: _encode_blosc1(b, 4, shuffle=2, use_zlib=True))
+    _write_zarr_var("v_blosc_memcpy", grad, (64, 64), ["lat", "lon"], {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 0}, lambda b: _encode_blosc1(b, 4, shuffle=0, use_zlib=False))
+
+    for lb, var in [
+        ("W30 ZARR v2 Gzip /bbox .npy", "v_gzip"),
+        ("W30 ZARR v2 LZ4 raw block /bbox .npy", "v_lz4"),
+        ("W30 ZARR v2 Blosc zlib+byte-shuffle /bbox .npy", "v_blosc_shuf"),
+        ("W30 ZARR v2 Blosc zlib+bit-shuffle /bbox .npy", "v_blosc_bitshuf"),
+        ("W30 ZARR v2 Blosc memcpy /bbox .npy", "v_blosc_memcpy"),
+    ]:
+        if wanted(lb):
+            p = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_root)}&variable={var}"
+            r = client.get(cw_base + p)
+            if r.status_code == 200:
+                arr = np.load(io.BytesIO(r.content))
+                err = float(np.max(np.abs(arr[0] - grad)))
+                rec(lb, arr.shape == (2, 64, 64) and err < 1e-4, f"max_err={err:.5f}", p)
+            else:
+                rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+    # Multi-URL COG fixtures
+    p1 = w30_dir / "b1.tif"
+    p2 = w30_dir / "b2.tif"
+    b1_arr = (xx.astype(np.float32) + 10.0)
+    b2_arr = (yy.astype(np.float32) * 2.0 + 20.0)
+    with rasterio.open(p1, "w", driver="GTiff", width=64, height=64, count=1, dtype="float32", crs="EPSG:4326", transform=tf, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(b1_arr, 1)
+    with rasterio.open(p2, "w", driver="GTiff", width=64, height=64, count=1, dtype="float32", crs="EPSG:4326", transform=tf, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(b2_arr, 1)
+
+    lb = "W30 MULTI-URL /cog/point 2-band stack"
+    if wanted(lb):
+        p = f"/cog/point/-122.25,37.75?url={q(p1)}&url={q(p2)}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            j = r.json()
+            vals = j.get("values", [])
+            ok = j.get("band_names") == ["b1", "b2"] and len(vals) == 2 and abs(vals[0] - 42.0) < 0.01 and abs(vals[1] - 84.0) < 0.01
+            rec(lb, ok, f"names={j.get('band_names')} values={vals}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+    lb = "W30 MULTI-URL /cog/point expr (b2-b1)/(b2+b1)"
+    if wanted(lb):
+        p = f"/cog/point/-122.25,37.75?url={q(p1)}&url={q(p2)}&expression={qe('(b2-b1)/(b2+b1)')}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            j = r.json()
+            vals = j.get("values", [])
+            exp_ndvi = (84.0 - 42.0) / (84.0 + 42.0)  # 1/3
+            ok = len(vals) == 1 and abs(vals[0] - exp_ndvi) < 1e-4
+            rec(lb, ok, f"values={vals} exp={exp_ndvi:.5f}", p)
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+    lb = "W30 MULTI-URL /cog/bbox b1+b2 .npy"
+    if wanted(lb):
+        p = f"/cog/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(p1)}&url={q(p2)}&expression={qe('b1+b2')}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            arr = np.load(io.BytesIO(r.content))
+            err = float(np.max(np.abs(arr[0] - (b1_arr + b2_arr))))
+            rec(lb, arr.shape == (2, 64, 64) and err < 1e-4, f"max_err={err:.5f}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_npy(r.content, rg.content, check_values=True)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+    # Ungeoreferenced & RPC-only TIFF diagnostics
+    p_nogeo = w30_dir / "nogeo.tif"
+    with rasterio.open(p_nogeo, "w", driver="GTiff", width=64, height=64, count=1, dtype="uint8", tiled=True, blockxsize=64, blockysize=64) as ds:
+        ds.write((xx % 256).astype(np.uint8), 1)
+    p_rpc = w30_dir / "rpc_only.tif"
+    with rasterio.open(p_rpc, "w", driver="GTiff", width=64, height=64, count=1, dtype="uint8", tiled=True, blockxsize=64, blockysize=64) as ds:
+        ds.write((xx % 256).astype(np.uint8), 1)
+        ds.update_tags(
+            ns="RPC", ERR_BIAS="0", ERR_RAND="0", LINE_OFF="32", SAMP_OFF="32",
+            LAT_OFF="37.75", LONG_OFF="-122.25", HEIGHT_OFF="0", LINE_SCALE="32",
+            SAMP_SCALE="32", LAT_SCALE="0.25", LONG_SCALE="0.25", HEIGHT_SCALE="100",
+            LINE_NUM_COEFF="0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            LINE_DEN_COEFF="1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            SAMP_NUM_COEFF="0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+            SAMP_DEN_COEFF="1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+        )
+
+    lb = "W30 TIFF ungeoreferenced -> 400 tile & 200 validate"
+    if wanted(lb):
+        pt = f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(p_nogeo)}"
+        pv = f"/cog/validate?url={q(p_nogeo)}"
+        rt, rv = client.get(cw_base + pt), client.get(cw_base + pv)
+        ok = rt.status_code == 400 and "no georeferencing" in rt.text.lower() and rv.status_code == 200
+        rec(lb, ok, f"tile={rt.status_code} validate={rv.status_code}", pt)
+
+    lb = "W30 TIFF RPC-only (tag 50844) -> 400 RPC msg & 200 validate"
+    if wanted(lb):
+        pt = f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(p_rpc)}"
+        pv = f"/cog/validate?url={q(p_rpc)}"
+        rt, rv = client.get(cw_base + pt), client.get(cw_base + pv)
+        ok = rt.status_code == 400 and "rpc" in rt.text.lower() and rv.status_code == 200
+        rec(lb, ok, f"tile={rt.status_code} validate={rv.status_code} msg={rt.text[:70]!r}", pt)
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -4241,6 +4469,7 @@ def main() -> int:
                 w26_ran = run_wave26_security_checks(client, cw_base, bin_path, tmp_dir, args.only, failures)
                 w28_ran = run_wave28_wms_and_mosaic_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w29_ran = run_wave29_http_protocol_checks(client, cw_base, s, args.only, failures)
+                w30_ran = run_wave30_zarr_codecs_multiurl_rpc_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w18_extra = 0
                 lb_wmts = "W18 WMTS Capabilities XML WebMercatorQuad"
                 if not args.only or args.only.lower() in lb_wmts.lower():
@@ -4257,7 +4486,7 @@ def main() -> int:
                         failures.append({"label": lb_wmts, "method": "GET", "path": wmts_path, "kind": "w18_wmts", "detail": det_w})
                     print(f"{'PASS' if ok_w else 'FAIL'} | {lb_wmts:54s} | {det_w}")
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w28_ran + w29_ran + w18_extra
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w28_ran + w29_ran + w30_ran + w18_extra
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
