@@ -1705,18 +1705,10 @@ mod tests {
         wgsl_codes.sort_unstable();
         wgsl_codes.dedup();
 
-        let rust_codes: Vec<u32> = [
-            GpuPixelSelection::First,
-            GpuPixelSelection::Highest,
-            GpuPixelSelection::Lowest,
-            GpuPixelSelection::Mean,
-            GpuPixelSelection::Median,
-            GpuPixelSelection::Stdev,
-            GpuPixelSelection::Count,
-        ]
-        .into_iter()
-        .map(GpuPixelSelection::as_u32)
-        .collect();
+        let rust_codes: Vec<u32> = GpuPixelSelection::ALL
+            .into_iter()
+            .map(GpuPixelSelection::as_u32)
+            .collect();
 
         assert_eq!(
             wgsl_codes, rust_codes,

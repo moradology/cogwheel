@@ -315,6 +315,17 @@ pub enum GpuPixelSelection {
 }
 
 impl GpuPixelSelection {
+    /// Exhaustive list of all GPU-supported pixel-selection modes, ordered by wire code `0..=6`.
+    pub const ALL: [Self; 7] = [
+        Self::First,
+        Self::Highest,
+        Self::Lowest,
+        Self::Mean,
+        Self::Median,
+        Self::Stdev,
+        Self::Count,
+    ];
+
     #[inline(always)]
     pub const fn as_u32(self) -> u32 {
         match self {
@@ -499,16 +510,7 @@ mod tests {
         assert!(!DemAlgorithm::Aspect.is_terrain_rgb_encoding());
         assert!(!DemAlgorithm::Slope { z_factor: 1.0 }.is_terrain_rgb_encoding());
 
-        let selections = [
-            GpuPixelSelection::First,
-            GpuPixelSelection::Highest,
-            GpuPixelSelection::Lowest,
-            GpuPixelSelection::Mean,
-            GpuPixelSelection::Median,
-            GpuPixelSelection::Stdev,
-            GpuPixelSelection::Count,
-        ];
-        for (i, sel) in selections.into_iter().enumerate() {
+        for (i, sel) in GpuPixelSelection::ALL.into_iter().enumerate() {
             assert_eq!(sel.as_u32(), i as u32);
         }
     }

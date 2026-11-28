@@ -2663,8 +2663,9 @@ async fn render_mosaic_tile_pixel_selection(
         return Err(err);
     }
     let gpu_selected: Option<Selected<f32>> = if let Some(gpu) = engine.accelerated()
+        && let Some(gpu_method) = method.gpu()
         && let Some(ref f) = fold
-        && let Some((nb, scenes)) = f.median_scenes()
+        && let Some((nb, scenes)) = f.held_scenes_for_gpu()
         && scenes.len() <= 32
     {
         let band_planes: Vec<Vec<&[f32]>> = (0..nb)
@@ -2677,7 +2678,7 @@ async fn render_mosaic_tile_pixel_selection(
             width: out_dim,
             height: out_dim,
             input: crate::gpu_backend::MosaicCompositeInput::Bands(&band_planes),
-            method: crate::gpu_backend::GpuPixelSelection::Median,
+            method: gpu_method,
             output: crate::gpu_backend::MosaicCompositeOutput::F32,
         })
         .and_then(crate::gpu_backend::MosaicCompositeResult::into_f32_bands)
