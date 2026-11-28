@@ -407,7 +407,75 @@ async fn zarr_raster_routes_and_geotiff_twin_http_tile_parity() {
         "Zarr tile requests must increment engine.stats.tiles_served"
     );
 
+    // 16. Unified TileCache seam (#542): format query/extension never collide in cache
+    // and ETag uses the server-wide weak W/"cgz-..." format.
+    assert!(
+        etag1.starts_with("W/\"cgz-"),
+        "expected unified weak ETag format, got {etag1}"
+    );
+    let png_fmt_uri = format!("/zarr/tiles/WebMercatorQuad/9/81/197?url={tmp_url}&rescale=100,900&format=png");
+    let webp_fmt_uri = format!("/zarr/tiles/WebMercatorQuad/9/81/197?url={tmp_url}&rescale=100,900&format=webp");
+    let (st_p, _, b_p) = get_bytes(&engine, &png_fmt_uri, None).await;
+    let (st_w, _, b_w) = get_bytes(&engine, &webp_fmt_uri, None).await;
+    assert_eq!(st_p, StatusCode::OK);
+    assert_eq!(st_w, StatusCode::OK);
+    assert_eq!(&b_p[0..4], b"\x89PNG");
+    assert_eq!(&b_w[0..4], b"RIFF");
+    assert!(
+        engine.tile_cache.misses.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "Zarr tile requests must go through TileCache::get_or_render (misses > 0)"
+    );
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zarr_tile_cache_coalesces_concurrent_requests() {
+    let Some(dir) = zarr_fixtures_dir() else {
+        return;
+    };
+    // Disable AIMD admission shedding so all 32 barrier-synchronized requests reach
+    // `TileCache::get_or_render` even on low-vCPU CI runners where the default AIMD limit is <32.
+    let engine = Arc::new(
+        TileEngine::new(64 * 1024 * 1024)
+            .with_aimd(cogzilla_server::aimd::AimdLimiter::new(false, 64, 1, 64, 1000)),
+    );
+    let zarr_url = dir.join("geotiff_twin.zarr").to_string_lossy().to_string();
+    let uri = format!(
+        "/zarr/tiles/WebMercatorQuad/10/163/395.png?url={zarr_url}&rescale=100,900&colormap_name=viridis&resampling=bilinear"
+    );
+
+    // Clear caches and launch 32 concurrent requests behind a barrier so they race into
+    // `TileCache::get_or_render` on multiple OS threads.
+    let barrier = Arc::new(tokio::sync::Barrier::new(32));
+    let mut handles = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let eng = Arc::clone(&engine);
+        let u = uri.clone();
+        let b = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            b.wait().await;
+            get_bytes(&eng, &u, None).await
+        }));
+    }
+    let mut first_body: Option<Bytes> = None;
+    for h in handles {
+        let (st, etag, body) = h.await.unwrap();
+        assert_eq!(st, StatusCode::OK);
+        assert!(etag.as_deref().unwrap_or("").starts_with("W/\"cgz-"));
+        assert_eq!(&body[0..4], b"\x89PNG");
+        if let Some(ref fb) = first_body {
+            assert_eq!(&body, fb);
+        } else {
+            first_body = Some(body);
+        }
+    }
+    let misses = engine.tile_cache.misses.load(std::sync::atomic::Ordering::Relaxed);
+    let coalesced = engine.tile_cache.coalesced.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        coalesced > 0 && misses < 32,
+        "expected concurrent /zarr/tiles burst to coalesce via get_or_render (misses={misses}, coalesced={coalesced})"
+    );
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {

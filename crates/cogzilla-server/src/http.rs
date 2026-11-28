@@ -5848,6 +5848,7 @@ where
         let resp = Box::pin(zarr::handle_zarr_request(
             &engine,
             method,
+            &path,
             sub,
             zarr_params,
             &raw_query,
@@ -6054,7 +6055,7 @@ fn to_http_response(
             let is_binary_tile = content_type.starts_with("image/")
                 || content_type == "application/octet-stream"
                 || content_type == "application/x-binary";
-            let etag = is_binary_tile.then(|| crate::tile_cache::compute_tile_etag(&bytes));
+            let etag = is_binary_tile.then(|| crate::tile_cache::compute_tile_etag(None, &bytes));
             binary_or_plain_response(engine, bytes, content_type, etag, if_none_match)
         }
         Err(EngineError::Shared(inner)) => error_to_http_response(&inner),
