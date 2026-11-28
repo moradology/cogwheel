@@ -1348,6 +1348,17 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.colorinterp = (rasterio.enums.ColorInterp.gray, rasterio.enums.ColorInterp.alpha)
     out["w49_gray_alpha"] = p_w49_ga
 
+    # Wave 50: Donut polygon (exterior + interior hole ring) & MultiPolygon COG with 5000.0 center spike
+    p_w50_donut = synth_dir / "w50_donut.tif"
+    arr50 = (10.0 + xx9 * 0.5 + yy9 * 0.5).astype(np.float32)
+    arr50[48:80, 48:80] = 5000.0
+    with rasterio.open(
+        p_w50_donut, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(arr50, 1)
+    out["w50_donut"] = p_w50_donut
+
     return out
 
 
@@ -3924,6 +3935,7 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W44 ZARR v3 gzip codec /bbox .npy",
         "W44 ZARR POST /statistics 2-feature FeatureCollection",
         "W44 ZARR POST /statistics coord_crs=EPSG:3857",
+        "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -4239,6 +4251,7 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W44 ZARR v3 gzip codec /bbox .npy",
         "W44 ZARR POST /statistics 2-feature FeatureCollection",
         "W44 ZARR POST /statistics coord_crs=EPSG:3857",
+        "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy",
     ]
     if any(wanted(l) for l in w44_labels):
         def _crc32c_w44(data: bytes) -> int:
@@ -4439,6 +4452,37 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
                             gpu_diffs.append({"label": lb, "detail": d_38})
             else:
                 rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p_38)
+
+        lb = "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy"
+        if wanted(lb):
+            f_be = np.asfortranarray(arr44).astype(">f4").tobytes(order="F")
+            gz_be = zlib.compress(f_be, level=5, wbits=31)
+            z_4s = _mk_z3_w44(
+                "w50_z3_4stage.zarr",
+                [
+                    {"name": "transpose", "configuration": {"order": [1, 0]}},
+                    {"name": "bytes", "configuration": {"endian": "big"}},
+                    {"name": "gzip", "configuration": {"level": 5}},
+                    {"name": "crc32c", "configuration": {}},
+                ],
+                gz_be + struct.pack("<I", _crc32c_w44(gz_be)),
+            )
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_4s)}&variable=data"
+            rb = client.get(cw_base + p_bb)
+            if rb.status_code == 200:
+                ab = np.load(io.BytesIO(rb.content))
+                err = float(np.abs(ab[0] - arr44).max())
+                rec(lb, err < 1e-4, f"max_err={err:.5f}", p_bb)
+                if gpu_base:
+                    rbg = client.get(gpu_base + p_bb)
+                    if rbg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rbg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(rb.content, rbg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {rb.status_code} {rb.text[:80]!r}", p_bb)
 
     return ran
 
@@ -5199,6 +5243,13 @@ def main() -> int:
                 ("PARITY W49 EXPR 3-band ; multi-output .npy (f64)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_rgb_nodata'])}&expression={qe('b1*0.5;b2*0.5;b3*0.5')}", None, "npy"),
                 ("PARITY W49 EXPR 3-band ; multi-output .png (RGB)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&expression={qe('b1*0.5;b2*0.5;b3*0.5')}&rescale=0,128", None, "png"),
                 ("PARITY W49 EXPR 2-band ; multi-output .npy (i32)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_rgb_nodata'])}&expression={qe('b1+b2;b3-b1')}", None, "npy"),
+                # --- Wave 50: Donut Polygon (interior hole ring), MultiPolygon (2 disjoint squares), POST /statistics params ---
+                ("PARITY W50 DONUT Polygon (interior hole) POST /statistics", "POST", f"/cog/statistics?url={q(s['w50_donut'])}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.05, 37.95], [-122.45, 37.95], [-122.45, 37.55]], [[-122.33, 37.67], [-122.33, 37.83], [-122.17, 37.83], [-122.17, 37.67], [-122.33, 37.67]]]}}, "post_stats"),
+                ("PARITY W50 DONUT Polygon (interior hole) POST /feature .npy", "POST", f"/cog/feature/64x64.npy?url={q(s['w50_donut'])}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.05, 37.95], [-122.45, 37.95], [-122.45, 37.55]], [[-122.33, 37.67], [-122.33, 37.83], [-122.17, 37.83], [-122.17, 37.67], [-122.33, 37.67]]]}}, "npy"),
+                ("PARITY W50 DONUT Polygon (interior hole) POST /feature .png", "POST", f"/cog/feature/64x64.png?url={q(s['w50_donut'])}&rescale=0,150&colormap_name=viridis", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.05, 37.95], [-122.45, 37.95], [-122.45, 37.55]], [[-122.33, 37.67], [-122.33, 37.83], [-122.17, 37.83], [-122.17, 37.67], [-122.33, 37.67]]]}}, "png"),
+                ("PARITY W50 MultiPolygon (2 disjoint) POST /statistics", "POST", f"/cog/statistics?url={q(s['w50_donut'])}", {"type": "Feature", "properties": {}, "geometry": {"type": "MultiPolygon", "coordinates": [[[[-122.46, 37.54], [-122.36, 37.54], [-122.36, 37.64], [-122.46, 37.64], [-122.46, 37.54]]], [[[-122.14, 37.86], [-122.04, 37.86], [-122.04, 37.96], [-122.14, 37.96], [-122.14, 37.86]]]]}}, "post_stats"),
+                ("PARITY W50 MultiPolygon (2 disjoint) POST /feature .npy", "POST", f"/cog/feature/64x64.npy?url={q(s['w50_donut'])}", {"type": "Feature", "properties": {}, "geometry": {"type": "MultiPolygon", "coordinates": [[[[-122.46, 37.54], [-122.36, 37.54], [-122.36, 37.64], [-122.46, 37.64], [-122.46, 37.54]]], [[[-122.14, 37.86], [-122.04, 37.86], [-122.04, 37.96], [-122.14, 37.96], [-122.14, 37.86]]]]}}, "npy"),
+                ("PARITY W50 POST /statistics p=25,75 & histogram_bins=6", "POST", f"/cog/statistics?url={q(s['w50_donut'])}&p=25&p=75&histogram_bins=6", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.05, 37.95], [-122.45, 37.95], [-122.45, 37.55]], [[-122.33, 37.67], [-122.33, 37.83], [-122.17, 37.83], [-122.17, 37.67], [-122.33, 37.67]]]}}, "post_stats"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
