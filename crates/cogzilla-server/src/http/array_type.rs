@@ -176,25 +176,6 @@ pub(super) fn shown(pq: &ParsedQuery) -> bool {
         || pq.color_formula.is_some()
 }
 
-/// The smallest and largest whole number of an integer type; `None` for a float type.
-pub(crate) fn integer_range(kind: SampleType) -> Option<(f64, f64)> {
-    use SampleType as T;
-    Some(match kind {
-        T::Bool | T::Uint1 => (0.0, 1.0),
-        T::Uint4 => (0.0, 15.0),
-        T::Uint8 => (0.0, 255.0),
-        T::Int8 => (-128.0, 127.0),
-        T::Uint12 => (0.0, 4095.0),
-        T::Uint16 => (0.0, 65_535.0),
-        T::Int16 => (-32_768.0, 32_767.0),
-        T::Uint32 => (0.0, 4_294_967_295.0),
-        T::Int32 => (-2_147_483_648.0, 2_147_483_647.0),
-        T::Uint64 => (0.0, u64::MAX as f64),
-        T::Int64 => (i64::MIN as f64, i64::MAX as f64),
-        T::Float16 | T::Float32 | T::Float64 => return None,
-    })
-}
-
 /// The type `algorithm_params={"dtype": ...}` names for `cast`, `uint8` when none is named;
 /// `None` for a name that is not a type supported by `cast`.
 pub(crate) fn cast_type(dtype: Option<&str>) -> Option<SampleType> {
@@ -353,7 +334,7 @@ impl ArrayRule {
     /// integer band's type that way (a value read with nearest is whole already, and is put
     /// as it is). `None` for anything else.
     pub(super) fn rounding(&self, kind: SampleType) -> Option<fn(f64) -> f64> {
-        integer_range(kind)?;
+        kind.storable_range()?;
         match self {
             Self::Data { unscale: false, resampled: true } => Some(round_into(kind)),
             Self::Algorithm { name, unscale: false, resampled: true, .. } if matches!(name.as_str(), "min" | "max") => {
@@ -532,5 +513,40 @@ mod tests {
             math_unscale.staged_kind(&[T::Uint16, T::Uint16], &[Some("b1*2".into()), None], ""),
             Some(T::Float32)
         );
+    }
+
+    #[test]
+    fn round_into_matches_storable_range_across_all_variants() {
+        use SampleType as T;
+        let all = [
+            T::Bool,
+            T::Uint1,
+            T::Uint4,
+            T::Uint8,
+            T::Int8,
+            T::Uint12,
+            T::Uint16,
+            T::Int16,
+            T::Uint32,
+            T::Int32,
+            T::Uint64,
+            T::Int64,
+            T::Float16,
+            T::Float32,
+            T::Float64,
+        ];
+        for kind in all {
+            let f = round_into(kind);
+            match (kind, kind.storable_range()) {
+                (T::Uint64 | T::Int64, Some(_)) | (_, None) => {
+                    assert_eq!(f(12.6), 13.0, "{kind:?}: round_into should round");
+                }
+                (_, Some((lo, hi))) => {
+                    assert_eq!(f(lo - 100.0), lo, "{kind:?}: lower clamp must match storable_range");
+                    assert_eq!(f(hi + 100.0), hi, "{kind:?}: upper clamp must match storable_range");
+                    assert_eq!(f(lo + 0.6), lo + 1.0, "{kind:?}: midpoint rounds to nearest");
+                }
+            }
+        }
     }
 }

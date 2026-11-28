@@ -139,11 +139,11 @@ impl SampleType {
         }
     }
 
-    /// Representable `(min, max)` range as `f32` for integer / boolean sample types, or `None`
-    /// for floating-point types. Used for default TiTiler rescale ranges and integer clamping
-    /// after cubic/lanczos resampling.
+    /// The `(min, max)` range of the dtype this type is *reported* as (`gdal_name`), for
+    /// TiTiler's `dtype_ranges` default rescale. Packed types (`Uint1`, `Uint4`, `Uint12`)
+    /// report their unpacked GDAL dtype's range (`0..255` / `0..65535`); floats return `None`.
     #[inline(always)]
-    pub const fn value_range(self) -> Option<(f32, f32)> {
+    pub const fn reported_range(self) -> Option<(f32, f32)> {
         match self {
             Self::Bool => Some((0.0, 1.0)),
             Self::Uint1 | Self::Uint4 | Self::Uint8 => Some((0.0, 255.0)),
@@ -154,6 +154,28 @@ impl SampleType {
             Self::Int32 => Some((i32::MIN as f32, i32::MAX as f32)),
             Self::Uint64 => Some((0.0, u64::MAX as f32)),
             Self::Int64 => Some((i64::MIN as f32, i64::MAX as f32)),
+            Self::Float16 | Self::Float32 | Self::Float64 => None,
+        }
+    }
+
+    /// The exact `(min, max)` values this sample type can actually store (`f64`), or `None`
+    /// for floating-point types. Used for post-resample clamping (preventing cubic/lanczos
+    /// overshoot past packed bit widths: `Uint1` `0..1`, `Uint4` `0..15`, `Uint12` `0..4095`)
+    /// and integer-range checks.
+    #[inline(always)]
+    pub const fn storable_range(self) -> Option<(f64, f64)> {
+        match self {
+            Self::Bool | Self::Uint1 => Some((0.0, 1.0)),
+            Self::Uint4 => Some((0.0, 15.0)),
+            Self::Uint8 => Some((0.0, 255.0)),
+            Self::Int8 => Some((-128.0, 127.0)),
+            Self::Uint12 => Some((0.0, 4095.0)),
+            Self::Uint16 => Some((0.0, 65_535.0)),
+            Self::Int16 => Some((-32_768.0, 32_767.0)),
+            Self::Uint32 => Some((0.0, u32::MAX as f64)),
+            Self::Int32 => Some((i32::MIN as f64, i32::MAX as f64)),
+            Self::Uint64 => Some((0.0, u64::MAX as f64)),
+            Self::Int64 => Some((i64::MIN as f64, i64::MAX as f64)),
             Self::Float16 | Self::Float32 | Self::Float64 => None,
         }
     }
@@ -343,14 +365,28 @@ mod tests {
             }
             assert!(st.npy_descr().len() == 3);
         }
-        assert_eq!(SampleType::Uint64.value_range(), Some((0.0, u64::MAX as f32)));
+        assert_eq!(SampleType::Uint1.reported_range(), Some((0.0, 255.0)));
+        assert_eq!(SampleType::Uint1.storable_range(), Some((0.0, 1.0)));
+        assert_eq!(SampleType::Uint4.reported_range(), Some((0.0, 255.0)));
+        assert_eq!(SampleType::Uint4.storable_range(), Some((0.0, 15.0)));
+        assert_eq!(SampleType::Uint12.reported_range(), Some((0.0, 65_535.0)));
+        assert_eq!(SampleType::Uint12.storable_range(), Some((0.0, 4095.0)));
+        assert_eq!(SampleType::Uint64.reported_range(), Some((0.0, u64::MAX as f32)));
+        assert_eq!(SampleType::Uint64.storable_range(), Some((0.0, u64::MAX as f64)));
         assert_eq!(
-            SampleType::Int64.value_range(),
+            SampleType::Int64.reported_range(),
             Some((i64::MIN as f32, i64::MAX as f32))
         );
-        assert_eq!(SampleType::Float16.value_range(), None);
-        assert_eq!(SampleType::Float32.value_range(), None);
-        assert_eq!(SampleType::Float64.value_range(), None);
+        assert_eq!(
+            SampleType::Int64.storable_range(),
+            Some((i64::MIN as f64, i64::MAX as f64))
+        );
+        assert_eq!(SampleType::Float16.reported_range(), None);
+        assert_eq!(SampleType::Float16.storable_range(), None);
+        assert_eq!(SampleType::Float32.reported_range(), None);
+        assert_eq!(SampleType::Float32.storable_range(), None);
+        assert_eq!(SampleType::Float64.reported_range(), None);
+        assert_eq!(SampleType::Float64.storable_range(), None);
     }
 
     #[test]

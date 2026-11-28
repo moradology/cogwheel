@@ -1308,7 +1308,7 @@ fn capped_native_bbox_dims(
 
 /// Default rescale range matching TiTiler's `dtype_ranges` when `?rescale=` is omitted.
 fn default_rescale_for_dtype(st: cogzilla_raster::SampleType, single: bool) -> (f32, f32) {
-    st.value_range().unwrap_or(if single { (0.0, 1000.0) } else { (0.0, 1.0) })
+    st.reported_range().unwrap_or(if single { (0.0, 1000.0) } else { (0.0, 1.0) })
 }
 
 /// The band math of a request whose `algorithm` works over its `expression`'s outputs
@@ -2290,7 +2290,7 @@ fn build_tile_request_for_tms(
 
 /// The range of an integer sample type (`None` for floats), for the statistics read.
 pub(crate) fn array_type_range(kind: cogzilla_raster::SampleType) -> Option<(f64, f64)> {
-    array_type::integer_range(kind)
+    kind.storable_range()
 }
 
 /// The type that holds every band of `cogs` as read.
