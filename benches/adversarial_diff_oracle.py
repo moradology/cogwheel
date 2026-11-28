@@ -3762,6 +3762,12 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W32 ZARR v3 sharding_indexed + gzip + missing chunk .npy",
         "W32 ZARR v3 /zarr/preview cubic .png",
         "W39 ZARR f64 >1e9 /zarr/point exact",
+        "W44 ZARR v3 transpose [1,0] Fortran /bbox .npy & /point",
+        "W44 ZARR v3 crc32c standalone codec /bbox .npy & /point",
+        "W44 ZARR v3 crc32c corrupt checksum -> 502",
+        "W44 ZARR v3 gzip codec /bbox .npy",
+        "W44 ZARR POST /statistics 2-feature FeatureCollection",
+        "W44 ZARR POST /statistics coord_crs=EPSG:3857",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -4068,6 +4074,215 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
                         gpu_diffs.append({"label": lb, "detail": f"cpu={vals} gpu={gvals}"})
         else:
             rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+    # --- Wave 44: Zarr v3 transpose [1,0], standalone crc32c (+ corrupt rejection), gzip, POST /zarr/statistics FC + coord_crs=EPSG:3857 ---
+    w44_labels = [
+        "W44 ZARR v3 transpose [1,0] Fortran /bbox .npy & /point",
+        "W44 ZARR v3 crc32c standalone codec /bbox .npy & /point",
+        "W44 ZARR v3 crc32c corrupt checksum -> 502",
+        "W44 ZARR v3 gzip codec /bbox .npy",
+        "W44 ZARR POST /statistics 2-feature FeatureCollection",
+        "W44 ZARR POST /statistics coord_crs=EPSG:3857",
+    ]
+    if any(wanted(l) for l in w44_labels):
+        def _crc32c_w44(data: bytes) -> int:
+            poly = 0x82F63B78
+            crc = 0xFFFFFFFF
+            for b_ in data:
+                crc ^= b_
+                for _ in range(8):
+                    crc = (crc >> 1) ^ poly if (crc & 1) else (crc >> 1)
+            return crc ^ 0xFFFFFFFF
+
+        h44, w44 = 64, 64
+        yy44, xx44 = np.mgrid[0:h44, 0:w44].astype(np.float32)
+        arr44 = (10.0 + xx44 * 10.0 + yy44 * 0.5).astype(np.float32)
+        raw44 = np.ascontiguousarray(arr44).tobytes()
+        xs44 = np.linspace(-122.5 + 0.5 / (2 * w44), -122.0 - 0.5 / (2 * w44), w44, dtype=np.float64)
+        ys44 = np.linspace(38.0 - 0.5 / (2 * h44), 37.5 + 0.5 / (2 * h44), h44, dtype=np.float64)
+
+        def _mk_z3_w44(name: str, codecs_cfg: list, chunk_bytes: bytes) -> Path:
+            root = w30_dir / name
+            root.mkdir(parents=True, exist_ok=True)
+            (root / "zarr.json").write_text(json.dumps({
+                "zarr_format": 3, "node_type": "group",
+                "attributes": {"multiscales": [{"version": "0.4", "datasets": [{"path": "data"}]}]},
+            }))
+            dd = root / "data"
+            dd.mkdir()
+            (dd / "zarr.json").write_text(json.dumps({
+                "zarr_format": 3, "node_type": "array",
+                "shape": [h44, w44], "data_type": "float32",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [h44, w44]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": -9999.0, "codecs": codecs_cfg,
+                "dimension_names": ["y", "x"], "attributes": {"_ARRAY_DIMENSIONS": ["y", "x"]},
+            }))
+            (dd / "c" / "0").mkdir(parents=True)
+            (dd / "c" / "0" / "0").write_bytes(chunk_bytes)
+            for cname, cvals in (("x", xs44), ("y", ys44)):
+                cd = root / cname
+                cd.mkdir()
+                (cd / "zarr.json").write_text(json.dumps({
+                    "zarr_format": 3, "node_type": "array",
+                    "shape": [len(cvals)], "data_type": "float64",
+                    "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [len(cvals)]}},
+                    "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                    "fill_value": "NaN",
+                    "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                    "dimension_names": [cname], "attributes": {"_ARRAY_DIMENSIONS": [cname]},
+                }))
+                (cd / "c").mkdir()
+                (cd / "c" / "0").write_bytes(cvals.tobytes())
+            return root
+
+        lon44 = -122.5 + (48 + 0.5) * 0.5 / 64
+        lat44 = 38.0 - (16 + 0.5) * 0.5 / 64
+
+        lb = "W44 ZARR v3 transpose [1,0] Fortran /bbox .npy & /point"
+        if wanted(lb):
+            z_tr = _mk_z3_w44(
+                "w44_z3_transpose.zarr",
+                [{"name": "transpose", "configuration": {"order": [1, 0]}}, {"name": "bytes", "configuration": {"endian": "little"}}],
+                np.asfortranarray(arr44).tobytes(order="F"),
+            )
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_tr)}&variable=data"
+            p_pt = f"/zarr/point/{lon44},{lat44}?url={q(z_tr)}&variable=data"
+            rb, rp = client.get(cw_base + p_bb), client.get(cw_base + p_pt)
+            if rb.status_code == 200 and rp.status_code == 200:
+                ab = np.load(io.BytesIO(rb.content))
+                err = float(np.abs(ab[0] - arr44).max())
+                vals = rp.json().get("values", [])
+                ok = err < 1e-4 and len(vals) == 1 and abs(vals[0] - 498.0) < 1e-3
+                rec(lb, ok, f"max_err={err:.5f} pt={vals} (exp 498.0)", p_bb)
+                if gpu_base:
+                    rbg = client.get(gpu_base + p_bb)
+                    if rbg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rbg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(rb.content, rbg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP bbox={rb.status_code} pt={rp.status_code}", p_bb)
+
+        lb = "W44 ZARR v3 crc32c standalone codec /bbox .npy & /point"
+        if wanted(lb):
+            z_crc = _mk_z3_w44(
+                "w44_z3_crc32c.zarr",
+                [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "crc32c", "configuration": {}}],
+                raw44 + struct.pack("<I", _crc32c_w44(raw44)),
+            )
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_crc)}&variable=data"
+            p_pt = f"/zarr/point/{lon44},{lat44}?url={q(z_crc)}&variable=data"
+            rb, rp = client.get(cw_base + p_bb), client.get(cw_base + p_pt)
+            if rb.status_code == 200 and rp.status_code == 200:
+                ab = np.load(io.BytesIO(rb.content))
+                err = float(np.abs(ab[0] - arr44).max())
+                vals = rp.json().get("values", [])
+                ok = err < 1e-4 and len(vals) == 1 and abs(vals[0] - 498.0) < 1e-3
+                rec(lb, ok, f"max_err={err:.5f} pt={vals} (exp 498.0)", p_bb)
+                if gpu_base:
+                    rbg = client.get(gpu_base + p_bb)
+                    if rbg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rbg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(rb.content, rbg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP bbox={rb.status_code} pt={rp.status_code}", p_bb)
+
+        lb = "W44 ZARR v3 crc32c corrupt checksum -> 502"
+        if wanted(lb):
+            bad_crc = _crc32c_w44(raw44) ^ 0xDEAD0001
+            z_bad = _mk_z3_w44(
+                "w44_z3_crc32c_bad.zarr",
+                [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "crc32c", "configuration": {}}],
+                raw44 + struct.pack("<I", bad_crc),
+            )
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_bad)}&variable=data"
+            rb = client.get(cw_base + p_bb)
+            ok = rb.status_code == 502 and "crc32c" in rb.text.lower()
+            rec(lb, ok, f"status={rb.status_code} msg={rb.text[:70]!r}", p_bb)
+
+        z_gz44 = None
+        if any(wanted(l) for l in ("W44 ZARR v3 gzip codec /bbox .npy", "W44 ZARR POST /statistics 2-feature FeatureCollection", "W44 ZARR POST /statistics coord_crs=EPSG:3857")):
+            z_gz44 = _mk_z3_w44(
+                "w44_z3_gzip.zarr",
+                [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "gzip", "configuration": {"level": 5}}],
+                zlib.compress(raw44, level=5, wbits=31),
+            )
+
+        lb = "W44 ZARR v3 gzip codec /bbox .npy"
+        if wanted(lb):
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_gz44)}&variable=data"
+            rb = client.get(cw_base + p_bb)
+            if rb.status_code == 200:
+                ab = np.load(io.BytesIO(rb.content))
+                err = float(np.abs(ab[0] - arr44).max())
+                rec(lb, err < 1e-4, f"max_err={err:.5f}", p_bb)
+                if gpu_base:
+                    rbg = client.get(gpu_base + p_bb)
+                    if rbg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rbg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(rb.content, rbg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {rb.status_code} {rb.text[:80]!r}", p_bb)
+
+        west_mean_ref = None
+        lb = "W44 ZARR POST /statistics 2-feature FeatureCollection"
+        if wanted(lb):
+            fc44 = {
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "properties": {"id": "west"}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.6], [-122.3, 37.6], [-122.3, 37.9], [-122.45, 37.9], [-122.45, 37.6]]]}},
+                    {"type": "Feature", "properties": {"id": "east"}, "geometry": {"type": "Polygon", "coordinates": [[[-122.2, 37.6], [-122.05, 37.6], [-122.05, 37.9], [-122.2, 37.9], [-122.2, 37.6]]]}},
+                ],
+            }
+            p_fc = f"/zarr/statistics?url={q(z_gz44)}&variable=data"
+            r = client.post(cw_base + p_fc, json=fc44)
+            if r.status_code == 200:
+                feats = r.json().get("features", [])
+                m_w = feats[0]["properties"]["statistics"]["b1"]["mean"] if len(feats) == 2 else 0.0
+                m_e = feats[1]["properties"]["statistics"]["b1"]["mean"] if len(feats) == 2 else 0.0
+                west_mean_ref = m_w
+                ok = len(feats) == 2 and 120.0 < m_w < 220.0 and 450.0 < m_e < 560.0 and (m_e - m_w) > 250.0
+                rec(lb, ok, f"west_mean={m_w:.2f} east_mean={m_e:.2f}", p_fc)
+                if gpu_base:
+                    rg = client.post(gpu_base + p_fc, json=fc44)
+                    if rg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                    else:
+                        d_fc = first_json_diff(r.json(), rg.json())
+                        if d_fc is not None:
+                            gpu_diffs.append({"label": lb, "detail": d_fc})
+            else:
+                rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p_fc)
+
+        lb = "W44 ZARR POST /statistics coord_crs=EPSG:3857"
+        if wanted(lb):
+            x3857, y3857 = rasterio.warp.transform("EPSG:4326", "EPSG:3857", [-122.45, -122.3, -122.3, -122.45, -122.45], [37.6, 37.6, 37.9, 37.9, 37.6])
+            f3857 = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [list(zip(x3857, y3857))]}}
+            p_38 = f"/zarr/statistics?url={q(z_gz44)}&variable=data&coord_crs=EPSG:3857"
+            r = client.post(cw_base + p_38, json=f3857)
+            if r.status_code == 200:
+                m38 = r.json()["properties"]["statistics"]["b1"]["mean"]
+                ok = 120.0 < m38 < 220.0 and (west_mean_ref is None or abs(m38 - west_mean_ref) < 5.0)
+                rec(lb, ok, f"mean_3857={m38:.2f}" + (f" (west_4326={west_mean_ref:.2f})" if west_mean_ref is not None else ""), p_38)
+                if gpu_base:
+                    rg = client.post(gpu_base + p_38, json=f3857)
+                    if rg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                    else:
+                        d_38 = first_json_diff(r.json(), rg.json())
+                        if d_38 is not None:
+                            gpu_diffs.append({"label": lb, "detail": d_38})
+            else:
+                rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p_38)
 
     return ran
 
@@ -4747,6 +4962,10 @@ def main() -> int:
                 ("PARITY W43 STRIPPED+OVR z10 full-res .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_stripped_ovr'])}", None, "png"),
                 ("PARITY W43 STRIPPED+OVR /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w43_stripped_ovr'])}", None, "point"),
                 ("PARITY W43 STRIPPED+OVR /statistics", "GET", f"/cog/statistics?url={q(s['w43_stripped_ovr'])}", None, "stats"),
+                # --- Wave 44: Chained & per-channel color_formula on 3-band RGB ---
+                ("PARITY W44 color_formula chained Gamma+Sigmoidal+Sat .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&color_formula={qe('Gamma RGB 1.5 Sigmoidal RGB 15 0.35 Saturation 1.3')}", None, "png"),
+                ("PARITY W44 color_formula per-channel Gamma R/B .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&color_formula={qe('Gamma R 1.8 Gamma B 0.7')}", None, "png"),
+                ("PARITY W44 color_formula per-channel Sigmoidal G .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&color_formula={qe('Sigmoidal G 10 0.5')}", None, "png"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
