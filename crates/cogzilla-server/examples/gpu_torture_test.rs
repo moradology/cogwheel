@@ -608,7 +608,8 @@ async fn main() {
                         &eng, &cog, &crs, &pm, 2048, false, None, &opts,
                     )
                     .await
-                    .expect("chaos zonal ok");
+                    .expect("chaos zonal ok")
+                    .expect("native exact stats");
                     assert!(j.is_object());
                     zonal_n.fetch_add(1, Ordering::Relaxed);
                 }

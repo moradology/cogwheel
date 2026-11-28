@@ -200,7 +200,15 @@ fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
     let pq_rescaled = parse_query(Some("rescale=0,1000"));
     let pq_cmap = parse_query(Some("colormap_name=viridis"));
     let single = BandRequest::Single { band_1based: 1, rescale: (0.0, 65535.0), colormap: ColormapName::Grayscale };
+    let rgb = BandRequest::Rgb { bands_1based: [1, 2, 3], rescale_min: [0.0; 3], rescale_max: [65535.0; 3] };
+    let two_band = BandRequest::MultiBand { bands_1based: vec![1, 2] };
+    let four_band = BandRequest::MultiBand { bands_1based: vec![1, 2, 3, 4] };
+    let pq_no_mask = parse_query(Some("return_mask=false"));
     assert!(wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_raster::SampleType::Uint16));
+    assert!(wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &rgb, cogzilla_raster::SampleType::Uint16));
+    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &two_band, cogzilla_raster::SampleType::Uint16));
+    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_no_mask, None, &two_band, cogzilla_raster::SampleType::Uint16));
+    assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_no_mask, None, &four_band, cogzilla_raster::SampleType::Uint16));
     assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_plain, None, &single, cogzilla_raster::SampleType::Uint8));
     assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_rescaled, None, &single, cogzilla_raster::SampleType::Uint16));
     assert!(!wants_u16_png(OutputFormat::Png, "image/png", &pq_cmap, None, &single, cogzilla_raster::SampleType::Uint16));
@@ -240,7 +248,7 @@ fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
         .collect();
     assert_eq!(decoded, vec![(0, 65535), (124, 65535), (65535, 65535), (0, 0)]);
 
-    // 2-band Uint16 `.png` tile request is accepted by build_tile_request_for_tms.
+    // 2-band Uint16 `.png` tile request is consistently rejected with 400 (matching Uint8/Float32).
     let pq_2b = parse_query(Some("bidx=1&bidx=2"));
     let res = build_tile_request_for_tms(
         None,
@@ -254,7 +262,11 @@ fn unrescaled_uint16_png_emits_16_bit_png_and_clamps_overshoot() {
         None,
         false,
     );
-    assert!(res.is_ok(), "2-band Uint16 .png tile should be accepted: {:?}", res.err());
+    assert!(
+        matches!(res, Err(EngineError::BadRequest(_))),
+        "2-band Uint16 .png tile should return 400 BadRequest, got: {:?}",
+        res
+    );
 }
 
 #[test]

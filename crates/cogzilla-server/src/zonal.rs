@@ -2171,7 +2171,7 @@ pub async fn compute_native_exact_polygon_stats(
     unscale: bool,
     nodata_override: Option<f32>,
     opts: &StatsOptions,
-) -> Result<serde_json::Value, EngineError> {
+) -> Result<Option<serde_json::Value>, EngineError> {
     let full = cog.index.full_res();
     let count = full.samples_per_pixel;
     let alpha_idx = cogzilla_codec::alpha_channel_index(count as usize, &full.extra_samples);
@@ -2231,23 +2231,17 @@ pub async fn compute_native_exact_polygon_stats(
     let is_geo_dataset = crs.is_geographic();
     let densify_lonlat = !is_geo_dataset && !pm.coord_crs_projected;
 
-    // Start on full-resolution IFD 0; only step down to an overview if explicit max_size > 0 requests it.
-    let mut ifd_idx = 0usize;
-    let mut proj = project_mask_to_ifd(pm, crs, full, is_geo_dataset, densify_lonlat, total_verts)?;
+    // Start on full-resolution IFD 0; if explicit max_size > 0 requests downsampling below the
+    // native polygon window, return Ok(None) so the caller renders the exact max_size-capped grid
+    // with `compute_exact_grid_polygon_stats` (preserving exact coverage, area/length/category_areas,
+    // and matching TiTiler's max_size grid even on overview-less COGs).
+    let ifd_idx = 0usize;
+    let proj = project_mask_to_ifd(pm, crs, full, is_geo_dataset, densify_lonlat, total_verts)?;
     if proj.is_empty() {
-        return Ok(empty_result());
+        return Ok(Some(empty_result()));
     }
     if opts.max_size_explicit && max_size > 0 && proj.max_dim() > max_size as usize {
-        for (i, ov) in cog.index.ifds.iter().enumerate().skip(1) {
-            proj = project_mask_to_ifd(pm, crs, ov, is_geo_dataset, densify_lonlat, total_verts)?;
-            ifd_idx = i;
-            if proj.max_dim() <= max_size as usize {
-                break;
-            }
-        }
-    }
-    if proj.is_empty() {
-        return Ok(empty_result());
+        return Ok(None);
     }
     let ProjectedMaskWindow {
         polys_px,
@@ -2789,9 +2783,9 @@ pub async fn compute_native_exact_polygon_stats(
     };
 
     if n_px >= 65_536 {
-        Ok(engine.store.run_heavy_cpu(compute_cpu).await?)
+        Ok(Some(engine.store.run_heavy_cpu(compute_cpu).await?))
     } else {
-        Ok(compute_cpu())
+        Ok(Some(compute_cpu()))
     }
 }
 
@@ -2852,19 +2846,17 @@ async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
     if cogs.len() == 1 && !SLOTS {
         let mut opts_e = opts.clone();
         opts_e.expressions = Some(exprs.to_vec());
-        return Ok(Some(
-            compute_native_exact_polygon_stats(
-                engine,
-                primary,
-                &crs,
-                pm,
-                max_size,
-                unscale,
-                nodata_override,
-                &opts_e,
-            )
-            .await?,
-        ));
+        return compute_native_exact_polygon_stats(
+            engine,
+            primary,
+            &crs,
+            pm,
+            max_size,
+            unscale,
+            nodata_override,
+            &opts_e,
+        )
+        .await;
     }
 
     let is_geo = crs.is_geographic();
@@ -2911,6 +2903,11 @@ async fn exact_multi_cog_expr_stats<const SLOTS: bool>(
             if proj.max_dim() <= max_size as usize {
                 break;
             }
+        }
+        // If explicit max_size could not be satisfied by matching native overviews, fall back
+        // to the resampled exact-grid path (which caps to max_size cleanly).
+        if proj.max_dim() > max_size as usize {
+            return Ok(None);
         }
     }
     if proj.is_empty() {
@@ -3469,7 +3466,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
                 | Selection::LastBandLow
         )
     {
-        let stats = compute_native_exact_polygon_stats(
+        let Some(stats) = compute_native_exact_polygon_stats(
             engine,
             primary,
             &crs,
@@ -3479,7 +3476,10 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             nodata_override,
             opts,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(None);
+        };
         return Ok(Some((stats, vec![assets[0].0.clone()])));
     }
 

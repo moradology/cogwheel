@@ -474,7 +474,8 @@ async fn run_mixed_contention_soak(
                             &stats_opts,
                         )
                         .await
-                        .expect("zonal ok");
+                        .expect("zonal ok")
+                        .expect("native exact stats");
                         std::hint::black_box(j.is_object());
                     }
                 }

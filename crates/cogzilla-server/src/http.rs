@@ -700,10 +700,7 @@ fn wants_u16_png(
         && pq.algorithm.is_none()
         && pq.expr_raw.is_none()
         && !source_cog.is_some_and(|c| has_embedded_palette(pq, c, bands))
-        && matches!(
-            bands,
-            BandRequest::Single { .. } | BandRequest::Rgb { .. } | BandRequest::MultiBand { .. }
-        )
+        && matches!(bands, BandRequest::Single { .. } | BandRequest::Rgb { .. })
         && (TileEngine::value_bands(bands) + usize::from(pq.return_mask)) <= 4
 }
 
@@ -2219,14 +2216,11 @@ fn build_tile_request_for_tms(
         maybe_upgrade_multiband_default(bands, format, content_type, pq, eff_default_bands)
     };
     let format = geotiff_render_format(format, content_type, pq, source_cog, &bands, sample_type, false);
-    let auto_fmt = ext_opt.is_none() && pq.format_param.is_none();
-    let u16_png = !auto_fmt && wants_u16_png(format, content_type, pq, source_cog, &bands, sample_type);
     if !matches!(format, OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64) {
         match bands {
             BandRequest::MultiBand { ref bands_1based }
-                if !(u16_png
-                    || pq.pixel_selection.by_last_band()
-                        && matches!(bands_1based.len(), 2 | 4)) =>
+                if !(pq.pixel_selection.by_last_band()
+                    && matches!(bands_1based.len(), 2 | 4)) =>
             {
                 return Err(EngineError::BadRequest(
                     "multi-band bidx (2 or 4..=15 bands) is only supported for .tif, .npy, or .f32 output"
