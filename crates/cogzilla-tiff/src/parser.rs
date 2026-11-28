@@ -964,6 +964,27 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             }
         };
 
+        // GDAL exposes <=8-bit 1-band unsigned integer TIFFs with Photometric=MinIsWhite
+        // (tag 262 = 0) and no explicit ColorMap as an inverted grayscale palette
+        // (0 = white, max = black). Restricting to <=8-bit keeps the palette <=256 entries
+        // (zero HashMap allocation per tile and no /cog/info JSON blowup).
+        if ifds.is_empty() && photometric == 0 && samples_per_pixel == 1 && color_map.is_none() {
+            let max_val: Option<usize> = match sample_type {
+                SampleType::Uint1 => Some(1),
+                SampleType::Uint4 => Some(15),
+                SampleType::Uint8 => Some(255),
+                _ => None,
+            };
+            if let Some(max_v) = max_val {
+                let mut lut = Vec::with_capacity(max_v + 1);
+                for i in 0..=max_v {
+                    let g = (((max_v - i) * 255) / max_v) as u8;
+                    lut.push([g, g, g, 255]);
+                }
+                color_map = Some(lut);
+            }
+        }
+
         const MAX_SAMPLES_PER_PIXEL: u16 = 1024;
         if width == 0
             || height == 0
@@ -1479,5 +1500,39 @@ mod tests {
         let mut desc = vec![String::new(); 1];
         parse_gdal_metadata(&xml, &mut scales, &mut offsets, &mut meta, &mut desc);
         assert_eq!(meta[0], vec![("ok".to_string(), "y".to_string())]);
+    }
+
+    #[test]
+    fn miniswhite_synthesizes_inverted_grayscale_palette() {
+        // Minimal classic LE TIFF with Photometric=0 (MinIsWhite), 1-band uint8, 1 strip.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        let entries: &[(u16, u16, u32, u32)] = &[
+            (256, 4, 1, 4),   // ImageWidth = 4
+            (257, 4, 1, 4),   // ImageLength = 4
+            (258, 3, 1, 8),   // BitsPerSample = 8
+            (259, 3, 1, 1),   // Compression = None
+            (262, 3, 1, 0),   // Photometric = MinIsWhite
+            (273, 4, 1, 200), // StripOffsets
+            (277, 3, 1, 1),   // SamplesPerPixel = 1
+            (278, 4, 1, 4),   // RowsPerStrip = 4
+            (279, 4, 1, 16),  // StripByteCounts = 16
+        ];
+        buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for &(tag, typ, cnt, val) in entries {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&typ.to_le_bytes());
+            buf.extend_from_slice(&cnt.to_le_bytes());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+        let cog = parse_cog(&buf).expect("parse MinIsWhite TIFF");
+        let pal = cog.color_map.expect("MinIsWhite should synthesize inverted palette");
+        assert_eq!(pal.len(), 256);
+        assert_eq!(pal[0], [255, 255, 255, 255]);
+        assert_eq!(pal[1], [254, 254, 254, 255]);
+        assert_eq!(pal[255], [0, 0, 0, 255]);
     }
 }

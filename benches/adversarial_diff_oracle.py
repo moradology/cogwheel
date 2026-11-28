@@ -21,6 +21,7 @@ Exits 0 iff 100% of checks pass (zero unexplained discrepancies).
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gzip
 import http.server
 import io
@@ -501,6 +502,53 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     with rasterio.open(p_am, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=from_bounds(170.0, -10.0, 190.0, 10.0, 128, 128), tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
         ds.write((100.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32))[None])
     out["w14_antimeridian"] = p_am
+
+    # Wave 16: Photometric=MinIsWhite (uint8 & 1-bit), partial final strips (CONTIG & SEPARATE RGBA), Palette
+    def _patch_short_tag(path: Path, tag_id: int, new_val: int) -> None:
+        buf = bytearray(path.read_bytes())
+        assert buf[:4] == b"II*\x00"
+        ifd_off = struct.unpack_from("<I", buf, 4)[0]
+        n_ent = struct.unpack_from("<H", buf, ifd_off)[0]
+        for i in range(n_ent):
+            off = ifd_off + 2 + i * 12
+            t, typ, cnt = struct.unpack_from("<HHI", buf, off)
+            if t == tag_id and typ == 3 and cnt == 1:
+                struct.pack_into("<H", buf, off + 8, new_val)
+                path.write_bytes(bytes(buf))
+                return
+        raise RuntimeError(f"tag {tag_id} not found in {path}")
+
+    p_miw8 = synth_dir / "w16_miniswhite_u8.tif"
+    with rasterio.open(p_miw8, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(((xx9 * 2 + yy9) % 256).astype(np.uint8), 1)
+    _patch_short_tag(p_miw8, 262, 0)  # Photometric = MinIsWhite
+    out["w16_miniswhite_u8"] = p_miw8
+
+    p_miw1 = synth_dir / "w16_miniswhite_1bit.tif"
+    with rasterio.open(p_miw1, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8", nbits=1, crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((((xx9 // 4) + (yy9 // 8)) % 2).astype(np.uint8), 1)
+    _patch_short_tag(p_miw1, 262, 0)  # Photometric = MinIsWhite
+    out["w16_miniswhite_1bit"] = p_miw1
+
+    tf_100 = from_bounds(-122.5, 37.5, -122.0, 38.0, 128, 100)
+    yy100, xx100 = np.mgrid[0:100, 0:128]
+    p_sc = synth_dir / "w16_strip_partial_contig.tif"
+    with rasterio.open(p_sc, "w", driver="GTiff", width=128, height=100, count=3, dtype="uint8", crs="EPSG:4326", transform=tf_100, tiled=False, blockysize=32, interleave="pixel", compress="deflate") as ds:
+        ds.write(np.stack([((xx100 * 2) % 256).astype(np.uint8), ((yy100 * 2) % 256).astype(np.uint8), ((xx100 + yy100) % 256).astype(np.uint8)]))
+    out["w16_strip_partial_contig"] = p_sc
+
+    p_ss = synth_dir / "w16_strip_partial_sep_rgba.tif"
+    with rasterio.open(p_ss, "w", driver="GTiff", width=128, height=100, count=4, dtype="uint8", crs="EPSG:4326", transform=tf_100, tiled=False, blockysize=32, interleave="band", compress="deflate", photometric="RGB", alpha="YES") as ds:
+        a100 = np.full((100, 128), 255, dtype=np.uint8)
+        a100[60:95, 60:100] = 0
+        ds.write(np.stack([((xx100 * 2) % 256).astype(np.uint8), ((yy100 * 2) % 256).astype(np.uint8), ((xx100 + yy100) % 256).astype(np.uint8), a100]))
+    out["w16_strip_partial_sep_rgba"] = p_ss
+
+    p_pal16 = synth_dir / "w16_palette.tif"
+    with rasterio.open(p_pal16, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(((xx9 + yy9) % 8).astype(np.uint8), 1)
+        ds.write_colormap(1, {i: (i * 31, (255 - i * 29) % 256, (i * 53) % 256, 255) for i in range(8)})
+    out["w16_palette"] = p_pal16
 
     return out
 
@@ -1790,6 +1838,22 @@ def run_wave15_resilience_checks(
             pass
 
         def do_HEAD(self):
+            if self.path.startswith("/redir"):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{srv_port}/target.tif")
+                self.end_headers()
+                return
+            if self.path.startswith("/loop"):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{srv_port}/loop.tif")
+                self.end_headers()
+                return
+            if self.path.startswith("/target"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(v1_bytes)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                return
             if self.path.startswith("/norange"):
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(big_bytes)))
@@ -1802,6 +1866,35 @@ def run_wave15_resilience_checks(
             self.end_headers()
 
         def do_GET(self):
+            if self.path.startswith("/redir"):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{srv_port}/target.tif")
+                self.end_headers()
+                return
+            if self.path.startswith("/loop"):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{srv_port}/loop.tif")
+                self.end_headers()
+                return
+            if self.path.startswith("/target"):
+                rng = self.headers.get("Range")
+                if rng and rng.startswith("bytes="):
+                    s0, e0 = rng[6:].split("-", 1)
+                    start = int(s0)
+                    end = min(int(e0) if e0 else len(v1_bytes) - 1, len(v1_bytes) - 1)
+                    chunk = v1_bytes[start:end + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{len(v1_bytes)}")
+                    self.send_header("Content-Length", str(len(chunk)))
+                    self.end_headers()
+                    self.wfile.write(chunk)
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(v1_bytes)))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    self.wfile.write(v1_bytes)
+                return
             if self.path.startswith("/norange"):
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(big_bytes)))
@@ -1937,7 +2030,37 @@ def run_wave15_resilience_checks(
                         if not gok:
                             gpu_diffs.append({"label": lb, "detail": gd})
 
-        # 5. Server health check after all hostile fuzzing
+        # 5. Wave 16 HTTP 302 redirect, redirect loop -> 502, and 16-way concurrent singleflight burst
+        lb = "W16 HTTP 302 redirect -> 200"
+        if wanted(lb):
+            p_rd = f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={qe(f'http://127.0.0.1:{srv_port}/redir.tif')}"
+            r_rd = client.get(cw_base + p_rd)
+            if r_rd.status_code == 200:
+                arr = np.load(io.BytesIO(r_rd.content))
+                v = float(arr[0, 128, 128])
+                rec(lb, v == 100.0, f"val={v} (exp 100.0)", p_rd)
+            else:
+                rec(lb, False, f"HTTP {r_rd.status_code} {r_rd.text[:80]!r}", p_rd)
+
+        lb = "W16 HTTP redirect loop -> 502"
+        if wanted(lb):
+            p_lp = f"/cog/info?url={qe(f'http://127.0.0.1:{srv_port}/loop.tif')}"
+            r_lp = client.get(cw_base + p_lp)
+            rec(lb, r_lp.status_code == 502, f"status={r_lp.status_code} {r_lp.text[:80]!r}", p_lp)
+
+        lb = "W16 CONCURRENT 16x singleflight burst"
+        if wanted(lb):
+            p_burst = f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(w15_dir / 'v1.tif')}"
+            def _fetch_one(_):
+                r = httpx.get(cw_base + p_burst, timeout=30.0)
+                return r.status_code, r.content
+            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+                res = list(ex.map(_fetch_one, range(16)))
+            all_200 = all(st == 200 for st, _ in res)
+            all_eq = len({b for _, b in res}) == 1
+            rec(lb, all_200 and all_eq and len(res[0][1]) > 0, f"all_200={all_200} identical_bytes={all_eq} len={len(res[0][1])}", p_burst)
+
+        # 6. Server health check after all hostile fuzzing
         lb = "W15 SERVER healthy after hostile fuzzing -> 200"
         if wanted(lb):
             rh = client.get(f"{cw_base}/healthz")
@@ -2365,6 +2488,14 @@ def main() -> int:
                 ("BETTER W14 F32 +/-Inf .npy (cw masks Inf, tt leaves Inf)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w14_inf'])}", None, "better_inf_masked"),
                 ("PARITY W14 F32 +/-Inf /statistics", "GET", f"/cog/statistics?url={q(s['w14_inf'])}", None, "stats"),
                 ("PARITY W14 SOUTH-POLE EPSG:3031 UPSAntarctic", "GET", f"/cog/tiles/UPSAntarcticWGS84Quad/2/1/1.npy?url={q(s['w14_south_pole'])}", None, "npy"),
+                # --- Wave 16: Photometric=MinIsWhite, partial final strips, Palette ---
+                ("PARITY W16 MINISWHITE u8 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w16_miniswhite_u8'])}", None, "png"),
+                ("PARITY W16 MINISWHITE 1bit .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w16_miniswhite_1bit'])}", None, "png"),
+                ("PARITY W16 STRIP partial final CONTIG .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w16_strip_partial_contig'])}", None, "npy"),
+                ("PARITY W16 STRIP partial final SEPARATE RGBA .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w16_strip_partial_sep_rgba'])}", None, "npy"),
+                ("PARITY W16 PALETTE u8 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w16_palette'])}", None, "png"),
+                ("BETTER W16 MINISWHITE u8 .npy raw (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w16_miniswhite_u8'])}", None, "better_palette_npy"),
+                ("BETTER W16 PALETTE u8 .npy raw (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w16_palette'])}", None, "better_palette_npy"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
