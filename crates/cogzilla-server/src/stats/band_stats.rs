@@ -21,7 +21,8 @@ impl BandStatsAcc {
             cogzilla_raster::SampleType::Uint1
             | cogzilla_raster::SampleType::Uint4
             | cogzilla_raster::SampleType::Uint8 => Self::HistU8([0u64; 256]),
-            cogzilla_raster::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
+            cogzilla_raster::SampleType::Uint12
+            | cogzilla_raster::SampleType::Uint16 => Self::HistU16(vec![0u64; 65_536]),
             s if s.needs_f64() => Self::Floats64(Vec::with_capacity(capacity_hint)),
             _ => Self::Floats(Vec::with_capacity(capacity_hint)),
         }

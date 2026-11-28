@@ -2646,6 +2646,71 @@ pub fn reconstruct_subbyte(
         .collect()
 }
 
+/// Unpack MSB-first 12-bit packed TIFF rows (`NBITS=12`, 2 samples per 3 bytes, rows padded to
+/// a byte boundary) into native `BandData::U16` (`0..=4095`).
+pub fn reconstruct_uint12(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let nd_u16: Option<u16> = nodata
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 4095.0 && v.fract() == 0.0)
+        .map(|v| v as u16);
+    let samples_per_row = w * bands_in_tile;
+    let row_bytes = (samples_per_row * 3).div_ceil(2);
+    let mut bufs: Vec<Vec<u16>> = (0..bands_in_tile).map(|_| vec![0u16; pixels]).collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    for y in 0..h {
+        let row = &raw[y * row_bytes..(y + 1) * row_bytes];
+        let row_px = y * w;
+        for x in 0..w {
+            for b in 0..bands_in_tile {
+                let s = x * bands_in_tile + b;
+                let byte_off = (s >> 1) * 3;
+                let v = if (s & 1) == 0 {
+                    ((row[byte_off] as u16) << 4) | ((row[byte_off + 1] as u16) >> 4)
+                } else {
+                    (((row[byte_off + 1] & 0x0F) as u16) << 8) | (row[byte_off + 2] as u16)
+                };
+                bufs[b][row_px + x] = v;
+                if nd_u16 == Some(v) {
+                    any_nodata[b] = true;
+                } else {
+                    any_valid[b] = true;
+                    let vf = v as f32;
+                    if vf < min_val[b] {
+                        min_val[b] = vf;
+                    }
+                    if vf > max_val[b] {
+                        max_val[b] = vf;
+                    }
+                }
+            }
+        }
+    }
+    bufs.into_iter()
+        .enumerate()
+        .map(|(b, data)| DecodedBand {
+            data: BandData::U16 {
+                data: data.into_boxed_slice(),
+                nodata: nd_u16,
+            },
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
 /// Zero-copy `float64` (`Predictor::None`) decode directly into exact `BandData::F64`.
 pub fn reconstruct_f64_uncompressed(
     raw: &[u8],
@@ -3191,5 +3256,29 @@ mod tests {
             unsafe { prefix_sum_stride3_avx2(&mut b) };
             assert_eq!(a, b, "mismatch for len={len}");
         }
+    }
+
+    #[test]
+    fn reconstruct_uint12_unpacks_odd_and_even_rows_with_nodata() {
+        // 3 pixels x 2 rows, 1 band -> 3 samples/row -> 5 bytes/row (MSB-first 12-bit packed)
+        // Row 0: [0xABC (2748), 0x123 (291), 0xFFF (4095)] -> bytes: AB C1 23 FF F0
+        // Row 1: [0x000 (0),    0x800 (2048), 0x001 (1)]   -> bytes: 00 08 00 00 10
+        let raw = [
+            0xABu8, 0xC1, 0x23, 0xFF, 0xF0, // row 0
+            0x00, 0x08, 0x00, 0x00, 0x10, // row 1
+        ];
+        let bands = reconstruct_uint12(&raw, 3, 2, 1, Some(0.0));
+        assert_eq!(bands.len(), 1);
+        match &bands[0].data {
+            BandData::U16 { data, nodata } => {
+                assert_eq!(&**data, &[2748, 291, 4095, 0, 2048, 1]);
+                assert_eq!(*nodata, Some(0));
+            }
+            _ => panic!("expected BandData::U16"),
+        }
+        assert!(!bands[0].stats.all_nodata);
+        assert!(!bands[0].stats.no_nodata);
+        assert_eq!(bands[0].stats.min, 1.0);
+        assert_eq!(bands[0].stats.max, 4095.0);
     }
 }

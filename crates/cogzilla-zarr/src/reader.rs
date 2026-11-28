@@ -602,8 +602,8 @@ pub(crate) fn bytes_to_decoded_band(
                 stats,
             }
         }
-        SampleType::Uint1 | SampleType::Uint4 => {
-            unreachable!("Zarr stores never produce sub-byte TIFF sample types")
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint12 => {
+            unreachable!("Zarr stores never produce bit-packed TIFF sample types")
         }
     }
 }

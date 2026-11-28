@@ -2629,7 +2629,7 @@ impl PlanesTile {
                 // It has room for four samples a pixel, the mask among them.
                 if let (Some((OutputFormat::Png, content_type)), false, 1..=4) =
                     (look.asked, shown, selected.bands + usize::from(look.return_mask))
-                    && kind() == SampleType::Uint16
+                    && matches!(kind(), SampleType::Uint12 | SampleType::Uint16)
                 {
                     return Ok((png_of_16_bits(&selected.values, selected.bands, width, height, look.return_mask), content_type));
                 }

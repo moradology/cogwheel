@@ -691,7 +691,10 @@ fn wants_u16_png(
 ) -> bool {
     fmt == OutputFormat::Png
         && ct == "image/png"
-        && sample_type == cogzilla_raster::SampleType::Uint16
+        && matches!(
+            sample_type,
+            cogzilla_raster::SampleType::Uint12 | cogzilla_raster::SampleType::Uint16
+        )
         && !pq.unscale
         && pq.rescale.is_empty()
         && !pq.colormap_explicit

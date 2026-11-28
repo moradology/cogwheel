@@ -947,6 +947,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             (1, 4) => SampleType::Uint4,
             (1, 8) => SampleType::Uint8,
             (2, 8) => SampleType::Int8,
+            (1, 12) => SampleType::Uint12,
             (1, 16) => SampleType::Uint16,
             (2, 16) => SampleType::Int16,
             (1, 32) => SampleType::Uint32,

@@ -80,7 +80,7 @@ fn write_npy_typed_planes(
             write_planes!(u8, |v: f64| v as u8)
         }
         SampleType::Int8 => write_planes!(i8, |v: f64| v as i8),
-        SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
+        SampleType::Uint12 | SampleType::Uint16 => write_planes!(u16, |v: f64| v as u16),
         SampleType::Int16 => write_planes!(i16, |v: f64| v as i16),
         SampleType::Uint32 => write_planes!(u32, |v: f64| v as u32),
         SampleType::Int32 => write_planes!(i32, |v: f64| v as i32),

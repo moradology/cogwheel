@@ -325,6 +325,38 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.offsets = (10.0,)
     out["int8_unscale"] = p_i8
 
+    # Wave 9: Exotic codecs & bit packing (LERC/DEFLATE/ZSTD, WebP lossless/lossy, JPEG YCbCr,
+    # 1-bit, 4-bit, 12-bit, Predictor=2 int16, Predictor=3 float64, PlanarConfig=SEPARATE).
+    tf_w9 = from_bounds(-122.5, 37.5, -122.0, 38.0, 128, 128)
+    yy9, xx9 = np.mgrid[0:128, 0:128]
+    f32_w9 = (100.0 + xx9.astype(np.float32) * 2.5 + yy9.astype(np.float32) * 1.25)
+    f32_w9_nd = f32_w9.copy()
+    f32_w9_nd[0:24, 0:24] = -9999.0
+    rgb_w9 = np.stack([
+        np.clip(20 + xx9 * 1.7, 0, 255).astype(np.uint8),
+        np.clip(40 + yy9 * 1.5, 0, 255).astype(np.uint8),
+        np.clip(220 - (xx9 + yy9) * 0.7, 0, 255).astype(np.uint8),
+    ], axis=0)
+    w9_specs = [
+        ("w9_lerc", f32_w9[None], dict(compress="lerc", max_z_error=0.01)),
+        ("w9_lerc_deflate", f32_w9_nd[None], dict(compress="lerc_deflate", max_z_error=0.01, nodata=-9999.0)),
+        ("w9_lerc_zstd", f32_w9_nd[None], dict(compress="lerc_zstd", max_z_error=0.01, nodata=-9999.0)),
+        ("w9_webp_lossless", rgb_w9, dict(compress="webp", webp_lossless=True)),
+        ("w9_webp_lossy", rgb_w9, dict(compress="webp", webp_level=90)),
+        ("w9_jpeg_ycbcr", rgb_w9, dict(compress="jpeg", photometric="ycbcr", jpeg_quality=95)),
+        ("w9_nbits_1", ((xx9 // 16 + yy9 // 16) % 2).astype(np.uint8)[None], dict(compress="deflate", nbits=1)),
+        ("w9_nbits_4", ((xx9 // 8 + yy9 // 16) % 16).astype(np.uint8)[None], dict(compress="deflate", nbits=4)),
+        ("w9_nbits_12", ((xx9 * 15 + yy9 * 17) % 4096).astype(np.uint16)[None], dict(compress="deflate", nbits=12)),
+        ("w9_pred2_i16", ((xx9 * 10 - yy9 * 8 - 500).astype(np.int16))[None], dict(compress="deflate", predictor=2, nodata=-32768)),
+        ("w9_pred3_f64", (f32_w9.astype(np.float64) * 1.000123)[None], dict(compress="zstd", predictor=3)),
+        ("w9_planar_sep_rgb", rgb_w9, dict(compress="deflate", interleave="band")),
+    ]
+    for name, arr, kw in w9_specs:
+        p = synth_dir / f"{name}.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=128, height=128, count=arr.shape[0], dtype=arr.dtype, crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, **kw) as ds:
+            ds.write(arr)
+        out[name] = p
+
     return out
 
 
@@ -1489,8 +1521,34 @@ def main() -> int:
                 ("PARITY CMAP semi-transparent alpha .png", "GET", f"/cog/tiles/WebMercatorQuad/11/327/792.png?url={q(s['cat_u8'])}&colormap={qe(json.dumps({'1':[255,0,0,128],'2':[0,255,0,0],'3':[0,0,255,255],'5':[255,255,0,200],'10':[255,0,255,255]}))}", None, "png"),
             ]
 
+            # --- 5d. Wave 9: Exotic codecs (LERC/WebP/JPEG/1-bit/4-bit/12-bit/Pred2/Pred3/PlanarSep), chained color_formula, algorithm_params ---
+            for name in ("w9_lerc", "w9_lerc_deflate", "w9_lerc_zstd", "w9_webp_lossless", "w9_webp_lossy", "w9_nbits_4", "w9_nbits_12", "w9_pred2_i16", "w9_pred3_f64", "w9_planar_sep_rgb"):
+                p = s[name]
+                lon, lat, z, tx, ty, _ = center_lonlat_and_tile(p, z=10)
+                cases += [
+                    (f"PARITY W9 [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/{z}/{tx}/{ty}.npy?url={q(p)}", None, "npy"),
+                    (f"PARITY W9 [{name}] point", "GET", f"/cog/point/{lon:.5f},{lat:.5f}?url={q(p)}", None, "point"),
+                    (f"PARITY W9 [{name}] stats", "GET", f"/cog/statistics?url={q(p)}", None, "stats"),
+                ]
+            lon_j, lat_j, z_j, tx_j, ty_j, _ = center_lonlat_and_tile(s["w9_jpeg_ycbcr"], z=10)
+            cases += [
+                ("PARITY W9 [w9_jpeg_ycbcr] .png", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.png?url={q(s['w9_jpeg_ycbcr'])}", None, "png"),
+                ("PARITY W9 [w9_jpeg_ycbcr] point", "GET", f"/cog/point/{lon_j:.5f},{lat_j:.5f}?url={q(s['w9_jpeg_ycbcr'])}", None, "point"),
+                ("PARITY W9 [w9_nbits_1] point", "GET", f"/cog/point/{lon_j:.5f},{lat_j:.5f}?url={q(s['w9_nbits_1'])}", None, "point"),
+                ("PARITY W9 [w9_nbits_1] stats", "GET", f"/cog/statistics?url={q(s['w9_nbits_1'])}", None, "stats"),
+                ("PARITY W9 [w9_nbits_12] .png", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.png?url={q(s['w9_nbits_12'])}", None, "png"),
+                ("PARITY W9 CF chained Gamma+Sigmoidal+Sat", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={q(sat)}&rescale=0,0.35&color_formula={qe('Gamma RGB 1.5 Sigmoidal RGB 6 0.5 Saturation 1.3')}", None, "png"),
+                ("PARITY W9 CF per-channel Gamma R/G/B", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={q(sat)}&rescale=0,0.35&color_formula={qe('Gamma R 1.2 Gamma G 0.8 Gamma B 1.4')}", None, "png"),
+                ("PARITY W9 ALG contours custom params", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=contours&algorithm_params={qe(json.dumps({'increment':50,'thickness':2,'minz':0,'maxz':1000}))}", None, "png"),
+                ("PARITY W9 ALG normalizedIndex .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&bidx=1&bidx=2&algorithm=normalizedIndex", None, "npy"),
+                ("PARITY W9 ALG terrarium .png", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=terrarium", None, "png"),
+                ("PARITY W9 ALG terrainrgb .png", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=terrainrgb", None, "png"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
+                ("BETTER W9 nbits_1 .npy raw 0/1 (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.npy?url={q(s['w9_nbits_1'])}", None, "better_palette_npy"),
+                ("BETTER W9 hillshade custom 256x256 (cw 256, tt 250)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=hillshade&algorithm_params={qe(json.dumps({'azimuth':135,'angle_altitude':30,'z_exaggeration':2.0}))}", None, "better_hillshade_256"),
                 ("BETTER inverted rescale (cw inverts, tt clips 255)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=1000,0&colormap_name=viridis", None, "better_inverted_rescale"),
                 ("BETTER resampling=min (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=0,1000&colormap_name=viridis&resampling=min", None, "better_cw200_tt422"),
                 ("BETTER resampling=med (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=0,1000&colormap_name=viridis&resampling=med", None, "better_cw200_tt422"),
@@ -1626,6 +1684,19 @@ def main() -> int:
                             border_valid = bool((ac[1, 0, :] > 0).all() and (ac[1, -1, :] > 0).all() and (ac[1, :, 0] > 0).all() and (ac[1, :, -1] > 0).all())
                             ok = ac.shape == (2, 256, 256) and at.shape == (2, 250, 250) and diff < 1e-2 and border_valid
                             detail = f"cw={ac.shape} tt={at.shape} inner_max_diff={diff:.4f} border_valid={border_valid}"
+                    elif kind == "better_hillshade_256":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ac = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            at = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            if ac.shape != (256, 256, 4) or at.shape != (250, 250, 4):
+                                ok, detail = False, f"shape mismatch cw={ac.shape} tt={at.shape}"
+                            else:
+                                inner_mae = float(np.abs(ac[3:253, 3:253, :3].astype(np.float32) - at[:, :, :3].astype(np.float32)).mean())
+                                border_opaque = bool((ac[0, :, 3] == 255).all() and (ac[-1, :, 3] == 255).all() and (ac[:, 0, 3] == 255).all() and (ac[:, -1, 3] == 255).all())
+                                ok = inner_mae < 2.0 and border_opaque
+                                detail = f"cw={ac.shape} tt={at.shape} inner_MAE={inner_mae:.2f} border_opaque={border_opaque}"
                     elif kind == "better_cast_i16":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
