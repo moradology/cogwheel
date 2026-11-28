@@ -9,10 +9,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use bytes::Bytes;
 use cogzilla_kernel::{
-    ColormapName, OutputFormat, ResampleMode, SingleBandStyle, render_single_band, sample_general,
-    wrap_raw_f32_as_npy_with_mask,
+    ColormapName, OutputFormat, ResampleMode, SingleBandStyle, encode_npy_typed,
+    render_single_band, sample_general,
 };
 use cogzilla_proj::{CoordPlan, CrsModel, TileCoord, normalize_geographic_lon};
+use cogzilla_raster::SampleType;
 use cogzilla_zarr::hierarchy::BoxFuture;
 use cogzilla_zarr::{
     CfTimeUnits, FsStore, MultiscalePyramid,
@@ -1000,8 +1001,8 @@ async fn handle_tile(
     };
 
     let caps = ZarrCaps::from_env();
-    let etag_key = format!("zarr:tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
-    let tile_cache_key = format!("zarr_tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}?{raw_query}");
+    let etag_key = format!("zarr:tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}:{content_type}?{raw_query}");
+    let tile_cache_key = format!("zarr_tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}:{content_type}?{raw_query}");
 
     // Fast warm-tile cache hit (keyed by store validator so mutated stores never serve stale tiles).
     if let Some(cached) = engine.tile_cache.get(&tile_cache_key) {
@@ -1060,18 +1061,34 @@ async fn handle_tile(
         if let Some(nd) = q.nodata {
             src = src.with_nodata_override(Some(nd));
         }
-        let body = if matches!(fmt, OutputFormat::RawF32) {
-            let raw = render_single_band::<256>(
-                &plan,
-                &src,
-                &SingleBandStyle {
-                    format: OutputFormat::RawF32,
-                    ..style
-                },
-            );
-            encode_geotiff_f32(256, 256, &raw, tile_bounds, tms.epsg, q.return_mask)
-        } else {
-            render_single_band::<256>(&plan, &src, &style)
+        let body = match fmt {
+            OutputFormat::RawF32 => {
+                let raw = render_single_band::<256>(
+                    &plan,
+                    &src,
+                    &SingleBandStyle {
+                        format: OutputFormat::RawF32,
+                        ..style
+                    },
+                );
+                encode_geotiff_f32(256, 256, &raw, tile_bounds, tms.epsg, q.return_mask)
+            }
+            OutputFormat::Npy => {
+                let raw = render_single_band::<256>(
+                    &plan,
+                    &src,
+                    &SingleBandStyle {
+                        format: OutputFormat::RawF32,
+                        ..style
+                    },
+                );
+                let plane: Vec<f32> = raw
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                encode_zarr_npy(&plane, 256, 256, q.return_mask)
+            }
+            _ => render_single_band::<256>(&plan, &src, &style),
         };
         engine.tile_cache.insert(tile_cache_key, body.clone(), content_type);
         engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
@@ -1229,6 +1246,18 @@ fn f32_plane_to_le_bytes(plane: &[f32]) -> Vec<u8> {
     raw
 }
 
+fn encode_zarr_npy(plane: &[f32], out_w: u32, out_h: u32, return_mask: bool) -> Bytes {
+    encode_npy_typed(
+        plane,
+        1,
+        out_h as usize,
+        out_w as usize,
+        SampleType::Float32,
+        None,
+        return_mask,
+    )
+}
+
 fn encode_zarr_plane(
     plane: &[f32],
     out_w: u32,
@@ -1239,13 +1268,7 @@ fn encode_zarr_plane(
     fmt: OutputFormat,
 ) -> Bytes {
     match fmt {
-        OutputFormat::Npy => wrap_raw_f32_as_npy_with_mask(
-            Bytes::from(f32_plane_to_le_bytes(plane)),
-            1,
-            out_h,
-            out_w,
-            q.return_mask,
-        ),
+        OutputFormat::Npy => encode_zarr_npy(plane, out_w, out_h, q.return_mask),
         OutputFormat::RawF32 => {
             let raw = f32_plane_to_le_bytes(plane);
             encode_geotiff_f32(out_w, out_h, &raw, dst_bounds, dst_epsg, q.return_mask)
@@ -1622,5 +1645,32 @@ mod tests {
                 expected_substr
             );
         }
+    }
+
+    #[test]
+    fn encode_zarr_npy_writes_valid_header_and_rio_tiler_f32_mask() {
+        let plane = [12.5f32, f32::NAN, -3.25, 0.0];
+        let with_mask = encode_zarr_npy(&plane, 2, 2, true);
+        let (shape, start) = cogzilla_kernel::f32_npy_shape(&with_mask)
+            .expect("encode_zarr_npy must produce a valid <f4 .npy header");
+        assert_eq!(shape, vec![2, 2, 2]);
+        let vals: Vec<f32> = with_mask[start..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Data plane: NaN replaced by 0.0, valid values preserved
+        assert_eq!(&vals[0..4], &[12.5, 0.0, -3.25, 0.0]);
+        // Mask plane: f32::MAX where valid, f32::MIN where masked
+        assert_eq!(&vals[4..8], &[f32::MAX, f32::MIN, f32::MAX, f32::MAX]);
+
+        let no_mask = encode_zarr_npy(&plane, 2, 2, false);
+        let (shape_nm, start_nm) = cogzilla_kernel::f32_npy_shape(&no_mask)
+            .expect("return_mask=false must produce a valid <f4 .npy header");
+        assert_eq!(shape_nm, vec![1, 2, 2]);
+        let vals_nm: Vec<f32> = no_mask[start_nm..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals_nm, vec![12.5, 0.0, -3.25, 0.0]);
     }
 }

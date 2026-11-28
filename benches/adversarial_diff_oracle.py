@@ -21,6 +21,7 @@ Exits 0 iff 100% of checks pass (zero unexplained discrepancies).
 from __future__ import annotations
 
 import argparse
+import gzip
 import io
 import json
 import math
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+import zlib
 from pathlib import Path
 from urllib.parse import quote
 
@@ -39,6 +41,7 @@ import numpy as np
 from PIL import Image
 import rasterio
 from rasterio.control import GroundControlPoint
+from rasterio.crs import CRS as RasterioCRS
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, from_bounds
 from rasterio.warp import transform_bounds
@@ -841,6 +844,416 @@ def run_wave7_checks(
     return ran
 
 
+def _write_v2_zarr_array(store: Path, name: str, arr: np.ndarray, chunks: tuple[int, ...], attrs: dict, compressor: dict | None = None, fill_value=None):
+    ad = store / name
+    ad.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "chunks": list(chunks),
+        "compressor": compressor,
+        "dtype": arr.dtype.str,
+        "fill_value": fill_value,
+        "filters": None,
+        "order": "C",
+        "shape": list(arr.shape),
+        "zarr_format": 2,
+    }
+    (ad / ".zarray").write_text(json.dumps(meta))
+    (ad / ".zattrs").write_text(json.dumps(attrs))
+    grid = [int(np.ceil(s / c)) for s, c in zip(arr.shape, chunks)]
+    for idx in np.ndindex(*grid):
+        slices = tuple(slice(i * c, min((i + 1) * c, s)) for i, c, s in zip(idx, chunks, arr.shape))
+        sub = arr[slices]
+        if sub.shape != chunks:
+            pad = np.full(chunks, fill_value if fill_value is not None else 0, dtype=arr.dtype)
+            pad[tuple(slice(0, x) for x in sub.shape)] = sub
+            sub = pad
+        raw = np.ascontiguousarray(sub).tobytes()
+        if compressor is None:
+            enc = raw
+        elif compressor["id"] == "zlib":
+            enc = zlib.compress(raw, compressor.get("level", 1))
+        elif compressor["id"] == "gzip":
+            enc = gzip.compress(raw, compresslevel=compressor.get("level", 1))
+        else:
+            raise ValueError(compressor)
+        key = ".".join(str(i) for i in idx) if idx else "0"
+        (ad / key).write_bytes(enc)
+
+
+def _write_v3_zarr_array(store: Path, name: str, arr: np.ndarray, chunks: tuple[int, ...], attrs: dict, dim_names: list[str], fill_value, use_gzip: bool = True):
+    ad = store / name
+    ad.mkdir(parents=True, exist_ok=True)
+    codecs = [{"name": "bytes", "configuration": {"endian": "little"}}]
+    if use_gzip:
+        codecs.append({"name": "gzip", "configuration": {"level": 1}})
+    meta = {
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": list(arr.shape),
+        "data_type": arr.dtype.name,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(chunks)}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": fill_value,
+        "codecs": codecs,
+        "dimension_names": dim_names,
+        "attributes": attrs,
+    }
+    (ad / "zarr.json").write_text(json.dumps(meta))
+    grid = [int(np.ceil(s / c)) for s, c in zip(arr.shape, chunks)]
+    for idx in np.ndindex(*grid):
+        slices = tuple(slice(i * c, min((i + 1) * c, s)) for i, c, s in zip(idx, chunks, arr.shape))
+        sub = np.ascontiguousarray(arr[slices]).tobytes()
+        enc = gzip.compress(sub, compresslevel=1) if use_gzip else sub
+        cp = ad / "c" / Path(*[str(i) for i in idx])
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_bytes(enc)
+
+
+def build_zarr_fixtures(d: Path) -> dict:
+    """Build 4 synthetic Zarr v2/v3 stores covering 3D time slicing, EPSG:3857, south-up v3, and 0..360° lon."""
+    d.mkdir(parents=True, exist_ok=True)
+    lat = np.linspace(38.0 - 0.5 / 128, 37.0 + 0.5 / 128, 128, dtype=np.float64)
+    lon = np.linspace(-123.0 + 0.5 / 128, -122.0 - 0.5 / 128, 128, dtype=np.float64)
+    yy, xx = np.mgrid[0:128, 0:128].astype(np.float32)
+    t0 = 20.0 + xx * 0.5 + yy * 0.25
+    t1 = 100.0 + xx * 1.0 - yy * 0.25
+    data_3d = np.stack([t0, t1], axis=0).astype(np.float32)
+    data_3d[:, 0:32, 0:32] = -9999.0
+
+    # 1. Zarr v2 Geographic 3D (time=2, lat=128, lon=128)
+    s_v2_geo = d / "v2_geo_3d.zarr"
+    s_v2_geo.mkdir()
+    (s_v2_geo / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    (s_v2_geo / ".zattrs").write_text(json.dumps({"Conventions": "CF-1.8"}))
+    _write_v2_zarr_array(s_v2_geo, "time", np.array([0, 1], dtype=np.int64), (2,), {"_ARRAY_DIMENSIONS": ["time"]})
+    _write_v2_zarr_array(s_v2_geo, "lat", lat, (128,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude", "units": "degrees_north"})
+    _write_v2_zarr_array(s_v2_geo, "lon", lon, (128,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude", "units": "degrees_east"})
+    _write_v2_zarr_array(s_v2_geo, "temp", data_3d, (1, 64, 64), {"_ARRAY_DIMENSIONS": ["time", "lat", "lon"], "scale_factor": 0.5, "add_offset": 10.0}, compressor={"id": "zlib", "level": 1}, fill_value=-9999.0)
+
+    # 2. Zarr v2 Projected EPSG:3857 2D (256x256) aligned to z=12/657/1582
+    s_v2_proj = d / "v2_proj_3857.zarr"
+    s_v2_proj.mkdir()
+    (s_v2_proj / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    (s_v2_proj / ".zattrs").write_text(json.dumps({"Conventions": "CF-1.8"}))
+    b = mercantile.xy_bounds(657, 1582, 12)
+    dx, dy = (b.right - b.left) / 256.0, (b.top - b.bottom) / 256.0
+    x_c = np.linspace(b.left + 0.5 * dx, b.right - 0.5 * dx, 256, dtype=np.float64)
+    y_c = np.linspace(b.top - 0.5 * dy, b.bottom + 0.5 * dy, 256, dtype=np.float64)
+    yy2, xx2 = np.mgrid[0:256, 0:256]
+    elev = (500 + xx2 * 4 + yy2 * 2).astype(np.int16)
+    elev[0:64, 0:64] = -32768
+    wkt_3857 = RasterioCRS.from_epsg(3857).to_wkt()
+    _write_v2_zarr_array(s_v2_proj, "x", x_c, (256,), {"_ARRAY_DIMENSIONS": ["x"], "standard_name": "projection_x_coordinate", "units": "m"})
+    _write_v2_zarr_array(s_v2_proj, "y", y_c, (256,), {"_ARRAY_DIMENSIONS": ["y"], "standard_name": "projection_y_coordinate", "units": "m"})
+    _write_v2_zarr_array(s_v2_proj, "spatial_ref", np.array(0, dtype=np.int64), (), {"_ARRAY_DIMENSIONS": [], "crs_wkt": wkt_3857, "spatial_ref": wkt_3857})
+    _write_v2_zarr_array(s_v2_proj, "elev", elev, (128, 128), {"_ARRAY_DIMENSIONS": ["y", "x"], "grid_mapping": "spatial_ref", "scale_factor": 0.1, "add_offset": 100.0}, compressor={"id": "gzip", "level": 1}, fill_value=-32768)
+
+    # 3. Zarr v3 Geographic 2D with ASCENDING latitude (south-up!), float64, NaN hole
+    s_v3_southup = d / "v3_southup.zarr"
+    s_v3_southup.mkdir()
+    (s_v3_southup / "zarr.json").write_text(json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {"Conventions": "CF-1.8"}}))
+    lat_asc = np.linspace(37.0 + 0.5 / 128, 38.0 - 0.5 / 128, 128, dtype=np.float64)
+    v3_arr = (lat_asc[:, None] * 10.0 + (lon[None, :] + 130.0)).astype(np.float64)
+    v3_arr[0:32, 0:32] = np.nan
+    _write_v3_zarr_array(s_v3_southup, "lat", lat_asc, (128,), {"standard_name": "latitude", "units": "degrees_north"}, ["lat"], "NaN", use_gzip=False)
+    _write_v3_zarr_array(s_v3_southup, "lon", lon, (128,), {"standard_name": "longitude", "units": "degrees_east"}, ["lon"], "NaN", use_gzip=False)
+    _write_v3_zarr_array(s_v3_southup, "sst", v3_arr, (64, 64), {"units": "K"}, ["lat", "lon"], "NaN", use_gzip=True)
+
+    # 4. Zarr v2 0..360° longitude grid
+    s_v2_360 = d / "v2_lon360.zarr"
+    s_v2_360.mkdir()
+    (s_v2_360 / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    (s_v2_360 / ".zattrs").write_text(json.dumps({"Conventions": "CF-1.8"}))
+    _write_v2_zarr_array(s_v2_360, "lat", lat, (128,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+    _write_v2_zarr_array(s_v2_360, "lon", lon + 360.0, (128,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+    _write_v2_zarr_array(s_v2_360, "var360", t0.astype(np.float32), (64, 64), {"_ARRAY_DIMENSIONS": ["lat", "lon"]}, compressor={"id": "zlib", "level": 1}, fill_value=-9999.0)
+
+    return {"v2_geo": s_v2_geo, "v2_proj": s_v2_proj, "v3_southup": s_v3_southup, "v2_360": s_v2_360, "data_3d": data_3d, "elev": elev, "v3_arr": v3_arr, "lat": lat, "lon": lon, "lat_asc": lat_asc}
+
+
+def run_wave8_checks(
+    client: httpx.Client,
+    cw_base: str,
+    gpu_base: str | None,
+    tmp_dir: Path,
+    only_substr: str | None,
+    failures: list[dict],
+    gpu_diffs: list[dict],
+) -> int:
+    """Wave 8: Zarr v2 & v3 adversarial oracle (tiles .npy/.png, return_mask=false, sel=, unscale, south-up v3, 0..360° lon, preview, bbox, GET/POST stats, ETag/HEAD)."""
+    def wants(label: str) -> bool:
+        return not only_substr or only_substr.lower() in label.lower()
+
+    all_labels = [
+        "W8 ZARR v2 /dataset/keys",
+        "W8 ZARR v2 /info",
+        "W8 ZARR v3 /validate",
+        "W8 ZARR v2 proj tile .npy unscale=False",
+        "W8 ZARR v2 proj tile .npy unscale=True",
+        "W8 ZARR v2 proj tile .npy return_mask=false",
+        "W8 ZARR v2 proj tile .png",
+        *[f"W8 ZARR v2 3D /point sel=time={t} unscale={u}" for t in (0, 1) for u in (False, True)],
+        "W8 ZARR v2 3D /preview/128x128.npy sel=time=1",
+        "W8 ZARR v2 3D /bbox 128x128.npy sel=time=0",
+        "W8 ZARR v2 3D GET /statistics sel=time=0",
+        "W8 ZARR v2 3D POST /statistics west half",
+        "W8 ZARR v3 south-up /point NE",
+        "W8 ZARR v3 south-up /bbox 128x128.npy",
+        "W8 ZARR v2 0..360° lon /point (-122.5, 37.5)",
+        "W8 ZARR tile ETag + If-None-Match -> 304",
+        "W8 ZARR tile HEAD -> 200 empty",
+        "W8 ZARR tile cache isolates .npy vs .png",
+    ]
+    if not any(wants(lb) for lb in all_labels):
+        return 0
+
+    fx = build_zarr_fixtures(tmp_dir / "wave8_zarr")
+    ran = 0
+
+    def rec(label: str, path: str, kind: str, ok: bool, detail: str, method: str = "GET"):
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": label, "method": method, "path": path, "kind": kind, "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {label:54s} | {detail}")
+
+    def try_npy(label: str, path: str, raw: bytes):
+        try:
+            return np.load(io.BytesIO(raw))
+        except Exception as exc:
+            rec(label, path, "zarr_npy", False, f"invalid .npy (len={len(raw)}, magic={raw[:8]!r}): {exc}")
+            return None
+
+    # 1. Metadata & introspection
+    for lb, path, check_fn in [
+        ("W8 ZARR v2 /dataset/keys", f"/zarr/dataset/keys?url={q(fx['v2_geo'])}", lambda r: r.status_code == 200 and "temp" in r.json()),
+        ("W8 ZARR v2 /info", f"/zarr/info?url={q(fx['v2_geo'])}&variable=temp", lambda r: r.status_code == 200 and r.json().get("width") == 128 and r.json().get("height") == 128),
+        ("W8 ZARR v3 /validate", f"/zarr/validate?url={q(fx['v3_southup'])}&variable=sst", lambda r: r.status_code == 200 and r.json().get("bounds") == [-123.0, 37.0, -122.0, 38.0]),
+    ]:
+        if wants(lb):
+            r = client.get(cw_base + path)
+            ok = check_fn(r) if r.status_code == 200 else False
+            rec(lb, path, "zarr_meta", ok, f"status={r.status_code} {r.text[:80]}")
+
+    # 2. Zarr v2 Projected EPSG:3857 exact tile z=12/657/1582 (.npy unscale=False/True, return_mask=false, .png)
+    for unscale in (False, True):
+        lb = f"W8 ZARR v2 proj tile .npy unscale={unscale}"
+        if not wants(lb):
+            continue
+        path = f"/zarr/tiles/WebMercatorQuad/12/657/1582.npy?url={q(fx['v2_proj'])}&variable=elev&unscale={'true' if unscale else 'false'}"
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": lb, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                if not gok:
+                    gpu_diffs.append({"label": lb, "detail": gd})
+        if rc.status_code != 200:
+            rec(lb, path, "zarr_npy", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+        else:
+            arr = try_npy(lb, path, rc.content)
+            if arr is not None:
+                low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+                mask = arr[-1] > low
+                exp_mask = fx["elev"] != -32768
+                exp_val = fx["elev"].astype(np.float64) * 0.1 + 100.0 if unscale else fx["elev"].astype(np.float64)
+                mask_eq = float((mask == exp_mask).mean()) * 100.0
+                both = mask & exp_mask
+                max_err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp_val[both]))) if both.any() else 0.0
+                rec(lb, path, "zarr_npy", arr.shape == (2, 256, 256) and mask_eq == 100.0 and max_err < 1e-2, f"shape={arr.shape} dtype={arr.dtype} mask_eq={mask_eq:.1f}% max_err={max_err:.5f}")
+
+    lb_nm = "W8 ZARR v2 proj tile .npy return_mask=false"
+    if wants(lb_nm):
+        path = f"/zarr/tiles/WebMercatorQuad/12/657/1582.npy?url={q(fx['v2_proj'])}&variable=elev&return_mask=false"
+        rc = client.get(cw_base + path)
+        if rc.status_code != 200:
+            rec(lb_nm, path, "zarr_npy", False, f"HTTP {rc.status_code}")
+        else:
+            arr = try_npy(lb_nm, path, rc.content)
+            if arr is not None:
+                valid = fx["elev"] != -32768
+                max_err = float(np.max(np.abs(arr[0][valid].astype(np.float64) - fx["elev"][valid].astype(np.float64))))
+                zeroed = bool((arr[0][~valid] == 0.0).all())
+                rec(lb_nm, path, "zarr_npy", arr.shape == (1, 256, 256) and zeroed and max_err < 1e-3, f"shape={arr.shape} zeroed={zeroed} max_err={max_err:.5f}")
+
+    lb_png = "W8 ZARR v2 proj tile .png"
+    if wants(lb_png):
+        path = f"/zarr/tiles/WebMercatorQuad/12/657/1582.png?url={q(fx['v2_proj'])}&variable=elev&rescale=500,2000&colormap_name=viridis"
+        rc = client.get(cw_base + path)
+        if rc.status_code != 200:
+            rec(lb_png, path, "zarr_png", False, f"HTTP {rc.status_code}")
+        else:
+            rgba = np.array(Image.open(io.BytesIO(rc.content)).convert("RGBA"))
+            exp_mask = fx["elev"] != -32768
+            alpha_ok = bool(((rgba[..., 3] > 0) == exp_mask).all())
+            rgb_std = float(rgba[exp_mask, :3].std())
+            detail = f"shape={rgba.shape} alpha_ok={alpha_ok} rgb_std={rgb_std:.1f}"
+            if gpu_base is not None:
+                rg = client.get(gpu_base + path)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb_png, "detail": f"status cpu=200 gpu={rg.status_code}"})
+                else:
+                    iok, idet = compare_images(rc.content, rg.content)
+                    if not iok:
+                        gpu_diffs.append({"label": lb_png, "detail": idet})
+                    detail = f"{detail} | CPU==GPU {idet}"
+            rec(lb_png, path, "zarr_png", rgba.shape == (256, 256, 4) and alpha_ok and rgb_std > 1.0, detail)
+
+    # 3. Zarr v2 Geographic 3D: sel=time=0/1 & unscale=False/True on /point
+    lat_p, lon_p = float(fx["lat"][64]), float(fx["lon"][64])
+    for t_idx in (0, 1):
+        for unscale in (False, True):
+            lb = f"W8 ZARR v2 3D /point sel=time={t_idx} unscale={unscale}"
+            if not wants(lb):
+                continue
+            path = f"/zarr/point/{lon_p:.8f},{lat_p:.8f}?url={q(fx['v2_geo'])}&variable=temp&sel={qe(f'time={t_idx}')}&unscale={'true' if unscale else 'false'}"
+            rc = client.get(cw_base + path)
+            if gpu_base is not None:
+                rg = client.get(gpu_base + path)
+                if rc.status_code != rg.status_code or (rc.status_code == 200 and first_json_diff(rc.json(), rg.json()) is not None):
+                    gpu_diffs.append({"label": lb, "detail": f"cpu={rc.text[:80]} gpu={rg.text[:80]}"})
+            if rc.status_code != 200:
+                rec(lb, path, "zarr_point", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+            else:
+                got = rc.json()["values"][0]
+                raw_v = float(fx["data_3d"][t_idx, 64, 64])
+                exp = raw_v * 0.5 + 10.0 if unscale else raw_v
+                rec(lb, path, "zarr_point", abs(got - exp) < 1e-3, f"got={got:.4f} exp={exp:.4f}")
+
+    # 4. Zarr v2 Geographic 3D /preview & /bbox
+    for lb, path, exp_arr in [
+        ("W8 ZARR v2 3D /preview/128x128.npy sel=time=1", f"/zarr/preview/128x128.npy?url={q(fx['v2_geo'])}&variable=temp&sel={qe('time=1')}", fx["data_3d"][1]),
+        ("W8 ZARR v2 3D /bbox 128x128.npy sel=time=0", f"/zarr/bbox/-123,37,-122,38/128x128.npy?url={q(fx['v2_geo'])}&variable=temp&sel={qe('time=0')}", fx["data_3d"][0]),
+    ]:
+        if not wants(lb):
+            continue
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": lb, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                if not gok:
+                    gpu_diffs.append({"label": lb, "detail": gd})
+        if rc.status_code != 200:
+            rec(lb, path, "zarr_npy", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+        else:
+            arr = try_npy(lb, path, rc.content)
+            if arr is not None:
+                low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+                mask = arr[-1] > low
+                exp_mask = exp_arr != -9999.0
+                both = mask & exp_mask
+                mask_eq = float((mask == exp_mask).mean()) * 100.0
+                max_err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp_arr[both]))) if both.any() else 0.0
+                rec(lb, path, "zarr_npy", arr.shape == (2, 128, 128) and mask_eq == 100.0 and max_err < 1e-3, f"shape={arr.shape} mask_eq={mask_eq:.1f}% max_err={max_err:.5f}")
+
+    # 5. Zarr v2 GET & POST /statistics
+    stats_path = f"/zarr/statistics?url={q(fx['v2_geo'])}&variable=temp&sel={qe('time=0')}"
+    if wants("W8 ZARR v2 3D GET /statistics sel=time=0"):
+        rc = client.get(cw_base + stats_path)
+        if rc.status_code != 200:
+            rec("W8 ZARR v2 3D GET /statistics sel=time=0", stats_path, "zarr_stats", False, f"HTTP {rc.status_code}")
+        else:
+            st = next(iter(rc.json().values()))
+            valid = fx["data_3d"][0][fx["data_3d"][0] != -9999.0]
+            rec("W8 ZARR v2 3D GET /statistics sel=time=0", stats_path, "zarr_stats", abs(st["mean"] - float(valid.mean())) < 1e-2 and int(st["count"]) == valid.size, f"mean={st['mean']:.4f}/{valid.mean():.4f} cnt={st['count']}/{valid.size}")
+
+    if wants("W8 ZARR v2 3D POST /statistics west half"):
+        poly_west = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-123.0, 37.0], [-122.5, 37.0], [-122.5, 38.0], [-123.0, 38.0], [-123.0, 37.0]]]}}
+        rc = client.post(cw_base + stats_path, json=poly_west)
+        if gpu_base is not None:
+            rg = client.post(gpu_base + stats_path, json=poly_west)
+            if rc.status_code != rg.status_code or (rc.status_code == 200 and first_json_diff(rc.json(), rg.json()) is not None):
+                gpu_diffs.append({"label": "W8 ZARR v2 3D POST /statistics west half", "detail": "CPU vs GPU stats diff"})
+        if rc.status_code != 200:
+            rec("W8 ZARR v2 3D POST /statistics west half", stats_path, "zarr_stats", False, f"HTTP {rc.status_code}", method="POST")
+        else:
+            st = next(iter(rc.json()["properties"]["statistics"].values()))
+            sub = fx["data_3d"][0][:, 0:64]
+            valid = sub[sub != -9999.0]
+            rec("W8 ZARR v2 3D POST /statistics west half", stats_path, "zarr_stats", abs(st["mean"] - float(valid.mean())) < 0.2 and int(st["count"]) == valid.size, f"mean={st['mean']:.4f}/{valid.mean():.4f} cnt={st['count']:.0f}/{valid.size}", method="POST")
+
+    # 6. Zarr v3 ASCENDING latitude (south-up!) /point + /bbox
+    if wants("W8 ZARR v3 south-up /point NE"):
+        lat_ne, lon_ne = float(fx["lat_asc"][100]), float(fx["lon"][100])
+        exp_ne = float(fx["v3_arr"][100, 100])
+        path = f"/zarr/point/{lon_ne:.8f},{lat_ne:.8f}?url={q(fx['v3_southup'])}&variable=sst"
+        rc = client.get(cw_base + path)
+        if rc.status_code != 200:
+            rec("W8 ZARR v3 south-up /point NE", path, "zarr_point", False, f"HTTP {rc.status_code}")
+        else:
+            got = rc.json()["values"][0]
+            rec("W8 ZARR v3 south-up /point NE", path, "zarr_point", abs(got - exp_ne) < 1e-3, f"got={got:.4f} exp={exp_ne:.4f}")
+
+    if wants("W8 ZARR v3 south-up /bbox 128x128.npy"):
+        path = f"/zarr/bbox/-123,37,-122,38/128x128.npy?url={q(fx['v3_southup'])}&variable=sst"
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": "W8 ZARR v3 south-up /bbox 128x128.npy", "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                if not gok:
+                    gpu_diffs.append({"label": "W8 ZARR v3 south-up /bbox 128x128.npy", "detail": gd})
+        if rc.status_code != 200:
+            rec("W8 ZARR v3 south-up /bbox 128x128.npy", path, "zarr_npy", False, f"HTTP {rc.status_code}")
+        else:
+            arr = try_npy("W8 ZARR v3 south-up /bbox 128x128.npy", path, rc.content)
+            if arr is not None:
+                low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+                mask = arr[-1] > low
+                exp = fx["v3_arr"][::-1, :]
+                exp_mask = np.isfinite(exp)
+                both = mask & exp_mask
+                mask_eq = float((mask == exp_mask).mean()) * 100.0
+                max_err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp[both]))) if both.any() else 0.0
+                rec("W8 ZARR v3 south-up /bbox 128x128.npy", path, "zarr_npy", arr.shape == (2, 128, 128) and mask_eq == 100.0 and max_err < 1e-3, f"shape={arr.shape} dtype={arr.dtype} mask_eq={mask_eq:.1f}% max_err={max_err:.5f}")
+
+    # 7. Zarr v2 0..360° longitude /point
+    if wants("W8 ZARR v2 0..360° lon /point (-122.5, 37.5)"):
+        path = f"/zarr/point/{lon_p:.8f},{lat_p:.8f}?url={q(fx['v2_360'])}&variable=var360"
+        rc = client.get(cw_base + path)
+        if rc.status_code != 200:
+            rec("W8 ZARR v2 0..360° lon /point (-122.5, 37.5)", path, "zarr_point", False, f"HTTP {rc.status_code}")
+        else:
+            got = rc.json()["values"][0]
+            exp = float(fx["data_3d"][0, 64, 64])
+            rec("W8 ZARR v2 0..360° lon /point (-122.5, 37.5)", path, "zarr_point", abs(got - exp) < 1e-3, f"got={got:.4f} exp={exp:.4f}")
+
+    # 8. Zarr tile ETag/304 & HEAD
+    tu = f"/zarr/tiles/WebMercatorQuad/12/657/1582.png?url={q(fx['v2_proj'])}&variable=elev&rescale=500,2000&colormap_name=viridis"
+    if wants("W8 ZARR tile ETag + If-None-Match -> 304"):
+        etag = client.get(cw_base + tu).headers.get("etag")
+        r304 = client.get(cw_base + tu, headers={"If-None-Match": etag or ""})
+        rec("W8 ZARR tile ETag + If-None-Match -> 304", tu, "zarr_http", bool(etag) and r304.status_code == 304 and len(r304.content) == 0, f"etag={etag} status={r304.status_code}")
+    if wants("W8 ZARR tile HEAD -> 200 empty"):
+        rh = client.head(cw_base + tu)
+        rec("W8 ZARR tile HEAD -> 200 empty", tu, "zarr_http", rh.status_code == 200 and len(rh.content) == 0, f"status={rh.status_code} len={len(rh.content)}", method="HEAD")
+
+    # 9. Regression: identical query string with .npy then .png must NOT collide in tile_cache
+    if wants("W8 ZARR tile cache isolates .npy vs .png"):
+        qs = f"url={q(fx['v2_proj'])}&variable=elev"
+        p_npy = f"/zarr/tiles/WebMercatorQuad/12/657/1582.npy?{qs}"
+        p_png = f"/zarr/tiles/WebMercatorQuad/12/657/1582.png?{qs}"
+        r_npy = client.get(cw_base + p_npy)
+        r_png = client.get(cw_base + p_png)
+        ok_cache = (
+            r_npy.status_code == 200
+            and r_png.status_code == 200
+            and r_npy.content.startswith(b"\x93NUMPY")
+            and r_png.content.startswith(b"\x89PNG\r\n\x1a\n")
+            and r_npy.headers.get("etag") != r_png.headers.get("etag")
+        )
+        rec("W8 ZARR tile cache isolates .npy vs .png", p_png, "zarr_http", ok_cache, f"npy_magic={r_npy.content[:6]!r} png_magic={r_png.content[:4]!r}")
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -1254,8 +1667,9 @@ def main() -> int:
                     print(f"{tag} | {label:54s} | {detail}")
 
                 w7_ran = run_wave7_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+                w8_ran = run_wave8_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
 
-            total_checks = len(cases) + w7_ran
+            total_checks = len(cases) + w7_ran + w8_ran
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
