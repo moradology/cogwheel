@@ -357,6 +357,49 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
             ds.write(arr)
         out[name] = p
 
+    # Wave 11: Rotated (30 deg EPSG:3857), Sheared (EPSG:32610), South-Up (e > 0 EPSG:4326),
+    # and additional regional/global CRSs (Equal Earth EPSG:8857, CONUS Albers EPSG:5070,
+    # France Lambert-93 EPSG:2154, UTM 56S EPSG:32756), plus a local STAC item.
+    arr_w11 = (100.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32) * 1.5)
+    arr_w11[0:16, 0:16] = -9999.0
+    tf_rot30 = Affine.translation(-13640000.0, 4560000.0) * Affine.rotation(30.0) * Affine.scale(150.0, -150.0)
+    for name, crs_s, tf_m in [
+        ("w11_rot30", "EPSG:3857", tf_rot30),
+        ("w11_sheared", "EPSG:32610", Affine(100.0, 25.0, 540000.0, 15.0, -100.0, 4190000.0)),
+        ("w11_southup", "EPSG:4326", Affine(0.004, 0.0, -122.5, 0.0, 0.004, 37.5)),
+        ("w11_equal_earth", "EPSG:8857", from_bounds(-1000000.0, 4500000.0, 1000000.0, 5500000.0, 128, 128)),
+        ("w11_albers_5070", "EPSG:5070", from_bounds(-500000.0, 1500000.0, 500000.0, 2200000.0, 128, 128)),
+        ("w11_lambert93_2154", "EPSG:2154", from_bounds(600000.0, 6700000.0, 750000.0, 6850000.0, 128, 128)),
+        ("w11_utm56s_32756", "EPSG:32756", from_bounds(300000.0, 6220000.0, 350000.0, 6270000.0, 128, 128)),
+    ]:
+        p = synth_dir / f"{name}.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs=crs_s, transform=tf_m, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-9999.0) as ds:
+            ds.write(arr_w11[None])
+        out[name] = p
+
+    # Local self-contained STAC item with two 1-band assets (like Landsat/Sentinel STAC items)
+    p_stac_local = synth_dir / "w11_local_stac.json"
+    p_stac_a = synth_dir / "w11_stac_a.tif"
+    p_stac_b = synth_dir / "w11_stac_b.tif"
+    tf_stac = from_bounds(-122.75, 37.65, -122.45, 37.95, 128, 128)
+    with rasterio.open(p_stac_a, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_stac, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((100.0 + xx9.astype(np.float32) * 1.5)[None])
+    with rasterio.open(p_stac_b, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_stac, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((200.0 + yy9.astype(np.float32) * 2.0)[None])
+    p_stac_local.write_text(json.dumps({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "w11-local-stac",
+        "bbox": [-122.75, 37.65, -122.45, 37.95],
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.75, 37.65], [-122.45, 37.65], [-122.45, 37.95], [-122.75, 37.95], [-122.75, 37.65]]]},
+        "properties": {"datetime": "2024-06-01T00:00:00Z"},
+        "assets": {
+            "a": {"href": str(p_stac_a.resolve()), "type": "image/tiff; application=geotiff"},
+            "b": {"href": str(p_stac_b.resolve()), "type": "image/tiff; application=geotiff"},
+        },
+    }))
+    out["w11_stac"] = p_stac_local
+
     return out
 
 
@@ -1563,8 +1606,45 @@ def main() -> int:
                 ("PARITY W10 TMS WorldCRS84Quad .npy", "GET", f"/cog/tiles/WorldCRS84Quad/11/652/593.npy?url={q(sat)}", None, "npy"),
             ]
 
+            # --- 5f. Wave 11: Rotated/Sheared/South-Up geotransforms, Global/Regional CRSs, Deep /stac/* ---
+            for name in ("w11_rot30", "w11_sheared", "w11_southup"):
+                p = s[name]
+                lon, lat, z, tx, ty, wgs = center_lonlat_and_tile(p)
+                miny, maxy = min(wgs[1], wgs[3]), max(wgs[1], wgs[3])
+                bb = f"{wgs[0]:.5f},{miny:.5f},{wgs[2]:.5f},{maxy:.5f}"
+                if name != "w11_rot30":
+                    cases.append((f"PARITY W11 XFORM [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/{z}/{tx}/{ty}.npy?url={q(p)}", None, "npy"))
+                cases.append((f"PARITY W11 XFORM [{name}] point", "GET", f"/cog/point/{lon:.5f},{lat:.5f}?url={q(p)}", None, "point"))
+                if name == "w11_southup":
+                    cases.append(("BETTER W11 south-up /bbox (cw 200, tt 500)", "GET", f"/cog/bbox/{bb}/64x64.npy?url={q(p)}", None, "better_cw200_tt500"))
+                else:
+                    cases.append((f"PARITY W11 XFORM [{name}] bbox", "GET", f"/cog/bbox/{bb}/64x64.npy?url={q(p)}", None, "npy"))
+                cases.append((f"PARITY W11 XFORM [{name}] stats", "GET", f"/cog/statistics?url={q(p)}", None, "stats"))
+            for name in ("w11_equal_earth", "w11_albers_5070", "w11_lambert93_2154", "w11_utm56s_32756"):
+                p = s[name]
+                lon, lat, z, tx, ty, _ = center_lonlat_and_tile(p)
+                cases += [
+                    (f"PARITY W11 CRS [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/{z}/{tx}/{ty}.npy?url={q(p)}", None, "npy"),
+                    (f"PARITY W11 CRS [{name}] point", "GET", f"/cog/point/{lon:.5f},{lat:.5f}?url={q(p)}", None, "point"),
+                ]
+            poly_stac = {
+                "type": "Feature", "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [[[-122.70, 37.70], [-122.55, 37.70], [-122.55, 37.85], [-122.70, 37.85], [-122.70, 37.70]]]},
+            }
+            cases += [
+                ("PARITY W11 STAC /point multi-asset", "GET", f"/stac/point/-122.62,37.78?url={q(s['w11_stac'])}&assets=a&assets=b", None, "point"),
+                ("PARITY W11 STAC /point expr", "GET", f"/stac/point/-122.62,37.78?url={q(s['w11_stac'])}&assets=a&assets=b&expression={qe('b1-b2')}", None, "point"),
+                ("PARITY W11 STAC /bbox 64x64.npy", "GET", f"/stac/bbox/-122.70,37.70,-122.55,37.85/64x64.npy?url={q(s['w11_stac'])}&assets=a&assets=b", None, "npy"),
+                ("PARITY W11 STAC /bbox 64x64.png expr", "GET", f"/stac/bbox/-122.70,37.70,-122.55,37.85/64x64.png?url={q(s['w11_stac'])}&assets=a&assets=b&expression={qe('(b1-b2)/(b1+b2)')}&rescale=-1,1&colormap_name=viridis", None, "png"),
+                ("PARITY W11 STAC /preview/64x64.npy", "GET", f"/stac/preview/64x64.npy?url={q(s['w11_stac'])}&assets=a", None, "npy"),
+                ("PARITY W11 STAC POST /feature 64x64.npy", "POST", f"/stac/feature/64x64.npy?url={q(s['w11_stac'])}&assets=a", poly_stac, "npy"),
+                ("PARITY W11 STAC GET /statistics", "GET", f"/stac/statistics?url={q(s['w11_stac'])}&assets=a&max_size=128", None, "stats"),
+                ("PARITY W11 STAC POST /statistics", "POST", f"/stac/statistics?url={q(s['w11_stac'])}&assets=a&max_size=128", poly_stac, "post_stats"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
+                ("BETTER W11 rot30 EPSG:3857 tile (cw exact, tt unrotated)", "GET", f"/cog/tiles/WebMercatorQuad/12/655/1582.npy?url={q(s['w11_rot30'])}", None, "better_rot30_3857"),
                 ("BETTER W9 nbits_1 .npy raw 0/1 (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.npy?url={q(s['w9_nbits_1'])}", None, "better_palette_npy"),
                 ("BETTER W9 hillshade custom 256x256 (cw 256, tt 250)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=hillshade&algorithm_params={qe(json.dumps({'azimuth':135,'angle_altitude':30,'z_exaggeration':2.0}))}", None, "better_hillshade_256"),
                 ("BETTER inverted rescale (cw inverts, tt clips 255)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=1000,0&colormap_name=viridis", None, "better_inverted_rescale"),
@@ -1724,6 +1804,16 @@ def main() -> int:
                             valid = ac[1] > np.iinfo(np.int16).min
                             ok = ac.dtype == np.int16 and at.dtype == np.uint8 and bool(valid.any()) and int(ac[0][valid].min()) < 0
                             detail = f"cw={ac.dtype} min={int(ac[0][valid].min())} tt={at.dtype}"
+                    elif kind == "better_rot30_3857":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            at = np.load(io.BytesIO(r_tt.content))
+                            # Exact affine ground truth at tile 12/655/1582 pixel (128, 128) = 373.5
+                            cw_v, tt_v = float(ac[0, 128, 128]), float(at[0, 128, 128])
+                            ok = ac.shape == (2, 256, 256) and abs(cw_v - 373.5) < 1e-3 and abs(tt_v - 373.5) > 5.0
+                            detail = f"cw[128,128]={cw_v:.2f} (exact=373.50) vs tt[128,128]={tt_v:.2f}"
                     elif r_cw.status_code != 200 or r_tt.status_code != 200:
                         ok = False
                         detail = f"HTTP cw={r_cw.status_code} ({r_cw.text[:100]!r}) vs tt={r_tt.status_code} ({r_tt.text[:100]!r})"
