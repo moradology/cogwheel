@@ -1304,6 +1304,18 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
             ds.write(a46, 1)
         out[f"w47_crs_{tag}"] = p_crs
 
+    # Wave 48: 3-band float32 COG for deep Expression VM math/conditionals/div-by-zero checks
+    p_w48_3b = synth_dir / "w48_expr3b.tif"
+    b1_48 = (10.0 + xx9 * 1.5).astype(np.float32)
+    b2_48 = (20.0 + yy9 * 1.2).astype(np.float32)
+    b3_48 = (5.0 + (xx9 + yy9) * 0.5).astype(np.float32)
+    with rasterio.open(
+        p_w48_3b, "w", driver="GTiff", width=128, height=128, count=3, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(np.stack([b1_48, b2_48, b3_48]))
+    out["w48_expr3b"] = p_w48_3b
+
     return out
 
 
@@ -5133,6 +5145,18 @@ def main() -> int:
                     (f"PARITY W47 CRS {desc} .npy", "GET", f"/cog/tiles/WebMercatorQuad/{t47.z}/{t47.x}/{t47.y}.npy?url={q(s[f'w47_crs_{tag}'])}", None, "npy"),
                     (f"PARITY W47 CRS {desc} /point", "GET", f"/cog/point/{lon_c},{lat_c}?url={q(s[f'w47_crs_{tag}'])}", None, "point"),
                 ]
+            # --- Wave 48: Expression VM deep math/conditionals/div-by-zero + STAC algorithm/feature-3857/bbox-expr ---
+            cases += [
+                ("PARITY W48 EXPR where(b1>120,b2,b3) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w48_expr3b'])}&expression={qe('where(b1>120,b2,b3)')}", None, "npy"),
+                ("PARITY W48 EXPR log10(b1)+log(b2) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w48_expr3b'])}&expression={qe('log10(b1)+log(b2)')}", None, "npy"),
+                ("PARITY W48 EXPR exp(b1*0.01)+abs(b2-120) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w48_expr3b'])}&expression={qe('exp(b1*0.01)+abs(b2-120)')}", None, "npy"),
+                ("PARITY W48 EXPR sin(b1*0.02)+cos(b2*0.02) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w48_expr3b'])}&expression={qe('sin(b1*0.02)+cos(b2*0.02)')}", None, "npy"),
+                ("PARITY W48 EXPR minimum(b1,b2)+maximum(b2,b3) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w48_expr3b'])}&expression={qe('minimum(b1,b2)+maximum(b2,b3)')}", None, "npy"),
+                ("BETTER W48 EXPR div-by-zero masked (cw clean, tt leaks)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w48_expr3b'])}&expression={qe('b2/where(b1>130,b1,0)')}", None, "better_div0_w48"),
+                ("PARITY W48 STAC tile algorithm=mean .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w36_stac5b'])}&assets=ms&algorithm=mean", None, "npy"),
+                ("PARITY W48 STAC POST /feature coord_crs=EPSG:3857 .npy", "POST", f"/stac/feature/64x64.npy?url={q(s['w36_stac5b'])}&assets=ms&coord_crs=EPSG:3857", w37_poly_3857, "npy"),
+                ("BETTER W48 STAC /bbox expr auto-asset (cw 200, tt 422)", "GET", f"/stac/bbox/-122.4,37.6,-122.1,37.9/64x64.npy?url={q(s['w36_stac5b'])}&expression={qe('(ms_b4-ms_b3)/(ms_b4+ms_b3)')}", None, "better_stac_bbox_auto_asset"),
+            ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
@@ -5709,6 +5733,28 @@ def main() -> int:
                             vc = r_cw.json().get("values", [])
                             ok = len(vc) == 1 and abs(vc[0] - 436.0) < 1e-3
                             detail = f"cw=200 values={vc} (exp 436.0) tt=404"
+                    elif kind == "better_div0_w48":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ac, at = np.load(io.BytesIO(r_cw.content)), np.load(io.BytesIO(r_tt.content))
+                            mc = ac[1] > np.finfo(ac.dtype).min
+                            mt = at[1] > np.finfo(at.dtype).min
+                            both = mc & mt & np.isfinite(ac[0]) & np.isfinite(at[0])
+                            mae = float(np.abs(ac[0][both] - at[0][both]).mean()) if both.any() else 999.0
+                            masked_div0 = int((mt & ~mc).sum())
+                            ok = ac.shape == (2, 256, 256) and int(both.sum()) > 20000 and mae < 1e-4 and masked_div0 > 20000 and int(np.isinf(ac[0][mc]).sum()) == 0
+                            detail = f"valid_MAE={mae:.5f} cw_masked_div0={masked_div0} cw_valid={int(mc.sum())} tt_valid={int(mt.sum())}"
+                    elif kind == "better_stac_bbox_auto_asset":
+                        if r_cw.status_code != 200 or r_tt.status_code != 422:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 422)"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            vm = ac[1] > np.finfo(ac.dtype).min
+                            vmin = float(ac[0][vm].min()) if vm.any() else -999.0
+                            vmax = float(ac[0][vm].max()) if vm.any() else -999.0
+                            ok = ac.shape == (2, 64, 64) and ac.dtype == np.float32 and int(vm.sum()) == 64 * 64 and -1.0 <= vmin < vmax <= 1.0
+                            detail = f"cw=200 shape={ac.shape} range=[{vmin:.4f}..{vmax:.4f}] tt=422"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"

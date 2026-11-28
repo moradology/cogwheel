@@ -126,11 +126,14 @@ fn single_expr_type(expr: &str, read: SampleType) -> SampleType {
                 .bytes()
                 .any(|c| c == b'/' || c == b'.' || c == b'^' || (c.is_ascii_alphabetic() && c != b'b'))
     };
-    // float32 stays float32 through operations and functions alike; a literal with a
-    // fraction or an exponent is a double and makes the result one.
+    // float32 stays float32 through operations and most functions; a literal with a
+    // fraction/exponent or a double-only numexpr function (`minimum`, `maximum`) promotes to float64.
     let plain = |e: &str| {
         let bytes = e.as_bytes();
-        !bytes.contains(&b'.') && !bytes.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
+        !bytes.contains(&b'.')
+            && !bytes.windows(2).any(|w| w[0].is_ascii_digit() && matches!(w[1], b'e' | b'E'))
+            && !e.contains("minimum(")
+            && !e.contains("maximum(")
     };
     if read == SampleType::Float32 && plain(trimmed) {
         SampleType::Float32
@@ -419,6 +422,7 @@ mod tests {
         assert_eq!(kind("sqrt(b1)", T::Uint8), T::Float64);
         assert_eq!(kind("b1/2", T::Float32), T::Float32);
         assert_eq!(kind("b1*0.5", T::Float32), T::Float64);
+        assert_eq!(kind("minimum(b1,b2)+maximum(b2,b3)", T::Float32), T::Float64);
         assert_eq!(kind("b1*2", T::Int32), T::Float64);
         assert_eq!(kind("b1**-1", T::Uint16), T::Float64);
         assert_eq!(kind("b1^-1", T::Uint8), T::Float64);
