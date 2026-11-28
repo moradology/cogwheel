@@ -1316,6 +1316,38 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(np.stack([b1_48, b2_48, b3_48]))
     out["w48_expr3b"] = p_w48_3b
 
+    # Wave 49: 3-band RGB ?nodata=255 (pure [255,255,255] hole + partial [255,120,200] valid) & 2-band Gray+Alpha (ExtraSamples=2)
+    p_w49_rgb255 = synth_dir / "w49_rgb_nd255.tif"
+    r49 = np.clip(40 + xx9, 1, 250).astype(np.uint8)
+    g49 = np.clip(60 + yy9, 1, 250).astype(np.uint8)
+    b49 = np.clip(80 + (xx9 + yy9) // 2, 1, 250).astype(np.uint8)
+    r49[80:100, 55:75] = 255
+    g49[80:100, 55:75] = 255
+    b49[80:100, 55:75] = 255
+    r49[100:120, 75:100] = 255
+    g49[100:120, 75:100] = 120
+    b49[100:120, 75:100] = 200
+    with rasterio.open(
+        p_w49_rgb255, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(np.stack([r49, g49, b49]))
+    out["w49_rgb_nd255"] = p_w49_rgb255
+
+    p_w49_ga = synth_dir / "w49_gray_alpha.tif"
+    gray49 = np.clip(30 + xx9 + yy9 // 2, 1, 250).astype(np.uint8)
+    alpha49 = np.full((128, 128), 255, dtype=np.uint8)
+    alpha49[80:110, 60:90] = 0
+    with rasterio.open(
+        p_w49_ga, "w", driver="GTiff", width=128, height=128, count=2, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+        photometric="minisblack",
+    ) as ds:
+        ds.write(gray49, 1)
+        ds.write(alpha49, 2)
+        ds.colorinterp = (rasterio.enums.ColorInterp.gray, rasterio.enums.ColorInterp.alpha)
+    out["w49_gray_alpha"] = p_w49_ga
+
     return out
 
 
@@ -5156,6 +5188,17 @@ def main() -> int:
                 ("PARITY W48 STAC tile algorithm=mean .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w36_stac5b'])}&assets=ms&algorithm=mean", None, "npy"),
                 ("PARITY W48 STAC POST /feature coord_crs=EPSG:3857 .npy", "POST", f"/stac/feature/64x64.npy?url={q(s['w36_stac5b'])}&assets=ms&coord_crs=EPSG:3857", w37_poly_3857, "npy"),
                 ("BETTER W48 STAC /bbox expr auto-asset (cw 200, tt 422)", "GET", f"/stac/bbox/-122.4,37.6,-122.1,37.9/64x64.npy?url={q(s['w36_stac5b'])}&expression={qe('(ms_b4-ms_b3)/(ms_b4+ms_b3)')}", None, "better_stac_bbox_auto_asset"),
+                # --- Wave 49: Issue #602 RGB scalar nodata .png (0/255 + bilinear), 2-band Gray+Alpha (ExtraSamples=2), semicolon multi-band expressions ---
+                ("PARITY W49 RGB nodata=0 .png (all-band dataset_mask)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&nodata=0", None, "png"),
+                ("PARITY W49 RGB nodata=0 bilinear .png (all-band mask)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&nodata=0&resampling=bilinear", None, "png"),
+                ("PARITY W49 RGB nodata=255 .png (all-band dataset_mask)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w49_rgb_nd255'])}&nodata=255", None, "png"),
+                ("PARITY W49 GRAY+ALPHA (ExtraSamples=2) .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w49_gray_alpha'])}", None, "png"),
+                ("PARITY W49 GRAY+ALPHA (ExtraSamples=2) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w49_gray_alpha'])}", None, "npy"),
+                ("PARITY W49 GRAY+ALPHA (ExtraSamples=2) /statistics", "GET", f"/cog/statistics?url={q(s['w49_gray_alpha'])}", None, "stats"),
+                ("PARITY W49 GRAY+ALPHA (ExtraSamples=2) /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w49_gray_alpha'])}", None, "point"),
+                ("PARITY W49 EXPR 3-band ; multi-output .npy (f64)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_rgb_nodata'])}&expression={qe('b1*0.5;b2*0.5;b3*0.5')}", None, "npy"),
+                ("PARITY W49 EXPR 3-band ; multi-output .png (RGB)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&expression={qe('b1*0.5;b2*0.5;b3*0.5')}&rescale=0,128", None, "png"),
+                ("PARITY W49 EXPR 2-band ; multi-output .npy (i32)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_rgb_nodata'])}&expression={qe('b1+b2;b3-b1')}", None, "npy"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
