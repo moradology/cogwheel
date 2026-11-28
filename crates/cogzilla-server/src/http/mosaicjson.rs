@@ -2,23 +2,26 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_mosaic_request<B>(
-    engine: Arc<TileEngine>,
+pub(super) async fn handle<B>(
+    ctx: RequestCtx<'_>,
     method: Method,
-    path: &str,
     segs: &[&str],
-    raw_query: &str,
-    host: &str,
-    forwarded_prefix: &str,
-    if_none_match: Option<&str>,
     pq: ParsedQuery,
     req: Request<B>,
-) -> Option<Response<Full<Bytes>>>
+) -> Resp
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
+    let RequestCtx {
+        engine,
+        path,
+        raw_query,
+        host,
+        forwarded_prefix,
+        if_none_match,
+    } = ctx;
+    let engine = Arc::clone(engine);
 // ------------------------------------------------------------------------
 // Dynamic registration of spatial catalogs (MosaicJSON, STAC FeatureCollection,
 // JSON array, or live STAC-API POST /search):
@@ -104,7 +107,7 @@ if method == Method::POST && path == "/mosaic/register" {
         Ok((Bytes::from(body), "application/json"))
     }
     .await;
-    return Some(to_http_response(&engine, res, if_none_match));
+    return to_http_response(&engine, res, if_none_match);
 }
 
 // ------------------------------------------------------------------------
@@ -320,7 +323,7 @@ if method == Method::POST && segs.first() == Some(&"mosaicjson") {
         attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
     }
     attach_x_assets(&mut resp, &x_assets);
-    return Some(resp);
+    return resp;
 }
 
 if method == Method::GET && segs.first() == Some(&"mosaicjson") {
@@ -1014,7 +1017,7 @@ if method == Method::GET && segs.first() == Some(&"mosaicjson") {
             {
                 attach_tile_geo_headers(&mut resp, tms, z, x, y, sc, &pq);
             }
-            return Some(resp);
+            return resp;
         }
         _ => Err(EngineError::NotFound(path.to_string())),
     };
@@ -1023,7 +1026,7 @@ if method == Method::GET && segs.first() == Some(&"mosaicjson") {
         attach_geo_headers(&mut resp, bbox, epsg, is_crs84);
     }
     attach_x_assets(&mut resp, &x_assets);
-    return Some(resp);
+    return resp;
 }
 
 // ------------------------------------------------------------------------
@@ -1064,11 +1067,11 @@ if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(1) == So
                 if let Err(e) = engine.store.ensure_uris_fresh(&pq.urls).await {
                     engine.sync_tile_cache_epoch();
                     if !matches!(e.root(), cogzilla_io::IoError::Fs(io) if io.kind() == std::io::ErrorKind::NotFound) {
-                        return Some(to_http_response(
+                        return to_http_response(
                             &engine,
                             Err(EngineError::Io(e)),
                             if_none_match,
-                        ));
+                        );
                     }
                 } else {
                     engine.sync_tile_cache_epoch();
@@ -1127,14 +1130,14 @@ if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(1) == So
                 let failed = failed_assets.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 attach_x_failed_assets(&mut resp, &failed);
                 attach_tile_geo_headers(&mut resp, "WebMercatorQuad", z, x, y, sc, &pq);
-                return Some(resp);
+                return resp;
             }
         }
         _ => Err(EngineError::BadRequest(
             "invalid /mosaic/tiles coordinate path".into(),
         )),
     };
-    return Some(to_http_response(&engine, res, if_none_match));
+    return to_http_response(&engine, res, if_none_match);
 }
 
 if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(2) == Some(&"tiles") {
@@ -1285,13 +1288,22 @@ if method == Method::GET && segs.first() == Some(&"mosaic") && segs.get(2) == So
             if let Ok(guard) = failed_assets.lock() {
                 attach_x_failed_assets(&mut resp, &guard);
             }
-            return Some(resp);
+            return resp;
         }
         _ => Err(EngineError::BadRequest(
             "invalid /mosaic/{name}/tiles coordinate path".into(),
         )),
     };
-    return Some(to_http_response(&engine, res, if_none_match));
+    return to_http_response(&engine, res, if_none_match);
 }
-    None
+    let allow = if matches!(segs, ["mosaicjson", "validate" | "statistics" | "feature", ..]) {
+        "POST"
+    } else {
+        "GET, HEAD"
+    };
+    if segs.first() == Some(&"mosaicjson") {
+        method_not_allowed_resp(allow)
+    } else {
+        json_error_resp(StatusCode::NOT_FOUND, path)
+    }
 }

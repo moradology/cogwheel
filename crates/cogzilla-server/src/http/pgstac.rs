@@ -65,6 +65,20 @@ pub(super) struct Ctx<'a> {
     pub only: Option<&'a Arc<Vec<MosaicItem>>>,
 }
 
+impl<'a> Ctx<'a> {
+    pub(super) fn from_request(req: super::RequestCtx<'a>) -> Self {
+        Self {
+            engine: req.engine,
+            host: req.host,
+            forwarded_prefix: req.forwarded_prefix,
+            path: req.path,
+            raw_query: req.raw_query,
+            if_none_match: req.if_none_match,
+            only: None,
+        }
+    }
+}
+
 /// The items a picture over `geometry` is made of: the request's own item, or what the
 /// search finds there.
 #[allow(clippy::too_many_arguments)]
@@ -84,7 +98,7 @@ async fn pixel_items(
     }
 }
 
-type Resp = Response<Full<Bytes>>;
+use super::Resp;
 
 fn json_resp(status: StatusCode, body: &Value) -> Resp {
     super::plain_resp(status, body.to_string(), "application/json")
@@ -6601,25 +6615,19 @@ fn item_picture_by_asset(rest: &[&str], pairs: &[(String, String)]) -> bool {
     specs.iter().any(|s| s.expression.is_some()) || (specs.len() > 1 && specs.iter().any(|s| s.indexes.is_some()))
 }
 
-/// Serve a request whose path starts with `/searches`.
+/// Serve a request whose path starts with `/searches` or `/collections`.
 pub(super) async fn handle<B>(
-    ctx: Ctx<'_>,
-    method: &Method,
+    ctx: super::RequestCtx<'_>,
+    method: Method,
     segs: &[&str],
-    req_params: super::query::FamilyRequestParams,
+    pq: ParsedQuery,
     req: Request<B>,
 ) -> Resp
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
-    let super::query::FamilyRequestParams {
-        common: pq,
-        family: super::query::FamilyParams::Searches,
-    } = req_params
-    else {
-        unreachable!("pgstac::handle must receive FamilyParams::Searches");
-    };
+    let ctx = Ctx::from_request(ctx);
     let Some(pg) = ctx.engine.pgstac() else {
         return detail(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6628,20 +6636,20 @@ where
     };
     let pg: &PgStac = pg;
     let pairs = query_pairs(ctx.raw_query);
-    let get = *method == Method::GET;
+    let get = method == Method::GET;
     let not_found = || detail(StatusCode::NOT_FOUND, "Not Found");
 
     match segs {
-        ["searches", "register"] if *method == Method::POST => register(&ctx, pg, req).await,
+        ["searches", "register"] if method == Method::POST => register(&ctx, pg, req).await,
         ["searches"] | ["searches", ""] | ["searches", "list"] if get => list(&ctx, pg, &pairs).await,
         // Item routes with a path are answered before this is reached.
         ["collections", _, "items", ..] => not_found(),
         // A route asked with a method it does not take is a 405 before anything is looked up.
-        ["searches" | "collections", _, rest @ ..] if route_method(rest).is_some_and(|takes| takes != *method) => {
+        ["searches" | "collections", _, rest @ ..] if route_method(rest).is_some_and(|takes| takes != method) => {
             method_not_allowed(route_method(rest))
         }
         [family @ ("searches" | "collections"), id, rest @ ..]
-            if (get || *method == Method::POST) && !rest.is_empty() =>
+            if (get || method == Method::POST) && !rest.is_empty() =>
         {
             // A tile matrix set in the path is validated before anything is looked up.
             let tms = match rest {

@@ -2,26 +2,39 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_stac_request<B>(
-    engine: Arc<TileEngine>,
+/// Extra context for `/stac/*` (and pgSTAC item routes forwarded through it).
+pub(super) struct StacContext<'a> {
+    pub(super) prefix: &'a str,
+    pub(super) pgstac_item: Option<Arc<StacItem>>,
+    pub(super) pgstac_item_extent: Option<pgstac::ItemExtent>,
+}
+
+pub(super) async fn handle<B>(
+    ctx: RequestCtx<'_>,
     method: Method,
-    path: &str,
     sub: &[&str],
-    raw_query: &str,
-    host: &str,
-    forwarded_prefix: &str,
-    if_none_match: Option<&str>,
-    stac_prefix: &str,
-    mut pgstac_item: Option<Arc<StacItem>>,
-    pgstac_item_extent: Option<pgstac::ItemExtent>,
     pq: ParsedQuery,
+    stac: StacContext<'_>,
     req: Request<B>,
-) -> Response<Full<Bytes>>
+) -> Resp
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
+    let RequestCtx {
+        engine,
+        path,
+        raw_query,
+        host,
+        forwarded_prefix,
+        if_none_match,
+    } = ctx;
+    let engine = Arc::clone(engine);
+    let StacContext {
+        prefix: stac_prefix,
+        mut pgstac_item,
+        pgstac_item_extent,
+    } = stac;
     let stac_x_assets = pq.assets.clone();
     let stac_url_hdr = pq.urls.first().cloned();
     // An item read from pgSTAC is held here; one named by `url` is in the cache by then.
