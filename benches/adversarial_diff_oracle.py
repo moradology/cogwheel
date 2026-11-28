@@ -764,6 +764,16 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write((50.0 + xx128g * 1.5 + yy64 * 2.0)[None])
     out["w25_global"] = p_w25_glob
 
+    # Wave 27: 100%-opaque RGB COG covering all of tile 10/164/396 for auto-format (opaque -> JPEG) & @2x Retina checks
+    p_w27_op = synth_dir / "w27_opaque_rgb.tif"
+    with rasterio.open(
+        p_w27_op, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=from_bounds(-122.5, 37.3, -121.9, 37.8, 128, 128),
+        tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(np.stack([((xx9 * 2) % 256).astype(np.uint8), ((yy9 * 2) % 256).astype(np.uint8), ((xx9 + yy9) % 256).astype(np.uint8)]))
+    out["w27_opaque_rgb"] = p_w27_op
+
     return out
 
 
@@ -3323,6 +3333,15 @@ def main() -> int:
                 ("PARITY W25 GLOBAL WebMercatorQuad 0/0/0 .npy", "GET", f"/cog/tiles/WebMercatorQuad/0/0/0.npy?url={q(s['w25_global'])}", None, "npy"),
                 ("PARITY W25 GLOBAL WGS1984Quad 0/0/0 .npy", "GET", f"/cog/tiles/WGS1984Quad/0/0/0.npy?url={q(s['w25_global'])}", None, "npy"),
                 ("PARITY W25 GLOBAL WGS1984Quad 0/1/0 .png", "GET", f"/cog/tiles/WGS1984Quad/0/1/0.png?url={q(s['w25_global'])}&rescale=50,370&colormap_name=viridis", None, "png"),
+                # --- Wave 27: @2x Retina tiles, POST /feature formats (.png/.tif/.webp), LineString/MultiLineString stats & auto-format ---
+                ("BETTER W27 @2x Retina 512x512 .png (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396@2x.png?url={q(s['w23_f32_3b'])}&bidx=1&rescale=10,270&colormap_name=viridis", None, "better_retina_2x"),
+                ("BETTER W27 @2x Retina 512x512 .npy (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396@2x.npy?url={q(s['w23_f32_3b'])}&bidx=1", None, "better_retina_2x"),
+                ("PARITY W27 POST /feature triangle .png", "POST", f"/cog/feature/128x128.png?url={q(s['w23_f32_3b'])}&bidx=1&rescale=10,270&colormap_name=viridis", {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}, "properties": {}}, "png"),
+                ("PARITY W27 POST /feature triangle .tif", "POST", f"/cog/feature/128x128.tif?url={q(s['w23_f32_3b'])}&bidx=1", {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}, "properties": {}}, "geotiff"),
+                ("PARITY W27 POST /feature triangle .webp", "POST", f"/cog/feature/128x128.webp?url={q(s['w19_rgb_u8'])}", {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}, "properties": {}}, "png"),
+                ("BETTER W27 POST /statistics LineString (cw exact, tt 10x low)", "POST", f"/cog/statistics?url={q(s['w23_f32_3b'])}&bidx=1", {"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-122.45, 37.55], [-122.25, 37.75], [-122.05, 37.95]]}, "properties": {}}, "better_linestring_stats"),
+                ("BETTER W27 POST /statistics MultiLineString (cw 204.8, tt 20.5)", "POST", f"/cog/statistics?url={q(s['w23_f32_3b'])}&bidx=1", {"type": "Feature", "geometry": {"type": "MultiLineString", "coordinates": [[[-122.45, 37.60], [-122.05, 37.60]], [[-122.45, 37.90], [-122.05, 37.90]]]}, "properties": {}}, "better_linestring_stats"),
+                ("PARITY W27 AUTO-FMT extensionless opaque -> JPEG", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396?url={q(s['w27_opaque_rgb'])}", None, "auto_jpeg"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -3383,6 +3402,11 @@ def main() -> int:
                             elif kind == "json_exact":
                                 d = first_json_diff(r_cw.json(), r_gpu.json())
                                 gok, gd = (d is None), (d or "exact JSON match")
+                            elif kind == "auto_jpeg":
+                                gct = r_gpu.headers.get("content-type", "")
+                                iok, idet = compare_images(r_cw.content, r_gpu.content)
+                                gok = ("image/jpeg" in gct) and iok
+                                gd = idet if "image/jpeg" in gct else f"gpu content-type={gct!r}"
                             elif "image/png" in ct or "image/jpeg" in ct or "image/webp" in ct:
                                 gok, gd = compare_images(r_cw.content, r_gpu.content)
                             elif "application/x-binary" in ct or ".npy" in path:
@@ -3391,7 +3415,7 @@ def main() -> int:
                                 gok, gd = compare_geotiffs(r_cw.content, r_gpu.content, compare_pixels=True, masked=not is_unmasked, smooth=is_smooth)
                             elif kind in ("stats", "stats_w23"):
                                 gok, gd = compare_stats_strict(r_cw.json(), r_gpu.json())
-                            elif kind == "post_stats":
+                            elif kind in ("post_stats", "better_linestring_stats"):
                                 gok, gd = compare_stats_strict(r_cw.json()["properties"]["statistics"], r_gpu.json()["properties"]["statistics"])
                             elif kind == "post_fc_stats_w23":
                                 fc_c, fc_g = r_cw.json()["features"], r_gpu.json()["features"]
@@ -3529,6 +3553,43 @@ def main() -> int:
                                 and abs(sc["mean"] - st["mean"]) < 0.02
                             )
                             detail = f"cw count={sc['count']:.1f} mean={sc['mean']:.4f} std={sc['std']:.4f} vs tt count={st['count']:.3f} mean={st['mean']:.4f}"
+                    elif kind == "better_linestring_stats":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            sc = r_cw.json()["properties"]["statistics"]["b1"]
+                            st = r_tt.json()["properties"]["statistics"]["b1"]
+                            # cogzilla measures exact geometric line pixel length (~145 / ~205 px),
+                            # whereas TiTiler's 10x10 sub-pixel rasterization undercounts 1D lines by ~7-10x.
+                            ok = (
+                                sc["count"] > 100.0
+                                and st["count"] < 30.0
+                                and abs(sc["mean"] - st["mean"]) < 2.0
+                            )
+                            detail = f"cw count={sc['count']:.1f} mean={sc['mean']:.2f} vs tt count={st['count']:.2f} mean={st['mean']:.2f}"
+                    elif kind == "better_retina_2x":
+                        size_ok = False
+                        got_sz = None
+                        if r_cw.status_code == 200:
+                            if ".npy" in path:
+                                arr = np.load(io.BytesIO(r_cw.content))
+                                got_sz = arr.shape
+                                size_ok = arr.shape == (2, 512, 512)
+                            else:
+                                im = Image.open(io.BytesIO(r_cw.content))
+                                got_sz = im.size
+                                size_ok = im.size == (512, 512)
+                        ok = r_cw.status_code == 200 and size_ok and r_tt.status_code == 422
+                        detail = f"cw={r_cw.status_code} size={got_sz} tt={r_tt.status_code}"
+                    elif kind == "auto_jpeg":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ct_c = r_cw.headers.get("content-type", "")
+                            ct_t = r_tt.headers.get("content-type", "")
+                            iok, idet = compare_images(r_cw.content, r_tt.content)
+                            ok = ("image/jpeg" in ct_c) and ("image/jpeg" in ct_t) and iok
+                            detail = f"ct_cw={ct_c!r} ct_tt={ct_t!r} {idet}"
                     elif kind == "better_inf_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
