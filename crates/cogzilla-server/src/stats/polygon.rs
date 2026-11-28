@@ -750,16 +750,21 @@ impl PolygonMask {
                 mark_segment(ax, ay, bx, by);
             }
         }
+        const EDGE_EPS: f64 = 1e-9;
         for &(lon, lat) in &self.points {
             let (px_crs, py_crs) = dst_crs.from_lonlat_deg(lon, lat);
             let fx = (px_crs - bbox[0]) / dlx;
             let fy = (bbox[3] - py_crs) / dly;
-            if fx.is_finite() && fy.is_finite() {
-                let ix = fx.floor() as isize;
-                let iy = fy.floor() as isize;
-                if ix >= 0 && ix < w as isize && iy >= 0 && iy < h as isize {
-                    mask[iy as usize * w + ix as usize] = true;
-                }
+            if fx.is_finite()
+                && fy.is_finite()
+                && fx >= -EDGE_EPS
+                && fx <= (w as f64) + EDGE_EPS
+                && fy >= -EDGE_EPS
+                && fy <= (h as f64) + EDGE_EPS
+            {
+                let ix = (fx.floor() as isize).clamp(0, (w as isize) - 1);
+                let iy = (fy.floor() as isize).clamp(0, (h as isize) - 1);
+                mask[iy as usize * w + ix as usize] = true;
             }
         }
         mask
