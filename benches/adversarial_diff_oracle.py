@@ -696,6 +696,12 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     }))
     out["w21_stac"] = p_w21_stac
 
+    # Wave 22: 2-band float32 straddling 0 inside tile 10/164/396 (b1 in [-20, 23.5], b2 in [-9, 18.5]) for trig, nested where & domain-error checks
+    p_w22_2b = synth_dir / "w22_f32_2b.tif"
+    with rasterio.open(p_w22_2b, "w", driver="GTiff", width=128, height=128, count=2, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(np.stack([(-40.0 + xx9.astype(np.float32) * 0.5), (-45.0 + yy9.astype(np.float32) * 0.5)]))
+    out["w22_f32_2b"] = p_w22_2b
+
     return out
 
 
@@ -2908,6 +2914,14 @@ def main() -> int:
                 ("BETTER W21 STAC hetero NDVI asset_as_band .png (cw 200, tt 400)", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w21_stac'])}&assets=red&assets=nir&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}&rescale=-1,1&colormap_name=viridis", None, "better_cw200_tt400"),
                 ("BETTER W21 STAC hetero NDVI without assets= (cw 200, tt 422)", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w21_stac'])}&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}&rescale=-1,1&colormap_name=viridis", None, "better_cw200_tt422"),
                 ("BETTER W21 STAC hetero /point NDVI without assets= (cw 200, tt 422)", "GET", f"/stac/point/-122.25,37.75?url={q(s['w21_stac'])}&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}", None, "better_cw200_tt422"),
+                # --- Wave 22: GeoTIFF NaN-leak fix on hetero STAC .tif & Expression VM trig/where/domain ops ---
+                ("PARITY W22 STAC hetero stack red+nir .tif", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.tif?url={q(s['w21_stac'])}&assets=red&assets=nir", None, "geotiff"),
+                ("PARITY W22 EXPR nested where .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('where(b1>10,where(b2>15,b1+b2,b1-b2),0)')}", None, "npy"),
+                ("PARITY W22 EXPR sin+cos .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('sin(b1*0.1)+cos(b2*0.1)')}", None, "npy"),
+                ("PARITY W22 EXPR arctan2 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('arctan2(b2,b1)')}", None, "npy"),
+                ("PARITY W22 EXPR abs+sqrt(abs) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('sqrt(abs(b1))+abs(b2)')}", None, "npy"),
+                ("PARITY W22 EXPR log1p(abs) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('log1p(abs(b1))')}", None, "npy"),
+                ("BETTER W22 EXPR domain sqrt(b1) w/ negs .png (cw masks NaN, tt purple)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w22_f32_2b'])}&expression={qe('sqrt(b1)')}&rescale=0,10&colormap_name=viridis", None, "better_expr_nan_masked"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -3160,6 +3174,26 @@ def main() -> int:
                                 and int(imc[128, 128, 1]) == 0
                             )
                             detail = f"cw_cov={cw_cov:.1f}% px[128,128]={imc[128,128,:3].tolist()} vs tt_cov={tt_cov:.2f}%"
+                    elif kind == "better_expr_nan_masked":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            mc, mt = imc[..., 3] > 0, imt[..., 3] > 0
+                            both = mc & mt
+                            mae = float(np.abs(imc[both, :3].astype(np.float32) - imt[both, :3].astype(np.float32)).mean()) if both.any() else 999.0
+                            # On sqrt(b1) where b1 < 0: cogzilla masks NaN to alpha=0, while TiTiler paints opaque viridis(0).
+                            only_tt = mt & ~mc
+                            ok = (
+                                imc.shape == (256, 256, 4)
+                                and bool(both.any())
+                                and mae < 0.5
+                                and int(only_tt.sum()) > 10000
+                                and int(imc[100, 30, 3]) == 0
+                                and imt[100, 30].tolist() == [68, 1, 84, 255]
+                            )
+                            detail = f"valid_MAE={mae:.2f} cw_masked_nan_px={int(only_tt.sum())} tt_nan_rgba={imt[100,30].tolist()}"
                     elif kind == "tilejson_w18":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
