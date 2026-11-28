@@ -6116,6 +6116,98 @@ fn json_error_resp(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
     plain_resp(status, Bytes::from(body), "application/json")
 }
 
+/// Semantic failure class shared across all five route families (`/cog`, `/stac`,
+/// `/mosaicjson`, `/searches`, `/zarr`).
+///
+/// Server-wide HTTP status rule:
+/// - Client / request / malformed-source fault -> `400 Bad Request` ([`Self::ClientFault`])
+/// - Origin auth / access refusal -> `403 Forbidden` ([`Self::Forbidden`])
+/// - Missing resource or out-of-footprint target -> `404 Not Found` ([`Self::NotFound`])
+/// - Feature not implemented by this build (unsupported codec, predictor, sample format,
+///   or GCP count) -> `501 Not Implemented` ([`Self::NotImplemented`])
+/// - Origin / store / decode fault -> `502 Bad Gateway` ([`Self::UpstreamFault`])
+/// - Origin timeout -> `504 Gateway Timeout` ([`Self::UpstreamTimeout`])
+/// - Unexpected internal error -> `500 Internal Server Error` ([`Self::Internal`])
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpErrorClass {
+    ClientFault,
+    Forbidden,
+    NotFound,
+    NotImplemented,
+    UpstreamFault,
+    UpstreamTimeout,
+    Internal,
+}
+
+impl HttpErrorClass {
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::ClientFault => StatusCode::BAD_REQUEST,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
+            Self::UpstreamFault => StatusCode::BAD_GATEWAY,
+            Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+pub(crate) fn classify_tiff_error(err: &cogzilla_tiff::TiffError) -> HttpErrorClass {
+    match err {
+        cogzilla_tiff::TiffError::UnsupportedCompression(_)
+        | cogzilla_tiff::TiffError::UnsupportedPredictor(_)
+        | cogzilla_tiff::TiffError::UnsupportedSampleFormat { .. }
+        | cogzilla_tiff::TiffError::UnsupportedGcpGeoreferencing(_) => {
+            HttpErrorClass::NotImplemented
+        }
+        _ => HttpErrorClass::ClientFault,
+    }
+}
+
+pub(crate) fn classify_io_error(io_e: &cogzilla_io::IoError) -> HttpErrorClass {
+    match io_e.root() {
+        cogzilla_io::IoError::InvalidUri(_) => HttpErrorClass::ClientFault,
+        cogzilla_io::IoError::Tiff(e) => classify_tiff_error(e),
+        cogzilla_io::IoError::Codec(_) => HttpErrorClass::UpstreamFault,
+        cogzilla_io::IoError::Forbidden(_)
+        | cogzilla_io::IoError::HttpStatus {
+            status: 401 | 403, ..
+        } => HttpErrorClass::Forbidden,
+        cogzilla_io::IoError::HttpStatus { status: 404, .. } => HttpErrorClass::NotFound,
+        cogzilla_io::IoError::HttpStatus {
+            status: 408 | 504, ..
+        } => HttpErrorClass::UpstreamTimeout,
+        cogzilla_io::IoError::HttpStatus { .. }
+        | cogzilla_io::IoError::RangeNotSupported { .. }
+        | cogzilla_io::IoError::SourceChanged { .. }
+        | cogzilla_io::IoError::ResponseTooLarge { .. } => HttpErrorClass::UpstreamFault,
+        cogzilla_io::IoError::Http(req_err) => {
+            let mut src: Option<&(dyn std::error::Error + 'static)> =
+                std::error::Error::source(req_err);
+            while let Some(s) = src {
+                if matches!(
+                    s.downcast_ref::<cogzilla_io::IoError>(),
+                    Some(cogzilla_io::IoError::Forbidden(_))
+                ) {
+                    return HttpErrorClass::Forbidden;
+                }
+                src = s.source();
+            }
+            if req_err.is_timeout() {
+                HttpErrorClass::UpstreamTimeout
+            } else {
+                HttpErrorClass::UpstreamFault
+            }
+        }
+        cogzilla_io::IoError::Fs(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            HttpErrorClass::NotFound
+        }
+        _ => HttpErrorClass::Internal,
+    }
+}
+
+/// Convert an [`EngineError`] into an HTTP JSON response using [`HttpErrorClass`].
 fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
     match err {
         EngineError::Shared(inner) => error_to_http_response(inner),
@@ -6125,88 +6217,59 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
             .body(Full::new(Bytes::new()))
             .unwrap(),
         EngineError::MethodNotAllowed(allow) => method_not_allowed_resp(allow),
-        EngineError::NotFound(msg) => json_error_resp(StatusCode::NOT_FOUND, msg),
-        EngineError::BadGateway(msg) => json_error_resp(StatusCode::BAD_GATEWAY, msg),
-        EngineError::BadRequest(msg) => json_error_resp(StatusCode::BAD_REQUEST, msg),
+        EngineError::NotFound(msg) => json_error_resp(HttpErrorClass::NotFound.status(), msg),
+        EngineError::BadGateway(msg) => json_error_resp(HttpErrorClass::UpstreamFault.status(), msg),
+        EngineError::BadRequest(msg) => json_error_resp(HttpErrorClass::ClientFault.status(), msg),
         EngineError::PayloadTooLarge(msg) => json_error_resp(StatusCode::PAYLOAD_TOO_LARGE, msg),
         EngineError::RequestTimeout(msg) => json_error_resp(StatusCode::REQUEST_TIMEOUT, msg),
         // The file is in a coordinate system this server cannot place. That is a
         // property of the requested source, not a server fault.
-        EngineError::Proj(e) => json_error_resp(StatusCode::BAD_REQUEST, &e.to_string()),
-        EngineError::Io(io_e) => match io_e.root() {
-            e @ cogzilla_io::IoError::InvalidUri(_) => {
-                json_error_resp(StatusCode::BAD_REQUEST, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::Tiff(_) => {
-                json_error_resp(StatusCode::BAD_REQUEST, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::Codec(_) => {
-                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::Forbidden(_) => {
-                json_error_resp(StatusCode::FORBIDDEN, &e.to_string())
-            }
-            cogzilla_io::IoError::HttpStatus {
-                status: status @ (401 | 403),
-                url,
-            } => json_error_resp(
-                StatusCode::FORBIDDEN,
-                &format!("origin refused access (HTTP {status}) fetching {url}"),
-            ),
-            e @ cogzilla_io::IoError::HttpStatus { status: 404, .. } => {
-                json_error_resp(StatusCode::NOT_FOUND, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::HttpStatus {
-                status: 408 | 504, ..
-            } => json_error_resp(StatusCode::GATEWAY_TIMEOUT, &e.to_string()),
-            e @ cogzilla_io::IoError::HttpStatus { .. } => {
-                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::RangeNotSupported { .. } => {
-                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::SourceChanged { .. } => {
-                let mut r = json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string());
-                r.headers_mut()
-                    .insert("x-cogzilla-retry", HeaderValue::from_static("1"));
-                r
-            }
-            e @ cogzilla_io::IoError::ResponseTooLarge { .. } => {
-                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
-            }
-            e @ cogzilla_io::IoError::Http(req_err) => {
-                let mut src: Option<&(dyn std::error::Error + 'static)> =
-                    std::error::Error::source(req_err);
-                while let Some(s) = src {
-                    if let Some(cogzilla_io::IoError::Forbidden(u)) =
-                        s.downcast_ref::<cogzilla_io::IoError>()
-                    {
-                        return json_error_resp(
-                            StatusCode::FORBIDDEN,
-                            &cogzilla_io::IoError::Forbidden(u.clone()).to_string(),
-                        );
+        EngineError::Proj(e) => json_error_resp(HttpErrorClass::ClientFault.status(), &e.to_string()),
+        EngineError::Io(io_e) => {
+            let class = classify_io_error(io_e);
+            let status = class.status();
+            match io_e.root() {
+                cogzilla_io::IoError::HttpStatus {
+                    status: code @ (401 | 403),
+                    url,
+                } => json_error_resp(
+                    status,
+                    &format!("origin refused access (HTTP {code}) fetching {url}"),
+                ),
+                e @ cogzilla_io::IoError::SourceChanged { .. } => {
+                    let mut r = json_error_resp(status, &e.to_string());
+                    r.headers_mut()
+                        .insert("x-cogzilla-retry", HeaderValue::from_static("1"));
+                    r
+                }
+                e @ cogzilla_io::IoError::Http(req_err) => {
+                    let mut src: Option<&(dyn std::error::Error + 'static)> =
+                        std::error::Error::source(req_err);
+                    while let Some(s) = src {
+                        if let Some(cogzilla_io::IoError::Forbidden(u)) =
+                            s.downcast_ref::<cogzilla_io::IoError>()
+                        {
+                            return json_error_resp(
+                                status,
+                                &cogzilla_io::IoError::Forbidden(u.clone()).to_string(),
+                            );
+                        }
+                        src = s.source();
                     }
-                    src = s.source();
+                    if req_err.is_timeout() {
+                        json_error_resp(status, &format!("upstream timeout: {e}"))
+                    } else {
+                        json_error_resp(status, &e.to_string())
+                    }
                 }
-                if req_err.is_timeout() {
-                    json_error_resp(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        &format!("upstream timeout: {e}"),
-                    )
-                } else {
-                    json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+                e => {
+                    if class == HttpErrorClass::Internal {
+                        tracing::warn!(error = %e, "request failed with 500");
+                    }
+                    json_error_resp(status, &e.to_string())
                 }
             }
-            e @ cogzilla_io::IoError::Fs(io_err)
-                if io_err.kind() == std::io::ErrorKind::NotFound =>
-            {
-                json_error_resp(StatusCode::NOT_FOUND, &e.to_string())
-            }
-            e => {
-                tracing::warn!(error = %e, "request failed with 500");
-                json_error_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-            }
-        },
+        }
     }
 }
 

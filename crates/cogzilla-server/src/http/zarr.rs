@@ -192,14 +192,13 @@ fn record_window_metrics(wb: &cogzilla_zarr::ZarrWindowBlocks) {
     ZARR_METRICS.bytes_decoded.fetch_add(bytes, Ordering::Relaxed);
 }
 
-/// Unified failure -> HTTP status table for every `/zarr/*` route (#388).
+/// Unified failure -> HTTP status table for every `/zarr/*` route (#388), delegating to the
+/// server-wide [`super::HttpErrorClass`] rule.
 ///
-/// Rules:
-/// - Client fault is 4xx, origin/store fault is 5xx, unsupported codec is 501.
 /// - Every error message names the offending thing (keys looked for, available variables,
 ///   available range, rank, dimension + index, CRS, codec + supported list, chunk key, or cap).
 /// - No `/zarr/*` route constructs an error status inline; all errors pass through this mapping.
-pub fn zarr_error_status(err: &ZarrError) -> StatusCode {
+pub(crate) fn classify_zarr_error(err: &ZarrError) -> super::HttpErrorClass {
     match err {
         ZarrError::NotAZarrStore { .. }
         | ZarrError::GroupNotFound { .. }
@@ -218,19 +217,23 @@ pub fn zarr_error_status(err: &ZarrError) -> StatusCode {
         | ZarrError::ChunkTooLarge { .. }
         | ZarrError::MissingField { .. }
         | ZarrError::BadField { .. }
-        | ZarrError::Json(_) => StatusCode::BAD_REQUEST,
+        | ZarrError::Json(_) => super::HttpErrorClass::ClientFault,
 
-        ZarrError::NotFound { .. } => StatusCode::NOT_FOUND,
-        ZarrError::UpstreamRefused { .. } => StatusCode::FORBIDDEN,
-        ZarrError::UpstreamTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        ZarrError::NotFound { .. } => super::HttpErrorClass::NotFound,
+        ZarrError::UpstreamRefused { .. } => super::HttpErrorClass::Forbidden,
+        ZarrError::UpstreamTimeout { .. } => super::HttpErrorClass::UpstreamTimeout,
 
-        ZarrError::UnsupportedCodec { .. } => StatusCode::NOT_IMPLEMENTED,
+        ZarrError::UnsupportedCodec { .. } => super::HttpErrorClass::NotImplemented,
 
         ZarrError::MissingChunk { .. }
         | ZarrError::Codec { .. }
         | ZarrError::UpstreamError { .. }
-        | ZarrError::Io { .. } => StatusCode::BAD_GATEWAY,
+        | ZarrError::Io { .. } => super::HttpErrorClass::UpstreamFault,
     }
+}
+
+pub fn zarr_error_status(err: &ZarrError) -> StatusCode {
+    classify_zarr_error(err).status()
 }
 
 /// Convert any [`ZarrError`] into a JSON HTTP error response using [`zarr_error_status`].
