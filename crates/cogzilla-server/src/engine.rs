@@ -293,8 +293,9 @@ pub struct EngineStats {
 }
 
 /// Map a fetch/I/O error on an asset referenced by a STAC item or MosaicJSON document to
-/// `502 Bad Gateway` naming the asset (while preserving `403 Forbidden` for allowlist rejections
-/// and `400 Bad Request` for invalid URIs / corrupt TIFFs).
+/// `502 Bad Gateway` naming the asset (while preserving `403 Forbidden` for allowlist rejections,
+/// `501 Not Implemented` for unsupported TIFF features, and `400 Bad Request` for invalid URIs /
+/// malformed TIFFs).
 pub fn asset_fetch_error(asset_uri: &str, err: IoError) -> EngineError {
     if err.is_fatal() {
         return EngineError::Io(err);

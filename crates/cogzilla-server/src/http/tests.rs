@@ -450,6 +450,26 @@ fn xyz_bounds_and_http_error_status_mapping() {
         cogzilla_tiff::TiffError::Corrupt("not a tiff"),
     )));
     assert_eq!(r_tiff.status(), StatusCode::BAD_REQUEST);
+    for tiff_err in [
+        cogzilla_tiff::TiffError::UnsupportedCompression(34712),
+        cogzilla_tiff::TiffError::UnsupportedPredictor(99),
+        cogzilla_tiff::TiffError::UnsupportedSampleFormat {
+            format: 5,
+            bits: 128,
+        },
+        cogzilla_tiff::TiffError::UnsupportedGcpGeoreferencing(2),
+    ] {
+        let resp = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Tiff(tiff_err)));
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+    assert_eq!(
+        zarr::zarr_error_status(&cogzilla_zarr::ZarrError::UnsupportedCodec {
+            chunk_key: "0.0".into(),
+            codec: "jpeg2000".into(),
+            supported: "gzip, zstd",
+        }),
+        StatusCode::NOT_IMPLEMENTED
+    );
     let r_codec = error_to_http_response(&EngineError::Io(cogzilla_io::IoError::Codec(
         cogzilla_codec::CodecError::Deflate("corrupt deflate payload".into()),
     )));

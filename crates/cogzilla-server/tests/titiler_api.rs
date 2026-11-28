@@ -6934,3 +6934,96 @@ async fn an_algorithm_works_over_band_math_results() {
     assert_eq!(stats["b1"]["description"], "(b2*3 - b1) / (b2*3 + b1)");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A TIFF using a compression code this build does not implement returns `501 Not Implemented`
+/// uniformly across `/cog`, `/stac`, and `/mosaicjson`, matching `/zarr`'s `501` for
+/// `UnsupportedCodec` (#556).
+#[tokio::test]
+async fn unsupported_tiff_compression_returns_501_across_cog_stac_and_mosaicjson() {
+    let tmp = std::env::temp_dir().join(format!("cogzilla_unsupported_comp_556_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Start from a valid synthetic GeoTIFF, then patch IFD0's Compression tag (259) to 34712 (JPEG2000).
+    let cog = tmp.join("jp2_unsupported.tif");
+    write_synthetic_u16_2band_4326_geotiff(&cog, 64, 64, [10.0, 40.0, 10.64, 40.64], 3, 5, None);
+    let mut raw = std::fs::read(&cog).unwrap();
+    let ifd0_off = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+    let num_entries = u16::from_le_bytes(raw[ifd0_off..ifd0_off + 2].try_into().unwrap()) as usize;
+    let mut patched = false;
+    for i in 0..num_entries {
+        let off = ifd0_off + 2 + i * 12;
+        let tag = u16::from_le_bytes(raw[off..off + 2].try_into().unwrap());
+        if tag == 259 {
+            raw[off + 8..off + 10].copy_from_slice(&34712u16.to_le_bytes());
+            patched = true;
+            break;
+        }
+    }
+    assert!(patched, "synthetic GeoTIFF should contain Compression tag 259");
+    std::fs::write(&cog, &raw).unwrap();
+
+    let cog_url = cog.to_string_lossy().to_string();
+    let stac_path = tmp.join("item.json");
+    std::fs::write(
+        &stac_path,
+        serde_json::json!({
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "id": "jp2-item",
+            "bbox": [10.0, 40.0, 10.64, 40.64],
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[10.0, 40.0], [10.64, 40.0], [10.64, 40.64], [10.0, 40.64], [10.0, 40.0]]]
+            },
+            "properties": { "datetime": "2026-01-01T00:00:00Z" },
+            "assets": {
+                "data": { "href": cog_url, "type": "image/tiff; application=geotiff" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mosaic_path = tmp.join("mosaic.json");
+    std::fs::write(
+        &mosaic_path,
+        serde_json::json!({
+            "mosaicjson": "0.0.3",
+            "minzoom": 6,
+            "maxzoom": 10,
+            "quadkey_zoom": 6,
+            "bounds": [10.0, 40.0, 10.64, 40.64],
+            "tiles": {
+                "122001": [cog_url]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    for (family, url) in [
+        ("/cog/info", format!("{base}/cog/info?url={}", cog.display())),
+        ("/stac/info", format!("{base}/stac/info?url={}&assets=data", stac_path.display())),
+        (
+            "/mosaicjson/tiles",
+            format!("{base}/mosaicjson/tiles/WebMercatorQuad/6/33/24.png?url={}", mosaic_path.display()),
+        ),
+    ] {
+        let resp = client.get(&url).send().await.unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 501, "{family} should return 501 for unsupported TIFF compression: {body}");
+        assert!(body.contains("34712"), "{family} body should name compression code 34712: {body}");
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
