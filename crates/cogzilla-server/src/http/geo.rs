@@ -136,7 +136,7 @@ pub(super) fn reproject_wgs84_bounds(
     wgs84: [f64; 4],
     dst: &cogzilla_proj::CrsModel,
 ) -> Result<[f64; 4], EngineError> {
-    if matches!(dst, cogzilla_proj::CrsModel::Geographic) {
+    if dst.is_wgs84_degrees() {
         return Ok(wgs84);
     }
     let [w, mut s, e, mut n] = wgs84;
@@ -267,10 +267,13 @@ pub(super) fn coord_to_lonlat(
     y: f64,
     coord_crs: Option<&cogzilla_proj::CrsModel>,
 ) -> Result<(f64, f64), EngineError> {
-    let (lon, lat) = match coord_crs {
-        None | Some(cogzilla_proj::CrsModel::Geographic) => (x, y),
-        Some(cogzilla_proj::CrsModel::Epsg3857) => mercator_to_lonlat_deg(x, y),
-        Some(crs) => crs.to_lonlat_deg(x, y),
+    let (lon, lat) = if coord_crs.is_none_or(|c| c.is_wgs84_degrees()) {
+        (x, y)
+    } else {
+        match coord_crs.unwrap() {
+            cogzilla_proj::CrsModel::Epsg3857 => mercator_to_lonlat_deg(x, y),
+            crs => crs.to_lonlat_deg(x, y),
+        }
     };
     if !lon.is_finite() || !lat.is_finite() {
         return Err(EngineError::BadRequest(
@@ -292,7 +295,7 @@ pub(super) fn bbox_to_wgs84(
     let Some(crs) = coord_crs else {
         return Ok(bbox);
     };
-    if matches!(crs, cogzilla_proj::CrsModel::Geographic) {
+    if crs.is_wgs84_degrees() {
         return Ok(bbox);
     }
     let [x0, y0, x1, y1] = bbox;
@@ -839,7 +842,11 @@ mod tests {
         for epsg in [4326u16, 4267, 4277, 4289, 4149, 4150] {
             let crs = CrsModel::from_epsg(epsg).unwrap_or_else(|e| panic!("EPSG:{epsg}: {e}"));
             assert!(crs.is_geographic(), "EPSG:{epsg} must be geographic");
-            assert!(crs.is_degree_based(), "EPSG:{epsg} must be degree-based");
+            assert_eq!(
+                crs.is_wgs84_degrees(),
+                epsg == 4326,
+                "EPSG:{epsg} is_wgs84_degrees should be true only for unshifted WGS84"
+            );
             assert!(!crs.is_web_mercator(), "EPSG:{epsg} must not be web mercator");
 
             // Antimeridian bbox unwrap: 170..-170 -> 170..190 (previously 400 on 4267/4277/4289/4149/4150).

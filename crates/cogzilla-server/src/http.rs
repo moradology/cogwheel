@@ -1756,10 +1756,8 @@ fn resolve_resample(
     };
     let same_crs = match crs_res {
         Some(cogzilla_proj::CrsModel::Epsg3857) => target_epsg == 3857,
-        Some(cogzilla_proj::CrsModel::Geographic) => matches!(
-            cogzilla_proj::CrsModel::from_epsg(target_epsg),
-            Ok(cogzilla_proj::CrsModel::Geographic)
-        ),
+        Some(ref c) if c.is_wgs84_degrees() => cogzilla_proj::CrsModel::from_epsg(target_epsg)
+            .is_ok_and(|t| t.is_wgs84_degrees()),
         _ => false,
     };
     if same_crs { pq.resample } else { pq.reproject }

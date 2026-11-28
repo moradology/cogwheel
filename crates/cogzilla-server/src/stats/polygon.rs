@@ -537,13 +537,13 @@ impl PolygonMask {
         let wrap_hi = self.bbox[2] > 180.0;
         let wrap_lo = self.bbox[0] < -180.0;
         if !self.polygons.is_empty() {
-            let is_geo = matches!(dst_crs, cogzilla_proj::CrsModel::Geographic);
+            let is_wgs84_geo = dst_crs.is_wgs84_degrees();
             let is_merc = matches!(
                 dst_crs,
                 cogzilla_proj::CrsModel::Epsg3857 | cogzilla_proj::CrsModel::WorldMercator
             );
             let project_pt = |lon: f64, lat: f64, lon_shift: f64| -> (f64, f64) {
-                let (ax, ay) = if lon_shift != 0.0 && is_geo {
+                let (ax, ay) = if lon_shift != 0.0 && is_wgs84_geo {
                     (lon + lon_shift, lat)
                 } else {
                     dst_crs.from_lonlat_deg(lon + lon_shift, lat)
@@ -555,7 +555,7 @@ impl PolygonMask {
                 let mut rings_px: Vec<Vec<(f64, f64)>> = Vec::with_capacity(poly.len());
                 for (ring_idx, ring) in poly.iter().enumerate() {
                     let mut rpx: Vec<(f64, f64)> = Vec::with_capacity(ring.len());
-                    if is_geo {
+                    if is_wgs84_geo {
                         for &(lon, lat) in ring {
                             let (px, py) = project_pt(lon, lat, lon_shift);
                             if px.is_finite() && py.is_finite() {
@@ -616,11 +616,11 @@ impl PolygonMask {
             };
             for poly in &self.polygons {
                 push_poly(poly, 0.0);
-                if is_geo || is_merc {
-                    if (is_geo && bbox[2] > 180.0) || wrap_lo {
+                if is_wgs84_geo || is_merc {
+                    if (is_wgs84_geo && bbox[2] > 180.0) || wrap_lo {
                         push_poly(poly, 360.0);
                     }
-                    if (is_geo && bbox[0] < -180.0) || wrap_hi {
+                    if (is_wgs84_geo && bbox[0] < -180.0) || wrap_hi {
                         push_poly(poly, -360.0);
                     }
                 }

@@ -469,7 +469,7 @@ pub fn densify_ring_lonlat_to_pixel(
     if ring.len() < 2 {
         return Vec::new();
     }
-    let is_wgs84_geo = matches!(crs, CrsModel::Geographic);
+    let is_wgs84_geo = crs.is_wgs84_degrees();
     let map_pt = |lon: f64, lat: f64| -> (f64, f64) {
         let (sx, sy) = if is_wgs84_geo {
             (lon + lon_shift_deg, lat)
@@ -2118,7 +2118,7 @@ fn project_mask_to_ifd(
         }
     }
 
-    let is_wgs84_geo = matches!(crs, CrsModel::Geographic);
+    let is_wgs84_geo = crs.is_wgs84_degrees();
     let mut pts_px = Vec::with_capacity(pm.points.len());
     for &(lon, lat) in &pm.points {
         let adj_lon = geo_point_lon_shift(lon, ifd, is_geo);
