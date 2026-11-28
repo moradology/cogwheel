@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 import httpx
 import mercantile
+import morecantile
 import numpy as np
 from PIL import Image
 from pyproj import Transformer
@@ -727,6 +728,18 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.scales = (0.1, 0.2, 0.5)
         ds.offsets = (1.0, 2.0, 3.0)
     out["w23_f32_3b"] = p_w23_3b
+
+    # Wave 24: Regional EPSG:4326 COGs for non-Mercator OGC TileMatrixSets
+    grad24 = 100.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32) * 1.5
+    for key, bounds in (
+        ("w24_eu", (9.0, 47.0, 12.0, 50.0)),
+        ("w24_nz", (171.0, -43.5, 174.0, -40.5)),
+        ("w24_ca", (-100.0, 50.0, -94.0, 56.0)),
+    ):
+        p_reg = synth_dir / f"{key}.tif"
+        with rasterio.open(p_reg, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=from_bounds(*bounds, 128, 128), tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+            ds.write(grad24[None])
+        out[key] = p_reg
 
     return out
 
@@ -2967,6 +2980,17 @@ def main() -> int:
                 ("PARITY W23 DUP bidx=1,1,1 pseudo-RGB .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w23_f32_3b'])}&bidx=1&bidx=1&bidx=1&rescale=0,250", None, "png"),
                 ("PARITY W23 DUP bidx=1,1,1 pseudo-RGB .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w23_f32_3b'])}&bidx=1&bidx=1&bidx=1", None, "npy"),
             ]
+            # --- Wave 24: Non-Mercator OGC TileMatrixSets (pixel + Content-Crs/Content-Bbox parity) ---
+            for tms_id, fpath, lon, lat, z in (
+                ("WGS1984Quad", s["w23_f32_3b"], -122.25, 37.75, 8),
+                ("WorldMercatorWGS84Quad", s["w23_f32_3b"], -122.25, 37.75, 9),
+                ("EuropeanETRS89_LAEAQuad", s["w24_eu"], 10.5, 48.5, 6),
+                ("NZTM2000Quad", s["w24_nz"], 172.5, -42.0, 5),
+                ("CanadianNAD83_LCC", s["w24_ca"], -97.0, 53.0, 5),
+            ):
+                t24 = morecantile.tms.get(tms_id).tile(lon, lat, z)
+                cases.append((f"PARITY W24 TMS {tms_id} {z}/{t24.x}/{t24.y}.npy", "GET", f"/cog/tiles/{tms_id}/{z}/{t24.x}/{t24.y}.npy?url={q(fpath)}", None, "npy"))
+                cases.append((f"PARITY W24 TMS {tms_id} {z}/{t24.x}/{t24.y}.png+hdr", "GET", f"/cog/tiles/{tms_id}/{z}/{t24.x}/{t24.y}.png?url={q(fpath)}&bidx=1&rescale=100,600&colormap_name=viridis", None, "headers"))
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
