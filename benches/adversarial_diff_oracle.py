@@ -1275,6 +1275,35 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
             ds.write(a46, 1)
         out[f"w46_crs_{tag}"] = p_crs
 
+    # Wave 47: Antimeridian-crossing COG (179E..181E) + 6 exotic CRS families
+    # (Equal Earth 8857, NSIDC Polar Stereo N 3413, Australian Albers 3577, Dutch RD New 28992, Swiss LV95 2056, NAD83 4269)
+    p_w47_anti = synth_dir / "w47_antimeridian.tif"
+    with rasterio.open(
+        p_w47_anti, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=from_bounds(179.0, -18.0, 181.0, -16.0, 128, 128),
+        tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(a46, 1)
+    out["w47_antimeridian"] = p_w47_anti
+
+    for tag, epsg, (bw, bs, be, bn) in [
+        ("8857", "EPSG:8857", (10.0, 20.0, 11.0, 21.0)),
+        ("3413", "EPSG:3413", (-45.0, 72.0, -43.0, 73.0)),
+        ("3577", "EPSG:3577", (135.0, -26.0, 136.0, -25.0)),
+        ("28992", "EPSG:28992", (5.0, 52.0, 6.0, 52.5)),
+        ("2056", "EPSG:2056", (7.5, 46.5, 8.5, 47.0)),
+        ("4269", "EPSG:4269", (-105.5, 39.5, -104.5, 40.5)),
+    ]:
+        l_, b_, r_, t_ = transform_bounds("EPSG:4326", epsg, bw, bs, be, bn)
+        p_crs = synth_dir / f"w47_crs_{tag}.tif"
+        with rasterio.open(
+            p_crs, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+            crs=epsg, transform=from_bounds(l_, b_, r_, t_, 128, 128),
+            tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+        ) as ds:
+            ds.write(a46, 1)
+        out[f"w47_crs_{tag}"] = p_crs
+
     return out
 
 
@@ -5082,6 +5111,28 @@ def main() -> int:
                     (f"PARITY W46 CRS {desc} .npy", "GET", f"/cog/tiles/WebMercatorQuad/{t46.z}/{t46.x}/{t46.y}.npy?url={q(s[f'w46_crs_{tag}'])}", None, "npy"),
                     (f"PARITY W46 CRS {desc} /point", "GET", f"/cog/point/{lon_c},{lat_c}?url={q(s[f'w46_crs_{tag}'])}", None, "point"),
                 ]
+            # --- Wave 47: Antimeridian-crossing COG (179E..181E) + 6 exotic CRS families ---
+            tw47 = mercantile.tile(179.5, -17.0, 9)
+            te47 = mercantile.tile(-179.5, -17.0, 9)
+            cases += [
+                ("PARITY W47 ANTIMERIDIAN west 179.5E tile .npy", "GET", f"/cog/tiles/WebMercatorQuad/{tw47.z}/{tw47.x}/{tw47.y}.npy?url={q(s['w47_antimeridian'])}", None, "npy"),
+                ("PARITY W47 ANTIMERIDIAN west 179.5E /point", "GET", f"/cog/point/179.5,-17.0?url={q(s['w47_antimeridian'])}", None, "point"),
+                ("BETTER W47 ANTIMERIDIAN east -179.5W tile .npy (cw 200, tt 404)", "GET", f"/cog/tiles/WebMercatorQuad/{te47.z}/{te47.x}/{te47.y}.npy?url={q(s['w47_antimeridian'])}", None, "better_antimeridian_w47"),
+                ("BETTER W47 ANTIMERIDIAN east -179.5W /point (cw 200, tt 404)", "GET", f"/cog/point/-179.5,-17.0?url={q(s['w47_antimeridian'])}", None, "better_antimeridian_w47"),
+            ]
+            for tag, desc, lon_c, lat_c in [
+                ("8857", "EPSG:8857 Equal Earth", 10.5, 20.5),
+                ("3413", "EPSG:3413 Polar Stereo N", -44.0, 72.5),
+                ("3577", "EPSG:3577 Australian Albers", 135.5, -25.5),
+                ("28992", "EPSG:28992 Dutch RD New", 5.5, 52.25),
+                ("2056", "EPSG:2056 Swiss LV95", 8.0, 46.75),
+                ("4269", "EPSG:4269 NAD83 Geog", -105.0, 40.0),
+            ]:
+                t47 = mercantile.tile(lon_c, lat_c, 9)
+                cases += [
+                    (f"PARITY W47 CRS {desc} .npy", "GET", f"/cog/tiles/WebMercatorQuad/{t47.z}/{t47.x}/{t47.y}.npy?url={q(s[f'w47_crs_{tag}'])}", None, "npy"),
+                    (f"PARITY W47 CRS {desc} /point", "GET", f"/cog/point/{lon_c},{lat_c}?url={q(s[f'w47_crs_{tag}'])}", None, "point"),
+                ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
@@ -5644,6 +5695,20 @@ def main() -> int:
                                 and vmax < 900
                             )
                             detail = f"cw={ac.dtype} [{vmin}..{vmax}] vs tt={at.dtype} (hardcoded uint8)"
+                    elif kind == "better_antimeridian_w47":
+                        if r_cw.status_code != 200 or r_tt.status_code != 404:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 404)"
+                        elif ".npy" in path:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            vm = ac[1] > np.finfo(np.float32).min
+                            vmin = float(ac[0][vm].min()) if vm.any() else -1.0
+                            vmax = float(ac[0][vm].max()) if vm.any() else -1.0
+                            ok = ac.shape == (2, 256, 256) and ac.dtype == np.float32 and int(vm.sum()) == 256 * 256 and 250.0 < vmin < 400.0 and 400.0 < vmax < 620.0
+                            detail = f"cw=200 valid={int(vm.sum())} range=[{vmin:.1f}..{vmax:.1f}] tt=404"
+                        else:
+                            vc = r_cw.json().get("values", [])
+                            ok = len(vc) == 1 and abs(vc[0] - 436.0) < 1e-3
+                            detail = f"cw=200 values={vc} (exp 436.0) tt=404"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
