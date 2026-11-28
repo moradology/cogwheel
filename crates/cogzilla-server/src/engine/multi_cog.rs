@@ -316,7 +316,8 @@ impl TileEngine {
                     });
                     inputs.push((&all_refs[idx][..], None, scale_offset));
                 }
-                Some(cogzilla_kernel::band_math_blocks(prog, &inputs))
+                // Every pixel of every block read: kept off the async I/O workers.
+                Some(super::block_in_place_if_multithread(true, || cogzilla_kernel::band_math_blocks(prog, &inputs)))
             }
             _ => None,
         };

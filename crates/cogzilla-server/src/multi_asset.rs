@@ -504,8 +504,7 @@ pub(crate) async fn render_mixed_grid_bbox(
                         if vals.iter().any(|v| v.is_nan()) {
                             return f32::NAN;
                         }
-                        let r = prog.eval(&vals);
-                        if r.is_finite() { r } else { f32::NAN }
+                        cogzilla_kernel::band_math_nan_to_num(prog.eval(&vals))
                     })
                     .collect(),
             )

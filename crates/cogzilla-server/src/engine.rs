@@ -202,7 +202,8 @@ impl TileEngine {
                 .zip(&refs)
                 .map(|(&b, r)| (&r[..], None, unscale.then(|| band_scale_offset(cog, b))))
                 .collect();
-            let blocks = cogzilla_kernel::band_math_blocks(prog, &inputs);
+            // Every pixel of every block read: kept off the async I/O workers.
+            let blocks = block_in_place_if_multithread(true, || cogzilla_kernel::band_math_blocks(prog, &inputs));
             read.math = Some(blocks);
         }
         Ok(read)

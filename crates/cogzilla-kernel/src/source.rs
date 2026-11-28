@@ -821,6 +821,21 @@ pub fn copy_band_data_rect_to_f32(
     }
 }
 
+/// A band math result where every band it reads has a value: a number all the same, as
+/// rio-tiler passes it through numpy's `nan_to_num` (zero for `0/0`, the largest number of
+/// either sign for a division by zero), so only a missing input leaves a pixel missing.
+pub fn band_math_nan_to_num(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else if v.is_nan() {
+        0.0
+    } else if v > 0.0 {
+        f32::MAX
+    } else {
+        f32::MIN
+    }
+}
+
 /// One band of band math, block by block: for a terrain algorithm (hillshade, slope, ...)
 /// over an expression's first output, read like any one band. `inputs` are the blocks of
 /// each band `prog` reads, in its slot order (`prog.used_bands`), each with the request's
@@ -855,8 +870,7 @@ pub fn band_math_blocks(
                     *v = plane[px];
                     missing |= v.is_nan();
                 }
-                let r = if missing { f32::NAN } else { prog.eval(&vals) };
-                *o = if r.is_finite() { r } else { f32::NAN };
+                *o = if missing { f32::NAN } else { band_math_nan_to_num(prog.eval(&vals)) };
                 if o.is_nan() {
                     all = false;
                 } else {
@@ -908,6 +922,16 @@ mod tests {
         let out = band_math_blocks(&prog, &[(&ar[..], Some(2.0), None), (&br[..], None, None)]);
         let BandData::F32(slab) = &out[0].as_ref().unwrap().data else { panic!("f32") };
         assert!(slab.as_slice()[1].is_nan());
+        // Arithmetic with no value to give over bands that have one is a number, as numpy's
+        // `nan_to_num` makes it (0/0 and the root of a negative are 0); a missing band is not.
+        for expr in ["(b1-1)/(b1-1)", "sqrt(1-b1)+1"] {
+            let prog = crate::expr_vm::ExprProgram::compile(expr).unwrap();
+            let out = band_math_blocks(&prog, &[(&ar[..], None, None)]);
+            let BandData::F32(slab) = &out[0].as_ref().unwrap().data else { panic!("f32") };
+            let v = slab.as_slice();
+            assert_eq!((v[0], v[1]), if expr.starts_with("sqrt") { (1.0, 0.0) } else { (0.0, 1.0) }, "{expr}");
+            assert!(v[2].is_nan(), "{expr}");
+        }
     }
 
     #[test]
