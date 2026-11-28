@@ -1400,6 +1400,44 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(np.stack([r52, g52, b52]))
     out["w52_u16_rgb"] = p_w52_u16_rgb
 
+    # Wave 53: Negative scale (scale=-0.01, offset=100.0) uint16, WebP lossless 3-band RGB, ZSTD float64 Predictor=3 (>1e9)
+    p_w53_neg = synth_dir / "w53_neg_scale.tif"
+    dn53 = (1000 + xx9.astype(np.uint32) * 30 + yy9.astype(np.uint32) * 20).astype(np.uint16)
+    dn53[80:110, 60:90] = 65535
+    with rasterio.open(
+        p_w53_neg, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=65535,
+    ) as ds:
+        ds.write(dn53, 1)
+        ds.scales = (-0.01,)
+        ds.offsets = (100.0,)
+    out["w53_neg_scale"] = p_w53_neg
+
+    p_w53_webp = synth_dir / "w53_webp_lossless.tif"
+    rgb53 = np.stack([
+        np.clip(20 + xx9 * 1.5, 1, 250).astype(np.uint8),
+        np.clip(40 + yy9 * 1.5, 1, 250).astype(np.uint8),
+        np.clip(60 + (xx9 + yy9) * 0.7, 1, 250).astype(np.uint8),
+    ])
+    with rasterio.open(
+        p_w53_webp, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="webp", webp_lossless=True,
+    ) as ds:
+        ds.write(rgb53)
+    out["w53_webp_lossless"] = p_w53_webp
+
+    p_w53_f64 = synth_dir / "w53_zstd_f64_p3.tif"
+    f64_53 = (1_000_000_000.0 + xx9.astype(np.float64) * 0.002 + yy9.astype(np.float64) * 0.005)
+    f64_53[80:110, 60:90] = -9999.0
+    with rasterio.open(
+        p_w53_f64, "w", driver="GTiff", width=128, height=128, count=1, dtype="float64",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="zstd", predictor=3, nodata=-9999.0,
+    ) as ds:
+        ds.write(f64_53, 1)
+    out["w53_zstd_f64_p3"] = p_w53_f64
+
     return out
 
 
@@ -5348,6 +5386,13 @@ def main() -> int:
                 ("PARITY W52 16-bit 3-band uint16 .npy + nodata=0 hole", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w52_u16_rgb'])}", None, "npy"),
                 ("PARITY W52 STAC POST /statistics coord_crs=EPSG:3857", "POST", f"/stac/statistics?url={q(s['w36_stac5b'])}&assets={qe('ms|bidx=4')}&coord_crs=EPSG:3857", w37_poly_3857, "post_stats"),
                 ("PARITY W52 STAC POST /statistics inline expr + 3857", "POST", f"/stac/statistics?url={q(s['w36_stac5b'])}&assets={qe('ms|expression=(b4-b3)/(b4+b3)')}&coord_crs=EPSG:3857", w37_poly_3857, "post_stats"),
+                # --- Wave 53: Negative scale unscale=true, WebP lossless RGB, ZSTD float64 Predictor=3 (>1e9 strict) ---
+                ("PARITY W53 NEG-SCALE unscale=true .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w53_neg_scale'])}&unscale=true", None, "npy"),
+                ("PARITY W53 NEG-SCALE unscale=true viridis .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w53_neg_scale'])}&unscale=true&rescale=25,90&colormap_name=viridis", None, "png"),
+                ("PARITY W53 NEG-SCALE unscale=true /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w53_neg_scale'])}&unscale=true", None, "point"),
+                ("PARITY W53 NEG-SCALE unscale=true /statistics", "GET", f"/cog/statistics?url={q(s['w53_neg_scale'])}&unscale=true", None, "stats"),
+                ("PARITY W53 WEBP lossless 3-band RGB .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w53_webp_lossless'])}", None, "npy"),
+                ("PARITY W53 ZSTD float64 Predictor=3 (>1e9) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w53_zstd_f64_p3'])}", None, "npy_f64_exact"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
