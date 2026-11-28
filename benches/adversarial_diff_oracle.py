@@ -1128,6 +1128,27 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(b3_w41)
     out["w41_u16_3b_hi"] = p_w41_u16
 
+    # Wave 42: IEEE-754 float16 (NBITS=16, SampleFormat=3) COGs — Predictor=1 and Predictor=3 (2-plane byte shuffle)
+    f16_arr = (-10.0 + xx9 * 0.25 + yy9 * 0.125).astype(np.float32)
+    f16_arr[80:110, 60:90] = -1024.0
+    p_w42_f16 = synth_dir / "w42_f16.tif"
+    with rasterio.open(
+        p_w42_f16, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", predictor=1, nbits=16, nodata=-1024.0,
+    ) as ds:
+        ds.write(f16_arr, 1)
+    out["w42_f16"] = p_w42_f16
+
+    p_w42_f16_p3 = synth_dir / "w42_f16_p3.tif"
+    with rasterio.open(
+        p_w42_f16_p3, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", predictor=3, nbits=16, nodata=-1024.0,
+    ) as ds:
+        ds.write(f16_arr, 1)
+    out["w42_f16_p3"] = p_w42_f16_p3
+
     return out
 
 
@@ -4616,6 +4637,18 @@ def main() -> int:
                 ("BETTER W41 ALG 3-band u16 sum >65535 (cw 200 u64, tt 500)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_u16_3b_hi'])}&algorithm=sum", None, "better_u16_sum_u64"),
                 ("PARITY W41 ALG 3-band u16 median (odd) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_u16_3b_hi'])}&algorithm=median", None, "npy"),
                 ("PARITY W41 ALG 3-band u16 min .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_u16_3b_hi'])}&algorithm=min", None, "npy"),
+                # --- Wave 42: IEEE-754 float16 GeoTIFF (Predictor=1 & Predictor=3), bidx+algorithm composition, POST /statistics expression+unscale ---
+                ("PARITY W42 FLOAT16 tile .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w42_f16'])}", None, "npy"),
+                ("PARITY W42 FLOAT16 tile .png (viridis)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w42_f16'])}&rescale=-10,40&colormap_name=viridis", None, "png"),
+                ("PARITY W42 FLOAT16 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w42_f16'])}", None, "point"),
+                ("PARITY W42 FLOAT16 /statistics", "GET", f"/cog/statistics?url={q(s['w42_f16'])}", None, "stats"),
+                ("PARITY W42 FLOAT16 Predictor=3 tile .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w42_f16_p3'])}", None, "npy"),
+                ("PARITY W42 FLOAT16 Predictor=3 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w42_f16_p3'])}", None, "point"),
+                ("PARITY W42 bidx=1,3 + algorithm=mean .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&bidx=1&bidx=3&algorithm=mean", None, "npy"),
+                ("PARITY W42 bidx=1,3 + algorithm=normalizedIndex .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w41_f32_4b'])}&bidx=1&bidx=3&algorithm=normalizedIndex", None, "npy"),
+                ("PARITY W42 bidx=1,3 + algorithm=normalizedIndex .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w41_f32_4b'])}&bidx=1&bidx=3&algorithm=normalizedIndex&rescale=-1,1&colormap_name=rdylgn", None, "png"),
+                ("PARITY W42 POST /statistics expression=(b3-b1)/(b3+b1)", "POST", f"/cog/statistics?url={q(s['w41_f32_4b'])}&expression={qe('(b3-b1)/(b3+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.4, 37.6], [-122.1, 37.6], [-122.1, 37.9], [-122.4, 37.9], [-122.4, 37.6]]]}}, "post_stats"),
+                ("PARITY W42 POST /statistics unscale+expression NDVI", "POST", f"/cog/statistics?url={q(s['w35_scaled_2b'])}&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.4, 37.6], [-122.1, 37.6], [-122.1, 37.9], [-122.4, 37.9], [-122.4, 37.6]]]}}, "post_stats"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---

@@ -36,7 +36,7 @@ pub enum SampleType {
     Uint64,
     /// Signed 64-bit integer.
     Int64,
-    /// IEEE-754 16-bit half-precision float (produced by Zarr stores).
+    /// IEEE-754 16-bit half-precision float (GeoTIFF `NBITS=16` `SampleFormat=3` and Zarr stores).
     Float16,
     /// IEEE-754 32-bit float (SAR RTC, DEMs, scientific COGs).
     Float32,
