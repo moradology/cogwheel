@@ -590,6 +590,33 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.offsets = (1.0, 2.0, 3.0)
     out["w18_cog3b"] = p_cog18
 
+    # Wave 19: Custom JSON colormaps (discrete/hex/transparent/interval/linear/negative int16) & built-in algorithms
+    p_cat19 = synth_dir / "w19_cat_u8.tif"
+    with rasterio.open(p_cat19, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((((xx9 // 16) + (yy9 // 16)) % 4).astype(np.uint8), 1)
+    out["w19_cat_u8"] = p_cat19
+
+    p_i16_19 = synth_dir / "w19_neg_i16.tif"
+    vals_i16_19 = np.where((xx9 // 32) % 3 == 0, -10, np.where((xx9 // 32) % 3 == 1, 0, 10)).astype(np.int16)
+    with rasterio.open(p_i16_19, "w", driver="GTiff", width=128, height=128, count=1, dtype="int16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(vals_i16_19, 1)
+    out["w19_neg_i16"] = p_i16_19
+
+    p_dem19 = synth_dir / "w19_dem_f32.tif"
+    with rasterio.open(p_dem19, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((-160.5 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32) * 0.5), 1)
+    out["w19_dem_f32"] = p_dem19
+
+    p_rgb19 = synth_dir / "w19_rgb_u8.tif"
+    with rasterio.open(p_rgb19, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(np.stack([((xx9 * 4) % 256).astype(np.uint8), ((yy9 * 4) % 256).astype(np.uint8), (((xx9 + yy9) * 3) % 256).astype(np.uint8)]))
+    out["w19_rgb_u8"] = p_rgb19
+
+    p_2b19 = synth_dir / "w19_nir_red.tif"
+    with rasterio.open(p_2b19, "w", driver="GTiff", width=128, height=128, count=2, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(np.stack([50.0 + xx9.astype(np.float32) * 2.0, 20.0 + yy9.astype(np.float32) * 1.5]))
+    out["w19_nir_red"] = p_2b19
+
     return out
 
 
@@ -2768,6 +2795,20 @@ def main() -> int:
                 ("PARITY W18 PREVIEW max_size=64 unscale expr .png", "GET", f"/cog/preview.png?url={q(s['w18_cog3b'])}&max_size=64&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}&rescale=-1,1&colormap_name=viridis", None, "png"),
                 ("PARITY W18 GPU torture cubic+RGB+formula .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w18_cog3b'])}&resampling=cubic&rescale=0,300&color_formula={qe('Gamma RGB 1.4')}", None, "png"),
                 ("PARITY W18 TILEJSON WebMercatorQuad", "GET", f"/cog/WebMercatorQuad/tilejson.json?url={q(s['w18_cog3b'])}&bidx=1&rescale=0,300&colormap_name=viridis", None, "tilejson_w18"),
+                # --- Wave 19: Custom JSON Colormaps & Built-In Algorithms ---
+                ("PARITY W19 CMAP discrete w/ transparent class .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_cat_u8'])}&colormap={qe(json.dumps({'0':[255,0,0,255],'1':[0,255,0,255],'2':[0,0,255,0],'3':[255,255,0,255]}))}", None, "png"),
+                ("PARITY W19 CMAP discrete hex strings .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_cat_u8'])}&colormap={qe(json.dumps({'0':'#ff0000','1':'#00ff00','2':'#0000ff','3':'#ffff00'}))}", None, "png"),
+                ("PARITY W19 CMAP interval negative-to-pos f32 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_dem_f32'])}&colormap={qe(json.dumps([[[-100,0],[0,0,255,255]],[[0,100],[0,255,0,255]],[[100,300],[255,0,0,255]]]))}", None, "png"),
+                ("BETTER W19 CMAP linear + rescale (cw interp, tt sparse)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_dem_f32'])}&rescale=-60,200&colormap={qe(json.dumps({'0':[0,0,0,255],'128':[255,0,0,255],'255':[255,255,255,255]}))}&colormap_type=linear", None, "better_linear_cmap"),
+                ("PARITY W19 CMAP negative int16 keys .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_neg_i16'])}&colormap={qe(json.dumps({'-10':[255,0,0,255],'0':[0,255,0,255],'10':[0,0,255,255]}))}", None, "png"),
+                ("PARITY W19 ALG terrarium .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_dem_f32'])}&algorithm=terrarium", None, "png"),
+                ("PARITY W19 ALG terrainrgb .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_dem_f32'])}&algorithm=terrainrgb", None, "png"),
+                ("PARITY W19 ALG normalizedIndex .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w19_nir_red'])}&algorithm=normalizedIndex", None, "npy"),
+                ("PARITY W19 ALG grayscale .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_rgb_u8'])}&algorithm=grayscale", None, "png"),
+                ("PARITY W19 ALG bitonal .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_rgb_u8'])}&algorithm=bitonal", None, "png"),
+                ("PARITY W19 ALG ceil negative f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w19_dem_f32'])}&algorithm=ceil", None, "npy"),
+                ("PARITY W19 ALG floor negative f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w19_dem_f32'])}&algorithm=floor", None, "npy"),
+                ("PARITY W19 ALG contours increment=50 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_dem_f32'])}&algorithm=contours&algorithm_params={qe(json.dumps({'increment':50}))}", None, "png"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -3002,6 +3043,24 @@ def main() -> int:
                                 and tt_std < 1.0
                             )
                             detail = f"cw[128,128]={imc[128,128,:3].tolist()} spatial_std={cw_std:.1f} vs tt[128,128]={imt[128,128,:3].tolist()} spatial_std={tt_std:.1f}"
+                    elif kind == "better_linear_cmap":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            cw_cov = float((imc[..., 3] > 0).mean()) * 100.0
+                            tt_cov = float((imt[..., 3] > 0).mean()) * 100.0
+                            # cogzilla linearly interpolates custom JSON stops across all valid pixels (~76.7%),
+                            # whereas TiTiler treats the 3-stop JSON dict as discrete (~0.6% coverage).
+                            ok = (
+                                imc.shape == (256, 256, 4)
+                                and cw_cov > 70.0
+                                and tt_cov < 5.0
+                                and 180 < int(imc[128, 128, 0]) < 255
+                                and int(imc[128, 128, 1]) == 0
+                            )
+                            detail = f"cw_cov={cw_cov:.1f}% px[128,128]={imc[128,128,:3].tolist()} vs tt_cov={tt_cov:.2f}%"
                     elif kind == "tilejson_w18":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
