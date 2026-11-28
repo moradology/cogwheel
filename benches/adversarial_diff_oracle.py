@@ -1149,6 +1149,49 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(f16_arr, 1)
     out["w42_f16_p3"] = p_w42_f16_p3
 
+    # Wave 43: 3-band RGB ?nodata=0 (pure [0,0,0] hole + partial [0,120,200] valid region),
+    # multi-overview float32 (dual resampling= + reproject=), and stripped (non-tiled) 3-band TIFF with internal overviews
+    tf_w43 = from_bounds(-122.5, 37.5, -122.0, 38.0, 256, 256)
+    yy43, xx43 = np.mgrid[0:256, 0:256]
+    r43 = np.clip(40 + xx43 // 2, 1, 250).astype(np.uint8)
+    g43 = np.clip(60 + yy43 // 2, 1, 250).astype(np.uint8)
+    b43 = np.clip(80 + (xx43 + yy43) // 4, 1, 250).astype(np.uint8)
+    # Pure [0,0,0] hole inside tile 10/164/396 (rows 144..256, cols 80..256)
+    r43[160:200, 110:150] = 0
+    g43[160:200, 110:150] = 0
+    b43[160:200, 110:150] = 0
+    # Partial [0,120,200] (only R=0): valid under GDAL dataset_mask all-band nodata semantics
+    r43[200:240, 150:200] = 0
+    g43[200:240, 150:200] = 120
+    b43[200:240, 150:200] = 200
+
+    p_w43_rgb = synth_dir / "w43_rgb_nodata.tif"
+    with rasterio.open(
+        p_w43_rgb, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w43, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(np.stack([r43, g43, b43]))
+    out["w43_rgb_nodata"] = p_w43_rgb
+
+    p_w43_ovr = synth_dir / "w43_multi_ovr.tif"
+    dem43 = (100.0 + xx43 * 2.0 + yy43 * 1.5 + 30.0 * np.sin(xx43 * 0.2)).astype(np.float32)
+    with rasterio.open(
+        p_w43_ovr, "w", driver="GTiff", width=256, height=256, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w43, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(dem43, 1)
+        ds.build_overviews([2, 4], Resampling.average)
+    out["w43_multi_ovr"] = p_w43_ovr
+
+    p_w43_strip = synth_dir / "w43_stripped_ovr.tif"
+    with rasterio.open(
+        p_w43_strip, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w43, tiled=False, blockysize=16, compress="deflate",
+    ) as ds:
+        ds.write(np.stack([r43, g43, b43]))
+        ds.build_overviews([2, 4], Resampling.average)
+    out["w43_stripped_ovr"] = p_w43_strip
+
     return out
 
 
@@ -3245,6 +3288,8 @@ def run_wave28_wms_and_mosaic_checks(
         "W38 MOSAIC POST /feature 64x64.npy",
         "W38 MOSAIC GET /bbox 64x64.npy",
         "W38 MOSAIC GET /point",
+        "W43 MOSAIC expression + resampling=cubic .npy",
+        "W43 MOSAIC expression + colormap_name=viridis .png",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -3570,6 +3615,49 @@ def run_wave28_wms_and_mosaic_checks(
                     d_pt = first_json_diff(j, rg.json())
                     if d_pt is not None:
                         gpu_diffs.append({"label": lb, "detail": d_pt})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W43 MOSAIC expression + resampling=cubic .npy"
+    if wanted(lb):
+        p = f"/mosaicjson/tiles/WebMercatorQuad/10/164/396.npy?url={q(mj_p)}&expression={qe('(b2-b1)/(b2+b1+100)')}&resampling=cubic"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            a = np.load(io.BytesIO(r.content))
+            vm = a[1] > np.finfo(a.dtype).min
+            astd = float(a[0][vm].std()) if vm.any() else 0.0
+            amax = float(np.abs(a[0][vm]).max()) if vm.any() else 999.0
+            ok = a.shape == (2, 256, 256) and a.dtype == np.float64 and int(vm.sum()) > 10000 and astd > 0.05 and amax <= 1.5
+            rec(lb, ok, f"shape={a.shape} dtype={a.dtype} valid={int(vm.sum())} std={astd:.4f} max={amax:.4f}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_npy(r.content, rg.content, check_values=True, smooth=True)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W43 MOSAIC expression + colormap_name=viridis .png"
+    if wanted(lb):
+        p = f"/mosaicjson/tiles/WebMercatorQuad/10/164/396.png?url={q(mj_p)}&expression={qe('(b2-b1)/(b2+b1+100)')}&rescale=-1,1&colormap_name=viridis"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+            vm = im[..., 3] == 255
+            cstd = float(im[vm, :3].std(axis=0).max()) if vm.any() else 0.0
+            ok = im.shape == (256, 256, 4) and int(vm.sum()) > 10000 and cstd > 5.0
+            rec(lb, ok, f"shape={im.shape} valid={int(vm.sum())} std={cstd:.1f}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_images(r.content, rg.content)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
         else:
             rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
 
@@ -4649,6 +4737,16 @@ def main() -> int:
                 ("PARITY W42 bidx=1,3 + algorithm=normalizedIndex .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w41_f32_4b'])}&bidx=1&bidx=3&algorithm=normalizedIndex&rescale=-1,1&colormap_name=rdylgn", None, "png"),
                 ("PARITY W42 POST /statistics expression=(b3-b1)/(b3+b1)", "POST", f"/cog/statistics?url={q(s['w41_f32_4b'])}&expression={qe('(b3-b1)/(b3+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.4, 37.6], [-122.1, 37.6], [-122.1, 37.9], [-122.4, 37.9], [-122.4, 37.6]]]}}, "post_stats"),
                 ("PARITY W42 POST /statistics unscale+expression NDVI", "POST", f"/cog/statistics?url={q(s['w35_scaled_2b'])}&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.4, 37.6], [-122.1, 37.6], [-122.1, 37.9], [-122.4, 37.9], [-122.4, 37.6]]]}}, "post_stats"),
+                # --- Wave 43: 3-band RGB ?nodata=0 .npy (all-band dataset_mask), dual resampling=+reproject=, stripped multi-band TIFF with internal overviews ---
+                ("PARITY W43 RGB nodata=0 .npy (all-band dataset_mask)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_rgb_nodata'])}&nodata=0", None, "npy"),
+                ("PARITY W43 DUAL resampling=average&reproject=cubic .npy", "GET", f"/cog/tiles/WebMercatorQuad/9/82/198.npy?url={q(s['w43_multi_ovr'])}&resampling=average&reproject=cubic", None, "npy"),
+                ("PARITY W43 DUAL resampling=nearest&reproject=bilinear .npy", "GET", f"/cog/tiles/WebMercatorQuad/9/82/198.npy?url={q(s['w43_multi_ovr'])}&resampling=nearest&reproject=bilinear", None, "npy"),
+                ("PARITY W43 DUAL resampling=bilinear&reproject=nearest .npy", "GET", f"/cog/tiles/WebMercatorQuad/9/82/198.npy?url={q(s['w43_multi_ovr'])}&resampling=bilinear&reproject=nearest", None, "npy"),
+                ("PARITY W43 STRIPPED+OVR z10 full-res .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_stripped_ovr'])}", None, "npy"),
+                ("PARITY W43 STRIPPED+OVR z8 overview .npy", "GET", f"/cog/tiles/WebMercatorQuad/8/41/99.npy?url={q(s['w43_stripped_ovr'])}", None, "npy"),
+                ("PARITY W43 STRIPPED+OVR z10 full-res .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_stripped_ovr'])}", None, "png"),
+                ("PARITY W43 STRIPPED+OVR /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w43_stripped_ovr'])}", None, "point"),
+                ("PARITY W43 STRIPPED+OVR /statistics", "GET", f"/cog/statistics?url={q(s['w43_stripped_ovr'])}", None, "stats"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
