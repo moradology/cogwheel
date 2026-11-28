@@ -48,9 +48,9 @@ fn sample_bilinear(u: f32, v: f32) -> f32 {
 
 fn sample_cubic(u: f32, v: f32) -> f32 {
     if (!is_finite_f32(u) || !is_finite_f32(v)
-        || u < -2.0 || v < -2.0
-        || u > f32(params.src_w) + 1.0
-        || v > f32(params.src_h) + 1.0) {
+        || u < -0.5 || v < -0.5
+        || u > f32(params.src_w) - 0.5
+        || v > f32(params.src_h) - 0.5) {
         return nan_f32();
     }
     let x0_f = floor(u);
