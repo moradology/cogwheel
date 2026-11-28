@@ -1045,6 +1045,16 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     }))
     out["w36_stac5b"] = p_w36_stac
 
+    # Wave 37: float32 COG for projected GeoJSON coord_crs (EPSG:3857, EPSG:32610), US-feet /point (EPSG:2227), /cog/bounds?crs=, /cog/info?crs=, /cog/stac
+    p_w37_cog = synth_dir / "w37_cog.tif"
+    arr_w37 = (10.0 + xx9.astype(np.float32) * 2.5 + yy9.astype(np.float32) * 1.5).astype(np.float32)
+    with rasterio.open(
+        p_w37_cog, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(arr_w37, 1)
+    out["w37_cog"] = p_w37_cog
+
     return out
 
 
@@ -4380,6 +4390,23 @@ def main() -> int:
                 ]}, "post_fc_stats_w23"),
                 ("PARITY W36 EXPR sci-notation + arctan .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w36_5band'])}&expression={qe('arctan(b1*1e-2)+2.5e1')}", None, "npy"),
             ]
+            # --- Wave 37: Projected GeoJSON coord_crs (3857/32610) on POST /statistics & /feature, US-feet /point (2227), /cog/info?crs=3857, /cog/bounds?crs=3857 & /cog/stac ---
+            from rasterio.warp import transform as rio_transform
+            w37_x3857, w37_y3857 = rio_transform("EPSG:4326", "EPSG:3857", [-122.4, -122.1, -122.1, -122.4, -122.4], [37.6, 37.6, 37.9, 37.9, 37.6])
+            w37_poly_3857 = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [list(zip(w37_x3857, w37_y3857))]}}
+            w37_xutm, w37_yutm = rio_transform("EPSG:4326", "EPSG:32610", [-122.4, -122.1, -122.1, -122.4, -122.4], [37.6, 37.6, 37.9, 37.9, 37.6])
+            w37_poly_utm = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [list(zip(w37_xutm, w37_yutm))]}}
+            w37_px2227, w37_py2227 = rio_transform("EPSG:4326", "EPSG:2227", [-122.25], [37.75])
+            cases += [
+                ("PARITY W37 POST /statistics coord_crs=EPSG:3857", "POST", f"/cog/statistics?url={q(s['w37_cog'])}&coord_crs=EPSG:3857", w37_poly_3857, "post_stats"),
+                ("PARITY W37 POST /statistics coord_crs=EPSG:32610", "POST", f"/cog/statistics?url={q(s['w37_cog'])}&coord_crs=EPSG:32610", w37_poly_utm, "post_stats"),
+                ("PARITY W37 POST /feature coord_crs=EPSG:3857 .npy", "POST", f"/cog/feature/64x64.npy?url={q(s['w37_cog'])}&coord_crs=EPSG:3857", w37_poly_3857, "npy"),
+                ("PARITY W37 POST /feature coord_crs=32610 dst_crs=32610 .npy", "POST", f"/cog/feature/64x64.npy?url={q(s['w37_cog'])}&coord_crs=EPSG:32610&dst_crs=EPSG:32610", w37_poly_utm, "npy"),
+                ("PARITY W37 /point coord_crs=EPSG:2227 (US Survey Feet)", "GET", f"/cog/point/{w37_px2227[0]:.2f},{w37_py2227[0]:.2f}?url={q(s['w37_cog'])}&coord_crs=EPSG:2227", None, "point"),
+                ("BETTER W37 GET /cog/info?crs=EPSG:3857 (cw 3857, tt ignores)", "GET", f"/cog/info?url={q(s['w37_cog'])}&crs=EPSG:3857", None, "better_info_crs3857"),
+                ("BETTER W37 GET /cog/bounds?crs=EPSG:3857 (cw 200, tt 404)", "GET", f"/cog/bounds?url={q(s['w37_cog'])}&crs=EPSG:3857", None, "better_bounds_crs3857"),
+                ("BETTER W37 GET /cog/stac item JSON (cw 200, tt 404)", "GET", f"/cog/stac?url={q(s['w37_cog'])}", None, "better_cog_stac"),
+            ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
@@ -4474,6 +4501,9 @@ def main() -> int:
                             elif kind == "better_stac_wmts":
                                 gok = ET.fromstring(r_gpu.content).tag.endswith("Capabilities") and "WebMercatorQuad" in r_gpu.text
                                 gd = "wmts xml match" if gok else "gpu wmts invalid"
+                            elif kind in ("better_info_crs3857", "better_bounds_crs3857", "better_cog_stac"):
+                                d = first_json_diff(r_cw.json(), r_gpu.json())
+                                gok, gd = (d is None), (d or "exact JSON match")
                             else:
                                 gok, gd = (r_cw.content == r_gpu.content), "bytes diff"
                             if not gok:
@@ -4760,6 +4790,31 @@ def main() -> int:
                             imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
                             ok = imc.shape == (64, 64, 4) and imt.shape[:2] == (58, 58) and int((imc[..., 3] == 255).sum()) == 64 * 64
                             detail = f"cw={imc.shape[:2]} tt={imt.shape[:2]}"
+                    elif kind == "better_info_crs3857":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            jc, jt = r_cw.json(), r_tt.json()
+                            exp_b = transform_bounds("EPSG:4326", "EPSG:3857", -122.5, 37.5, -122.0, 38.0)
+                            berr = max(abs(a - b) for a, b in zip(jc["bounds"], exp_b))
+                            ok = berr < 1.0 and "3857" in str(jc.get("crs", "")) and abs(jt["bounds"][0] - (-122.5)) < 1e-4
+                            detail = f"cw_crs={jc.get('crs')} berr={berr:.2f}m vs tt_bounds={jt['bounds']}"
+                    elif kind == "better_bounds_crs3857":
+                        if r_cw.status_code != 200 or r_tt.status_code != 404:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 404)"
+                        else:
+                            jc = r_cw.json()
+                            exp_b = transform_bounds("EPSG:4326", "EPSG:3857", -122.5, 37.5, -122.0, 38.0)
+                            berr = max(abs(a - b) for a, b in zip(jc["bounds"], exp_b))
+                            ok = berr < 1.0
+                            detail = f"cw=200 berr={berr:.2f}m tt=404"
+                    elif kind == "better_cog_stac":
+                        if r_cw.status_code != 200 or r_tt.status_code != 404:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 404)"
+                        else:
+                            jc = r_cw.json()
+                            ok = jc.get("type") == "Feature" and "assets" in jc and "data" in jc["assets"] and jc.get("bbox") == [-122.5, 37.5, -122.0, 38.0]
+                            detail = f"cw=200 stac_version={jc.get('stac_version')} bbox={jc.get('bbox')} tt=404"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
