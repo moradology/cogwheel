@@ -1050,15 +1050,63 @@ where
             .await
         }
 
-        // 10. GET /cog/point/{lon},{lat} (supports coord_crs=EPSG:3857)
+        // 10. GET /cog/point/{lon},{lat} (supports coord_crs=EPSG:3857 and multi-URL stacking)
         (Method::GET, ["point", coord]) => async {
             let cogs = open_query_urls(&engine, &pq.urls, pq.nodata).await?;
             let Some((x, y)) = parse_point_coord(coord) else {
                 return Err(EngineError::BadRequest("expected /cog/point/{lon},{lat}".into()));
             };
             let (lon, lat) = coord_to_lonlat(x, y, pq.coord_crs.as_ref())?;
-            let mut json =
-                query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?;
+            let mut json = if cogs.len() == 1 {
+                query_point(&engine, &cogs[0], lon, lat, pq.unscale, pq.nodata).await?
+            } else {
+                let n = cogs.len();
+                let mut set = tokio::task::JoinSet::new();
+                for (idx, cog) in cogs.into_iter().enumerate() {
+                    let eng = engine.clone();
+                    let unscale = pq.unscale;
+                    let nodata = pq.nodata;
+                    set.spawn(async move {
+                        let res = query_point(&eng, &cog, lon, lat, unscale, nodata).await;
+                        (idx, res)
+                    });
+                }
+                let mut vals = vec![serde_json::Value::Null; n];
+                let mut any_ok = false;
+                let mut first_oob: Option<EngineError> = None;
+                while let Some(joined) = set.join_next().await {
+                    let (idx, res) = joined
+                        .map_err(|e| EngineError::BadRequest(format!("join error: {e}")))?;
+                    match res {
+                        Ok(pt) => {
+                            any_ok = true;
+                            if let Some(v) = pt["values"].as_array().and_then(|a| a.first()) {
+                                vals[idx] = v.clone();
+                            }
+                        }
+                        Err(e @ EngineError::NotFound(_)) => {
+                            if first_oob.is_none() {
+                                first_oob = Some(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                if !any_ok {
+                    return Err(first_oob.unwrap_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "point ({lon}, {lat}) is outside dataset bounds"
+                        ))
+                    }));
+                }
+                let names: Vec<String> = (1..=n).map(|i| format!("b{i}")).collect();
+                serde_json::json!({
+                    "coordinates": [lon, lat],
+                    "values": vals,
+                    "band_names": names,
+                    "band_descriptions": names,
+                })
+            };
             if pq.coord_crs.is_some() {
                 json["coordinates"] = serde_json::json!([x, y]);
             }
