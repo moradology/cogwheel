@@ -933,6 +933,46 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(np.stack([grad_w33, grad_w33 * 0.5 + 10.0, grad_w33 * 0.25 - 5.0]))
     out["w33_planar_f32_zstd_p3"] = p_w33_sep
 
+    # Wave 34: int64 & uint64 BigTIFF COGs + multi-band STAC asset for inline pipe syntax & dst_crs/coord_crs bbox
+    p_w34_i64 = synth_dir / "w34_i64.tif"
+    i64_w34 = ((xx9.astype(np.int64) - 64) * 100000 + (yy9.astype(np.int64) - 64) * 50000)
+    with rasterio.open(
+        p_w34_i64, "w", driver="GTiff", width=128, height=128, count=1, dtype="int64",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(i64_w34, 1)
+    out["w34_i64"] = p_w34_i64
+
+    p_w34_u64 = synth_dir / "w34_u64.tif"
+    u64_w34 = (xx9.astype(np.uint64) * 100000 + yy9.astype(np.uint64) * 50000 + 1000)
+    with rasterio.open(
+        p_w34_u64, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint64",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(u64_w34, 1)
+    out["w34_u64"] = p_w34_u64
+
+    p_w34_mb = synth_dir / "w34_multi3b.tif"
+    with rasterio.open(
+        p_w34_mb, "w", driver="GTiff", width=128, height=128, count=3, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(np.stack([
+            (xx9.astype(np.float32) + 10.0),
+            (yy9.astype(np.float32) * 2.0 + 20.0),
+            ((xx9 + yy9).astype(np.float32) + 5.0),
+        ]))
+    out["w34_multi3b"] = p_w34_mb
+
+    p_w34_stac = synth_dir / "w34_stac_pipe.json"
+    p_w34_stac.write_text(json.dumps({
+        "type": "Feature", "stac_version": "1.0.0", "id": "w34-pipe",
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.5], [-122.0, 37.5], [-122.0, 38.0], [-122.5, 38.0], [-122.5, 37.5]]]},
+        "bbox": [-122.5, 37.5, -122.0, 38.0], "properties": {"datetime": "2024-06-01T00:00:00Z"}, "links": [],
+        "assets": {"multi": {"href": str(p_w34_mb)}},
+    }))
+    out["w34_stac_pipe"] = p_w34_stac
+
     return out
 
 
@@ -4230,6 +4270,19 @@ def main() -> int:
                     (f"PARITY W33 CRS [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/{z_c}/{tx_c}/{ty_c}.npy?url={q(p)}", None, "npy"),
                     (f"PARITY W33 CRS [{name}] point", "GET", f"/cog/point/{lon_c:.5f},{lat_c:.5f}?url={q(p)}", None, "point"),
                 ]
+            # --- Wave 34: int64/uint64 64-bit integer COGs, STAC inline pipe syntax & dst_crs/coord_crs bbox ---
+            cases += [
+                ("PARITY W34 DTYPE int64 tile .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w34_i64'])}", None, "npy"),
+                ("PARITY W34 DTYPE int64 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w34_i64'])}", None, "point"),
+                ("PARITY W34 DTYPE int64 /statistics", "GET", f"/cog/statistics?url={q(s['w34_i64'])}", None, "stats"),
+                ("BETTER W34 DTYPE uint64 tile .npy (cw 200 u64, tt 500)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w34_u64'])}", None, "better_u64_npy"),
+                ("PARITY W34 DTYPE uint64 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w34_u64'])}", None, "point"),
+                ("PARITY W34 STAC inline assets=multi|bidx=2 .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w34_stac_pipe'])}&assets={qe('multi|bidx=2')}", None, "npy"),
+                ("PARITY W34 STAC inline assets=multi|expression=b2-b1 .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w34_stac_pipe'])}&assets={qe('multi|expression=b2-b1')}", None, "npy"),
+                ("PARITY W34 STAC inline assets=multi|bidx=2 /point", "GET", f"/stac/point/-122.25,37.75?url={q(s['w34_stac_pipe'])}&assets={qe('multi|bidx=2')}", None, "point"),
+                ("PARITY W34 BBOX dst_crs=EPSG:32610 cubic .npy", "GET", f"/cog/bbox/-122.4,37.6,-122.1,37.9/64x64.npy?url={q(s['w34_multi3b'])}&bidx=1&dst_crs=EPSG:32610&resampling=cubic", None, "npy"),
+                ("PARITY W34 BBOX coord_crs=EPSG:32610 dst_crs=32610 .npy", "GET", f"/cog/bbox/550000,4165000,575000,4190000/64x64.npy?url={q(s['w34_multi3b'])}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610", None, "npy"),
+            ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
@@ -4592,6 +4645,16 @@ def main() -> int:
                             root = ET.fromstring(r_cw.content)
                             ok = root.tag.endswith("Capabilities") and "WebMercatorQuad" in r_cw.text and "assets=dem" in r_cw.text
                             detail = f"cw=200 root={root.tag.split('}')[-1]} len={len(r_cw.text)} tt=404"
+                    elif kind == "better_u64_npy":
+                        if r_cw.status_code != 200 or r_tt.status_code != 500:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 500)"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            vm = ac[1] > 0
+                            vmin = int(ac[0][vm].min()) if vm.any() else 0
+                            vmax = int(ac[0][vm].max()) if vm.any() else 0
+                            ok = ac.shape == (2, 256, 256) and ac.dtype == np.uint64 and int(vm.sum()) > 10000 and vmin >= 1000 and vmax > 10000000
+                            detail = f"cw=200 dtype={ac.dtype} valid={int(vm.sum())} range=[{vmin}..{vmax}] tt=500"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
