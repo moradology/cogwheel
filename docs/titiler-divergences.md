@@ -124,7 +124,7 @@ cogzilla keeps its choice. Against the area mean of the 10 m pixels (the ideal v
 
 ### 1.15 Additional Correctness & Robustness Improvements Verified by Differential Oracle
 
-Confirmed against stock TiTiler 2.4.1 (`rio-tiler 9.4.14`, `rasterio 1.5.2`) across 318 adversarial differential checks:
+Confirmed against stock TiTiler 2.4.1 (`rio-tiler 9.4.14`, `rasterio 1.5.2`) across 426 adversarial differential checks:
 - **Inverted `rescale` ranges (`rescale=max,min`, e.g. `rescale=1000,0`):** `rio_tiler.utils.linear_rescale` calls `numpy.clip(image, imin, imax)` which collapses every pixel to `imax` whenever `imin > imax`, rendering a solid `255` tile. `cogzilla` performs proper linear inversion across `[imin, imax]`.
 - **Extended GDAL `resampling=` modes (`min`, `max`, `med`, `q1`, `q3`, `sum`):** TiTiler 2.4.1 rejects these six modes with `422 literal_error`; `cogzilla` supports all 15 GDAL resampling modes across tiles and previews.
 - **`color_formula` on single-band grayscale imagery:** TiTiler crashes with `500` (`index 1 is out of bounds for axis 0 with size 1`) when `color_formula` (e.g. `Gamma RGB 1.8`) is applied to a 1-band COG; `cogzilla` applies the formula cleanly and returns a valid `200` grayscale PNG.
@@ -134,6 +134,7 @@ Confirmed against stock TiTiler 2.4.1 (`rio-tiler 9.4.14`, `rasterio 1.5.2`) acr
 - **Embedded palette COGs on `.npy`:** TiTiler unconditionally expands an embedded TIFF `ColorMap` into `(4, H, W)` RGB+mask on `.npy` with no query parameter to opt out, destroying raw integer class IDs for scientific/ML land-cover datasets (NLCD, WorldCover, CDL). `cogzilla` applies the embedded palette on visual formats (`.png`/`.jpg`/`.webp`) and preserves raw class indices `(2, H, W)` on `.npy` (matching `/point` and `/statistics`).
 - **Rotated same-CRS GeoTIFFs (`ModelTransformationTag` on `EPSG:3857`):** When `src_crs == dst_crs == EPSG:3857` and the GeoTIFF has a non-zero rotation/shear (`b != 0` or `d != 0`), `rio-tiler`'s same-CRS tile read bypasses `WarpedVRT` and samples as if axis-aligned (misplacing values and dropping ~14% of valid pixels on a 30°-rotated tile). `cogzilla`'s `CoordPlan` checks `crs_to_pixel.is_axis_aligned()` and routes rotated same-CRS rasters through exact 2D affine sampling, matching exact ground-truth pixel coordinates.
 - **South-up (`e > 0`) GeoTIFF `/bbox` requests:** TiTiler 2.4.1 crashes with `500` (`Bounds and transform are inconsistent`) on `/cog/bbox` for south-up (`e > 0`) rasters; `cogzilla` handles positive-Y transforms cleanly and returns a valid `200` north-up crop.
+- **GCP-only `float32` GeoTIFFs (no GeoTransform, Ground Control Points only):** On `float32` GCP-only rasters, `rio-tiler` / TiTiler 2.4.1 corrupts its own mask to `-3.4028235e+38` (`f32::MIN` / `-FLT_MAX`) on `/cog/point` (returning `{"values": [null]}`) and renders a solid `viridis(0)` tile on `/cog/tiles/...png` (`MAE=61.0` vs GeoTransform ground truth). `cogzilla` fits the exact GCP transform in `cogzilla-tiff`, matching the equivalent GeoTransform raster bit-for-bit (`MAE=0.00, PSNR=99.0 dB` on `.png`, exact pixel value on `/cog/point`).
 
 ## 2. Deliberate API & Error-Handling Divergences
 
