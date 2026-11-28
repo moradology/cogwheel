@@ -114,7 +114,12 @@ def compare_arrays(
         top = np.iinfo(a.dtype).max if a.dtype.kind in "ui" else 1
         a = np.concatenate([a, (there * top).astype(a.dtype)[None]])
         b = np.concatenate([b, (there * top).astype(b.dtype)[None]])
-    ma, mb = a[-1] != 0, b[-1] != 0
+        ma, mb = a[-1] != 0, b[-1] != 0
+    else:
+        # Signed int and float `.npy` mask bands use dtype min for masked and dtype max for valid
+        # (unsigned ints use 0 for masked and 255 / 65535 for valid).
+        low = np.finfo(a.dtype).min if a.dtype.kind == "f" else np.iinfo(a.dtype).min
+        ma, mb = a[-1] > low, b[-1] > low
     mask = float((ma == mb).mean()) * 100.0
     tops = set(np.unique(a[-1][ma]).tolist()) == set(np.unique(b[-1][mb]).tolist())
     both = ma & mb

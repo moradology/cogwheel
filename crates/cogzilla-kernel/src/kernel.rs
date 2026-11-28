@@ -765,10 +765,10 @@ fn sample_bilinear<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f
     if !CLEAN
         && (!u.is_finite()
             || !v.is_finite()
-            || u < -1.0
-            || v < -1.0
-            || u > src.ifd_w as f32
-            || v > src.ifd_h as f32)
+            || u < -0.5
+            || v < -0.5
+            || u > src.ifd_w as f32 - 0.5
+            || v > src.ifd_h as f32 - 0.5)
     {
         return f32::NAN;
     }
@@ -861,10 +861,10 @@ fn cubic_weights(t: f32) -> [f32; 4] {
 pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
     if !u.is_finite()
         || !v.is_finite()
-        || u < -2.0
-        || v < -2.0
-        || u > src.ifd_w as f32 + 1.0
-        || v > src.ifd_h as f32 + 1.0
+        || u < -0.5
+        || v < -0.5
+        || u > src.ifd_w as f32 - 0.5
+        || v > src.ifd_h as f32 - 0.5
     {
         return f32::NAN;
     }
