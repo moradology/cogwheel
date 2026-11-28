@@ -293,13 +293,7 @@ pub fn sample_kernel_widened(
     scale_y: f32,
     mode: ResampleMode,
 ) -> f32 {
-    if !u.is_finite()
-        || !v.is_finite()
-        || u < -0.5
-        || v < -0.5
-        || u > src.ifd_w as f32 - 0.5
-        || v > src.ifd_h as f32 - 0.5
-    {
+    if !src.contains_sample(u, v) {
         return f32::NAN;
     }
     let sx = widened_scale(mode, scale_x);
@@ -532,13 +526,7 @@ impl WidenedSampler {
         if self.width == 0 {
             return sample_kernel_widened(src, u, v, self.scale_x, self.scale_y, self.mode);
         }
-        if !u.is_finite()
-            || !v.is_finite()
-            || u < -0.5
-            || v < -0.5
-            || u > src.ifd_w as f32 - 0.5
-            || v > src.ifd_h as f32 - 0.5
-        {
+        if !src.contains_sample(u, v) {
             return f32::NAN;
         }
         // SAFETY: `WidenedSampler` is `!Sync` (it holds `UnsafeCell`s) and `sample` never re-enters
@@ -603,13 +591,7 @@ pub fn sample_f64_kernel_widened(
     scale_y: f32,
     mode: ResampleMode,
 ) -> f64 {
-    if !u.is_finite()
-        || !v.is_finite()
-        || u < -0.5
-        || v < -0.5
-        || u > src.ifd_w as f64 - 0.5
-        || v > src.ifd_h as f64 - 0.5
-    {
+    if !src.contains_sample_f64(u, v) {
         return f64::NAN;
     }
     let axis = |c: f64, s: f32| -> (i32, Vec<f64>) {
@@ -678,9 +660,8 @@ impl AxisTapTable {
         let mut packed = vec![0.0f32; coords.len() * bound];
         let mut tmp = [0.0f32; WIDE_MAX_TAPS];
         let mut most = 0usize;
-        let max_c = lim as f32 - 0.5;
         for (k, &c) in coords.iter().enumerate() {
-            let (st, n) = if c.is_finite() && c >= -0.5 && c <= max_c {
+            let (st, n) = if BandSource::axis_contains_sample(c, lim) {
                 widened_axis_taps(mode, c, s, &mut tmp[..bound])
             } else {
                 (0, 0)
@@ -832,7 +813,6 @@ pub(super) fn widened_plane_separable_with_tables(
 ) -> Vec<f32> {
     let (w, h) = (us.len(), vs.len());
     let mut out = vec![f32::NAN; w * h];
-    let in_range = |c: f32, lim: i32| c.is_finite() && c >= -0.5 && c <= lim as f32 - 0.5;
     let (Some((c_lo, c_hi)), Some(_)) = (cols.span(), rows.span()) else {
         return out;
     };
@@ -842,13 +822,15 @@ pub(super) fn widened_plane_separable_with_tables(
     let col_ok: Vec<bool> = (0..w)
         .map(|k| {
             let (st, t) = cols.taps(k);
-            in_range(us[k], src.ifd_w) && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_w))
+            BandSource::axis_contains_sample(us[k], src.ifd_w)
+                && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_w))
         })
         .collect();
     let row_ok: Vec<bool> = (0..h)
         .map(|k| {
             let (st, t) = rows.taps(k);
-            in_range(vs[k], src.ifd_h) && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_h))
+            BandSource::axis_contains_sample(vs[k], src.ifd_h)
+                && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_h))
         })
         .collect();
     let (gc0, gc1) = if clean { (c_lo.max(0), c_hi.min(src.ifd_w - 1)) } else { (c_lo, c_hi) };

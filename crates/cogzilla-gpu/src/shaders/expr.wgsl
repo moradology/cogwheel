@@ -71,10 +71,7 @@ fn sample_bilinear_raw(band: u32, u: f32, v: f32) -> f32 {
 }
 
 fn sample_cubic(band: u32, u: f32, v: f32) -> f32 {
-    if (!is_finite_f32(u) || !is_finite_f32(v)
-        || u < -0.5 || v < -0.5
-        || u > f32(params.src_w) - 0.5
-        || v > f32(params.src_h) - 0.5) {
+    if (!in_sample_extent(u, v)) {
         return nan_f32();
     }
     let x0_f = floor(u);
@@ -101,10 +98,7 @@ fn sample_cubic(band: u32, u: f32, v: f32) -> f32 {
 }
 
 fn sample_lanczos3(band: u32, u: f32, v: f32) -> f32 {
-    if (!is_finite_f32(u) || !is_finite_f32(v)
-        || u < -0.5 || v < -0.5
-        || u > f32(params.src_w) - 0.5
-        || v > f32(params.src_h) - 0.5) {
+    if (!in_sample_extent(u, v)) {
         return nan_f32();
     }
     let x0_f = floor(u);
@@ -145,20 +139,14 @@ fn sample_lanczos3(band: u32, u: f32, v: f32) -> f32 {
 
 fn sample_band(band: u32, u: f32, v: f32) -> f32 {
     if (params.resample_mode == 0u) {
-        if (!is_finite_f32(u) || !is_finite_f32(v)
-            || u < -0.5 || v < -0.5
-            || u > f32(params.src_w) - 0.5
-            || v > f32(params.src_h) - 0.5) {
+        if (!in_sample_extent(u, v)) {
             return nan_f32();
         }
         return sample_bilinear_raw(band, u, v);
     } else if (params.resample_mode == 1u) {
         return sample_cubic(band, u, v);
     } else if (params.resample_mode == 3u) {
-        if (!is_finite_f32(u) || !is_finite_f32(v)
-            || u < -0.5 || v < -0.5
-            || u > f32(params.src_w) - 0.5
-            || v > f32(params.src_h) - 0.5) {
+        if (!in_sample_extent(u, v)) {
             return nan_f32();
         }
         return sample_checked(band, i32(floor(u + 0.5)), i32(floor(v + 0.5)));
