@@ -1055,6 +1055,27 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(arr_w37, 1)
     out["w37_cog"] = p_w37_cog
 
+    # Wave 38: High-precision uint32 (> 2^24) & signed int32 (< -2^24 + INT32_MIN nodata hole) to catch any f32 truncation
+    p_w38_u32 = synth_dir / "w38_u32_hi.tif"
+    u32_w38 = (np.uint32(2_000_000_000) + xx9.astype(np.uint32) + yy9.astype(np.uint32) * np.uint32(3))
+    with rasterio.open(
+        p_w38_u32, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(u32_w38, 1)
+    out["w38_u32_hi"] = p_w38_u32
+
+    p_w38_i32 = synth_dir / "w38_i32_hi.tif"
+    i32_w38 = (np.int32(-2_000_000_000) + xx9.astype(np.int32) + yy9.astype(np.int32) * np.int32(3))
+    i32_w38[80:100, 60:90] = -2147483648
+    with rasterio.open(
+        p_w38_i32, "w", driver="GTiff", width=128, height=128, count=1, dtype="int32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", nodata=-2147483648,
+    ) as ds:
+        ds.write(i32_w38, 1)
+    out["w38_i32_hi"] = p_w38_i32
+
     return out
 
 
@@ -3148,6 +3169,9 @@ def run_wave28_wms_and_mosaic_checks(
         "W28 MOSAIC TileJSON WebMercatorQuad",
         "W28 MOSAIC WMTS Capabilities XML",
         "W28 MOSAIC POST /statistics FeatureCollection",
+        "W38 MOSAIC POST /feature 64x64.npy",
+        "W38 MOSAIC GET /bbox 64x64.npy",
+        "W38 MOSAIC GET /point",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -3414,6 +3438,67 @@ def run_wave28_wms_and_mosaic_checks(
                 rec(lb, False, f"unexpected FC shape: {j.get('type')} n={len(feats)}", p, "POST")
         else:
             rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p, "POST")
+
+    # --- Wave 38: MosaicJSON POST /feature, GET /bbox & GET /point ---
+    lb = "W38 MOSAIC POST /feature 64x64.npy"
+    if wanted(lb):
+        p = f"/mosaicjson/feature/64x64.npy?url={q(mj_p)}"
+        tri = {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}
+        r = client.post(cw_base + p, json=tri)
+        if r.status_code == 200:
+            a = np.load(io.BytesIO(r.content))
+            vm = a[3] > 0
+            rec(lb, a.shape == (4, 64, 64) and a.dtype == np.uint8 and 1500 < int(vm.sum()) < 2600, f"shape={a.shape} valid={int(vm.sum())}", p, "POST")
+            if gpu_base:
+                rg = client.post(gpu_base + p, json=tri)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_npy(r.content, rg.content, check_values=True)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p, "POST")
+
+    lb = "W38 MOSAIC GET /bbox 64x64.npy"
+    if wanted(lb):
+        p = f"/mosaicjson/bbox/-122.45,37.85,-122.35,37.95/64x64.npy?url={q(mj_p)}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            a = np.load(io.BytesIO(r.content))
+            vm = a[3] > 0
+            rec(lb, a.shape == (4, 64, 64) and int(vm.sum()) == 4096 and 40.0 < float(a[0].mean()) < 65.0, f"shape={a.shape} valid={int(vm.sum())} b1_mean={float(a[0].mean()):.1f}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    ok_g, det_g = compare_npy(r.content, rg.content, check_values=True)
+                    if not ok_g:
+                        gpu_diffs.append({"label": lb, "detail": det_g})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
+
+    lb = "W38 MOSAIC GET /point"
+    if wanted(lb):
+        p = f"/mosaicjson/point/-122.45,37.95?url={q(mj_p)}"
+        r = client.get(cw_base + p)
+        if r.status_code == 200:
+            j = r.json()
+            assets = j.get("assets", [])
+            vals = assets[0].get("values", []) if assets else []
+            ok = len(assets) >= 1 and len(vals) == 3 and all(v is not None and v > 0 for v in vals)
+            rec(lb, ok, f"n_assets={len(assets)} vals={vals}", p)
+            if gpu_base:
+                rg = client.get(gpu_base + p)
+                if rg.status_code != 200:
+                    gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                else:
+                    d_pt = first_json_diff(j, rg.json())
+                    if d_pt is not None:
+                        gpu_diffs.append({"label": lb, "detail": d_pt})
+        else:
+            rec(lb, False, f"HTTP {r.status_code} {r.text[:80]!r}", p)
 
     return ran
 
@@ -4406,6 +4491,15 @@ def main() -> int:
                 ("BETTER W37 GET /cog/info?crs=EPSG:3857 (cw 3857, tt ignores)", "GET", f"/cog/info?url={q(s['w37_cog'])}&crs=EPSG:3857", None, "better_info_crs3857"),
                 ("BETTER W37 GET /cog/bounds?crs=EPSG:3857 (cw 200, tt 404)", "GET", f"/cog/bounds?url={q(s['w37_cog'])}&crs=EPSG:3857", None, "better_bounds_crs3857"),
                 ("BETTER W37 GET /cog/stac item JSON (cw 200, tt 404)", "GET", f"/cog/stac?url={q(s['w37_cog'])}", None, "better_cog_stac"),
+                # --- Wave 38: High-precision uint32 (>2^24) & int32 (<-2^24) + OGC/TiTiler discovery endpoints ---
+                ("PARITY W38 DTYPE u32 >2^24 exact .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w38_u32_hi'])}", None, "npy"),
+                ("PARITY W38 DTYPE u32 >2^24 exact .tif", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.tif?url={q(s['w38_u32_hi'])}", None, "geotiff"),
+                ("PARITY W38 DTYPE u32 >2^24 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w38_u32_hi'])}", None, "point"),
+                ("PARITY W38 DTYPE u32 >2^24 /statistics", "GET", f"/cog/statistics?url={q(s['w38_u32_hi'])}", None, "stats"),
+                ("PARITY W38 DTYPE i32 <-2^24+nodata .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w38_i32_hi'])}", None, "npy"),
+                ("PARITY W38 DTYPE i32 <-2^24+nodata /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w38_i32_hi'])}", None, "point"),
+                ("PARITY W38 DISCOVERY /tileMatrixSets & /algorithms", "GET", "/algorithms", None, "discovery_w38"),
+                ("PARITY W38 DISCOVERY /colorMaps", "GET", "/colorMaps", None, "discovery_w38"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -4504,6 +4598,12 @@ def main() -> int:
                             elif kind in ("better_info_crs3857", "better_bounds_crs3857", "better_cog_stac"):
                                 d = first_json_diff(r_cw.json(), r_gpu.json())
                                 gok, gd = (d is None), (d or "exact JSON match")
+                            elif kind == "discovery_w38":
+                                jc, jg = r_cw.json(), r_gpu.json()
+                                k = "algorithms" if path == "/algorithms" else "colormaps"
+                                ic = [x["id"] if isinstance(x, dict) else x for x in jc.get(k, [])]
+                                ig = [x["id"] if isinstance(x, dict) else x for x in jg.get(k, [])]
+                                gok, gd = (ic == ig), f"ids match ({len(ic)})" if ic == ig else f"cw={len(ic)} gpu={len(ig)}"
                             else:
                                 gok, gd = (r_cw.content == r_gpu.content), "bytes diff"
                             if not gok:
@@ -4815,6 +4915,29 @@ def main() -> int:
                             jc = r_cw.json()
                             ok = jc.get("type") == "Feature" and "assets" in jc and "data" in jc["assets"] and jc.get("bbox") == [-122.5, 37.5, -122.0, 38.0]
                             detail = f"cw=200 stac_version={jc.get('stac_version')} bbox={jc.get('bbox')} tt=404"
+                    elif kind == "discovery_w38":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        elif path == "/algorithms":
+                            def _alg_ids(obj):
+                                a = obj.get("algorithms", [])
+                                if isinstance(a, dict):
+                                    return set(a.keys())
+                                return {x["id"] if isinstance(x, dict) else x for x in a}
+                            ac, at = _alg_ids(r_cw.json()), _alg_ids(r_tt.json())
+                            missing = sorted(at - ac)
+                            rtms_c, rtms_t = client.get(cw_base + "/tileMatrixSets"), client.get(tt_base + "/tileMatrixSets")
+                            tms_c = {t["id"] for t in rtms_c.json().get("tileMatrixSets", [])}
+                            tms_t = {t["id"] for t in rtms_t.json().get("tileMatrixSets", [])}
+                            ok = len(missing) == 0 and "WebMercatorQuad" in tms_c and "WorldCRS84Quad" in tms_c and len(tms_c & tms_t) >= 10
+                            detail = f"algs={len(ac)} (tt={len(at)}, missing={missing}) tms={len(tms_c)}"
+                        else:
+                            def _cm_ids(obj):
+                                c = obj.get("colormaps") or obj.get("colorMaps") or []
+                                return {x["id"] if isinstance(x, dict) else x for x in c}
+                            cc, ct = _cm_ids(r_cw.json()), _cm_ids(r_tt.json())
+                            ok = {"viridis", "plasma", "inferno", "terrain", "turbo"}.issubset(cc) and len(cc & ct) >= 100
+                            detail = f"cw_cmaps={len(cc)} tt_cmaps={len(ct)} shared={len(cc & ct)}"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
