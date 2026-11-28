@@ -32,7 +32,10 @@ pub use self::npy::{
     f32_npy_shape, npy_descr, retype_f32_npy, retype_f32_npy_with, wrap_raw_f32_as_npy,
     wrap_raw_f32_as_npy_with_mask,
 };
-use self::widened::{AxisTapTable, widened_plane_separable_with_tables};
+use self::widened::{
+    AxisTapTable, lanczos3_lut, plan_separable_conv_scale, widened_plane_separable_into_with_tables,
+    widened_rgb_separable_stream_clean,
+};
 pub use self::rgb::render_rgb_bands;
 pub use self::single_band::render_single_band;
 pub use self::widened::{
@@ -938,16 +941,7 @@ fn cubic_spline_weights(t: f32) -> [f32; 4] {
 
 #[inline(always)]
 fn lanczos3_weight(x: f32) -> f32 {
-    let ax = x.abs();
-    if ax < 1e-6 {
-        return 1.0;
-    }
-    if ax >= 3.0 {
-        return 0.0;
-    }
-    let px = std::f32::consts::PI * ax;
-    let px3 = px * (1.0 / 3.0);
-    (px.sin() / px) * (px3.sin() / px3)
+    lanczos3_lut(x.abs())
 }
 
 /// Separable plan over output pixel indices (`u[px] = px`, `v[py] = py`), used to feed a
@@ -1065,12 +1059,43 @@ pub fn sample_general_unwidened(
         ResampleMode::Lanczos => {
             let (x0, fx) = fast_floor_i32(u);
             let (y0, fy) = fast_floor_i32(v);
-            let mut wx = [0.0f32; 6];
-            let mut wy = [0.0f32; 6];
-            for k in 0..6 {
-                let d = (k as i32 - 2) as f32;
-                wx[k] = lanczos3_weight(d - fx);
-                wy[k] = lanczos3_weight(d - fy);
+            let wx = [
+                lanczos3_weight(-2.0 - fx),
+                lanczos3_weight(-1.0 - fx),
+                lanczos3_weight(-fx),
+                lanczos3_weight(1.0 - fx),
+                lanczos3_weight(2.0 - fx),
+                lanczos3_weight(3.0 - fx),
+            ];
+            let wy = [
+                lanczos3_weight(-2.0 - fy),
+                lanczos3_weight(-1.0 - fy),
+                lanczos3_weight(-fy),
+                lanczos3_weight(1.0 - fy),
+                lanczos3_weight(2.0 - fy),
+                lanczos3_weight(3.0 - fy),
+            ];
+            if src.no_nodata
+                && let Some((band, base, stride)) = src.rect_in_block(x0 - 2, y0 - 2, 6, 6)
+                && let Some(sl) = band.data.as_f32_slice()
+            {
+                let mut col = [0.0f32; 6];
+                for j in 0..6 {
+                    let off = base + j * stride;
+                    let row = &sl[off..off + 6];
+                    let wyj = wy[j];
+                    for i in 0..6 {
+                        col[i] += row[i] * wyj;
+                    }
+                }
+                let mut sum = 0.0f32;
+                let mut wxs = 0.0f32;
+                for i in 0..6 {
+                    sum += col[i] * wx[i];
+                    wxs += wx[i];
+                }
+                let wys: f32 = wy[0] + wy[1] + wy[2] + wy[3] + wy[4] + wy[5];
+                return sum / (wxs * wys);
             }
             let mut sum = 0.0f32;
             let mut wsum = 0.0f32;
