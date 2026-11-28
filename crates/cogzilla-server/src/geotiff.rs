@@ -465,16 +465,11 @@ pub(crate) fn retype_f32_geotiff_with(
             ($t:ty, $cast:expr) => {{
                 let cast = $cast;
                 for i in 0..total_samples {
-                    let mut v = read_sample(i);
+                    let v = read_sample(i);
                     let x: $t = if !is_mask(i) {
-                        if mask && v.is_nan() {
-                            let m = read_sample(mask_index_of(i));
-                            if m.is_finite() && m > 0.0 {
-                                v = 0.0;
-                            }
-                        }
-                        cast(prepare(v))
-                    } else if v.is_finite() && v > 0.0 {
+                        let mask_sample = (mask && v.is_nan()).then(|| read_sample(mask_index_of(i)));
+                        cast(prepare(cogzilla_kernel::retype_value_with_mask(v, mask_sample)))
+                    } else if cogzilla_kernel::is_valid_mask_sample(v) {
                         <$t>::MAX
                     } else {
                         <$t>::MIN
@@ -1536,5 +1531,70 @@ mod retype_tests {
         assert!(got[3].is_nan(), "masked pixel band0 stays NaN");
         assert!(got[4].is_nan(), "masked pixel band1 stays NaN");
         assert_eq!(got[5], f32::MIN);
+    }
+
+    #[test]
+    fn retype_npy_and_geotiff_agree_across_both_mask_conventions() {
+        let bbox = [0.0, 0.0, 2.0, 1.0];
+        // Both mask conventions: (255.0 / 0.0) and (f32::MAX / f32::MIN).
+        for (valid_m, masked_m) in [(255.0f32, 0.0f32), (f32::MAX, f32::MIN)] {
+            // 2-band 2x1 CHW + explicit mask plane:
+            // px0: b0=NaN, b1=100.0, mask=valid_m -> b0 must become 0, b1=100, mask=MAX
+            // px1: b0=NaN, b1=NaN,   mask=masked_m -> b0/b1 stay absent (NaN for f32, 0 for int), mask=MIN
+            let chw = [f32::NAN, f32::NAN, 100.0, f32::NAN, valid_m, masked_m];
+            let hdr = cogzilla_kernel::encode_npy_f32_header(3, 1, 2);
+            let mut npy_in = Vec::with_capacity(hdr.len() + chw.len() * 4);
+            npy_in.extend_from_slice(&hdr);
+            for v in chw {
+                npy_in.extend_from_slice(&v.to_le_bytes());
+            }
+            // Chunky GeoTIFF with the exact same 2 pixels: [px0_b0, px0_b1, px0_m, px1_b0, px1_b1, px1_m].
+            let chunky = [f32::NAN, 100.0, valid_m, f32::NAN, f32::NAN, masked_m];
+            let tif_in = made(GeoTiffSample::F32, 3, &[0, 2], bbox, 3857, &f32s(&chunky));
+
+            for kind in [T::Float32, T::Int16, T::Uint16] {
+                let npy_out = cogzilla_kernel::retype_f32_npy(&npy_in, kind, true).expect("retype npy");
+                let tif_out = retype_f32_geotiff(&tif_in, kind, true).expect("retype tif");
+
+                let npy_hdr_len = 10 + usize::from(u16::from_le_bytes([npy_out[8], npy_out[9]]));
+                let npy_body = &npy_out[npy_hdr_len..];
+                let tif_body = &tif_out[tif_out.len() - npy_body.len()..];
+
+                assert_eq!(npy_body.len(), tif_body.len(), "length mismatch for {kind:?}");
+                match kind {
+                    T::Float32 => {
+                        let nf: Vec<f32> = npy_body.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                        let tf_chunky: Vec<f32> = tif_body.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                        // Reorder Chunky [p0b0, p0b1, p0m, p1b0, p1b1, p1m] -> CHW [p0b0, p1b0, p0b1, p1b1, p0m, p1m].
+                        let tf = [tf_chunky[0], tf_chunky[3], tf_chunky[1], tf_chunky[4], tf_chunky[2], tf_chunky[5]];
+                        assert_eq!(nf[0], 0.0);
+                        assert_eq!(tf[0], 0.0);
+                        assert!(nf[1].is_nan() && tf[1].is_nan(), "masked px1 b0 must stay NaN under ({valid_m}, {masked_m})");
+                        assert_eq!(nf[2], 100.0);
+                        assert_eq!(tf[2], 100.0);
+                        assert!(nf[3].is_nan() && tf[3].is_nan(), "masked px1 b1 must stay NaN under ({valid_m}, {masked_m})");
+                        assert_eq!(nf[4], f32::MAX);
+                        assert_eq!(tf[4], f32::MAX);
+                        assert_eq!(nf[5], f32::MIN);
+                        assert_eq!(tf[5], f32::MIN);
+                    }
+                    T::Int16 => {
+                        let nv: Vec<i16> = npy_body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+                        let tc: Vec<i16> = tif_body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+                        let tv = vec![tc[0], tc[3], tc[1], tc[4], tc[2], tc[5]];
+                        assert_eq!(nv, vec![0, 0, 100, 0, i16::MAX, i16::MIN]);
+                        assert_eq!(tv, nv, "Int16 values must match under ({valid_m}, {masked_m})");
+                    }
+                    T::Uint16 => {
+                        let nv: Vec<u16> = npy_body.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let tc: Vec<u16> = tif_body.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        let tv = vec![tc[0], tc[3], tc[1], tc[4], tc[2], tc[5]];
+                        assert_eq!(nv, vec![0, 0, 100, 0, u16::MAX, u16::MIN]);
+                        assert_eq!(tv, nv, "Uint16 values must match under ({valid_m}, {masked_m})");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
     }
 }

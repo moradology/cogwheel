@@ -15,7 +15,7 @@ pub use colormap::{ColormapLut, ColormapName, CustomColormap};
 pub use expr_vm::ExprProgram;
 pub use kernel::{
     DemAlgorithm, OutputFormat, ResampleMode, RgbStyle, SingleBandStyle,
-    coord_plan_scale, exact_coord_scale, grid_coord_scale, separable_coord_scale, empty_tile_bytes, encode_npy_f32_header, encode_npy_header, encode_npy_typed, encode_npy_typed_f64, f32_npy_shape, retype_f32_npy, retype_f32_npy_with,
+    coord_plan_scale, exact_coord_scale, grid_coord_scale, separable_coord_scale, empty_tile_bytes, encode_npy_f32_header, encode_npy_header, encode_npy_typed, encode_npy_typed_f64, f32_npy_shape, is_valid_mask_sample, retype_f32_npy, retype_f32_npy_with, retype_value_with_mask,
     encode_grey_rgba_tile, encode_rgba_tile, encode_terrain_pixel, encode_terrain_rgb,
     encode_terrarium_rgb, dem_gradient, eval_dem_stencil, npy_descr,
     render_bandmath1, render_bandmath2, render_bandmath3, render_dem_algorithm, render_expr_vm, render_rgb_bands,
