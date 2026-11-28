@@ -457,8 +457,6 @@ pub fn render_expr_vm<const N: usize>(
     let nb = srcs.len().min(16);
     let mask_oob =
         !plan.all_in_bounds() && (nb == 0 || prog.ops.contains(&crate::expr_vm::Op::Where));
-    let max_u = ifd_dims.0 as f32 - 0.5;
-    let max_v = ifd_dims.1 as f32 - 0.5;
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let all_clean =
         plan.all_in_bounds() && srcs[..nb].iter().all(|s| s.is_clean_inbounds(c0, c1, r0, r1));
@@ -585,13 +583,7 @@ pub fn render_expr_vm<const N: usize>(
         prog.eval_row_with_scratch::<N>(band_rows, expr_scratch, out_row);
         if mask_oob {
             for_each_pixel_in_row(plan, py, |px, u, v| {
-                if !u.is_finite()
-                    || !v.is_finite()
-                    || u < -0.5
-                    || u > max_u
-                    || v < -0.5
-                    || v > max_v
-                {
+                if !BandSource::dims_contain_sample(ifd_dims.0 as i32, ifd_dims.1 as i32, u, v) {
                     out_row[px] = f32::NAN;
                 }
             });

@@ -95,6 +95,43 @@ impl<'a> BandSource<'a> {
         self
     }
 
+    /// Whether 1D sample coordinate `c` lies inside the pixel-center extent
+    /// `[-0.5, dim - 0.5]` (inclusive on both edges, finite only).
+    ///
+    /// Source pixels are indexed by pixel center (`0.0` = center of pixel 0,
+    /// `dim - 1.0` = center of the last pixel), so the raster covers
+    /// `[-0.5, dim - 0.5]` along each axis.
+    #[inline(always)]
+    pub fn axis_contains_sample(c: f32, dim: i32) -> bool {
+        c.is_finite() && c >= -0.5 && c <= dim as f32 - 0.5
+    }
+
+    /// `f64` twin of [`Self::axis_contains_sample`].
+    #[inline(always)]
+    pub fn axis_contains_sample_f64(c: f64, dim: i32) -> bool {
+        c.is_finite() && c >= -0.5 && c <= dim as f64 - 0.5
+    }
+
+    /// Whether 2D sample coordinate `(u, v)` lies inside the raster's
+    /// `[-0.5, w - 0.5] × [-0.5, h - 0.5]` sample extent.
+    #[inline(always)]
+    pub fn dims_contain_sample(w: i32, h: i32, u: f32, v: f32) -> bool {
+        Self::axis_contains_sample(u, w) && Self::axis_contains_sample(v, h)
+    }
+
+    /// Whether 2D sample coordinate `(u, v)` lies inside this band's
+    /// `[-0.5, ifd_w - 0.5] × [-0.5, ifd_h - 0.5]` sample extent.
+    #[inline(always)]
+    pub fn contains_sample(&self, u: f32, v: f32) -> bool {
+        Self::dims_contain_sample(self.ifd_w, self.ifd_h, u, v)
+    }
+
+    /// `f64` twin of [`Self::contains_sample`].
+    #[inline(always)]
+    pub fn contains_sample_f64(&self, u: f64, v: f64) -> bool {
+        Self::axis_contains_sample_f64(u, self.ifd_w) && Self::axis_contains_sample_f64(v, self.ifd_h)
+    }
+
     /// Sample source pixel `(col, row)` with bounds check. Out-of-bounds returns `f32::NAN`.
     #[inline(always)]
     pub fn sample_checked(&self, col: i32, row: i32) -> f32 {
@@ -1053,5 +1090,45 @@ mod tests {
             &blocks,
         );
         assert!(src_exact.single_block_flat().is_some());
+    }
+
+    #[test]
+    fn sample_extent_helpers_pin_inclusive_half_pixel_bounds() {
+        let blocks: [Option<&DecodedBand>; 0] = [];
+        let src = BandSource::new(10, 20, 16, 16, 0, 0, 0, 0, &blocks);
+
+        // Inclusive edges: [-0.5, dim - 0.5]
+        assert!(src.contains_sample(-0.5, -0.5));
+        assert!(src.contains_sample(9.5, 19.5));
+        assert!(src.contains_sample(0.0, 0.0));
+        assert!(src.contains_sample_f64(-0.5, -0.5));
+        assert!(src.contains_sample_f64(9.5, 19.5));
+
+        // Strictly outside by 1 ulp / small epsilon
+        assert!(!src.contains_sample(-0.5001, 0.0));
+        assert!(!src.contains_sample(0.0, -0.5001));
+        assert!(!src.contains_sample(9.5001, 0.0));
+        assert!(!src.contains_sample(0.0, 19.5001));
+        assert!(!src.contains_sample(10.0, 0.0));
+        assert!(!src.contains_sample_f64(-0.5000001, 0.0));
+        assert!(!src.contains_sample_f64(9.5000001, 0.0));
+        assert!(!src.contains_sample_f64(0.0, 19.5000001));
+
+        // Non-finite coordinates are always outside
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!src.contains_sample(bad, 0.0));
+            assert!(!src.contains_sample(0.0, bad));
+            assert!(!BandSource::axis_contains_sample(bad, 10));
+        }
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!src.contains_sample_f64(bad, 0.0));
+            assert!(!src.contains_sample_f64(0.0, bad));
+            assert!(!BandSource::axis_contains_sample_f64(bad, 10));
+        }
+
+        // Static dim helpers match BandSource methods
+        assert!(BandSource::dims_contain_sample(10, 20, 9.5, 19.5));
+        assert!(!BandSource::dims_contain_sample(10, 20, 9.6, 19.5));
+        assert!(!BandSource::axis_contains_sample(0.0, 0));
     }
 }

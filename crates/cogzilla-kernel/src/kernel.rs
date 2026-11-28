@@ -762,14 +762,7 @@ fn fast_floor_i32(x: f32) -> (i32, f32) {
 
 #[inline(always)]
 fn sample_bilinear<const CLEAN: bool>(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
-    if !CLEAN
-        && (!u.is_finite()
-            || !v.is_finite()
-            || u < -0.5
-            || v < -0.5
-            || u > src.ifd_w as f32 - 0.5
-            || v > src.ifd_h as f32 - 0.5)
-    {
+    if !CLEAN && !src.contains_sample(u, v) {
         return f32::NAN;
     }
     let (x0, fx) = fast_floor_i32(u);
@@ -859,13 +852,7 @@ fn cubic_weights(t: f32) -> [f32; 4] {
 
 #[inline(always)]
 pub fn sample_cubic(src: &BandSource<'_>, u: f32, v: f32) -> f32 {
-    if !u.is_finite()
-        || !v.is_finite()
-        || u < -0.5
-        || v < -0.5
-        || u > src.ifd_w as f32 - 0.5
-        || v > src.ifd_h as f32 - 0.5
-    {
+    if !src.contains_sample(u, v) {
         return f32::NAN;
     }
     let (x0, fx) = fast_floor_i32(u);
@@ -1047,7 +1034,7 @@ pub fn sample_general_unwidened(
     ) {
         return sample_footprint_exact(src, u, v, scale_x, scale_y, mode);
     }
-    if u < -0.5 || v < -0.5 || u > src.ifd_w as f32 - 0.5 || v > src.ifd_h as f32 - 0.5 {
+    if !src.contains_sample(u, v) {
         return f32::NAN;
     }
     match mode {
@@ -1541,10 +1528,7 @@ pub fn sample_f64_general(
     v: f64,
     mode: ResampleMode,
 ) -> f64 {
-    if !u.is_finite() || !v.is_finite() {
-        return f64::NAN;
-    }
-    if u < -0.5 || v < -0.5 || u > src.ifd_w as f64 - 0.5 || v > src.ifd_h as f64 - 0.5 {
+    if !src.contains_sample_f64(u, v) {
         return f64::NAN;
     }
     match mode {
