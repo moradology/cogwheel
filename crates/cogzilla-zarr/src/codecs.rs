@@ -14,7 +14,7 @@ pub const MAX_DECODED_CHUNK_BYTES: usize = 128 * 1024 * 1024;
 
 /// Human-readable list of codecs supported by this build (included in `UnsupportedCodec` errors).
 pub const SUPPORTED_CODECS: &str =
-    "bytes, transpose, gzip, zlib, zstd, lz4, blosc, shuffle, bitshuffle";
+    "bytes, transpose, crc32c, gzip, zlib, zstd, lz4, blosc, shuffle, bitshuffle";
 
 /// Compute the expected uncompressed byte length of one chunk, enforcing `MAX_DECODED_CHUNK_BYTES`.
 pub fn expected_chunk_bytes(
@@ -85,6 +85,28 @@ pub fn decode_chunk_with_shape(
     // array-to-bytes (`bytes`), then array-to-array (`transpose`).
     for codec in codecs.iter().rev() {
         match codec.name.as_str() {
+            "crc32c" => {
+                if buf.len() < 4 {
+                    return Err(ZarrError::Codec {
+                        codec: "crc32c".into(),
+                        chunk_key: chunk_key.to_string(),
+                        detail: format!("truncated crc32c payload: {} bytes (need >= 4)", buf.len()),
+                    });
+                }
+                let body_len = buf.len() - 4;
+                let expected_crc = u32::from_le_bytes(buf[body_len..].try_into().unwrap());
+                let actual_crc = crate::sharding::crc32c(&buf[..body_len]);
+                if actual_crc != expected_crc {
+                    return Err(ZarrError::Codec {
+                        codec: "crc32c".into(),
+                        chunk_key: chunk_key.to_string(),
+                        detail: format!(
+                            "crc32c mismatch (expected 0x{expected_crc:08x}, got 0x{actual_crc:08x})"
+                        ),
+                    });
+                }
+                buf.truncate(body_len);
+            }
             "gzip" => {
                 buf = decompress_gzip(&buf, expected, chunk_key)?;
             }
@@ -858,5 +880,43 @@ mod tests {
         let huge = make_meta(vec![10000, 10000], SampleType::Float32, Endianness::Little, vec![]);
         let err = decode_chunk_bytes(&huge, &[], "c/0/0").unwrap_err();
         assert!(matches!(err, ZarrError::ChunkTooLarge { .. }), "{err}");
+    }
+
+    #[test]
+    fn zarr_v3_crc32c_codec_verifies_and_rejects_corrupt_or_truncated_payloads() {
+        let vals: [f32; 4] = [1.5, -2.25, 42.0, 0.0];
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let crc = crate::sharding::crc32c(&raw);
+        let mut with_crc = raw.clone();
+        with_crc.extend_from_slice(&crc.to_le_bytes());
+
+        let meta = make_meta(
+            vec![2, 2],
+            SampleType::Float32,
+            Endianness::Little,
+            vec![
+                CodecSpec {
+                    name: "bytes".into(),
+                    configuration: serde_json::json!({"endian": "little"}),
+                },
+                CodecSpec {
+                    name: "crc32c".into(),
+                    configuration: serde_json::json!({}),
+                },
+            ],
+        );
+
+        let decoded = decode_chunk_bytes(&meta, &with_crc, "c/0/0").expect("valid crc32c");
+        assert_eq!(decoded, raw);
+
+        // Corrupt one payload byte -> Codec error
+        let mut bad = with_crc.clone();
+        bad[0] ^= 0x01;
+        let err = decode_chunk_bytes(&meta, &bad, "c/0/0").unwrap_err();
+        assert!(matches!(err, ZarrError::Codec { ref codec, .. } if codec == "crc32c"), "{err}");
+
+        // Truncated (< 4 bytes) -> Codec error
+        let err_short = decode_chunk_bytes(&meta, &[1, 2, 3], "c/0/0").unwrap_err();
+        assert!(matches!(err_short, ZarrError::Codec { ref codec, .. } if codec == "crc32c"), "{err_short}");
     }
 }

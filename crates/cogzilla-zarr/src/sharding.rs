@@ -403,8 +403,8 @@ fn parse_codec_list(val: Option<&Value>, field: &'static str) -> Result<Vec<Code
     Ok(out)
 }
 
-/// Castagnoli CRC32C (polynomial `0x82F63B78`) used by Zarr v3 `crc32c` index codec.
-fn crc32c(data: &[u8]) -> u32 {
+/// Castagnoli CRC32C (polynomial `0x82F63B78`) used by Zarr v3 `crc32c` codecs.
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in data {
         crc ^= byte as u32;
