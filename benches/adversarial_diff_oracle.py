@@ -885,6 +885,25 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(rgb_w31)
     out["w31_rgb"] = p_w31_rgb
 
+    # Wave 32: DEM + STAC fixtures for non-256 tilesize (128/512) cubic/hillshade and STAC OGC (/stac/map, tilejson, WMTS)
+    p_w32_dem = synth_dir / "w32_dem.tif"
+    dem_w32 = (100.0 + xx9.astype(np.float32) * 4.0 + yy9.astype(np.float32) * 2.5 + 30.0 * np.sin(xx9 / 10.0)).astype(np.float32)
+    with rasterio.open(
+        p_w32_dem, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(dem_w32, 1)
+    out["w32_dem"] = p_w32_dem
+
+    p_w32_stac = synth_dir / "w32_stac.json"
+    p_w32_stac.write_text(json.dumps({
+        "type": "Feature", "stac_version": "1.0.0", "id": "w32-stac",
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.5], [-122.0, 37.5], [-122.0, 38.0], [-122.5, 38.0], [-122.5, 37.5]]]},
+        "bbox": [-122.5, 37.5, -122.0, 38.0], "properties": {"datetime": "2024-06-01T00:00:00Z"}, "links": [],
+        "assets": {"dem": {"href": str(p_w32_dem)}},
+    }))
+    out["w32_stac"] = p_w32_stac
+
     return out
 
 
@@ -3343,6 +3362,8 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W30 MULTI-URL /cog/bbox b1+b2 .npy",
         "W30 TIFF ungeoreferenced -> 400 tile & 200 validate",
         "W30 TIFF RPC-only (tag 50844) -> 400 RPC msg & 200 validate",
+        "W32 ZARR v3 sharding_indexed + gzip + missing chunk .npy",
+        "W32 ZARR v3 /zarr/preview cubic .png",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -3533,6 +3554,89 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         rt, rv = client.get(cw_base + pt), client.get(cw_base + pv)
         ok = rt.status_code == 400 and "rpc" in rt.text.lower() and rv.status_code == 200
         rec(lb, ok, f"tile={rt.status_code} validate={rv.status_code} msg={rt.text[:70]!r}", pt)
+
+    # --- Wave 32: Zarr v3 sharding_indexed with gzip inner codec + missing inner chunk + cubic /zarr/preview ---
+    if wanted("W32 ZARR v3 sharding_indexed + gzip + missing chunk .npy") or wanted("W32 ZARR v3 /zarr/preview cubic .png"):
+        z3 = w30_dir / "w32_shard_gzip.zarr"
+        (z3 / "v" / "c" / "0").mkdir(parents=True)
+        (z3 / "zarr.json").write_text(json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {}}))
+        for cname, arr_c in [("lat", lat), ("lon", lon)]:
+            (z3 / cname / "c").mkdir(parents=True)
+            (z3 / cname / "zarr.json").write_text(json.dumps({
+                "zarr_format": 3, "node_type": "array", "shape": [64], "data_type": "float64",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "fill_value": 0.0, "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "dimension_names": [cname], "attributes": {},
+            }))
+            (z3 / cname / "c" / "0").write_bytes(arr_c.tobytes())
+        g64 = (10.0 + xx * 2.0 + yy * 3.0).astype(np.float32)
+        sbuf = bytearray()
+        sidx = []
+        for iy in range(2):
+            for ix in range(2):
+                if iy == 1 and ix == 1:
+                    sidx.append((0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF))
+                else:
+                    comp = gzip.compress(np.ascontiguousarray(g64[iy * 32:(iy + 1) * 32, ix * 32:(ix + 1) * 32]).tobytes())
+                    sidx.append((len(sbuf), len(comp)))
+                    sbuf.extend(comp)
+        idx_b = b"".join(struct.pack("<QQ", o, l) for o, l in sidx)
+        def _crc32c(data: bytes) -> int:
+            crc = 0xFFFFFFFF
+            for b in data:
+                crc ^= b
+                for _ in range(8):
+                    crc = (crc >> 1) ^ 0x82F63B78 if (crc & 1) else (crc >> 1)
+            return crc ^ 0xFFFFFFFF
+        (z3 / "v" / "c" / "0" / "0").write_bytes(bytes(sbuf) + idx_b + struct.pack("<I", _crc32c(idx_b)))
+        (z3 / "v" / "zarr.json").write_text(json.dumps({
+            "zarr_format": 3, "node_type": "array", "shape": [64, 64], "data_type": "float32",
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64, 64]}},
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+            "fill_value": -9999.0,
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [32, 32],
+                    "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "gzip", "configuration": {"level": 5}}],
+                    "index_codecs": [{"name": "bytes", "configuration": {"endian": "little"}}, {"name": "crc32c"}],
+                    "index_location": "end",
+                },
+            }],
+            "dimension_names": ["lat", "lon"], "attributes": {},
+        }))
+
+        lb = "W32 ZARR v3 sharding_indexed + gzip + missing chunk .npy"
+        if wanted(lb):
+            p = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z3)}&variable=v"
+            r = client.get(cw_base + p)
+            if r.status_code == 200:
+                arr = np.load(io.BytesIO(r.content))
+                miss_masked = int((arr[1, 32:, 32:] == np.finfo(np.float32).min).sum())
+                valid_err = float(np.max(np.abs(arr[0, :32, :32] - g64[:32, :32])))
+                rec(lb, arr.shape == (2, 64, 64) and valid_err < 1e-4 and miss_masked == 1024, f"valid_err={valid_err:.5f} missing_masked={miss_masked}/1024", p)
+            else:
+                rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
+
+        lb = "W32 ZARR v3 /zarr/preview cubic .png"
+        if wanted(lb):
+            p = f"/zarr/preview/64x64.png?url={q(z3)}&variable=v&resampling=cubic&rescale=10,330&colormap_name=viridis"
+            r = client.get(cw_base + p)
+            if r.status_code == 200:
+                im = np.array(Image.open(io.BytesIO(r.content)).convert("RGBA"))
+                ok = im.shape == (64, 64, 4) and int(im[48, 48, 3]) == 0 and int(im[16, 16, 3]) == 255
+                rec(lb, ok, f"shape={im.shape} miss_a={im[48,48,3]} valid_a={im[16,16,3]}", p)
+                if gpu_base:
+                    rg = client.get(gpu_base + p)
+                    if rg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_images(r.content, rg.content)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {r.status_code} {r.text[:100]!r}", p)
 
     return ran
 
@@ -4079,6 +4183,14 @@ def main() -> int:
                 ("BETTER W31 CMAP+CF viridis + Gamma RGB 1.8 (cw 200, tt 500)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w31_f32'])}&rescale=-100,200&colormap_name=viridis&color_formula={qe('Gamma RGB 1.8')}", None, "better_cmap_color_formula"),
                 ("PARITY W31 RETURN_MASK=false .webp", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.webp?url={q(s['w31_rgb'])}&return_mask=false", None, "png"),
                 ("PARITY W31 PREVIEW non-square 96x48 .png", "GET", f"/cog/preview/96x48.png?url={q(s['w31_rgb'])}", None, "png"),
+                # --- Wave 32: Non-256 tilesize (128/512) cubic/hillshade + STAC OGC (/stac/map, TileJSON, WMTS) ---
+                ("PARITY W32 TILESIZE=128 cubic viridis .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w32_dem'])}&tilesize=128&resampling=cubic&rescale=100,900&colormap_name=viridis", None, "png"),
+                ("PARITY W32 TILESIZE=512 cubic viridis .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w32_dem'])}&tilesize=512&resampling=cubic&rescale=100,900&colormap_name=viridis", None, "png"),
+                ("PARITY W32 TILESIZE=128 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w32_dem'])}&tilesize=128", None, "npy"),
+                ("BETTER W32 TILESIZE=512 hillshade seamless (cw 512, tt 506)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w32_dem'])}&tilesize=512&algorithm=hillshade", None, "better_hillshade_512"),
+                ("PARITY W32 STAC /stac/map 4326 64x64 .png", "GET", f"/stac/map?url={q(s['w32_stac'])}&assets=dem&bbox=-122.5,37.5,-122.0,38.0&width=64&height=64&rescale=100,900&colormap_name=viridis&f=png", None, "png"),
+                ("PARITY W32 STAC TileJSON WebMercatorQuad", "GET", f"/stac/WebMercatorQuad/tilejson.json?url={q(s['w32_stac'])}&assets=dem", None, "tilejson_w32"),
+                ("BETTER W32 STAC WMTS Capabilities XML (cw 200, tt 404)", "GET", f"/stac/WebMercatorQuad/WMTSCapabilities.xml?url={q(s['w32_stac'])}&assets=dem", None, "better_stac_wmts"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -4167,10 +4279,13 @@ def main() -> int:
                                 gok, gd = (d_ig is None), (d_ig or "exact JSON match")
                             elif kind == "point" or "/point/" in path:
                                 gok, gd = compare_point_strict(r_cw.json(), r_gpu.json())
-                            elif kind == "tilejson_w18":
+                            elif kind in ("tilejson_w18", "tilejson_w32"):
                                 jc, jg = r_cw.json(), r_gpu.json()
                                 gok = (jc["bounds"] == jg["bounds"] and jc["minzoom"] == jg["minzoom"] and jc["maxzoom"] == jg["maxzoom"] and jc["center"] == jg["center"])
                                 gd = "tilejson metadata match" if gok else f"cw={jc} gpu={jg}"
+                            elif kind == "better_stac_wmts":
+                                gok = ET.fromstring(r_gpu.content).tag.endswith("Capabilities") and "WebMercatorQuad" in r_gpu.text
+                                gd = "wmts xml match" if gok else "gpu wmts invalid"
                             else:
                                 gok, gd = (r_cw.content == r_gpu.content), "bytes diff"
                             if not gok:
@@ -4415,6 +4530,30 @@ def main() -> int:
                             cw_std = float(imc[vm, :3].std(axis=0).max()) if vm.any() else 0.0
                             ok = imc.shape == (256, 256, 4) and int(vm.sum()) > 10000 and cw_std > 20.0
                             detail = f"cw=200 valid={int(vm.sum())} std={cw_std:.1f} tt=500"
+                    elif kind == "better_hillshade_512":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            ok = imc.shape == (512, 512, 4) and imt.shape[:2] == (506, 506) and int((imc[..., 3] == 255).sum()) > 100000
+                            detail = f"cw={imc.shape[:2]} tt={imt.shape[:2]}"
+                    elif kind == "tilejson_w32":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            jc, jt = r_cw.json(), r_tt.json()
+                            berr = max(abs(a - b) for a, b in zip(jc["bounds"], jt["bounds"]))
+                            tile0 = jc.get("tiles", [""])[0]
+                            ok = berr < 1e-4 and 0 <= jc["minzoom"] <= jc["maxzoom"] <= 24 and "assets=dem" in tile0
+                            detail = f"bounds_err={berr:.6f} cw_z={jc['minzoom']}..{jc['maxzoom']} tt_z={jt['minzoom']}..{jt['maxzoom']}"
+                    elif kind == "better_stac_wmts":
+                        if r_cw.status_code != 200 or r_tt.status_code != 404:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 404)"
+                        else:
+                            root = ET.fromstring(r_cw.content)
+                            ok = root.tag.endswith("Capabilities") and "WebMercatorQuad" in r_cw.text and "assets=dem" in r_cw.text
+                            detail = f"cw=200 root={root.tag.split('}')[-1]} len={len(r_cw.text)} tt=404"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
