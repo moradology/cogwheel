@@ -1693,8 +1693,39 @@ def main() -> int:
                 ("PARITY W12 STATS POST expr NDVI", "POST", f"/cog/statistics?url={q(sat)}&expression={qe('(b1-b2)/(b1+b2)')}&max_size=128", w12_swiss, "post_stats"),
             ]
 
+            # --- 5h. Wave 13: Full 9-mode resampling/reproject matrix, buffer=, coord_crs/dst_crs, tilesize=128/512 ---
+            for mode in ("nearest", "bilinear", "cubic", "cubic_spline", "lanczos", "average", "mode", "gauss", "rms"):
+                cases.append((f"PARITY W13 RESAMP same-CRS [{mode}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.npy?url={q(merc)}&resampling={mode}", None, "npy"))
+                if mode != "gauss":
+                    cases.append((f"PARITY W13 REPROJ [{mode}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&reproject={mode}", None, "npy"))
+            # Precomputed EPSG:3857 and EPSG:32610 coords for SF point (-122.62, 37.78) and bbox (-122.70, 37.70, -122.55, 37.85)
+            w13_poly_3857 = {
+                "type": "Feature", "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [[
+                    [-13658901.07, 4537178.90], [-13642203.15, 4537178.90],
+                    [-13642203.15, 4558308.60], [-13658901.07, 4558308.60],
+                    [-13658901.07, 4537178.90],
+                ]]},
+            }
+            cases += [
+                ("PARITY W13 RESAMP+REPROJ bilinear+cubic .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&resampling=bilinear&reproject=cubic", None, "npy"),
+                ("PARITY W13 RESAMP+REPROJ average+lanczos .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&resampling=average&reproject=lanczos", None, "npy"),
+                ("PARITY W13 BUFFER=4 DEM .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.npy?url={q(merc)}&buffer=4", None, "npy"),
+                ("PARITY W13 BUFFER=16 RGB .png", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={q(sat)}&rescale=0,0.35&buffer=16", None, "png"),
+                ("PARITY W13 BUFFER=4 DEM .tif", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.tif?url={q(merc)}&buffer=4", None, "geotiff"),
+                ("PARITY W13 /point coord_crs=3857", "GET", f"/cog/point/-13649995.51,4548436.11?url={q(sat)}&coord_crs=EPSG:3857", None, "point"),
+                ("PARITY W13 /point coord_crs=32610", "GET", f"/cog/point/533447.82,4181384.60?url={q(sat)}&coord_crs=EPSG:32610", None, "point"),
+                ("PARITY W13 /bbox coord=32610 dst=3857 .npy", "GET", f"/cog/bbox/526430.92,4172485.08,539579.88,4189174.16/64x64.npy?url={q(sat)}&coord_crs=EPSG:32610&dst_crs=EPSG:3857", None, "npy"),
+                ("PARITY W13 /bbox coord=3857 dst=4326 .npy", "GET", f"/cog/bbox/-13658901.07,4537178.90,-13642203.15,4558308.60/64x64.npy?url={q(sat)}&coord_crs=EPSG:3857&dst_crs=EPSG:4326", None, "npy"),
+                ("PARITY W13 POST /feature coord=3857 dst=32610", "POST", f"/cog/feature/64x64.npy?url={q(sat)}&coord_crs=EPSG:3857&dst_crs=EPSG:32610", w13_poly_3857, "npy"),
+                ("PARITY W13 POST /statistics coord=3857 native", "POST", f"/cog/statistics?url={q(sat)}&coord_crs=EPSG:3857", w13_poly_3857, "post_stats"),
+                ("PARITY W13 TILESIZE=128 .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.npy?url={q(merc)}&tilesize=128", None, "npy"),
+                ("PARITY W13 TILESIZE=512 .png", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.png?url={q(sat)}&rescale=0,0.35&tilesize=512", None, "png"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
+                ("BETTER W13 reproject=gauss (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&reproject=gauss", None, "better_cw200_tt422"),
                 ("BETTER W12 ZONAL MultiPoint exact count=3 (cw 3.0, tt 0.03)", "POST", f"/cog/statistics?url={q(sat)}&max_size=128", w12_mpt, "better_multipoint_3"),
                 ("BETTER W11 rot30 EPSG:3857 tile (cw exact, tt unrotated)", "GET", f"/cog/tiles/WebMercatorQuad/12/655/1582.npy?url={q(s['w11_rot30'])}", None, "better_rot30_3857"),
                 ("BETTER W9 nbits_1 .npy raw 0/1 (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.npy?url={q(s['w9_nbits_1'])}", None, "better_palette_npy"),
@@ -1735,7 +1766,7 @@ def main() -> int:
                             r_tt = c2.request(method, tt_base + path, json=body)
 
                     is_unmasked = "return_mask=false" in path
-                    is_smooth = "resampling=" in path and "nearest" not in path
+                    is_smooth = ("resampling=" in path and "resampling=nearest" not in path) or ("reproject=" in path and "reproject=nearest" not in path)
 
                     if gpu_base is not None:
                         r_gpu = client.request(method, gpu_base + path, json=body)
