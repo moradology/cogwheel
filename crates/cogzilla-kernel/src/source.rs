@@ -836,6 +836,19 @@ pub fn band_math_nan_to_num(v: f32) -> f32 {
     }
 }
 
+/// Double-precision twin of [`band_math_nan_to_num`] for `f64` band-math evaluators.
+pub fn band_math_nan_to_num_f64(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else if v.is_nan() {
+        0.0
+    } else if v > 0.0 {
+        f64::MAX
+    } else {
+        f64::MIN
+    }
+}
+
 /// One band of band math, block by block: for a terrain algorithm (hillshade, slope, ...)
 /// over an expression's first output, read like any one band. `inputs` are the blocks of
 /// each band `prog` reads, in its slot order (`prog.used_bands`), each with the request's

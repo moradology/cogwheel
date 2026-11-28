@@ -25,4 +25,7 @@ pub use kernel::{
     WidenedSampler, separable_axes,
     wrap_raw_f32_as_npy_with_mask,
 };
-pub use source::{BandSource, band_math_blocks, band_math_nan_to_num, copy_band_data_rect_to_f32};
+pub use source::{
+    BandSource, band_math_blocks, band_math_nan_to_num, band_math_nan_to_num_f64,
+    copy_band_data_rect_to_f32,
+};

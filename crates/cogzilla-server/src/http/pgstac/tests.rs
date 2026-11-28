@@ -636,14 +636,37 @@ fn bytes_are_rio_tilers_to_the_level() {
 
 #[test]
 fn band_math_is_over_whole_planes() {
-    let bands = [vec![1.0f32, 2.0, f32::NAN, 4.0], vec![3.0, 0.0, 1.0, 4.0]];
+    let bands = [vec![1.0f32, 2.0, f32::NAN, 4.0, -2.0, 0.0], vec![3.0, 0.0, 1.0, 4.0, 0.0, 0.0]];
     let out = band_math("(b2-b1)/(b2+b1);b1/b2", &bands).unwrap();
     assert_eq!(out.len(), 2);
     assert_eq!(out[0][0], 0.5);
     assert_eq!(out[0][1], -1.0);
     assert!(out[0][2].is_nan(), "no data in, no data out");
     assert_eq!(out[0][3], 0.0);
-    assert_eq!(out[1][1], f32::INFINITY, "a division by zero is the largest number, as numpy's nan_to_num makes it");
+    assert_eq!(out[1][1], f32::MAX, "positive division by zero saturates to f32::MAX, matching /cog and numpy nan_to_num");
+    assert_eq!(out[1][4], f32::MIN, "negative division by zero saturates to f32::MIN, matching /cog and numpy nan_to_num");
+    assert_eq!(out[1][5], 0.0, "0/0 maps to 0.0, matching /cog and numpy nan_to_num");
+    // Both f64->f32 narrowing and direct f32 nan_to_num agree on IEEE division-by-zero / 0/0 / missing.
+    for px in 0..bands[0].len() {
+        let missing = bands[0][px].is_nan() || bands[1][px].is_nan();
+        let expected = if missing {
+            f32::NAN
+        } else {
+            cogzilla_kernel::band_math_nan_to_num(bands[0][px] / bands[1][px])
+        };
+        assert_eq!(
+            out[1][px].to_bits(),
+            expected.to_bits(),
+            "px {px}: /searches band_math diverged from cogzilla_kernel::band_math_nan_to_num"
+        );
+    }
+    // Single-precision narrowing of an f64 nan_to_num sentinel must remain finite (not become inf/NaN).
+    let f64_pos = cogzilla_kernel::band_math_nan_to_num_f64(2.0f64 / 0.0f64);
+    assert_eq!(f64_pos, f64::MAX);
+    assert_eq!(cogzilla_kernel::band_math_nan_to_num(f64_pos as f32), f32::MAX);
+    let f64_neg = cogzilla_kernel::band_math_nan_to_num_f64(-2.0f64 / 0.0f64);
+    assert_eq!(f64_neg, f64::MIN);
+    assert_eq!(cogzilla_kernel::band_math_nan_to_num(f64_neg as f32), f32::MIN);
     assert!(band_math("b3", &bands).is_err());
 }
 

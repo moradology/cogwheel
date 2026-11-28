@@ -313,13 +313,7 @@ impl Program {
                 _ => return f64::NAN,
             }
         }
-        if v.is_nan() {
-            0.0
-        } else if v > 0.0 {
-            f64::MAX
-        } else {
-            f64::MIN
-        }
+        cogzilla_kernel::band_math_nan_to_num_f64(v)
     }
 
     /// The text of each part, as it was written.
