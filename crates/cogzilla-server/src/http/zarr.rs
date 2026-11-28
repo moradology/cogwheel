@@ -130,11 +130,74 @@ struct CachedZarrStore {
     /// Store freshness validator (local `mtime_ns:size` or remote `ETag`/`Last-Modified`).
     validator: String,
     fetched_at: Instant,
+    last_used: AtomicU64,
 }
 
-fn zarr_hierarchy_cache() -> &'static DashMap<String, CachedZarrStore> {
-    static CACHE: OnceLock<DashMap<String, CachedZarrStore>> = OnceLock::new();
-    CACHE.get_or_init(DashMap::new)
+struct ZarrHierarchyCache {
+    map: DashMap<String, CachedZarrStore>,
+    budget: cogzilla_io::ByteBudget,
+}
+
+impl ZarrHierarchyCache {
+    fn new() -> Self {
+        Self {
+            map: DashMap::new(),
+            budget: cogzilla_io::ByteBudget::new(1024),
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[inline(always)]
+    fn clear(&self) {
+        self.map.clear();
+    }
+
+    #[inline(always)]
+    fn touch(&self, entry: &CachedZarrStore) {
+        entry.last_used.store(self.budget.touch(), Ordering::Relaxed);
+    }
+
+    fn insert_and_evict(&self, key: String, entry: CachedZarrStore, max_entries: usize) {
+        self.map.insert(key, entry);
+        let limit = max_entries.max(1) as u64;
+        if self.map.len() as u64 > limit {
+            self.budget.evict_to_limit(self, limit);
+        }
+    }
+}
+
+impl cogzilla_io::EvictTarget for ZarrHierarchyCache {
+    type Key = String;
+
+    fn current_usage(&self) -> Option<u64> {
+        Some(self.map.len() as u64)
+    }
+
+    fn candidates(&self) -> Vec<(u64, Self::Key)> {
+        self.map
+            .iter()
+            .map(|item| (item.value().last_used.load(Ordering::Relaxed), item.key().clone()))
+            .collect()
+    }
+
+    fn remove_if_cold(&self, key: &Self::Key, expected_stamp: u64) -> Option<u64> {
+        self.map
+            .remove_if(key, |_, v| v.last_used.load(Ordering::Relaxed) == expected_stamp)
+            .map(|_| 1)
+    }
+
+    fn remove_now(&self, key: &Self::Key) -> Option<u64> {
+        self.map.remove(key).map(|_| 1)
+    }
+}
+
+fn zarr_hierarchy_cache() -> &'static ZarrHierarchyCache {
+    static CACHE: OnceLock<ZarrHierarchyCache> = OnceLock::new();
+    CACHE.get_or_init(ZarrHierarchyCache::new)
 }
 
 const MAX_ZARR_REMOTE_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024;
@@ -773,32 +836,34 @@ async fn open_store_and_hierarchy(
     match &store {
         ServerZarrStore::Local(fs) => {
             let validator = local_store_validator(fs.root());
-            if let Some(entry) = cache.get(url)
+            if let Some(entry) = cache.map.get(url)
                 && entry.validator == validator
             {
+                cache.touch(&entry);
                 return Ok((store, Arc::clone(&entry.hierarchy), validator));
             }
             let hierarchy = Arc::new(ZarrHierarchy::open(&store).await?);
             ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
-            if cache.len() >= io.max_open_uris() {
-                cache.clear();
-            }
-            cache.insert(
+            let stamp = cache.budget.touch();
+            cache.insert_and_evict(
                 url.to_string(),
                 CachedZarrStore {
                     hierarchy: Arc::clone(&hierarchy),
                     validator: validator.clone(),
                     fetched_at: Instant::now(),
+                    last_used: AtomicU64::new(stamp),
                 },
+                io.max_open_uris(),
             );
             Ok((store, hierarchy, validator))
         }
         ServerZarrStore::Remote { base_uri, io } => {
             let ttl = io.remote_cache_ttl();
             if ttl > Duration::ZERO
-                && let Some(entry) = cache.get(url)
+                && let Some(entry) = cache.map.get(url)
                 && entry.fetched_at.elapsed() < ttl
             {
+                cache.touch(&entry);
                 return Ok((store, Arc::clone(&entry.hierarchy), entry.validator.clone()));
             }
 
@@ -812,30 +877,31 @@ async fn open_store_and_hierarchy(
             }
 
             if !remote_validator.is_empty()
-                && let Some(mut entry) = cache.get_mut(url)
+                && let Some(mut entry) = cache.map.get_mut(url)
                 && entry.validator == remote_validator
             {
                 entry.fetched_at = Instant::now();
+                cache.touch(&entry);
                 return Ok((store, Arc::clone(&entry.hierarchy), remote_validator));
             }
 
             let hierarchy = Arc::new(ZarrHierarchy::open(&store).await?);
             ZARR_METRICS.stores_opened.fetch_add(1, Ordering::Relaxed);
-            if cache.len() >= io.max_open_uris() {
-                cache.clear();
-            }
             let validator = if remote_validator.is_empty() {
                 format!("http:gen:{}", ZARR_METRICS.stores_opened.load(Ordering::Relaxed))
             } else {
                 remote_validator
             };
-            cache.insert(
+            let stamp = cache.budget.touch();
+            cache.insert_and_evict(
                 url.to_string(),
                 CachedZarrStore {
                     hierarchy: Arc::clone(&hierarchy),
                     validator: validator.clone(),
                     fetched_at: Instant::now(),
+                    last_used: AtomicU64::new(stamp),
                 },
+                io.max_open_uris(),
             );
             Ok((store, hierarchy, validator))
         }
@@ -1826,5 +1892,48 @@ mod tests {
         assert!(f_z10 < 1.0, "expected z10 downsample < 1.0, got {f_z10}");
         // At z=5 (~4892 m/px ~= 0.035 deg/px), factor must be > 4.0 (selects 4x coarser overview).
         assert!(f_z5 > 4.0 && f_z5 < 8.0, "expected z5 downsample in (4, 8), got {f_z5}");
+    }
+
+    #[test]
+    fn hierarchy_cache_evicts_coldest_entry_instead_of_clearing_all() {
+        let cache = ZarrHierarchyCache::new();
+        let max_open = 3usize;
+        let dummy = Arc::new(ZarrHierarchy {
+            version: cogzilla_zarr::ZarrVersion::V3,
+            open_mode: cogzilla_zarr::OpenMode::V3Consolidated,
+            nodes: std::collections::BTreeMap::new(),
+        });
+        let mk = |stamp: u64| CachedZarrStore {
+            hierarchy: Arc::clone(&dummy),
+            validator: "v1".into(),
+            fetched_at: Instant::now(),
+            last_used: AtomicU64::new(stamp),
+        };
+
+        for name in ["store_a", "store_b", "store_c"] {
+            let stamp = cache.budget.touch();
+            cache.insert_and_evict(name.into(), mk(stamp), max_open);
+        }
+        assert_eq!(cache.len(), max_open);
+
+        // Touch store_a so store_b becomes the coldest entry.
+        {
+            let a = cache.map.get("store_a").unwrap();
+            cache.touch(&a);
+        }
+
+        // Inserting the (max_open + 1)-th store evicts only the coldest entry (store_b),
+        // leaving max_open (3) warm entries cached instead of flushing to 0.
+        let stamp_d = cache.budget.touch();
+        cache.insert_and_evict("store_d".into(), mk(stamp_d), max_open);
+        assert_eq!(
+            cache.len(),
+            max_open,
+            "opening max_open_uris + 1 stores must leave max_open_uris entries cached"
+        );
+        assert!(!cache.map.contains_key("store_b"), "coldest entry must be evicted");
+        assert!(cache.map.contains_key("store_a"), "recently touched entry must survive");
+        assert!(cache.map.contains_key("store_c"));
+        assert!(cache.map.contains_key("store_d"));
     }
 }

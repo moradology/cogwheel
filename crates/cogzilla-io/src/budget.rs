@@ -1,15 +1,16 @@
-//! Shared lock-free byte-bounded LRU eviction policy used by `SingleflightBlockCache`,
-//! `DiskBlockCache`, and `TileCache`.
+//! Shared lock-free LRU eviction policy used by `SingleflightBlockCache`, `DiskBlockCache`,
+//! `TileCache`, `CogStore`'s URI cache, and `/zarr`'s hierarchy cache.
 //!
-//! All three caches share:
-//! - atomic byte accounting (`add` / saturating `sub`),
+//! All five caches share:
+//! - atomic usage accounting (`add` / saturating `sub`) or live target-reported count
+//!   (`EvictTarget::current_usage`),
 //! - a shared logical recency clock (`touch`),
 //! - a single-evictor CAS guard with an RAII reset so concurrent writers stay lock-free,
-//! - 25% hysteresis (`excess.max(max_bytes / 4)`) so an insert that trips the cap does not
+//! - 25% hysteresis (`excess.max(limit / 4).max(1)`) so an insert that trips the cap does not
 //!   re-trigger eviction on every subsequent insert, and
 //! - a two-pass eviction loop: Pass 1 drops cold entries whose recency stamp has not advanced;
 //!   Pass 2 drops the oldest skipped entries unconditionally if concurrent reads touched every
-//!   candidate and the cache is still over budget (keeping memory strictly bounded under
+//!   candidate and the cache is still over budget (keeping memory/count strictly bounded under
 //!   thundering herds).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,15 +19,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub trait EvictTarget {
     type Key;
 
+    /// Optional live usage (e.g. `DashMap::len() as u64` for count-bounded caches).
+    /// When `None` (default), [`ByteBudget`] tracks usage via its own atomic counter.
+    fn current_usage(&self) -> Option<u64> {
+        None
+    }
+
     /// Snapshot `(last_used_stamp, key)` for every currently evictable entry.
     fn candidates(&self) -> Vec<(u64, Self::Key)>;
 
     /// Pass 1: remove `key` only if its recency stamp is still `expected_stamp`,
-    /// returning the freed byte count if removed.
+    /// returning the freed units (bytes or entries) if removed.
     fn remove_if_cold(&self, key: &Self::Key, expected_stamp: u64) -> Option<u64>;
 
     /// Pass 2: unconditionally remove `key` if still present and evictable, returning the
-    /// freed byte count. Invoked only when Pass 1 could not bring the cache under budget
+    /// freed units. Invoked only when Pass 1 could not bring the cache under budget
     /// because concurrent readers advanced every candidate's stamp.
     fn remove_now(&self, key: &Self::Key) -> Option<u64>;
 }
@@ -93,10 +100,23 @@ impl ByteBudget {
     }
 
     /// Run the single-evictor loop with 25% hysteresis and two-pass cold-first eviction until
-    /// `current_bytes <= max_bytes` or no evictable entries remain.
+    /// usage `<= max_bytes` or no evictable entries remain.
     pub fn evict_to_budget<T: EvictTarget>(&self, target: &T) {
+        self.evict_to_limit(target, self.max);
+    }
+
+    /// Same as [`Self::evict_to_budget`], but using an explicit per-call `limit` (used by
+    /// count-bounded caches whose cap is supplied per store, e.g. `io.max_open_uris()`).
+    pub fn evict_to_limit<T: EvictTarget>(&self, target: &T, limit: u64) {
+        let usage = || {
+            target
+                .current_usage()
+                .unwrap_or_else(|| self.current.load(Ordering::Acquire))
+        };
+        let track_atomic = target.current_usage().is_none();
+
         loop {
-            if self.current.load(Ordering::Acquire) <= self.max {
+            if usage() <= limit {
                 return;
             }
             // Non-blocking guard: at most 1 worker evicts while all other workers stay lock-free.
@@ -118,15 +138,15 @@ impl ByteBudget {
                 }
                 let _reset = Reset(&self.evicting);
 
-                // Drain until within cap (aiming to free excess + 25% of max so we don't
+                // Drain until within cap (aiming to free excess + 25% of limit so we don't
                 // re-trigger on every subsequent insert).
                 loop {
-                    let cur = self.current.load(Ordering::Acquire);
-                    if cur <= self.max {
+                    let cur = usage();
+                    if cur <= limit {
                         break;
                     }
-                    let excess = cur - self.max;
-                    let target_drop = excess.max(self.max / 4);
+                    let excess = cur - limit;
+                    let target_drop = excess.max(limit / 4).max(1);
 
                     let mut candidates = target.candidates();
                     if candidates.is_empty() {
@@ -145,7 +165,9 @@ impl ByteBudget {
                         if let Some(freed) = target.remove_if_cold(&key, stamp) {
                             dropped = dropped.saturating_add(freed);
                             removed_any = true;
-                            self.sub(freed);
+                            if track_atomic {
+                                self.sub(freed);
+                            }
                         } else {
                             skipped.push(key);
                         }
@@ -153,16 +175,18 @@ impl ByteBudget {
 
                     // Pass 2: if concurrent reads touched every candidate and we are still over cap,
                     // evict the oldest entries from the snapshot regardless of recent hits so
-                    // memory/disk stays strictly bounded under thundering herds.
-                    if dropped < target_drop && self.current.load(Ordering::Acquire) > self.max {
+                    // memory/disk/URI count stays strictly bounded under thundering herds.
+                    if dropped < target_drop && usage() > limit {
                         for key in skipped {
-                            if self.current.load(Ordering::Acquire) <= self.max {
+                            if usage() <= limit {
                                 break;
                             }
                             if let Some(freed) = target.remove_now(&key) {
                                 dropped = dropped.saturating_add(freed);
                                 removed_any = true;
-                                self.sub(freed);
+                                if track_atomic {
+                                    self.sub(freed);
+                                }
                             }
                         }
                     }
@@ -174,8 +198,8 @@ impl ByteBudget {
             }
 
             // Re-check after releasing `evicting` to close the lost-wakeup race where another
-            // thread inserted while we were exiting `evict_to_budget`.
-            if !removed_any || self.current.load(Ordering::Acquire) <= self.max {
+            // thread inserted while we were exiting `evict_to_limit`.
+            if !removed_any || usage() <= limit {
                 return;
             }
         }
