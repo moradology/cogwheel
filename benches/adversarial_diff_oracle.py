@@ -2609,6 +2609,204 @@ def run_wave17_zarr_deep_checks(
         ok_wm = r.status_code == 200 and ET.fromstring(r.content).tag.endswith("Capabilities") and "variable=be_f32" in r.text
         rec(lb, ok_wm, f"status={r.status_code} len={len(r.text)}", p)
 
+    # --- Wave 26: Zarr CF unscale=true on /point & POST /statistics, plus nodata= query override ---
+    z_cf26 = w17_dir / "w26_cf_unscale.zarr"
+    z_cf26.mkdir()
+    (z_cf26 / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    _write_v2_zarr_array(z_cf26, "lat", lat, (64,), {"_ARRAY_DIMENSIONS": ["lat"], "standard_name": "latitude"})
+    _write_v2_zarr_array(z_cf26, "lon", lon, (64,), {"_ARRAY_DIMENSIONS": ["lon"], "standard_name": "longitude"})
+    i16_26 = np.full((64, 64), 1000, dtype=np.int16)
+    i16_26[0:16, 0:16] = -32768
+    i16_26[16:32, 0:16] = 500
+    _write_v2_zarr_array(
+        z_cf26, "temp", i16_26, (64, 64),
+        {"_ARRAY_DIMENSIONS": ["lat", "lon"], "scale_factor": 0.1, "add_offset": 200.0, "_FillValue": -32768},
+        fill_value=-32768,
+    )
+
+    lb = "W26 ZARR /point unscale=false vs true"
+    if wanted(lb):
+        p_raw = f"/zarr/point/-122.25,37.25?url={q(z_cf26)}&variable=temp&unscale=false"
+        p_uns = f"/zarr/point/-122.25,37.25?url={q(z_cf26)}&variable=temp&unscale=true"
+        r_raw, r_uns = client.get(cw_base + p_raw), client.get(cw_base + p_uns)
+        vr = r_raw.json()["values"][0] if r_raw.status_code == 200 else None
+        vu = r_uns.json()["values"][0] if r_uns.status_code == 200 else None
+        rec(lb, vr == 1000.0 and vu is not None and abs(vu - 300.0) < 1e-3, f"raw={vr} unscale={vu}", p_uns)
+
+    lb = "W26 ZARR POST /statistics unscale=false vs true"
+    if wanted(lb):
+        poly26 = {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.0], [-122.0, 37.0], [-122.0, 37.5], [-122.5, 37.5], [-122.5, 37.0]]]}, "properties": {}}
+        p_sr = f"/zarr/statistics?url={q(z_cf26)}&variable=temp&unscale=false"
+        p_su = f"/zarr/statistics?url={q(z_cf26)}&variable=temp&unscale=true"
+        r_sr, r_su = client.post(cw_base + p_sr, json=poly26), client.post(cw_base + p_su, json=poly26)
+        mr = r_sr.json()["properties"]["statistics"]["b1"]["mean"] if r_sr.status_code == 200 else None
+        mu = r_su.json()["properties"]["statistics"]["b1"]["mean"] if r_su.status_code == 200 else None
+        rec(lb, mr is not None and abs(mr - 1000.0) < 1e-3 and mu is not None and abs(mu - 300.0) < 1e-3, f"raw={mr} unscale={mu}", p_su, "POST")
+
+    lb = "W26 ZARR nodata=500 query override /bbox .npy"
+    if wanted(lb):
+        p_nd = f"/zarr/bbox/-123,37,-122,38/64x64.npy?url={q(z_cf26)}&variable=temp&nodata=500"
+        r_nd = client.get(cw_base + p_nd)
+        if r_nd.status_code == 200:
+            arr = np.load(io.BytesIO(r_nd.content))
+            m = arr[1] > np.finfo(np.float32).min
+            ok_nd = int(m[16:32, 0:16].sum()) == 0 and int(m[0:16, 0:16].sum()) == 0 and int(m[32:64, 32:64].sum()) == 1024
+            rec(lb, ok_nd, f"nd500_valid={int(m[16:32,0:16].sum())} fill_valid={int(m[0:16,0:16].sum())} data_valid={int(m[32:64,32:64].sum())}", p_nd)
+        else:
+            rec(lb, False, f"HTTP {r_nd.status_code}", p_nd)
+
+    return ran
+
+
+def run_wave26_security_checks(
+    client: httpx.Client,
+    cw_base: str,
+    bin_path: Path,
+    tmp_dir: Path,
+    only_filter: str,
+    failures: list[dict],
+) -> int:
+    """Wave 26: Live COGZILLA_ALLOWED_URL_PREFIXES SSRF enforcement (direct 403, cross-allowlist 302 redirect, STAC & MosaicJSON fatal 403) + X-Request-ID echo/sanitization."""
+    ran = 0
+
+    def wanted(lb: str) -> bool:
+        return not only_filter or only_filter.lower() in lb.lower()
+
+    def rec(lb: str, ok: bool, detail: str, path: str = ""):
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": lb, "method": "GET", "path": path, "kind": "w26", "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {lb:54s} | {detail}")
+
+    lb_id = "W26 HTTP X-Request-ID echo & sanitize"
+    if wanted(lb_id):
+        r1 = client.get(f"{cw_base}/healthz", headers={"X-Request-ID": "trace-abc-123"})
+        r2 = client.get(f"{cw_base}/healthz", headers={"X-Request-ID": "bad id with spaces!"})
+        ok_id = r1.headers.get("x-request-id") == "trace-abc-123" and r2.headers.get("x-request-id") not in (None, "", "bad id with spaces!")
+        rec(lb_id, ok_id, f"echo={r1.headers.get('x-request-id')!r} sanitized={r2.headers.get('x-request-id')!r}", "/healthz")
+
+    sec_labels = [
+        "W26 SEC allowed URL -> 200",
+        "W26 SEC disallowed URL -> 403",
+        "W26 SEC cross-allowlist 302 redirect -> 403",
+        "W26 SEC STAC disallowed asset -> 403",
+        "W26 SEC MosaicJSON mixed allowed+disallowed -> 403",
+    ]
+    if not any(wanted(lb) for lb in sec_labels):
+        return ran
+
+    w26_dir = tmp_dir / "w26"
+    w26_dir.mkdir(parents=True, exist_ok=True)
+    tf = from_bounds(-122.5, 37.5, -122.0, 38.0, 64, 64)
+    p_ok = w26_dir / "ok.tif"
+    with rasterio.open(p_ok, "w", driver="GTiff", width=64, height=64, count=1, dtype="float32", crs="EPSG:4326", transform=tf, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(np.full((1, 64, 64), 42.0, dtype=np.float32))
+    ok_bytes = p_ok.read_bytes()
+
+    srv_port = pick_free_port()
+    allowed_prefix = f"http://127.0.0.1:{srv_port}/allowed/"
+    stac_evil = json.dumps({
+        "type": "Feature", "stac_version": "1.0.0", "id": "evil-stac",
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.5], [-122.0, 37.5], [-122.0, 38.0], [-122.5, 38.0], [-122.5, 37.5]]]},
+        "bbox": [-122.5, 37.5, -122.0, 38.0], "properties": {"datetime": "2024-06-01T00:00:00Z"}, "links": [],
+        "assets": {"b1": {"href": f"http://127.0.0.1:{srv_port}/forbidden/secret.tif"}},
+    }).encode()
+    qk = mercantile.quadkey(164, 396, 10)
+    mj_mixed = json.dumps({
+        "mosaicjson": "0.0.2", "minzoom": 10, "maxzoom": 10,
+        "bounds": [-122.5, 37.5, -122.0, 38.0],
+        "tiles": {qk: [f"{allowed_prefix}ok.tif", f"http://127.0.0.1:{srv_port}/forbidden/secret.tif"]},
+    }).encode()
+
+    class SecHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _serve(self, is_head: bool):
+            if self.path == "/allowed/redir_to_forbidden.tif":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{srv_port}/forbidden/secret.tif")
+                self.end_headers()
+                return
+            if self.path == "/allowed/stac_evil.json":
+                body, ct = stac_evil, "application/json"
+            elif self.path == "/allowed/mj_mixed.json":
+                body, ct = mj_mixed, "application/json"
+            elif self.path in ("/allowed/ok.tif", "/forbidden/secret.tif"):
+                body, ct = ok_bytes, "image/tiff"
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            rng = self.headers.get("Range")
+            if not is_head and rng and rng.startswith("bytes="):
+                s0, e0 = rng[6:].split("-", 1)
+                start = int(s0)
+                end = min(int(e0) if e0 else len(body) - 1, len(body) - 1)
+                chunk = body[start:end + 1]
+                self.send_response(206)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                self.wfile.write(chunk)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                if not is_head:
+                    self.wfile.write(body)
+
+        def do_HEAD(self):
+            self._serve(True)
+
+        def do_GET(self):
+            self._serve(False)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", srv_port), SecHandler)
+    th = threading.Thread(target=httpd.serve_forever, daemon=True)
+    th.start()
+
+    ps: subprocess.Popen | None = None
+    try:
+        p_sec = pick_free_port()
+        env_sec = os.environ.copy()
+        env_sec["COGZILLA_GPU_POLICY"] = "never"
+        env_sec["COGZILLA_ALLOWED_URL_PREFIXES"] = allowed_prefix
+        ps = subprocess.Popen(
+            [str(bin_path), "--bind", f"127.0.0.1:{p_sec}", "--cache-mb", "64"],
+            env=env_sec, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        wait_ready(f"http://127.0.0.1:{p_sec}/healthz")
+        sec = f"http://127.0.0.1:{p_sec}"
+        for lb, path, exp_st in [
+            ("W26 SEC allowed URL -> 200", f"/cog/info?url={qe(allowed_prefix + 'ok.tif')}", 200),
+            ("W26 SEC disallowed URL -> 403", f"/cog/info?url={qe(f'http://127.0.0.1:{srv_port}/forbidden/secret.tif')}", 403),
+            ("W26 SEC cross-allowlist 302 redirect -> 403", f"/cog/info?url={qe(allowed_prefix + 'redir_to_forbidden.tif')}", 403),
+            ("W26 SEC STAC disallowed asset -> 403", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={qe(allowed_prefix + 'stac_evil.json')}&assets=b1", 403),
+            ("W26 SEC MosaicJSON mixed allowed+disallowed -> 403", f"/mosaicjson/tiles/WebMercatorQuad/10/164/396.npy?url={qe(allowed_prefix + 'mj_mixed.json')}", 403),
+        ]:
+            if wanted(lb):
+                r = client.get(sec + path)
+                rec(lb, r.status_code == exp_st, f"status={r.status_code} (exp {exp_st})", path)
+    finally:
+        if ps is not None:
+            try:
+                if ps.poll() is None:
+                    ps.terminate()
+                ps.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                ps.kill()
+                ps.wait(timeout=5)
+            except OSError:
+                pass
+        httpd.shutdown()
+        th.join(timeout=5)
+        httpd.server_close()
+
     return ran
 
 
@@ -3497,6 +3695,7 @@ def main() -> int:
                 w14_ran = run_wave14_fault_checks(client, cw_base, tmp_dir, s, args.only, failures)
                 w15_ran = run_wave15_resilience_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w17_ran = run_wave17_zarr_deep_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+                w26_ran = run_wave26_security_checks(client, cw_base, bin_path, tmp_dir, args.only, failures)
                 w18_extra = 0
                 lb_wmts = "W18 WMTS Capabilities XML WebMercatorQuad"
                 if not args.only or args.only.lower() in lb_wmts.lower():
@@ -3513,7 +3712,7 @@ def main() -> int:
                         failures.append({"label": lb_wmts, "method": "GET", "path": wmts_path, "kind": "w18_wmts", "detail": det_w})
                     print(f"{'PASS' if ok_w else 'FAIL'} | {lb_wmts:54s} | {det_w}")
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w18_extra
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w18_extra
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
