@@ -180,7 +180,7 @@ pub(super) async fn handle_cog_wms(
             let cogs = open_query_urls(engine, &pq.urls, None).await?;
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
-            let bounds = crs.wgs84_bounds_with_gcp(
+            let bounds = crs.wgs84_bounds(
                 &full.pixel_to_crs,
                 full.gcp_poly.as_deref(),
                 full.width,

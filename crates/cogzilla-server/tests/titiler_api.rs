@@ -3434,6 +3434,19 @@ async fn sweep16_u3_ungeoreferenced_and_u2b_nonlinear_gcp_self_contained() {
     let pt: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
     assert_eq!(pt["values"][0].as_f64().unwrap(), (32 * 100 + 32) as f64);
 
+    // #550: TileJSON bounds on a nonlinear 9-GCP TIFF must match /cog/info's polynomial wgs84_bounds.
+    let r = client
+        .get(format!("{base}/cog/WebMercatorQuad/tilejson.json?url={nl_url}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let nl_tj: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        nl_tj["bounds"], nl_info["wgs84_bounds"],
+        "TileJSON bounds must match /cog/info polynomial wgs84_bounds on nonlinear 9-GCP TIFF"
+    );
+
     srv_task.abort();
     let _ = std::fs::remove_dir_all(&tmp);
 }

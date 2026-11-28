@@ -900,8 +900,9 @@ impl CrsModel {
     }
 
     /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]`, using a
-    /// nonlinear `GcpPoly` when present or delegating directly to `wgs84_bounds` otherwise.
-    pub fn wgs84_bounds_with_gcp(
+    /// nonlinear `GcpPoly` when present or delegating directly to the zero-overhead affine path
+    /// when `gcp_poly` is `None`.
+    pub fn wgs84_bounds(
         &self,
         pixel_to_crs: &Affine2D,
         gcp_poly: Option<&cogzilla_tiff::GcpPoly>,
@@ -909,7 +910,7 @@ impl CrsModel {
         height: u32,
     ) -> [f64; 4] {
         let Some(poly) = gcp_poly else {
-            return self.wgs84_bounds(pixel_to_crs, width, height);
+            return self.wgs84_bounds_affine(pixel_to_crs, width, height);
         };
         let w = width as f64;
         let h = height as f64;
@@ -932,14 +933,14 @@ impl CrsModel {
             }
         }
         if !min_lon.is_finite() || !min_lat.is_finite() {
-            return self.wgs84_bounds(pixel_to_crs, width, height);
+            return self.wgs84_bounds_affine(pixel_to_crs, width, height);
         }
         [min_lon, min_lat, max_lon, max_lat]
     }
 
-    /// Exact WGS84 geographic bounding box `[min_lon, min_lat, max_lon, max_lat]` by sampling
-    /// 32 points along the 4 edges of the raster plus checking whether either pole lies inside.
-    pub fn wgs84_bounds(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
+    /// Affine-only fast path for [`Self::wgs84_bounds`] (32 edge samples + pole check).
+    #[inline(always)]
+    fn wgs84_bounds_affine(&self, pixel_to_crs: &Affine2D, width: u32, height: u32) -> [f64; 4] {
         let w = width as f64;
         let h = height as f64;
         if self.is_wgs84_degrees() {
@@ -1235,13 +1236,13 @@ impl CrsModel {
                         if local.is_finite() && local > 1e-3 {
                             local
                         } else {
-                            let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                            let [w, s, e, n] = self.wgs84_bounds_affine(pixel_to_crs, width, height);
                             let (a0, b0) = lonlat_deg_to_mercator(w, s);
                             let (a1, b1) = lonlat_deg_to_mercator(e, n);
                             (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
                         }
                     } else {
-                        let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                        let [w, s, e, n] = self.wgs84_bounds_affine(pixel_to_crs, width, height);
                         let (a0, b0) = lonlat_deg_to_mercator(w, s);
                         let (a1, b1) = lonlat_deg_to_mercator(e, n);
                         (a1 - a0).abs().max((b1 - b0).abs()).max(1.0) / wf.max(hf)
@@ -1365,11 +1366,11 @@ impl CrsModel {
                     if local.is_finite() && local > 1e-8 {
                         local
                     } else {
-                        let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                        let [w, s, e, n] = self.wgs84_bounds_affine(pixel_to_crs, width, height);
                         (n - s).abs().max((e - w).abs() * cos_lat).max(1e-6) / wf.max(hf)
                     }
                 } else {
-                    let [w, s, e, n] = self.wgs84_bounds(pixel_to_crs, width, height);
+                    let [w, s, e, n] = self.wgs84_bounds_affine(pixel_to_crs, width, height);
                     (e - w).abs().max((n - s).abs()).max(1e-6) / wf.max(hf)
                 };
                 (px_deg, wf, hf)

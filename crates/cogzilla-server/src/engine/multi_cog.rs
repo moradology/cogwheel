@@ -177,7 +177,7 @@ impl TileEngine {
         validate_multi_cog_grid(cogs, ifd_idx)?;
         let ifd = &primary.index.ifds[ifd_idx];
 
-        let Some(plan) = CoordPlan::<N>::build_with_gcp(
+        let Some(plan) = CoordPlan::<N>::build(
             &crs,
             &ifd.crs_to_pixel,
             ifd.gcp_poly.as_deref(),

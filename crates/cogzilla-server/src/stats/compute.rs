@@ -1254,7 +1254,7 @@ async fn compute_resampled_statistics(
     if read_bands.is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
-    let bbox = crs.wgs84_bounds_with_gcp(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
+    let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
     let request = BandRequest::MultiBand { bands_1based: read_bands.clone() };
     let raw = render_native_preview(
         engine,

@@ -30,7 +30,7 @@ where
             if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let wgs = crs.wgs84_bounds_with_gcp(
+                let wgs = crs.wgs84_bounds(
                     &full.pixel_to_crs,
                     full.gcp_poly.as_deref(),
                     full.width,
@@ -51,7 +51,7 @@ where
             if let Some((ref dst, dst_epsg)) = pq.bounds_crs {
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let wgs = crs.wgs84_bounds_with_gcp(
+                let wgs = crs.wgs84_bounds(
                     &full.pixel_to_crs,
                     full.gcp_poly.as_deref(),
                     full.width,
@@ -70,7 +70,7 @@ where
             let cogs = open_query_urls(&engine, &pq.urls, None).await?;
             let crs = engine.get_or_build_crs(&cogs[0])?;
             let full = cogs[0].index.full_res();
-            let bounds = crs.wgs84_bounds_with_gcp(
+            let bounds = crs.wgs84_bounds(
                 &full.pixel_to_crs,
                 full.gcp_poly.as_deref(),
                 full.width,
@@ -106,7 +106,7 @@ where
             });
             if is_dem_alg {
                 let crs = engine.get_or_build_crs(&cogs[0])?;
-                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                let bbox = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                 let scale = (pq.max_size as f64) / (full.width.max(full.height) as f64);
                 let def_w = ((full.width as f64 * scale.min(1.0)).ceil() as u32).max(1);
                 let def_h = ((full.height as f64 * scale.min(1.0)).ceil() as u32).max(1);
@@ -304,7 +304,7 @@ where
                     .and_then(|cogs| {
                         engine.get_or_build_crs(&cogs[0]).ok().map(|crs| {
                             let full = cogs[0].index.full_res();
-                            crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)
+                            crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height)
                         })
                     })
             } else {
@@ -344,7 +344,7 @@ where
                         );
                         let (mn, mx) = resolve_zoom_range(dmin, dmax, pq.minzoom, pq.maxzoom);
                         (
-                            Some(crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height)),
+                            Some(crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height)),
                             Some(mn),
                             Some(mx),
                         )
@@ -446,7 +446,7 @@ where
                         let full = cogs[0].index.full_res();
                         let b = engine
                             .get_or_build_crs(&cogs[0])
-                            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.width, full.height))
+                            .map(|c| c.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height))
                             .unwrap_or([-180.0, -90.0, 180.0, 90.0]);
                         return Err(EngineError::NotFound(format!(
                             "Tile {tms}/{z}/{x}/{y} is outside dataset bounds [{:.6}, {:.6}, {:.6}, {:.6}]",
@@ -624,7 +624,7 @@ where
             let (crs, native_epsg, native_bounds) =
                 dataset_native_crs_and_bounds(&engine, cog)?;
             let full = cog.index.full_res();
-            let wgs_bbox = crs.wgs84_bounds_with_gcp(
+            let wgs_bbox = crs.wgs84_bounds(
                 &full.pixel_to_crs,
                 full.gcp_poly.as_deref(),
                 full.width,
@@ -888,7 +888,7 @@ where
                 };
                 (wb, ob)
             } else {
-                let wb = native_crs.wgs84_bounds_with_gcp(
+                let wb = native_crs.wgs84_bounds(
                     &full.pixel_to_crs,
                     full.gcp_poly.as_deref(),
                     full.width,
@@ -982,7 +982,7 @@ where
                 let cogs = open_query_urls(&engine, &pq.urls, None).await?;
                 let crs = engine.get_or_build_crs(&cogs[0])?;
                 let full = cogs[0].index.full_res();
-                let bounds = crs.wgs84_bounds_with_gcp(
+                let bounds = crs.wgs84_bounds(
                 &full.pixel_to_crs,
                 full.gcp_poly.as_deref(),
                 full.width,
@@ -1082,7 +1082,7 @@ where
             }
             let (crs_opt, bbox) = if is_georef {
                 let crs = engine.get_or_build_crs(&cogs[0])?;
-                let b = crs.wgs84_bounds_with_gcp(
+                let b = crs.wgs84_bounds(
                     &full.pixel_to_crs,
                     full.gcp_poly.as_deref(),
                     full.width,
@@ -1183,7 +1183,7 @@ where
             }
             let (crs_opt, bbox) = if is_georef {
                 let crs = engine.get_or_build_crs(&cogs[0])?;
-                let b = crs.wgs84_bounds_with_gcp(
+                let b = crs.wgs84_bounds(
                     &full.pixel_to_crs,
                     full.gcp_poly.as_deref(),
                     full.width,

@@ -4068,7 +4068,7 @@ async fn compute_mosaic_statistics_with_fold(
                     {
                         (full.pixel_to_crs.a.abs(), full.pixel_to_crs.e.abs())
                     } else if let Ok(crs) = engine.get_or_build_crs(&cogs[0]) {
-                        let b = crs.wgs84_bounds(&full.pixel_to_crs, full.width, full.height);
+                        let b = crs.wgs84_bounds(&full.pixel_to_crs, full.gcp_poly.as_deref(), full.width, full.height);
                         (
                             ((b[2] - b[0]).abs() / full.width.max(1) as f64).max(1e-6),
                             ((b[3] - b[1]).abs() / full.height.max(1) as f64).max(1e-6),
