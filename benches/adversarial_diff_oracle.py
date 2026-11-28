@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import warnings
+import xml.etree.ElementTree as ET
 import zlib
 from pathlib import Path
 from urllib.parse import quote
@@ -549,6 +550,45 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(((xx9 + yy9) % 8).astype(np.uint8), 1)
         ds.write_colormap(1, {i: (i * 31, (255 - i * 29) % 256, (i * 53) % 256, 255) for i in range(8)})
     out["w16_palette"] = p_pal16
+
+    # Wave 18: GCP-only float32 GeoTIFFs (affine & rotated 9-point) + 3-band float32 COG with scales/offsets
+    grad18 = 100.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32) * 1.5
+    p_gcp_aff = synth_dir / "w18_gcp_affine.tif"
+    gcps_aff = [
+        GroundControlPoint(row=0, col=0, x=-122.5, y=38.0, id="1"),
+        GroundControlPoint(row=0, col=128, x=-122.0, y=38.0, id="2"),
+        GroundControlPoint(row=128, col=0, x=-122.5, y=37.5, id="3"),
+        GroundControlPoint(row=128, col=128, x=-122.0, y=37.5, id="4"),
+    ]
+    with rasterio.open(p_gcp_aff, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", gcps=gcps_aff, crs="EPSG:4326", tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(grad18[None])
+    out["w18_gcp_aff"] = p_gcp_aff
+
+    p_gcp_rot = synth_dir / "w18_gcp_rotated.tif"
+    gcps_rot = []
+    gid = 1
+    for r in (0, 64, 128):
+        for c_i in (0, 64, 128):
+            u = (c_i - 64) / 128.0 * 0.5
+            v = (64 - r) / 128.0 * 0.5
+            gcps_rot.append(GroundControlPoint(row=r, col=c_i, x=-122.25 + u * 0.985 - v * 0.174, y=37.75 + u * 0.174 + v * 0.985, id=str(gid)))
+            gid += 1
+    with rasterio.open(p_gcp_rot, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", gcps=gcps_rot, crs="EPSG:4326", tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(grad18[None])
+    out["w18_gcp_rot"] = p_gcp_rot
+
+    p_cog18 = synth_dir / "w18_cog3b.tif"
+    with rasterio.open(p_cog18, "w", driver="GTiff", width=128, height=128, count=3, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-9999.0) as ds:
+        b1 = 10.0 + xx9.astype(np.float32) * 1.5 + yy9.astype(np.float32) * 0.5
+        b2 = 20.0 + xx9.astype(np.float32) * 0.5 + yy9.astype(np.float32) * 1.5
+        b3 = 30.0 + (xx9 + yy9).astype(np.float32) * 0.8
+        b1[80:100, 64:84] = -9999.0
+        b2[80:100, 64:84] = -9999.0
+        b3[80:100, 64:84] = -9999.0
+        ds.write(np.stack([b1, b2, b3]))
+        ds.scales = (0.1, 0.2, 0.5)
+        ds.offsets = (1.0, 2.0, 3.0)
+    out["w18_cog3b"] = p_cog18
 
     return out
 
@@ -2718,6 +2758,16 @@ def main() -> int:
                 ("PARITY W16 PALETTE u8 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w16_palette'])}", None, "png"),
                 ("BETTER W16 MINISWHITE u8 .npy raw (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w16_miniswhite_u8'])}", None, "better_palette_npy"),
                 ("BETTER W16 PALETTE u8 .npy raw (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w16_palette'])}", None, "better_palette_npy"),
+                # --- Wave 18: GCP-only GeoTIFFs, OGC /cog/map, /cog/preview, TileJSON, GPU torture ---
+                ("BETTER W18 GCP affine /cog/point (cw 324.0, tt None)", "GET", f"/cog/point/-122.25,37.75?url={q(s['w18_gcp_aff'])}", None, "better_gcp_point"),
+                ("BETTER W18 GCP rotated /cog/point (cw 324.0, tt None)", "GET", f"/cog/point/-122.25,37.75?url={q(s['w18_gcp_rot'])}", None, "better_gcp_point"),
+                ("BETTER W18 GCP affine .png (cw gradient, tt solid purple)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w18_gcp_aff'])}&rescale=100,600&colormap_name=viridis", None, "better_gcp_png"),
+                ("PARITY W18 OGC /cog/map 4326 .png", "GET", f"/cog/map?url={q(s['w18_cog3b'])}&bbox=-122.5,37.5,-122.0,38.0&width=128&height=128&rescale=0,300&f=png", None, "png"),
+                ("PARITY W18 OGC /cog/map bbox-crs=3857 crs=4326 .png", "GET", f"/cog/map?url={q(s['w18_cog3b'])}&bbox=-13636637,4509036,-13580978,4579425&bbox-crs={qe('http://www.opengis.net/def/crs/EPSG/0/3857')}&crs={qe('http://www.opengis.net/def/crs/EPSG/0/4326')}&width=128&height=128&rescale=0,300&f=png", None, "png"),
+                ("PARITY W18 PREVIEW max_size=64 .npy", "GET", f"/cog/preview.npy?url={q(s['w18_cog3b'])}&max_size=64", None, "npy"),
+                ("PARITY W18 PREVIEW max_size=64 unscale expr .png", "GET", f"/cog/preview.png?url={q(s['w18_cog3b'])}&max_size=64&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}&rescale=-1,1&colormap_name=viridis", None, "png"),
+                ("PARITY W18 GPU torture cubic+RGB+formula .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w18_cog3b'])}&resampling=cubic&rescale=0,300&color_formula={qe('Gamma RGB 1.4')}", None, "png"),
+                ("PARITY W18 TILEJSON WebMercatorQuad", "GET", f"/cog/WebMercatorQuad/tilejson.json?url={q(s['w18_cog3b'])}&bidx=1&rescale=0,300&colormap_name=viridis", None, "tilejson_w18"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -2790,6 +2840,10 @@ def main() -> int:
                                 gok, gd = compare_stats_strict(r_cw.json()["properties"]["statistics"], r_gpu.json()["properties"]["statistics"])
                             elif kind == "point" or "/point/" in path:
                                 gok, gd = compare_point_strict(r_cw.json(), r_gpu.json())
+                            elif kind == "tilejson_w18":
+                                jc, jg = r_cw.json(), r_gpu.json()
+                                gok = (jc["bounds"] == jg["bounds"] and jc["minzoom"] == jg["minzoom"] and jc["maxzoom"] == jg["maxzoom"] and jc["center"] == jg["center"])
+                                gd = "tilejson metadata match" if gok else f"cw={jc} gpu={jg}"
                             else:
                                 gok, gd = (r_cw.content == r_gpu.content), "bytes diff"
                             if not gok:
@@ -2923,6 +2977,46 @@ def main() -> int:
                             max_err = float(np.max(np.abs(ac[0][both_fin] - at[0][both_fin]))) if both_fin.any() else 999.0
                             ok = ac.shape == (2, 256, 256) and cw_all_finite and tt_has_inf and max_err < 1e-3
                             detail = f"cw_all_finite={cw_all_finite} tt_has_inf={tt_has_inf} finite_max_err={max_err:.5f}"
+                    elif kind == "better_gcp_point":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            vc = r_cw.json()["values"][0]
+                            vt = r_tt.json()["values"][0]
+                            ok = vc is not None and abs(float(vc) - 324.0) < 1e-3 and vt is None
+                            detail = f"cw={vc} (exact=324.0) vs tt={vt}"
+                    elif kind == "better_gcp_png":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            # cogzilla renders the exact viridis gradient ([50, 181, 122] at center),
+                            # whereas TiTiler collapses the entire float32 GCP tile to viridis(0) ([68, 1, 84]).
+                            cw_std = float(imc[imc[..., 3] > 0, :3].std(axis=0).max())
+                            tt_std = float(imt[imt[..., 3] > 0, :3].std(axis=0).max())
+                            ok = (
+                                imc.shape == (256, 256, 4)
+                                and int(imc[128, 128, 1]) > 150
+                                and cw_std > 30.0
+                                and tt_std < 1.0
+                            )
+                            detail = f"cw[128,128]={imc[128,128,:3].tolist()} spatial_std={cw_std:.1f} vs tt[128,128]={imt[128,128,:3].tolist()} spatial_std={tt_std:.1f}"
+                    elif kind == "tilejson_w18":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            jc, jt = r_cw.json(), r_tt.json()
+                            berr = max(abs(a - b) for a, b in zip(jc["bounds"], jt["bounds"]))
+                            tile0 = jc["tiles"][0]
+                            ok = (
+                                berr < 1e-4
+                                and jc["minzoom"] == jt["minzoom"]
+                                and jc["maxzoom"] == jt["maxzoom"]
+                                and "colormap_name=viridis" in tile0
+                                and "rescale=0,300" in tile0
+                            )
+                            detail = f"bounds_err={berr:.6f} z={jc['minzoom']}..{jc['maxzoom']} vs {jt['minzoom']}..{jt['maxzoom']}"
                     elif r_cw.status_code != 200 or r_tt.status_code != 200:
                         ok = False
                         detail = f"HTTP cw={r_cw.status_code} ({r_cw.text[:100]!r}) vs tt={r_tt.status_code} ({r_tt.text[:100]!r})"
@@ -2959,8 +3053,23 @@ def main() -> int:
                 w14_ran = run_wave14_fault_checks(client, cw_base, tmp_dir, s, args.only, failures)
                 w15_ran = run_wave15_resilience_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w17_ran = run_wave17_zarr_deep_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+                w18_extra = 0
+                lb_wmts = "W18 WMTS Capabilities XML WebMercatorQuad"
+                if not args.only or args.only.lower() in lb_wmts.lower():
+                    w18_extra = 1
+                    wmts_path = f"/cog/WebMercatorQuad/WMTSCapabilities.xml?url={q(s['w18_cog3b'])}&rescale=0,300&colormap_name=viridis"
+                    rw = client.get(cw_base + wmts_path)
+                    if rw.status_code == 200:
+                        root_xml = ET.fromstring(rw.content)
+                        ok_w = root_xml.tag.endswith("Capabilities") and "WebMercatorQuad" in rw.text and "colormap_name=viridis" in rw.text
+                        det_w = f"root={root_xml.tag.split('}')[-1]} len={len(rw.text)}"
+                    else:
+                        ok_w, det_w = False, f"HTTP {rw.status_code} {rw.text[:80]!r}"
+                    if not ok_w:
+                        failures.append({"label": lb_wmts, "method": "GET", "path": wmts_path, "kind": "w18_wmts", "detail": det_w})
+                    print(f"{'PASS' if ok_w else 'FAIL'} | {lb_wmts:54s} | {det_w}")
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w18_extra
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
