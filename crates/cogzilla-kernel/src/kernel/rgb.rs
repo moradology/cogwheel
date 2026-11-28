@@ -1,5 +1,7 @@
 //! Monomorphized 3-band satellite RGB fused resampling and tile rendering kernels.
 
+use std::cell::RefCell;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use cogzilla_proj::CoordPlan;
 
@@ -10,11 +12,17 @@ use crate::webp_fast::{encode_webp_rgb, encode_webp_rgba};
 
 use super::{
     AxisTapTable, OutputFormat, ResampleMode, RgbStyle, SCRATCH, coord_plan_scale,
-    empty_tile_bytes, fast_floor_i32, fill_uv_row, for_each_pixel_in_row, index_plan,
-    plan_widened_scale, plane_at, rescale_u8, rgb_to_rgba_bytes, safe_rescale_denom,
+    empty_tile_bytes, fast_floor_i32, fill_uv_row, for_each_pixel_in_row,
+    plan_separable_conv_scale, rescale_u8, rgb_to_rgba_bytes, safe_rescale_denom,
     sample_bilinear, sample_cubic, sample_general_unwidened, sample_nearest, sample_val,
-    widened_plane, widened_plane_separable_with_tables,
+    widened_plane, widened_plane_separable_into_with_tables, widened_rgb_separable_stream_clean,
 };
+
+thread_local! {
+    static RGB_PLANE_SCRATCH: RefCell<[Vec<f32>; 3]> = const {
+        RefCell::new([Vec::new(), Vec::new(), Vec::new()])
+    };
+}
 
 /// Fused 3-band bilinear + rescale for a single-block raw typed slice (`u8`, `u16`, or `f32`).
 /// Computes floor/frac and `(p00, p01)` once per pixel across all 3 bands, with NEON 4-wide /
@@ -1593,28 +1601,115 @@ pub fn render_rgb_bands<const N: usize>(
     match (style.resample, clean) {
         (ResampleMode::Nearest, true) => render_rgb_specialized::<N, false, true>(plan, srcs, style),
         (ResampleMode::Nearest, false) => render_rgb_specialized::<N, false, false>(plan, srcs, style),
-        (mode, _) if plan_widened_scale(plan, mode).is_some() => {
+        (mode, _) if plan_separable_conv_scale(plan, mode).is_some() => {
             let (sx, sy) = coord_plan_scale(plan);
             let same_dims = srcs[1].ifd_w == srcs[0].ifd_w
                 && srcs[1].ifd_h == srcs[0].ifd_h
                 && srcs[2].ifd_w == srcs[0].ifd_w
                 && srcs[2].ifd_h == srcs[0].ifd_h;
-            let planes = if let (true, CoordPlan::Separable1D { u, v, .. }) = (same_dims, plan) {
+            if let (true, CoordPlan::Separable1D { u, v, .. }) = (same_dims, plan) {
                 let cols = AxisTapTable::build(mode, &u[..], sx, srcs[0].ifd_w);
                 let rows = AxisTapTable::build(mode, &v[..], sy, srcs[0].ifd_h);
-                [
-                    widened_plane_separable_with_tables(&u[..], &v[..], &srcs[0], mode, sx, sy, &cols, &rows),
-                    widened_plane_separable_with_tables(&u[..], &v[..], &srcs[1], mode, sx, sy, &cols, &rows),
-                    widened_plane_separable_with_tables(&u[..], &v[..], &srcs[2], mode, sx, sy, &cols, &rows),
-                ]
+                // Clean RGB JPEG/WebP/PNG hot path: stream row-by-row from L1-resident ring
+                // buffers straight into `sc.img_buf`, avoiding 3 MiB of intermediate planes.
+                if clean
+                    && matches!(
+                        style.format,
+                        OutputFormat::Jpeg { .. } | OutputFormat::Webp { .. } | OutputFormat::Png
+                    )
+                {
+                    let inv = [
+                        255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
+                        255.0 / safe_rescale_denom(style.rescale_min[1], style.rescale_max[1]),
+                        255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
+                    ];
+                    let mins = style.rescale_min;
+                    return SCRATCH.with(|cell| {
+                        let mut guard = cell.borrow_mut();
+                        let sc = &mut *guard;
+                        if matches!(style.format, OutputFormat::Png) {
+                            let stride = 1 + N * 3;
+                            let total = N * stride;
+                            if sc.img_buf.len() < total {
+                                sc.img_buf.resize(total, 0);
+                            }
+                            if sc.row_buf.len() < N * 3 {
+                                sc.row_buf.resize(N * 3, 0);
+                            }
+                            widened_rgb_separable_stream_clean(
+                                u, v, srcs, mode, sx, sy, &cols, &rows,
+                                |py, rr, rg, rb| {
+                                    let row = &mut sc.row_buf[..N * 3];
+                                    for px in 0..N {
+                                        let off = px * 3;
+                                        row[off] = rescale_u8(rr[px], inv[0], mins[0]);
+                                        row[off + 1] = rescale_u8(rg[px], inv[1], mins[1]);
+                                        row[off + 2] = rescale_u8(rb[px], inv[2], mins[2]);
+                                    }
+                                    filter_sub_rgb_row(
+                                        row,
+                                        &mut sc.img_buf[py * stride..(py + 1) * stride],
+                                    );
+                                },
+                            );
+                            return encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total]);
+                        }
+                        let total = N * N * 3;
+                        if sc.img_buf.len() < total {
+                            sc.img_buf.resize(total, 0);
+                        }
+                        let buf = &mut sc.img_buf[..total];
+                        widened_rgb_separable_stream_clean(
+                            u, v, srcs, mode, sx, sy, &cols, &rows,
+                            |py, rr, rg, rb| {
+                                let row = &mut buf[py * N * 3..(py + 1) * N * 3];
+                                for px in 0..N {
+                                    let off = px * 3;
+                                    row[off] = rescale_u8(rr[px], inv[0], mins[0]);
+                                    row[off + 1] = rescale_u8(rg[px], inv[1], mins[1]);
+                                    row[off + 2] = rescale_u8(rb[px], inv[2], mins[2]);
+                                }
+                            },
+                        );
+                        match style.format {
+                            OutputFormat::Jpeg { quality: jq } => {
+                                encode_jpeg_rgb(N as u32, N as u32, buf, jq)
+                            }
+                            OutputFormat::Webp { quality } => {
+                                encode_webp_rgb(N as u32, N as u32, buf, quality)
+                            }
+                            _ => unreachable!(),
+                        }
+                    });
+                }
+                RGB_PLANE_SCRATCH.with(|cell| {
+                    let mut planes = cell.borrow_mut();
+                    let len = N * N;
+                    for p in planes.iter_mut() {
+                        if p.len() < len {
+                            p.resize(len, 0.0);
+                        }
+                    }
+                    let [p0, p1, p2] = &mut *planes;
+                    widened_plane_separable_into_with_tables(
+                        &u[..], &v[..], &srcs[0], mode, sx, sy, &cols, &rows, &mut p0[..len],
+                    );
+                    widened_plane_separable_into_with_tables(
+                        &u[..], &v[..], &srcs[1], mode, sx, sy, &cols, &rows, &mut p1[..len],
+                    );
+                    widened_plane_separable_into_with_tables(
+                        &u[..], &v[..], &srcs[2], mode, sx, sy, &cols, &rows, &mut p2[..len],
+                    );
+                    render_rgb_planes::<N>([&p0[..len], &p1[..len], &p2[..len]], style, clean)
+                })
             } else {
-                [
+                let planes = [
                     widened_plane(plan, &srcs[0], mode, sx, sy),
                     widened_plane(plan, &srcs[1], mode, sx, sy),
                     widened_plane(plan, &srcs[2], mode, sx, sy),
-                ]
-            };
-            render_rgb_cubic::<N>(&index_plan::<N>(), style, clean, |b, u, v| plane_at::<N>(&planes[b], u, v))
+                ];
+                render_rgb_planes::<N>([&planes[0], &planes[1], &planes[2]], style, clean)
+            }
         }
         (ResampleMode::Bilinear, true) => render_rgb_specialized::<N, true, true>(plan, srcs, style),
         (ResampleMode::Bilinear, false) => render_rgb_specialized::<N, true, false>(plan, srcs, style),
@@ -1628,6 +1723,132 @@ pub fn render_rgb_bands<const N: usize>(
                 }
             })
         }
+    }
+}
+
+/// Direct encoder for 3 precomputed `N x N` f32 planes (zero `index_plan` allocation, direct flat
+/// indexing, and 3-byte RGB fast path for clean JPEG/WebP without RGBA alpha stripping).
+fn render_rgb_planes<const N: usize>(planes: [&[f32]; 3], style: &RgbStyle, clean: bool) -> Bytes {
+    let inv = [
+        255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
+        255.0 / safe_rescale_denom(style.rescale_min[1], style.rescale_max[1]),
+        255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
+    ];
+    let mins = style.rescale_min;
+    let [pr, pg, pb] = planes;
+    match style.format {
+        OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
+            let mut out = BytesMut::with_capacity(N * N * 12);
+            for plane in planes {
+                for &v in plane {
+                    out.put_slice(&v.to_le_bytes());
+                }
+            }
+            out.freeze()
+        }
+        OutputFormat::Png => SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            if clean {
+                let stride = 1 + N * 3;
+                let total = N * stride;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                if sc.row_buf.len() < N * 3 {
+                    sc.row_buf.resize(N * 3, 0);
+                }
+                for py in 0..N {
+                    let row = &mut sc.row_buf[..N * 3];
+                    let base = py * N;
+                    let rr = &pr[base..base + N];
+                    let rg = &pg[base..base + N];
+                    let rb = &pb[base..base + N];
+                    for px in 0..N {
+                        let off = px * 3;
+                        row[off] = rescale_u8(rr[px], inv[0], mins[0]);
+                        row[off + 1] = rescale_u8(rg[px], inv[1], mins[1]);
+                        row[off + 2] = rescale_u8(rb[px], inv[2], mins[2]);
+                    }
+                    filter_sub_rgb_row(row, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+                }
+                return encode_filtered_png(N as u32, N as u32, 2, &sc.img_buf[..total]);
+            }
+            let stride = 1 + N * 4;
+            let total = N * stride;
+            if sc.img_buf.len() < total {
+                sc.img_buf.resize(total, 0);
+            }
+            if sc.row_buf.len() < N * 4 {
+                sc.row_buf.resize(N * 4, 0);
+            }
+            for py in 0..N {
+                let row = &mut sc.row_buf[..N * 4];
+                let base = py * N;
+                let rr = &pr[base..base + N];
+                let rg = &pg[base..base + N];
+                let rb = &pb[base..base + N];
+                for px in 0..N {
+                    let (r, g, b) = (rr[px], rg[px], rb[px]);
+                    let off = px * 4;
+                    if r.is_nan() || g.is_nan() || b.is_nan() {
+                        row[off..off + 4].fill(0);
+                    } else {
+                        row[off] = rescale_u8(r, inv[0], mins[0]);
+                        row[off + 1] = rescale_u8(g, inv[1], mins[1]);
+                        row[off + 2] = rescale_u8(b, inv[2], mins[2]);
+                        row[off + 3] = 255;
+                    }
+                }
+                filter_sub_rgba_row(row, &mut sc.img_buf[py * stride..(py + 1) * stride]);
+            }
+            encode_filtered_png(N as u32, N as u32, 6, &sc.img_buf[..total])
+        }),
+        OutputFormat::Webp { .. } | OutputFormat::Jpeg { .. } | OutputFormat::RawRgba => SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let sc = &mut *guard;
+            if clean && !matches!(style.format, OutputFormat::RawRgba) {
+                let total = N * N * 3;
+                if sc.img_buf.len() < total {
+                    sc.img_buf.resize(total, 0);
+                }
+                let buf = &mut sc.img_buf[..total];
+                for i in 0..N * N {
+                    let off = i * 3;
+                    buf[off] = rescale_u8(pr[i], inv[0], mins[0]);
+                    buf[off + 1] = rescale_u8(pg[i], inv[1], mins[1]);
+                    buf[off + 2] = rescale_u8(pb[i], inv[2], mins[2]);
+                }
+                return match style.format {
+                    OutputFormat::Jpeg { quality: jq } => encode_jpeg_rgb(N as u32, N as u32, buf, jq),
+                    OutputFormat::Webp { quality } => encode_webp_rgb(N as u32, N as u32, buf, quality),
+                    _ => unreachable!(),
+                };
+            }
+            let total = N * N * 4;
+            if sc.img_buf.len() < total {
+                sc.img_buf.resize(total, 0);
+            }
+            let buf = &mut sc.img_buf[..total];
+            for i in 0..N * N {
+                let (r, g, b) = (pr[i], pg[i], pb[i]);
+                let off = i * 4;
+                if r.is_nan() || g.is_nan() || b.is_nan() {
+                    buf[off..off + 4].fill(0);
+                } else {
+                    buf[off] = rescale_u8(r, inv[0], mins[0]);
+                    buf[off + 1] = rescale_u8(g, inv[1], mins[1]);
+                    buf[off + 2] = rescale_u8(b, inv[2], mins[2]);
+                    buf[off + 3] = 255;
+                }
+            }
+            match style.format {
+                OutputFormat::Jpeg { quality: jq } => encode_jpeg_rgba(N as u32, N as u32, buf, jq),
+                OutputFormat::Webp { quality } => encode_webp_rgba(N as u32, N as u32, buf, quality),
+                OutputFormat::RawRgba => Bytes::copy_from_slice(buf),
+                _ => unreachable!(),
+            }
+        }),
     }
 }
 

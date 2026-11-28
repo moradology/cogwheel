@@ -17,7 +17,7 @@ use crate::webp_fast::encode_webp_rgba;
 use super::{
     OutputFormat, ResampleMode, RgbStyle, SCRATCH, SingleBandStyle, SingleBlockRef, WidenedSampler,
     build_plte_nodata, build_plte_opaque, coord_plan_scale, empty_tile_bytes,
-    for_each_pixel_in_row, index_plan, plan_widened_scale, plane_at, rescale_u8,
+    for_each_pixel_in_row, index_plan, plan_separable_conv_scale, plan_widened_scale, plane_at, rescale_u8,
     safe_rescale_denom, sample_bilinear, sample_cubic, sample_general_unwidened, sample_nearest,
     widened_plane,
 };
@@ -216,7 +216,7 @@ fn render_nband_eval<const N: usize, const B: usize>(
         (
             mode @ (ResampleMode::Bilinear | ResampleMode::Cubic | ResampleMode::CubicSpline | ResampleMode::Lanczos),
             _,
-        ) if plan_widened_scale(plan, mode).is_some() => {
+        ) if plan_separable_conv_scale(plan, mode).is_some() => {
             let (sx, sy) = coord_plan_scale(plan);
             let planes: [Vec<f32>; B] =
                 std::array::from_fn(|i| widened_plane(plan, srcs[i], mode, sx, sy));
@@ -484,7 +484,7 @@ pub fn render_expr_vm<const N: usize>(
         Vec::new()
     };
 
-    let widened_planes: Vec<Vec<f32>> = match plan_widened_scale(plan, style.resample) {
+    let widened_planes: Vec<Vec<f32>> = match plan_separable_conv_scale(plan, style.resample) {
         Some((sx, sy)) => srcs[..nb]
             .iter()
             .map(|s| widened_plane(plan, s, style.resample, sx, sy))

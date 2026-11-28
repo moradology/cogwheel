@@ -542,6 +542,43 @@ impl<'a> BandSource<'a> {
         Some((blk, ly as usize * tw + lx as usize, tw))
     }
 
+    /// Zero-copy slice of `len` contiguous `f32` pixels starting at `(col0, row)` when the entire
+    /// span lies within a single decoded `F32` block and has no nodata override or scale/offset.
+    #[inline(always)]
+    pub fn row_segment_f32_ref(&self, row: i32, col0: i32, len: usize) -> Option<&[f32]> {
+        if self.nodata_override.is_some()
+            || self.scale_offset.is_some()
+            || row < 0
+            || row >= self.ifd_h
+            || col0 < 0
+            || len == 0
+        {
+            return None;
+        }
+        let ux = col0 as u32;
+        let uy = row as u32;
+        let (tx, lx) = match self.shift_x {
+            Some(s) => (ux >> s, ux & self.mask_x),
+            None => (ux / self.tile_w, ux % self.tile_w),
+        };
+        let (ty, ly) = match self.shift_y {
+            Some(s) => (uy >> s, uy & self.mask_y),
+            None => (uy / self.tile_h, uy % self.tile_h),
+        };
+        let gx = tx.wrapping_sub(self.tx0);
+        let gy = ty.wrapping_sub(self.ty0);
+        if gx >= self.grid_w || gy >= self.grid_h {
+            return None;
+        }
+        let b = unsafe { *self.blocks.get_unchecked((gy * self.grid_w + gx) as usize) }?;
+        if ly >= b.height || (lx as usize) + len > b.width as usize {
+            return None;
+        }
+        let sl = b.data.as_f32_slice()?;
+        let base = ly as usize * self.tile_w as usize + lx as usize;
+        sl.get(base..base + len)
+    }
+
     /// Fill `out[i]` with pixel `(col0 + i, row)`, `NaN` outside the raster or the fetched blocks
     /// and for nodata (same values as [`Self::sample_checked`], read a block run at a time).
     pub fn read_row_segment(&self, row: i32, col0: i32, out: &mut [f32]) {

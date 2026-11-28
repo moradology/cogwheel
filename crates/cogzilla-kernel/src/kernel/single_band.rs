@@ -1,5 +1,7 @@
 //! Monomorphized single-band fused resampling and tile rendering kernels.
 
+use std::cell::RefCell;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use cogzilla_proj::CoordPlan;
 
@@ -12,11 +14,16 @@ use crate::source::BandSource;
 use crate::webp_fast::{encode_webp_rgb, encode_webp_rgba};
 
 use super::{
-    OutputFormat, ResampleMode, SCRATCH, SingleBandStyle, SingleBlockRef, build_plte_nodata,
-    build_plte_opaque, coord_plan_scale, empty_tile_bytes, fast_floor_i32, for_each_pixel_in_row,
-    plan_widened_scale, render_eval_fn, render_plane_single, rescale_u8, rgb_to_rgba_bytes,
-    safe_rescale_denom, sample_cubic, sample_general_unwidened, sample_val, widened_plane,
+    AxisTapTable, OutputFormat, ResampleMode, SCRATCH, SingleBandStyle, SingleBlockRef,
+    build_plte_nodata, build_plte_opaque, coord_plan_scale, empty_tile_bytes, fast_floor_i32,
+    for_each_pixel_in_row, plan_separable_conv_scale, render_eval_fn, render_plane_single,
+    rescale_u8, rgb_to_rgba_bytes, safe_rescale_denom, sample_cubic, sample_general_unwidened,
+    sample_val, widened_plane, widened_plane_separable_into_with_tables,
 };
+
+thread_local! {
+    static SINGLE_PLANE_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 // ============================================================================
 // Monomorphized Single-Band Fused Kernels (with SIMD Flat-Block Fast Path!)
@@ -481,9 +488,25 @@ pub fn render_single_band<const N: usize>(
     match (style.resample, clean) {
         (ResampleMode::Nearest, true) => render_single_specialized::<N, false, true>(plan, src, style),
         (ResampleMode::Nearest, false) => render_single_specialized::<N, false, false>(plan, src, style),
-        (mode, _) if plan_widened_scale(plan, mode).is_some() => {
+        (mode, _) if plan_separable_conv_scale(plan, mode).is_some() => {
             let (sx, sy) = coord_plan_scale(plan);
-            render_plane_single::<N>(&widened_plane(plan, src, mode, sx, sy), style)
+            if let CoordPlan::Separable1D { u, v, .. } = plan {
+                let cols = AxisTapTable::build(mode, &u[..], sx, src.ifd_w);
+                let rows = AxisTapTable::build(mode, &v[..], sy, src.ifd_h);
+                SINGLE_PLANE_SCRATCH.with(|cell| {
+                    let mut plane = cell.borrow_mut();
+                    let len = N * N;
+                    if plane.len() < len {
+                        plane.resize(len, 0.0);
+                    }
+                    widened_plane_separable_into_with_tables(
+                        &u[..], &v[..], src, mode, sx, sy, &cols, &rows, &mut plane[..len],
+                    );
+                    render_plane_single::<N>(&plane[..len], style)
+                })
+            } else {
+                render_plane_single::<N>(&widened_plane(plan, src, mode, sx, sy), style)
+            }
         }
         (ResampleMode::Bilinear, true) => render_single_specialized::<N, true, true>(plan, src, style),
         (ResampleMode::Bilinear, false) => render_single_specialized::<N, true, false>(plan, src, style),

@@ -1,11 +1,48 @@
 //! Widened convolution resampling (GDAL-compatible downsampling kernels).
 
 use std::cell::RefCell;
+use std::sync::LazyLock;
 
 use cogzilla_proj::CoordPlan;
 
 use super::{ResampleMode, coord_plan_scale, for_each_pixel_in_row};
 use crate::source::BandSource;
+
+const LANCZOS3_LUT_STEPS: usize = 2048;
+const LANCZOS3_LUT_SCALE: f32 = LANCZOS3_LUT_STEPS as f32 / 3.0;
+
+static LANCZOS3_LUT: LazyLock<[f32; LANCZOS3_LUT_STEPS + 2]> = LazyLock::new(|| {
+    let mut lut = [0.0f32; LANCZOS3_LUT_STEPS + 2];
+    lut[0] = 1.0;
+    for i in 1..LANCZOS3_LUT_STEPS {
+        let ax = (i as f64) * (3.0 / LANCZOS3_LUT_STEPS as f64);
+        let t = std::f64::consts::FRAC_PI_3 * ax;
+        let s = t.sin();
+        lut[i] = ((3.0 - 4.0 * s * s) * s * s / (3.0 * t * t)) as f32;
+    }
+    lut[LANCZOS3_LUT_STEPS] = 0.0;
+    lut[LANCZOS3_LUT_STEPS + 1] = 0.0;
+    lut
+});
+
+/// Fast Lanczos-3 kernel weight `sinc(x) * sinc(x / 3)` via 2048-entry linear-interpolated LUT
+/// on `[0, 3]` (max error `< 1e-6`, zero `sin()` calls).
+#[inline(always)]
+pub(super) fn lanczos3_lut(ax: f32) -> f32 {
+    if ax < 1e-6 {
+        return 1.0;
+    }
+    if ax >= 3.0 {
+        return 0.0;
+    }
+    let lut = &*LANCZOS3_LUT;
+    let f = ax * LANCZOS3_LUT_SCALE;
+    let idx = f as usize;
+    let frac = f - idx as f32;
+    // SAFETY: `ax < 3.0` implies `f < 2048.0`, so `idx <= 2047` and `idx + 1 <= 2048 < 2050`.
+    let (v0, v1) = unsafe { (*lut.get_unchecked(idx), *lut.get_unchecked(idx + 1)) };
+    v0 + frac * (v1 - v0)
+}
 
 // GDAL resamples with bilinear, cubic, cubicspline and lanczos as convolution kernels. When the
 // output is coarser than the source (both in the warper, `GWKResample`, and in RasterIO's
@@ -91,18 +128,7 @@ fn conv_kernel_weight(mode: ResampleMode, x: f32) -> f32 {
                 0.0
             }
         }
-        ResampleMode::Lanczos => {
-            if ax < 1e-6 {
-                1.0
-            } else if ax >= 3.0 {
-                0.0
-            } else {
-                // sinc(x) * sinc(x / 3) with one sine: sin(3t) = 3 sin(t) - 4 sin(t)^3, t = pi x / 3.
-                let t = std::f32::consts::FRAC_PI_3 * ax;
-                let s = t.sin();
-                (3.0 - 4.0 * s * s) * s * s / (3.0 * t * t)
-            }
-        }
+        ResampleMode::Lanczos => lanczos3_lut(ax),
         _ => 0.0,
     }
 }
@@ -634,11 +660,21 @@ struct WideScratch {
     hw: Vec<f32>,
     tags: Vec<i32>,
     wrow: Vec<f32>,
+    col_ok: Vec<bool>,
+    row_ok: Vec<bool>,
 }
 
 thread_local! {
     static WIDE_SCRATCH: RefCell<WideScratch> = const {
-        RefCell::new(WideScratch { seg: Vec::new(), hs: Vec::new(), hw: Vec::new(), tags: Vec::new(), wrow: Vec::new() })
+        RefCell::new(WideScratch {
+            seg: Vec::new(),
+            hs: Vec::new(),
+            hw: Vec::new(),
+            tags: Vec::new(),
+            wrow: Vec::new(),
+            col_ok: Vec::new(),
+            row_ok: Vec::new(),
+        })
     };
 }
 
@@ -736,19 +772,206 @@ pub fn widened_plane<const N: usize>(
     out
 }
 
+/// SIMD dot product of `K` f32 taps (`K` is 4, 8, 12, or 16).
+/// Uses explicit NEON on `aarch64`, 4-wide tree-reduced accumulators on other targets (breaking
+/// the serial FP32 dependency chain so LLVM emits AVX2/SSE FMAs cleanly).
+#[inline(always)]
+unsafe fn dot_fixed<const K: usize>(a: *const f32, b: *const f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vfmaq_f32, vld1q_f32, vmulq_f32};
+        unsafe {
+            match K {
+                4 => {
+                    let v0 = vmulq_f32(vld1q_f32(a), vld1q_f32(b));
+                    vaddvq_f32(v0)
+                }
+                8 => {
+                    let v0 = vmulq_f32(vld1q_f32(a), vld1q_f32(b));
+                    let v1 = vfmaq_f32(v0, vld1q_f32(a.add(4)), vld1q_f32(b.add(4)));
+                    vaddvq_f32(v1)
+                }
+                12 => {
+                    let v0 = vmulq_f32(vld1q_f32(a), vld1q_f32(b));
+                    let v1 = vmulq_f32(vld1q_f32(a.add(4)), vld1q_f32(b.add(4)));
+                    let v0 = vfmaq_f32(v0, vld1q_f32(a.add(8)), vld1q_f32(b.add(8)));
+                    vaddvq_f32(vaddq_f32(v0, v1))
+                }
+                16 => {
+                    let v0 = vmulq_f32(vld1q_f32(a), vld1q_f32(b));
+                    let v1 = vmulq_f32(vld1q_f32(a.add(4)), vld1q_f32(b.add(4)));
+                    let v0 = vfmaq_f32(v0, vld1q_f32(a.add(8)), vld1q_f32(b.add(8)));
+                    let v1 = vfmaq_f32(v1, vld1q_f32(a.add(12)), vld1q_f32(b.add(12)));
+                    vaddvq_f32(vaddq_f32(v0, v1))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut acc = [0.0f32; 4];
+        let mut k = 0;
+        while k < K {
+            unsafe {
+                acc[0] += *a.add(k) * *b.add(k);
+                acc[1] += *a.add(k + 1) * *b.add(k + 1);
+                acc[2] += *a.add(k + 2) * *b.add(k + 2);
+                acc[3] += *a.add(k + 3) * *b.add(k + 3);
+            }
+            k += 4;
+        }
+        (acc[0] + acc[1]) + (acc[2] + acc[3])
+    }
+}
+
+/// `x86_64` AVX2+FMA horizontal pass for `K = 4, 8, 12, 16`: processes 8 taps per `_mm256_fmadd_ps`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn h_pass_fixed_avx2<const K: usize>(
+    seg: &[f32],
+    gc0: i32,
+    cols: &AxisTapTable,
+    col_ok: &[bool],
+    all_cols_ok: bool,
+    hs_row: &mut [f32],
+) {
+    use std::arch::x86_64::{
+        __m128, __m256, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps,
+        _mm_mul_ps, _mm_shuffle_ps, _mm256_add_ps, _mm256_castps256_ps128, _mm256_extractf128_ps,
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
+    };
+    #[inline(always)]
+    unsafe fn hsum128(v: __m128) -> f32 {
+        let hi = _mm_movehl_ps(v, v);
+        let s = _mm_add_ps(v, hi);
+        let shuf = _mm_shuffle_ps(s, s, 0x55);
+        _mm_cvtss_f32(_mm_add_ss(s, shuf))
+    }
+    #[inline(always)]
+    unsafe fn hsum256(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        hsum128(_mm_add_ps(lo, hi))
+    }
+    let seg_ptr = seg.as_ptr();
+    let w_ptr = cols.weights.as_ptr();
+    let starts = &cols.start;
+    for (px, out) in hs_row.iter_mut().enumerate() {
+        if all_cols_ok || col_ok[px] {
+            let off = (starts[px] - gc0) as usize;
+            let a = unsafe { seg_ptr.add(off) };
+            let b = unsafe { w_ptr.add(px * K) };
+            *out = unsafe {
+                match K {
+                    4 => hsum128(_mm_mul_ps(_mm_loadu_ps(a), _mm_loadu_ps(b))),
+                    8 => hsum256(_mm256_mul_ps(_mm256_loadu_ps(a), _mm256_loadu_ps(b))),
+                    12 => {
+                        let v8 = _mm256_mul_ps(_mm256_loadu_ps(a), _mm256_loadu_ps(b));
+                        let lo = _mm256_castps256_ps128(v8);
+                        let hi = _mm256_extractf128_ps(v8, 1);
+                        let v4 = _mm_mul_ps(_mm_loadu_ps(a.add(8)), _mm_loadu_ps(b.add(8)));
+                        hsum128(_mm_add_ps(_mm_add_ps(lo, hi), v4))
+                    }
+                    16 => {
+                        let v0 = _mm256_mul_ps(_mm256_loadu_ps(a), _mm256_loadu_ps(b));
+                        let v1 = _mm256_fmadd_ps(
+                            _mm256_loadu_ps(a.add(8)),
+                            _mm256_loadu_ps(b.add(8)),
+                            v0,
+                        );
+                        hsum256(v1)
+                    }
+                    _ => unreachable!(),
+                }
+            };
+        }
+    }
+}
+
 /// Clean horizontal pass with `K`-wide zero-padded taps: `hs_row[px] = sum_i w_i * seg[off + i]`.
 #[inline(always)]
-fn h_pass_fixed<const K: usize>(seg: &[f32], gc0: i32, cols: &AxisTapTable, col_ok: &[bool], hs_row: &mut [f32]) {
-    for (px, out) in hs_row.iter_mut().enumerate() {
-        if col_ok[px] {
-            let off = (cols.start[px] - gc0) as usize;
-            let a: &[f32; K] = seg[off..off + K].try_into().unwrap();
-            let b: &[f32; K] = cols.taps_padded(px).try_into().unwrap();
-            let mut acc = 0.0f32;
-            for k in 0..K {
-                acc += a[k] * b[k];
+fn h_pass_fixed<const K: usize>(
+    seg: &[f32],
+    gc0: i32,
+    cols: &AxisTapTable,
+    col_ok: &[bool],
+    all_cols_ok: bool,
+    hs_row: &mut [f32],
+) {
+    debug_assert_eq!(cols.stride, K);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: runtime CPUID check verified AVX2 + FMA support.
+            unsafe { h_pass_fixed_avx2::<K>(seg, gc0, cols, col_ok, all_cols_ok, hs_row) };
+            return;
+        }
+    }
+    let seg_ptr = seg.as_ptr();
+    let w_ptr = cols.weights.as_ptr();
+    let starts = &cols.start;
+    if all_cols_ok {
+        for (px, out) in hs_row.iter_mut().enumerate() {
+            let off = (starts[px] - gc0) as usize;
+            debug_assert!(off + K <= seg.len());
+            // SAFETY: `all_cols_ok` guarantees `starts[px] >= gc0` and `off + K <= seg.len()`,
+            // and `cols.weights.len() == hs_row.len() * K`.
+            *out = unsafe { dot_fixed::<K>(seg_ptr.add(off), w_ptr.add(px * K)) };
+        }
+    } else {
+        for (px, out) in hs_row.iter_mut().enumerate() {
+            if col_ok[px] {
+                let off = (starts[px] - gc0) as usize;
+                debug_assert!(off + K <= seg.len());
+                *out = unsafe { dot_fixed::<K>(seg_ptr.add(off), w_ptr.add(px * K)) };
             }
-            *out = acc;
+        }
+    }
+}
+
+/// Clean horizontal pass for arbitrary multiple-of-4 strides (`> 16`): processes 4-wide chunks so
+/// LLVM emits NEON/AVX2 FMAs even for heavily widened Lanczos kernels.
+#[inline(always)]
+fn h_pass_chunks4(
+    seg: &[f32],
+    gc0: i32,
+    cols: &AxisTapTable,
+    col_ok: &[bool],
+    all_cols_ok: bool,
+    hs_row: &mut [f32],
+) {
+    let stride = cols.stride;
+    for (px, out) in hs_row.iter_mut().enumerate() {
+        if all_cols_ok || col_ok[px] {
+            let off = (cols.start[px] - gc0) as usize;
+            let src_sl = &seg[off..off + stride];
+            let tap_sl = cols.taps_padded(px);
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+                unsafe {
+                    let mut v = vdupq_n_f32(0.0);
+                    let mut k = 0;
+                    while k < stride {
+                        v = vfmaq_f32(v, vld1q_f32(src_sl.as_ptr().add(k)), vld1q_f32(tap_sl.as_ptr().add(k)));
+                        k += 4;
+                    }
+                    *out = vaddvq_f32(v);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut acc = [0.0f32; 4];
+                for (ac, bc) in src_sl.chunks_exact(4).zip(tap_sl.chunks_exact(4)) {
+                    acc[0] += ac[0] * bc[0];
+                    acc[1] += ac[1] * bc[1];
+                    acc[2] += ac[2] * bc[2];
+                    acc[3] += ac[3] * bc[3];
+                }
+                *out = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            }
         }
     }
 }
@@ -776,6 +999,76 @@ fn h_pass_fixed_nan<const K: usize>(
             }
             *out = acc;
             *wout = wacc;
+        }
+    }
+}
+
+/// Clean vertical pass over `wy` taps from ring buffer `hs`, unrolled for 4-tap (Cubic/CubicSpline)
+/// and 6-tap (1:1/upsampled Lanczos3) so `row_out` is written once per pixel instead of `K` times.
+#[inline(always)]
+fn v_pass_clean(hs: &[f32], w: usize, ring: usize, st: i32, wy: &[f32], row_out: &mut [f32]) {
+    let slot_of = |j: usize| (st + j as i32).rem_euclid(ring as i32) as usize * w;
+    match wy.len() {
+        4 => {
+            let (w0, w1, w2, w3) = (wy[0], wy[1], wy[2], wy[3]);
+            let r0 = &hs[slot_of(0)..slot_of(0) + w];
+            let r1 = &hs[slot_of(1)..slot_of(1) + w];
+            let r2 = &hs[slot_of(2)..slot_of(2) + w];
+            let r3 = &hs[slot_of(3)..slot_of(3) + w];
+            for px in 0..w {
+                row_out[px] = (r0[px] * w0 + r1[px] * w1) + (r2[px] * w2 + r3[px] * w3);
+            }
+        }
+        6 => {
+            let (w0, w1, w2, w3, w4, w5) = (wy[0], wy[1], wy[2], wy[3], wy[4], wy[5]);
+            let r0 = &hs[slot_of(0)..slot_of(0) + w];
+            let r1 = &hs[slot_of(1)..slot_of(1) + w];
+            let r2 = &hs[slot_of(2)..slot_of(2) + w];
+            let r3 = &hs[slot_of(3)..slot_of(3) + w];
+            let r4 = &hs[slot_of(4)..slot_of(4) + w];
+            let r5 = &hs[slot_of(5)..slot_of(5) + w];
+            for px in 0..w {
+                row_out[px] = ((r0[px] * w0 + r1[px] * w1) + (r2[px] * w2 + r3[px] * w3))
+                    + (r4[px] * w4 + r5[px] * w5);
+            }
+        }
+        0 => row_out.fill(0.0),
+        _ => {
+            // Strip-mine in 64-float L1/register chunks so `row_out` is written ONCE for any
+            // tap count (`wy.len() = 8, 9, 10, 12, 16, ...`).
+            const CHUNK: usize = 64;
+            let mut acc = [0.0f32; CHUNK];
+            let mut base = 0;
+            while base + CHUNK <= w {
+                let w0 = wy[0];
+                let r0 = &hs[slot_of(0) + base..slot_of(0) + base + CHUNK];
+                for i in 0..CHUNK {
+                    acc[i] = r0[i] * w0;
+                }
+                for (j, &wj) in wy.iter().enumerate().skip(1) {
+                    let rj = &hs[slot_of(j) + base..slot_of(j) + base + CHUNK];
+                    for i in 0..CHUNK {
+                        acc[i] += rj[i] * wj;
+                    }
+                }
+                row_out[base..base + CHUNK].copy_from_slice(&acc);
+                base += CHUNK;
+            }
+            if base < w {
+                let rem = w - base;
+                let w0 = wy[0];
+                let r0 = &hs[slot_of(0) + base..slot_of(0) + w];
+                for i in 0..rem {
+                    acc[i] = r0[i] * w0;
+                }
+                for (j, &wj) in wy.iter().enumerate().skip(1) {
+                    let rj = &hs[slot_of(j) + base..slot_of(j) + w];
+                    for i in 0..rem {
+                        acc[i] += rj[i] * wj;
+                    }
+                }
+                row_out[base..w].copy_from_slice(&acc[..rem]);
+            }
         }
     }
 }
@@ -811,35 +1104,61 @@ pub(super) fn widened_plane_separable_with_tables(
     cols: &AxisTapTable,
     rows: &AxisTapTable,
 ) -> Vec<f32> {
+    let mut out = vec![f32::NAN; us.len() * vs.len()];
+    widened_plane_separable_into_with_tables(us, vs, src, mode, scale_x, scale_y, cols, rows, &mut out);
+    out
+}
+
+/// Zero-allocation twin of [`widened_plane_separable_with_tables`] writing into caller-provided
+/// `out` (`out.len() == us.len() * vs.len()`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn widened_plane_separable_into_with_tables(
+    us: &[f32],
+    vs: &[f32],
+    src: &BandSource<'_>,
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+    cols: &AxisTapTable,
+    rows: &AxisTapTable,
+    out: &mut [f32],
+) {
     let (w, h) = (us.len(), vs.len());
-    let mut out = vec![f32::NAN; w * h];
-    let (Some((c_lo, c_hi)), Some(_)) = (cols.span(), rows.span()) else {
-        return out;
+    debug_assert_eq!(out.len(), w * h);
+    let (Some((c_lo, c_hi)), Some((r_lo, r_hi))) = (cols.span(), rows.span()) else {
+        out.fill(f32::NAN);
+        return;
     };
     let clean = src.no_nodata;
-    // Columns / rows the passes handle: sample point in range and, on clean data, the whole
-    // footprint inside the raster (taps outside it are skipped like nodata on the other path).
-    let col_ok: Vec<bool> = (0..w)
-        .map(|k| {
-            let (st, t) = cols.taps(k);
-            BandSource::axis_contains_sample(us[k], src.ifd_w)
-                && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_w))
-        })
-        .collect();
-    let row_ok: Vec<bool> = (0..h)
-        .map(|k| {
-            let (st, t) = rows.taps(k);
-            BandSource::axis_contains_sample(vs[k], src.ifd_h)
-                && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_h))
-        })
-        .collect();
     let (gc0, gc1) = if clean { (c_lo.max(0), c_hi.min(src.ifd_w - 1)) } else { (c_lo, c_hi) };
+    let known_complete = clean
+        && gc0 <= gc1
+        && src.is_clean_inbounds(gc0, gc1, r_lo.max(0), r_hi.min(src.ifd_h - 1));
     let positive = matches!(mode, ResampleMode::Bilinear | ResampleMode::CubicSpline);
     let ring = rows.stride + 1;
     let mut fallback: Vec<usize> = Vec::new();
     WIDE_SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
         let sc = &mut *guard;
+        // Columns / rows the passes handle: sample point in range and, on clean data, the whole
+        // footprint inside the raster (taps outside it are skipped like nodata on the other path).
+        sc.col_ok.clear();
+        let mut all_cols_ok = true;
+        for k in 0..w {
+            let (st, t) = cols.taps(k);
+            let ok = BandSource::axis_contains_sample(us[k], src.ifd_w)
+                && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_w));
+            all_cols_ok &= ok;
+            sc.col_ok.push(ok);
+        }
+        sc.row_ok.clear();
+        for k in 0..h {
+            let (st, t) = rows.taps(k);
+            sc.row_ok.push(
+                BandSource::axis_contains_sample(vs[k], src.ifd_h)
+                    && (!clean || (st >= 0 && st + t.len() as i32 <= src.ifd_h)),
+            );
+        }
         let seg_w = if gc0 <= gc1 { (gc1 - gc0 + 1) as usize } else { 0 };
         // Zero tail so fixed-width dots may read past the last column (with zero weights).
         let pad = cols.stride;
@@ -857,7 +1176,7 @@ pub(super) fn widened_plane_separable_with_tables(
         }
         sc.tags.clear();
         sc.tags.resize(ring, i32::MIN);
-        let WideScratch { seg, hs, hw, tags, wrow } = sc;
+        let WideScratch { seg, hs, hw, tags, wrow, col_ok, row_ok } = sc;
         let seg = &mut seg[..seg_w + pad];
         let wrow = &mut wrow[..w];
         for py in 0..h {
@@ -872,31 +1191,33 @@ pub(super) fn widened_plane_separable_with_tables(
                         continue;
                     }
                     tags[slot] = r;
-                    src.read_row_segment(r, gc0, &mut seg[..seg_w]);
                     let hs_row = &mut hs[slot * w..(slot + 1) * w];
                     if clean {
+                        // Zero-copy slice into the decoded F32 block when the full padded span
+                        // lies inside one block; falls back to `read_row_segment` at tile seams.
+                        let row_slice: &[f32] = if let Some(direct) =
+                            src.row_segment_f32_ref(r, gc0, seg_w + pad)
+                        {
+                            direct
+                        } else {
+                            src.read_row_segment(r, gc0, &mut seg[..seg_w]);
+                            seg
+                        };
                         match cols.stride {
-                            4 => h_pass_fixed::<4>(seg, gc0, cols, &col_ok, hs_row),
-                            8 => h_pass_fixed::<8>(seg, gc0, cols, &col_ok, hs_row),
-                            _ => {
-                                for px in 0..w {
-                                    if col_ok[px] {
-                                        let (cst, wx) = cols.taps(px);
-                                        let off = (cst - gc0) as usize;
-                                        let mut acc = 0.0f32;
-                                        for (a, b) in seg[off..off + wx.len()].iter().zip(wx) {
-                                            acc += a * b;
-                                        }
-                                        hs_row[px] = acc;
-                                    }
-                                }
-                            }
+                            4 => h_pass_fixed::<4>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+                            8 => h_pass_fixed::<8>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+                            12 => h_pass_fixed::<12>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+                            16 => h_pass_fixed::<16>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+                            _ => h_pass_chunks4(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
                         }
                     } else {
+                        src.read_row_segment(r, gc0, &mut seg[..seg_w]);
                         let hw_row = &mut hw[slot * w..(slot + 1) * w];
                         match cols.stride {
-                            4 => h_pass_fixed_nan::<4>(seg, gc0, cols, &col_ok, hs_row, hw_row),
-                            8 => h_pass_fixed_nan::<8>(seg, gc0, cols, &col_ok, hs_row, hw_row),
+                            4 => h_pass_fixed_nan::<4>(seg, gc0, cols, col_ok, hs_row, hw_row),
+                            8 => h_pass_fixed_nan::<8>(seg, gc0, cols, col_ok, hs_row, hw_row),
+                            12 => h_pass_fixed_nan::<12>(seg, gc0, cols, col_ok, hs_row, hw_row),
+                            16 => h_pass_fixed_nan::<16>(seg, gc0, cols, col_ok, hs_row, hw_row),
                             _ => {
                                 for px in 0..w {
                                     if col_ok[px] {
@@ -917,40 +1238,52 @@ pub(super) fn widened_plane_separable_with_tables(
                     }
                 }
                 // Vertical pass.
-                row_out.fill(0.0);
-                if !clean {
+                if clean {
+                    v_pass_clean(hs, w, ring, st, wy, row_out);
+                } else {
+                    row_out.fill(0.0);
                     wrow.fill(0.0);
-                }
-                for (j, &wj) in wy.iter().enumerate() {
-                    let slot = (st + j as i32).rem_euclid(ring as i32) as usize;
-                    for (o, &a) in row_out.iter_mut().zip(&hs[slot * w..(slot + 1) * w]) {
-                        *o += a * wj;
-                    }
-                    if !clean {
+                    for (j, &wj) in wy.iter().enumerate() {
+                        let slot = (st + j as i32).rem_euclid(ring as i32) as usize;
+                        for (o, &a) in row_out.iter_mut().zip(&hs[slot * w..(slot + 1) * w]) {
+                            *o += a * wj;
+                        }
                         for (o, &a) in wrow.iter_mut().zip(&hw[slot * w..(slot + 1) * w]) {
                             *o += a * wj;
                         }
                     }
                 }
             }
-            for px in 0..w {
-                if !row_ok[py] || !col_ok[px] || seg_w == 0 {
-                    row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
-                } else if clean {
-                    if row_out[px].is_nan() {
-                        row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+            if clean && row_ok[py] && all_cols_ok && seg_w > 0 {
+                // Fast clean interior row: when all touched blocks are verified present & nodata-free,
+                // no pixel can be NaN — skip scanning the entire row.
+                if !known_complete && row_out.iter().any(|v| v.is_nan()) {
+                    for px in 0..w {
+                        if row_out[px].is_nan() {
+                            row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                        }
                     }
-                } else {
-                    // Normalised weights: the valid weight is the share of the kernel on valid pixels.
-                    let ws = wrow[px];
-                    row_out[px] = if positive {
-                        if ws > 1e-6 { row_out[px] / ws } else { f32::NAN }
-                    } else if ws >= 0.5 {
-                        row_out[px] / ws
+                }
+            } else {
+                for px in 0..w {
+                    if !row_ok[py] || !col_ok[px] || seg_w == 0 {
+                        row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                    } else if clean {
+                        if row_out[px].is_nan() {
+                            row_out[px] = sample_kernel_widened(src, us[px], vs[py], scale_x, scale_y, mode);
+                        }
                     } else {
-                        fallback.push(py * w + px);
-                        f32::NAN
-                    };
+                        // Normalised weights: the valid weight is the share of the kernel on valid pixels.
+                        let ws = wrow[px];
+                        row_out[px] = if positive {
+                            if ws > 1e-6 { row_out[px] / ws } else { f32::NAN }
+                        } else if ws >= 0.5 {
+                            row_out[px] / ws
+                        } else {
+                            fallback.push(py * w + px);
+                            f32::NAN
+                        };
+                    }
                 }
             }
         }
@@ -973,7 +1306,162 @@ pub(super) fn widened_plane_separable_with_tables(
             out[i] = tent[sub_of_row[i / w] as usize * w + i % w];
         }
     }
-    out
+}
+
+    /// Zero-copy slice of `len` contiguous `f32` pixels helper, dispatch horizontal pass for a
+    /// clean band row into `hs_row`.
+#[inline(always)]
+fn h_pass_clean_dispatch(
+    src: &BandSource<'_>,
+    r: i32,
+    gc0: i32,
+    seg_w: usize,
+    pad: usize,
+    seg: &mut [f32],
+    cols: &AxisTapTable,
+    col_ok: &[bool],
+    all_cols_ok: bool,
+    hs_row: &mut [f32],
+) {
+    let row_slice: &[f32] = if let Some(direct) = src.row_segment_f32_ref(r, gc0, seg_w + pad) {
+        direct
+    } else {
+        src.read_row_segment(r, gc0, &mut seg[..seg_w]);
+        seg
+    };
+    match cols.stride {
+        4 => h_pass_fixed::<4>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+        8 => h_pass_fixed::<8>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+        12 => h_pass_fixed::<12>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+        16 => h_pass_fixed::<16>(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+        _ => h_pass_chunks4(row_slice, gc0, cols, col_ok, all_cols_ok, hs_row),
+    }
+}
+
+/// Fused 3-band clean separable convolution streaming one output row at a time into `emit_row`.
+/// Keeps 3 compact ring buffers (`3 * ring * N` floats, ~54 KiB for 512px Lanczos3) in L1/L2
+/// cache instead of materializing 3 full `N x N` planes (3 MiB), eliminating both memory traffic
+/// and per-thread scratch RSS overhead.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn widened_rgb_separable_stream_clean<const N: usize, F>(
+    u: &[f32; N],
+    v: &[f32; N],
+    srcs: &[BandSource<'_>; 3],
+    mode: ResampleMode,
+    scale_x: f32,
+    scale_y: f32,
+    cols: &AxisTapTable,
+    rows: &AxisTapTable,
+    mut emit_row: F,
+) where
+    F: FnMut(usize, &[f32; N], &[f32; N], &[f32; N]),
+{
+    let (Some((c_lo, c_hi)), Some((r_lo, r_hi))) = (cols.span(), rows.span()) else {
+        let nans = [f32::NAN; N];
+        for py in 0..N {
+            emit_row(py, &nans, &nans, &nans);
+        }
+        return;
+    };
+    let (gc0, gc1) = (c_lo.max(0), c_hi.min(srcs[0].ifd_w - 1));
+    let seg_w = if gc0 <= gc1 { (gc1 - gc0 + 1) as usize } else { 0 };
+    let (r0, r1) = (r_lo.max(0), r_hi.min(srcs[0].ifd_h - 1));
+    let known_complete = seg_w > 0
+        && srcs[0].is_clean_inbounds(gc0, gc1, r0, r1)
+        && srcs[1].is_clean_inbounds(gc0, gc1, r0, r1)
+        && srcs[2].is_clean_inbounds(gc0, gc1, r0, r1);
+    let ring = rows.stride + 1;
+    let band_ring = ring * N;
+    WIDE_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let sc = &mut *guard;
+        sc.col_ok.clear();
+        let mut all_cols_ok = true;
+        for k in 0..N {
+            let (st, t) = cols.taps(k);
+            let ok = BandSource::axis_contains_sample(u[k], srcs[0].ifd_w)
+                && st >= 0
+                && st + t.len() as i32 <= srcs[0].ifd_w;
+            all_cols_ok &= ok;
+            sc.col_ok.push(ok);
+        }
+        sc.row_ok.clear();
+        for k in 0..N {
+            let (st, t) = rows.taps(k);
+            sc.row_ok.push(
+                BandSource::axis_contains_sample(v[k], srcs[0].ifd_h)
+                    && st >= 0
+                    && st + t.len() as i32 <= srcs[0].ifd_h,
+            );
+        }
+        let pad = cols.stride;
+        if sc.seg.len() < seg_w + pad {
+            sc.seg.resize(seg_w + pad, 0.0);
+        }
+        sc.seg[seg_w..seg_w + pad].fill(0.0);
+        // Pack all 3 bands' ring buffers contiguously in `sc.hs` (3 * ring * N floats).
+        if sc.hs.len() < 3 * band_ring {
+            sc.hs.resize(3 * band_ring, 0.0);
+        }
+        sc.tags.clear();
+        sc.tags.resize(ring, i32::MIN);
+        let WideScratch { seg, hs, tags, col_ok, row_ok, .. } = sc;
+        let seg = &mut seg[..seg_w + pad];
+        let mut row_r = [0.0f32; N];
+        let mut row_g = [0.0f32; N];
+        let mut row_b = [0.0f32; N];
+        for py in 0..N {
+            if row_ok[py] && seg_w > 0 {
+                let (st, wy) = rows.taps(py);
+                for j in 0..wy.len() {
+                    let r = st + j as i32;
+                    let slot = r.rem_euclid(ring as i32) as usize;
+                    if tags[slot] == r {
+                        continue;
+                    }
+                    tags[slot] = r;
+                    for b in 0..3 {
+                        let hs_off = b * band_ring + slot * N;
+                        h_pass_clean_dispatch(
+                            &srcs[b],
+                            r,
+                            gc0,
+                            seg_w,
+                            pad,
+                            seg,
+                            cols,
+                            col_ok,
+                            all_cols_ok,
+                            &mut hs[hs_off..hs_off + N],
+                        );
+                    }
+                }
+                v_pass_clean(&hs[0..band_ring], N, ring, st, wy, &mut row_r);
+                v_pass_clean(&hs[band_ring..2 * band_ring], N, ring, st, wy, &mut row_g);
+                v_pass_clean(&hs[2 * band_ring..3 * band_ring], N, ring, st, wy, &mut row_b);
+            }
+            if !(row_ok[py] && all_cols_ok && seg_w > 0 && known_complete) {
+                for px in 0..N {
+                    if !row_ok[py] || !col_ok[px] || seg_w == 0 {
+                        row_r[px] = sample_kernel_widened(&srcs[0], u[px], v[py], scale_x, scale_y, mode);
+                        row_g[px] = sample_kernel_widened(&srcs[1], u[px], v[py], scale_x, scale_y, mode);
+                        row_b[px] = sample_kernel_widened(&srcs[2], u[px], v[py], scale_x, scale_y, mode);
+                    } else {
+                        if row_r[px].is_nan() {
+                            row_r[px] = sample_kernel_widened(&srcs[0], u[px], v[py], scale_x, scale_y, mode);
+                        }
+                        if row_g[px].is_nan() {
+                            row_g[px] = sample_kernel_widened(&srcs[1], u[px], v[py], scale_x, scale_y, mode);
+                        }
+                        if row_b[px].is_nan() {
+                            row_b[px] = sample_kernel_widened(&srcs[2], u[px], v[py], scale_x, scale_y, mode);
+                        }
+                    }
+                }
+            }
+            emit_row(py, &row_r, &row_g, &row_b);
+        }
+    });
 }
 
 /// `(scale_x, scale_y)` of `plan` when `mode` is a convolution kernel that widens on it.
@@ -987,6 +1475,26 @@ pub fn plan_widened_scale<const N: usize>(plan: &CoordPlan<N>, mode: ResampleMod
     }
     let (sx, sy) = coord_plan_scale(plan);
     kernel_widens(mode, sx, sy).then_some((sx, sy))
+}
+
+/// `(scale_x, scale_y)` when `plan` and `mode` should run through the 2-pass separable convolution
+/// pipeline: either the kernel widens (`scale > 1.05`), OR it is a `Separable1D` plan with
+/// `Lanczos`, `CubicSpline`, or `Cubic` (where 2-pass separable filtering at `scale <= 1.0` avoids
+/// per-pixel 2D 4×4/6×6 loops and shares tap tables across bands).
+#[inline]
+pub(super) fn plan_separable_conv_scale<const N: usize>(
+    plan: &CoordPlan<N>,
+    mode: ResampleMode,
+) -> Option<(f32, f32)> {
+    if let Some(s) = plan_widened_scale(plan, mode) {
+        return Some(s);
+    }
+    if matches!(plan, CoordPlan::Separable1D { .. })
+        && matches!(mode, ResampleMode::Lanczos | ResampleMode::CubicSpline | ResampleMode::Cubic)
+    {
+        return Some(coord_plan_scale(plan));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1242,6 +1750,94 @@ mod widened_kernel_tests {
                         assert!((got - want).abs() < 1e-4, "{mode:?} ({px},{py}): {got} vs {want}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn lanczos3_lut_matches_exact_sinc_within_2e_6() {
+        for i in 0..=30_000 {
+            let ax = i as f32 * 0.0001;
+            let got = lanczos3_lut(ax);
+            let want = if ax < 1e-6 {
+                1.0
+            } else if ax >= 3.0 {
+                0.0
+            } else {
+                let px = std::f64::consts::PI * ax as f64;
+                let px3 = px / 3.0;
+                ((px.sin() / px) * (px3.sin() / px3)) as f32
+            };
+            assert!(
+                (got - want).abs() < 2e-6,
+                "lanczos3_lut({ax}) = {got} vs exact {want} (err={})",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn rgb_separable_stream_clean_matches_per_pixel_lanczos() {
+        use super::super::{OutputFormat, RgbStyle, render_rgb_bands, sample_general_scaled};
+        let b0 = f32_band(96, 96, |x, y| ((x * 7 + y * 13) % 256) as f32);
+        let b1 = f32_band(96, 96, |x, y| ((x * 11 + y * 5) % 256) as f32);
+        let b2 = f32_band(96, 96, |x, y| ((x * 3 + y * 17) % 256) as f32);
+        let (r0, r1, r2) = ([Some(&b0)], [Some(&b1)], [Some(&b2)]);
+        let srcs = [
+            BandSource::new(96, 96, 96, 96, 0, 0, 1, 1, &r0),
+            BandSource::new(96, 96, 96, 96, 0, 0, 1, 1, &r1),
+            BandSource::new(96, 96, 96, 96, 0, 0, 1, 1, &r2),
+        ];
+        for (mode, scale) in [
+            (ResampleMode::Lanczos, 0.85f32),
+            (ResampleMode::Lanczos, 1.75f32),
+            (ResampleMode::Cubic, 0.9f32),
+            (ResampleMode::CubicSpline, 1.5f32),
+        ] {
+            let mut u = Box::new([0.0f32; 32]);
+            let mut v = Box::new([0.0f32; 32]);
+            for i in 0..32 {
+                u[i] = 8.3 + i as f32 * scale;
+                v[i] = 7.7 + i as f32 * scale;
+            }
+            let cols = AxisTapTable::build(mode, &u[..], scale, 96);
+            let rows = AxisTapTable::build(mode, &v[..], scale, 96);
+            widened_rgb_separable_stream_clean(
+                &u, &v, &srcs, mode, scale, scale, &cols, &rows,
+                |py, rr, rg, rb| {
+                    for px in 0..32 {
+                        for (b, got) in [rr[px], rg[px], rb[px]].into_iter().enumerate() {
+                            let want = sample_general_scaled(&srcs[b], u[px], v[py], scale, scale, mode);
+                            assert!(
+                                (got - want).abs() < 1e-3,
+                                "{mode:?} s={scale} b={b} ({px},{py}): stream={got} vs scalar={want}"
+                            );
+                        }
+                    }
+                },
+            );
+            // Smoke-test clean JPEG + PNG through render_rgb_bands.
+            let plan = CoordPlan::Separable1D {
+                u,
+                v,
+                src_min_col: 0,
+                src_max_col: 95,
+                src_min_row: 0,
+                src_max_row: 95,
+                all_in_bounds: true,
+            };
+            for fmt in [OutputFormat::Jpeg { quality: 85 }, OutputFormat::Png] {
+                let bytes = render_rgb_bands(
+                    &plan,
+                    &srcs,
+                    &RgbStyle {
+                        rescale_min: [0.0; 3],
+                        rescale_max: [255.0; 3],
+                        resample: mode,
+                        format: fmt,
+                    },
+                );
+                assert!(!bytes.is_empty());
             }
         }
     }
