@@ -10,23 +10,42 @@
 
 **A COG, STAC, MosaicJSON & Zarr tile server that speaks TiTiler's API, without GDAL.** Written in Rust. Point your map client at a new base URL and keep everything else.
 
-| Against TiTiler (CPU-only unless noted) | `cogzilla` | TiTiler | |
+| Against TiTiler 2.4 (CPU-only, encoded-tile cache off, 3× medians) | `cogzilla` | TiTiler 2.4 | |
 | :--- | ---: | ---: | ---: |
-| CPU per 1,000 tiles it has never seen (real S3 COGs, Apple M5) | **13.2 CPU-s** | 56.0 CPU-s | **4.3× less** |
-| CPU per 1,000 tiles once source blocks are cached (Apple M5) | **1.7 CPU-s** | 55.3 CPU-s | **32× less** |
-| Warm tiles/s over HTTP, 4-vCPU Linux (AMD EPYC 9V45, all cores) | **3,363** | 85 | **40×** |
-| Warm tiles/s over HTTP, Apple M5 (10 cores, all cores) | **13,195** | 180 | **73×** |
-| Reprojected 3-band RGB / 3-asset STAC band-math tile (M5, 1 core, warm) | **1.0–1.2 ms** | 45–50 ms | **43–46×** |
-| GeoJSON polygon statistics / 3-asset STAC point query (M5, 1 core, warm) | **1.49 / 0.24 ms** | 112 / 18 ms | **75×** |
-| Memory at idle | **4 MiB** | 1,112 MiB | **278× less** |
+| CPU per 1,000 tiles, cold miss (real S3 COGs, Apple M5) | **13.2 CPU-s** | 56.0 CPU-s | **4.3× less** |
+| CPU per 1,000 tiles, cached blocks (real S3 COGs, Apple M5) | **1.7 CPU-s** | 55.3 CPU-s | **32× less** |
+| Warm `256²` Mercator PNG over HTTP (Apple M5 `10C`, `c=32`) | **20,025 req/s** | 877 req/s | **23×** |
+| Warm `256²` RGB PNG over HTTP (3960X `48T` / M5 `10C`) | **7,622 / 7,298** | 952 / 419 | **8–17×** |
+| Warm `512²` RGB Lanczos3 JPEG (`c=32`, 3960X `48T` / M5 `10C`) | **7,908 / 3,288** | 240 / 104 | **32–33×** |
+| Reprojected UTM RGB / STAC band-math tile (M5, 1 core, warm) | **0.94 / 0.73 ms** | 9.1 / 23.6 ms | **10–32×** |
+| GeoJSON polygon statistics / 3-asset STAC point (M5, 1 core, warm) | **12.9 / 0.25 ms** | 55.2 / 15.2 ms | **4.3× / 62×** |
+| Memory at idle (M5, 1 process vs 10 TiTiler workers) | **9.8 MiB** | 1,236 MiB | **126× less** |
 
-Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network (lossy WebP on 4-vCPU Linux is **10.9×** warm / **7.0×** cold vs GDAL). Hardware specs, core counts, scaling graphs, and caveats are in [docs/benchmarks.md](docs/benchmarks.md) and [docs/gpu-benchmarks.md](docs/gpu-benchmarks.md).
+Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network. Full tables, hardware specs, and caveats are in [docs/benchmarks.md](docs/benchmarks.md) and [docs/gpu-benchmarks.md](docs/gpu-benchmarks.md).
+
+<p align="center">
+  <img src="assets/bench-concurrency-overload.png" alt="cogzilla vs TiTiler 2.4 throughput and latency scaling on 256x256 RGB Bilinear PNG and 512x512 RGB Lanczos3 JPEG across Apple M5 and Threadripper 3960X" width="100%" />
+</p>
+
+<details>
+<summary><strong>GPU Acceleration (wgpu Metal &amp; Vulkan) &amp; Live HTTP AIMD Overload Protection</strong></summary>
+<p align="center">
+  <img src="assets/bench-workload-contention.png" alt="GPU acceleration across heavy single-request endpoints, sustained soak p50 latency, and live HTTP AIMD overload goodput and latency" width="100%" />
+</p>
+</details>
+
+<details>
+<summary><strong>Cloud Storage Caching — Real S3 COGs &amp; Verified GDAL Range-Request Behavior</strong></summary>
+<p align="center">
+  <img src="assets/bench-s3-cache-scaling.png" alt="Real S3 COGs measured cold miss vs warm cache CPU cost and controlled HTTP Range origin verification" width="100%" />
+</p>
+</details>
 
 <p align="center">
   <img src="assets/terrain-gallery.jpg" alt="Mt. Rainier rendered six ways by cogzilla: colormapped elevation, hillshade, slope, aspect, Terrarium RGB and Mapbox Terrain-RGB" width="100%" />
 </p>
 
-Mt. Rainier from the public Copernicus 30 m DEM on S3, six ways from one file: colormapped elevation, hillshade, slope, aspect, and the Terrarium and Mapbox Terrain-RGB encodings that drive 3D terrain in MapLibre. Nothing is pre-rendered: every tile is resampled, shaded, colormapped and encoded when it is requested, at 3,372 hillshade tiles per second on an M5 once the source blocks are cached.
+Mt. Rainier from the public Copernicus 30 m DEM on S3, six ways from one file: colormapped elevation, hillshade, slope, aspect, and the Terrarium and Mapbox Terrain-RGB encodings that drive 3D terrain in MapLibre. Nothing is pre-rendered: every tile is resampled, shaded, colormapped and encoded when it is requested, at **7,952 hillshade tiles/s** (`1.69 ms` p50, encoded-tile cache off) on an Apple M5 once source blocks are cached.
 
 ## Try the demo
 
@@ -65,7 +84,7 @@ Prebuilt binaries for Linux and macOS (x86_64 and arm64) and native **AWS Lambda
 
 ## Coming from TiTiler
 
-Change the base URL. The `/cog`, `/stac`, `/algorithms`, `/colorMaps`, and `/tileMatrixSets` routes pass **174 of 174** differential checks against a live TiTiler 2.4.1 (`benches/titiler_diff_oracle.py`). Outputs are the same picture, not necessarily the same bytes.
+Change the base URL. The `/cog`, `/stac`, `/mosaicjson`, `/zarr`, `/algorithms`, `/colorMaps`, and `/tileMatrixSets` routes pass **755 of 755** differential checks against a live TiTiler 2.4 (`benches/titiler_diff_oracle.py` & `benches/adversarial_diff_oracle.py`). Outputs are the same picture, not necessarily the same bytes.
 
 `cogzilla` is not a general replacement. Its [pgSTAC support](docs/api.md#pgstac) covers titiler-pgstac's search, collection and item routes with [some options still missing](docs/api.md#not-there-yet), it has no custom Python algorithms or readers, and it only reads GeoTIFFs in the [coordinate systems it can place exactly](docs/api.md#coordinate-systems). For anything else, use TiTiler. A TiTiler option that `cogzilla` does not implement returns a `400` or `422` rather than being ignored; intentional differences are documented in [docs/titiler-divergences.md](docs/titiler-divergences.md) and [docs/api.md](docs/api.md#notes-on-titiler-compatibility).
 
