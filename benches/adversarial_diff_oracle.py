@@ -1384,6 +1384,22 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     assert p_w51_be_f32.read_bytes()[:2] == b"MM", "w51_be_f32_p3 must be Big-Endian MM"
     out["w51_be_f32_p3"] = p_w51_be_f32
 
+    # Wave 52: 3-band uint16 RGB COG with nodata=0 hole (unrescaled 16-bit RGBA PNG + .npy)
+    p_w52_u16_rgb = synth_dir / "w52_u16_rgb.tif"
+    r52 = (1000 + xx9.astype(np.uint32) * 300).astype(np.uint16)
+    g52 = (2000 + yy9.astype(np.uint32) * 300).astype(np.uint16)
+    b52 = (3000 + (xx9 + yy9).astype(np.uint32) * 150).astype(np.uint16)
+    r52[80:100, 60:80] = 0
+    g52[80:100, 60:80] = 0
+    b52[80:100, 60:80] = 0
+    with rasterio.open(
+        p_w52_u16_rgb, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", photometric="rgb", nodata=0,
+    ) as ds:
+        ds.write(np.stack([r52, g52, b52]))
+    out["w52_u16_rgb"] = p_w52_u16_rgb
+
     return out
 
 
@@ -3961,6 +3977,7 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W44 ZARR POST /statistics 2-feature FeatureCollection",
         "W44 ZARR POST /statistics coord_crs=EPSG:3857",
         "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy",
+        "W52 ZARR v2 shuffle filter + zlib compressor /bbox .npy",
     ]
     if not any(wanted(lb) for lb in labels):
         return 0
@@ -4277,6 +4294,7 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
         "W44 ZARR POST /statistics 2-feature FeatureCollection",
         "W44 ZARR POST /statistics coord_crs=EPSG:3857",
         "W50 ZARR v3 4-stage (transpose+big-endian+gzip+crc32c) .npy",
+        "W52 ZARR v2 shuffle filter + zlib compressor /bbox .npy",
     ]
     if any(wanted(l) for l in w44_labels):
         def _crc32c_w44(data: bytes) -> int:
@@ -4493,6 +4511,48 @@ def run_wave30_zarr_codecs_multiurl_rpc_checks(
                 gz_be + struct.pack("<I", _crc32c_w44(gz_be)),
             )
             p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z_4s)}&variable=data"
+            rb = client.get(cw_base + p_bb)
+            if rb.status_code == 200:
+                ab = np.load(io.BytesIO(rb.content))
+                err = float(np.abs(ab[0] - arr44).max())
+                rec(lb, err < 1e-4, f"max_err={err:.5f}", p_bb)
+                if gpu_base:
+                    rbg = client.get(gpu_base + p_bb)
+                    if rbg.status_code != 200:
+                        gpu_diffs.append({"label": lb, "detail": f"GPU HTTP {rbg.status_code}"})
+                    else:
+                        ok_g, det_g = compare_npy(rb.content, rbg.content, check_values=True)
+                        if not ok_g:
+                            gpu_diffs.append({"label": lb, "detail": det_g})
+            else:
+                rec(lb, False, f"HTTP {rb.status_code} {rb.text[:80]!r}", p_bb)
+
+        lb = "W52 ZARR v2 shuffle filter + zlib compressor /bbox .npy"
+        if wanted(lb):
+            z2_sh = w30_dir / "w52_z2_shuf_zlib.zarr"
+            z2_sh.mkdir(parents=True, exist_ok=True)
+            (z2_sh / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+            for vn, va, vd in [("lon", xs44, ["lon"]), ("lat", ys44, ["lat"])]:
+                d_ = z2_sh / vn
+                d_.mkdir()
+                (d_ / ".zarray").write_text(json.dumps({
+                    "zarr_format": 2, "shape": [len(va)], "chunks": [len(va)], "dtype": "<f8",
+                    "compressor": None, "fill_value": None, "order": "C", "filters": None,
+                }))
+                (d_ / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": vd}))
+                (d_ / "0").write_bytes(va.tobytes())
+            dv = z2_sh / "val"
+            dv.mkdir()
+            (dv / ".zarray").write_text(json.dumps({
+                "zarr_format": 2, "shape": [h44, w44], "chunks": [h44, w44], "dtype": "<f4",
+                "compressor": {"id": "zlib", "level": 5},
+                "filters": [{"id": "shuffle", "elementsize": 4}],
+                "fill_value": -9999.0, "order": "C",
+            }))
+            (dv / ".zattrs").write_text(json.dumps({"_ARRAY_DIMENSIONS": ["lat", "lon"]}))
+            shuf = np.frombuffer(raw44, dtype=np.uint8).reshape(-1, 4).T.tobytes()
+            (dv / "0.0").write_bytes(zlib.compress(shuf, level=5))
+            p_bb = f"/zarr/bbox/-122.5,37.5,-122.0,38.0/64x64.npy?url={q(z2_sh)}&variable=val"
             rb = client.get(cw_base + p_bb)
             if rb.status_code == 200:
                 ab = np.load(io.BytesIO(rb.content))
@@ -5283,6 +5343,11 @@ def main() -> int:
                 ("PARITY W51 POST /statistics all_touched=true", "POST", f"/cog/statistics?url={q(s['w51_be_f32_p3'])}&all_touched=true", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.40, 37.60], [-122.10, 37.60], [-122.10, 37.90], [-122.40, 37.90], [-122.40, 37.60]]]}}, "post_stats"),
                 ("PARITY W51 GET /bbox per-band rescale + color_formula .png", "GET", f"/cog/bbox/-122.4,37.6,-122.1,37.9/64x64.png?url={q(s['w43_rgb_nodata'])}&rescale=0,200&rescale=0,220&rescale=0,240&color_formula={qe('Gamma RGB 1.4 Saturation 1.2')}", None, "png"),
                 ("PARITY W51 POST /feature per-band rescale + color_formula .png", "POST", f"/cog/feature/64x64.png?url={q(s['w43_rgb_nodata'])}&rescale=0,200&rescale=0,220&rescale=0,240&color_formula={qe('Gamma RGB 1.4 Saturation 1.2')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.40, 37.60], [-122.10, 37.60], [-122.10, 37.90], [-122.40, 37.90], [-122.40, 37.60]]]}}, "png"),
+                # --- Wave 52: 16-bit unrescaled 3-band uint16 RGBA PNG & .npy, STAC POST /statistics coord_crs=3857 + inline pipe expr ---
+                ("PARITY W52 16-bit unrescaled 3-band uint16 RGBA .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w52_u16_rgb'])}", None, "png"),
+                ("PARITY W52 16-bit 3-band uint16 .npy + nodata=0 hole", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w52_u16_rgb'])}", None, "npy"),
+                ("PARITY W52 STAC POST /statistics coord_crs=EPSG:3857", "POST", f"/stac/statistics?url={q(s['w36_stac5b'])}&assets={qe('ms|bidx=4')}&coord_crs=EPSG:3857", w37_poly_3857, "post_stats"),
+                ("PARITY W52 STAC POST /statistics inline expr + 3857", "POST", f"/stac/statistics?url={q(s['w36_stac5b'])}&assets={qe('ms|expression=(b4-b3)/(b4+b3)')}&coord_crs=EPSG:3857", w37_poly_3857, "post_stats"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
