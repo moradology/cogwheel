@@ -42,6 +42,7 @@ from urllib.parse import quote
 
 import httpx
 import mercantile
+import morecantile
 import numpy as np
 from PIL import Image
 from pyproj import Transformer
@@ -701,6 +702,44 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     with rasterio.open(p_w22_2b, "w", driver="GTiff", width=128, height=128, count=2, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
         ds.write(np.stack([(-40.0 + xx9.astype(np.float32) * 0.5), (-45.0 + yy9.astype(np.float32) * 0.5)]))
     out["w22_f32_2b"] = p_w22_2b
+
+    # Wave 23: Categorical uint8 (with nodata=255), negative int16 (with nodata=-9999), and 3-band float32 for stats params & per-band rescale
+    p_w23_cat = synth_dir / "w23_cat_u8.tif"
+    cat23 = (((xx9 // 16) + (yy9 // 16)) % 4).astype(np.uint8)
+    cat23[0:16, 0:16] = 255
+    with rasterio.open(p_w23_cat, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=255) as ds:
+        ds.write(cat23, 1)
+    out["w23_cat_u8"] = p_w23_cat
+
+    p_w23_neg = synth_dir / "w23_cat_i16.tif"
+    neg23 = np.where((xx9 // 32) % 3 == 0, -10, np.where((xx9 // 32) % 3 == 1, 0, 10)).astype(np.int16)
+    neg23[0:16, 0:16] = -9999
+    with rasterio.open(p_w23_neg, "w", driver="GTiff", width=128, height=128, count=1, dtype="int16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-9999) as ds:
+        ds.write(neg23, 1)
+    out["w23_cat_i16"] = p_w23_neg
+
+    p_w23_3b = synth_dir / "w23_f32_3b.tif"
+    with rasterio.open(p_w23_3b, "w", driver="GTiff", width=128, height=128, count=3, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write(np.stack([
+            (10.0 + xx9.astype(np.float32) * 1.5 + yy9.astype(np.float32) * 0.5),
+            (40.0 + xx9.astype(np.float32) * 0.8 + yy9.astype(np.float32) * 1.2),
+            (80.0 + (xx9 + yy9).astype(np.float32) * 0.9),
+        ]))
+        ds.scales = (0.1, 0.2, 0.5)
+        ds.offsets = (1.0, 2.0, 3.0)
+    out["w23_f32_3b"] = p_w23_3b
+
+    # Wave 24: Regional EPSG:4326 COGs for non-Mercator OGC TileMatrixSets
+    grad24 = 100.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32) * 1.5
+    for key, bounds in (
+        ("w24_eu", (9.0, 47.0, 12.0, 50.0)),
+        ("w24_nz", (171.0, -43.5, 174.0, -40.5)),
+        ("w24_ca", (-100.0, 50.0, -94.0, 56.0)),
+    ):
+        p_reg = synth_dir / f"{key}.tif"
+        with rasterio.open(p_reg, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=from_bounds(*bounds, 128, 128), tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+            ds.write(grad24[None])
+        out[key] = p_reg
 
     return out
 
@@ -2922,7 +2961,36 @@ def main() -> int:
                 ("PARITY W22 EXPR abs+sqrt(abs) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('sqrt(abs(b1))+abs(b2)')}", None, "npy"),
                 ("PARITY W22 EXPR log1p(abs) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w22_f32_2b'])}&expression={qe('log1p(abs(b1))')}", None, "npy"),
                 ("BETTER W22 EXPR domain sqrt(b1) w/ negs .png (cw masks NaN, tt purple)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w22_f32_2b'])}&expression={qe('sqrt(b1)')}&rescale=0,10&colormap_name=viridis", None, "better_expr_nan_masked"),
+                # --- Wave 23: /info.geojson, stats params (categorical, p=, histogram_bins/range, FeatureCollection), per-band rescale & dup bidx ---
+                ("PARITY W23 /cog/info.geojson", "GET", f"/cog/info.geojson?url={q(s['w23_f32_3b'])}", None, "info_geojson_w23"),
+                ("PARITY W23 STATS categorical uint8", "GET", f"/cog/statistics?url={q(s['w23_cat_u8'])}&categorical=true", None, "stats_w23"),
+                ("PARITY W23 STATS categorical neg int16", "GET", f"/cog/statistics?url={q(s['w23_cat_i16'])}&categorical=true", None, "stats_w23"),
+                ("PARITY W23 STATS custom p=10,50,90", "GET", f"/cog/statistics?url={q(s['w23_f32_3b'])}&bidx=1&p=10&p=50&p=90", None, "stats_w23"),
+                ("PARITY W23 STATS histogram_bins=5 range=0,200", "GET", f"/cog/statistics?url={q(s['w23_f32_3b'])}&bidx=1&histogram_bins=5&histogram_range=0,200", None, "stats_w23"),
+                ("PARITY W23 STATS unscale=true", "GET", f"/cog/statistics?url={q(s['w23_f32_3b'])}&unscale=true", None, "stats"),
+                ("PARITY W23 STATS expression (b2-b1)/(b2+b1)", "GET", f"/cog/statistics?url={q(s['w23_f32_3b'])}&expression={qe('(b2-b1)/(b2+b1)')}", None, "stats"),
+                ("PARITY W23 POST /statistics FeatureCollection 2x", "POST", f"/cog/statistics?url={q(s['w23_cat_u8'])}&categorical=true&p=25&p=75", {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {"type": "Feature", "id": "west", "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.25, 37.55], [-122.25, 37.95], [-122.45, 37.95], [-122.45, 37.55]]]}, "properties": {"name": "west"}},
+                        {"type": "Feature", "id": "east", "geometry": {"type": "Polygon", "coordinates": [[[-122.25, 37.55], [-122.05, 37.55], [-122.05, 37.95], [-122.25, 37.95], [-122.25, 37.55]]]}, "properties": {"name": "east"}},
+                    ],
+                }, "post_fc_stats_w23"),
+                ("PARITY W23 PER-BAND rescale 3-band .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w23_f32_3b'])}&rescale=0,100&rescale=50,200&rescale=100,300", None, "png"),
+                ("PARITY W23 DUP bidx=1,1,1 pseudo-RGB .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w23_f32_3b'])}&bidx=1&bidx=1&bidx=1&rescale=0,250", None, "png"),
+                ("PARITY W23 DUP bidx=1,1,1 pseudo-RGB .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w23_f32_3b'])}&bidx=1&bidx=1&bidx=1", None, "npy"),
             ]
+            # --- Wave 24: Non-Mercator OGC TileMatrixSets (pixel + Content-Crs/Content-Bbox parity) ---
+            for tms_id, fpath, lon, lat, z in (
+                ("WGS1984Quad", s["w23_f32_3b"], -122.25, 37.75, 8),
+                ("WorldMercatorWGS84Quad", s["w23_f32_3b"], -122.25, 37.75, 9),
+                ("EuropeanETRS89_LAEAQuad", s["w24_eu"], 10.5, 48.5, 6),
+                ("NZTM2000Quad", s["w24_nz"], 172.5, -42.0, 5),
+                ("CanadianNAD83_LCC", s["w24_ca"], -97.0, 53.0, 5),
+            ):
+                t24 = morecantile.tms.get(tms_id).tile(lon, lat, z)
+                cases.append((f"PARITY W24 TMS {tms_id} {z}/{t24.x}/{t24.y}.npy", "GET", f"/cog/tiles/{tms_id}/{z}/{t24.x}/{t24.y}.npy?url={q(fpath)}", None, "npy"))
+                cases.append((f"PARITY W24 TMS {tms_id} {z}/{t24.x}/{t24.y}.png+hdr", "GET", f"/cog/tiles/{tms_id}/{z}/{t24.x}/{t24.y}.png?url={q(fpath)}&bidx=1&rescale=100,600&colormap_name=viridis", None, "headers"))
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
@@ -2988,10 +3056,21 @@ def main() -> int:
                                 gok, gd = compare_npy(r_cw.content, r_gpu.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                             elif "image/tiff" in ct:
                                 gok, gd = compare_geotiffs(r_cw.content, r_gpu.content, compare_pixels=True, masked=not is_unmasked, smooth=is_smooth)
-                            elif kind == "stats":
+                            elif kind in ("stats", "stats_w23"):
                                 gok, gd = compare_stats_strict(r_cw.json(), r_gpu.json())
                             elif kind == "post_stats":
                                 gok, gd = compare_stats_strict(r_cw.json()["properties"]["statistics"], r_gpu.json()["properties"]["statistics"])
+                            elif kind == "post_fc_stats_w23":
+                                fc_c, fc_g = r_cw.json()["features"], r_gpu.json()["features"]
+                                gok, gd = True, "ok"
+                                for fi in range(len(fc_c)):
+                                    fok, fgd = compare_stats_strict(fc_c[fi]["properties"]["statistics"], fc_g[fi]["properties"]["statistics"])
+                                    if not fok:
+                                        gok, gd = False, f"f{fi}: {fgd}"
+                                        break
+                            elif kind == "info_geojson_w23":
+                                d_ig = first_json_diff(r_cw.json(), r_gpu.json())
+                                gok, gd = (d_ig is None), (d_ig or "exact JSON match")
                             elif kind == "point" or "/point/" in path:
                                 gok, gd = compare_point_strict(r_cw.json(), r_gpu.json())
                             elif kind == "tilejson_w18":
@@ -3228,6 +3307,44 @@ def main() -> int:
                             ok, detail = same_place(r_cw, r_tt)
                     elif kind == "stats":
                         ok, detail = compare_stats_strict(r_cw.json(), r_tt.json())
+                    elif kind == "stats_w23":
+                        jc, jt = r_cw.json(), r_tt.json()
+                        ok, detail = compare_stats_strict(jc, jt)
+                        if ok and "categorical=true" in path:
+                            hc, ht = jc["b1"].get("histogram", [[], []]), jt["b1"].get("histogram", [[], []])
+                            ok = len(hc[0]) == len(ht[0]) and len(hc[0]) >= 3 and hc[1] == ht[1] and hc[0] == ht[0]
+                            detail += f" hist_vals={hc[1]} counts={hc[0]}"
+                        if ok and "&p=10" in path:
+                            for pk in ("percentile_10", "percentile_50", "percentile_90"):
+                                vc, vt = jc["b1"].get(pk), jt["b1"].get(pk)
+                                if vc is None or vt is None or abs(vc - vt) > 0.5:
+                                    ok = False
+                                    detail += f" {pk}: cw={vc} tt={vt}"
+                        if ok and "histogram_bins=5" in path:
+                            hc, ht = jc["b1"]["histogram"], jt["b1"]["histogram"]
+                            ok = len(hc[0]) == 5 and len(ht[0]) == 5 and max(abs(a - b) for a, b in zip(hc[1], ht[1])) < 1e-4
+                            detail += f" bins={len(hc[0])} edges=[{hc[1][0]}..{hc[1][-1]}]"
+                    elif kind == "info_geojson_w23":
+                        jc, jt = r_cw.json(), r_tt.json()
+                        ok = (
+                            jc.get("type") == "Feature"
+                            and jc.get("geometry", {}).get("type") == "Polygon"
+                            and jc["properties"]["count"] == jt["properties"]["count"]
+                            and jc["properties"]["dtype"] == jt["properties"]["dtype"]
+                            and jc["properties"]["bounds"] == jt["properties"]["bounds"]
+                        )
+                        detail = f"type={jc.get('type')} count={jc['properties']['count']} dtype={jc['properties']['dtype']}"
+                    elif kind == "post_fc_stats_w23":
+                        fc_c, fc_t = r_cw.json(), r_tt.json()
+                        ok = fc_c.get("type") == "FeatureCollection" and len(fc_c.get("features", [])) == 2
+                        dets = []
+                        for fi in range(2):
+                            sc = fc_c["features"][fi]["properties"]["statistics"]
+                            st = fc_t["features"][fi]["properties"]["statistics"]
+                            fok, fdet = compare_stats_strict(sc, st)
+                            ok = ok and fok
+                            dets.append(f"f{fi}:{fdet}")
+                        detail = " | ".join(dets)
                     elif kind == "post_stats":
                         ok, detail = compare_stats_strict(r_cw.json()["properties"]["statistics"], r_tt.json()["properties"]["statistics"])
                     elif kind == "point":

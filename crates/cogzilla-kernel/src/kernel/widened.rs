@@ -838,21 +838,27 @@ unsafe fn h_pass_fixed_avx2<const K: usize>(
 ) {
     use std::arch::x86_64::{
         __m128, __m256, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps,
-        _mm_mul_ps, _mm_shuffle_ps, _mm256_add_ps, _mm256_castps256_ps128, _mm256_extractf128_ps,
+        _mm_mul_ps, _mm_shuffle_ps, _mm256_castps256_ps128, _mm256_extractf128_ps,
         _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
     };
     #[inline(always)]
     unsafe fn hsum128(v: __m128) -> f32 {
-        let hi = _mm_movehl_ps(v, v);
-        let s = _mm_add_ps(v, hi);
-        let shuf = _mm_shuffle_ps(s, s, 0x55);
-        _mm_cvtss_f32(_mm_add_ss(s, shuf))
+        // SAFETY: `h_pass_fixed_avx2` has `#[target_feature(enable = "avx2,fma")]` (implies SSE).
+        unsafe {
+            let hi = _mm_movehl_ps(v, v);
+            let s = _mm_add_ps(v, hi);
+            let shuf = _mm_shuffle_ps(s, s, 0x55);
+            _mm_cvtss_f32(_mm_add_ss(s, shuf))
+        }
     }
     #[inline(always)]
     unsafe fn hsum256(v: __m256) -> f32 {
-        let lo = _mm256_castps256_ps128(v);
-        let hi = _mm256_extractf128_ps(v, 1);
-        hsum128(_mm_add_ps(lo, hi))
+        // SAFETY: `h_pass_fixed_avx2` has `#[target_feature(enable = "avx2,fma")]` (implies AVX/SSE).
+        unsafe {
+            let lo = _mm256_castps256_ps128(v);
+            let hi = _mm256_extractf128_ps(v, 1);
+            hsum128(_mm_add_ps(lo, hi))
+        }
     }
     let seg_ptr = seg.as_ptr();
     let w_ptr = cols.weights.as_ptr();
