@@ -1011,6 +1011,40 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(f32_nan_w35, 1)
     out["w35_f32_nan_notag"] = p_w35_nan
 
+    # Wave 36: 5-band multispectral COG (B, G, R, NIR, SWIR), DEM for /bbox & /feature algorithms, and STAC item
+    p_w36_5b = synth_dir / "w36_5band.tif"
+    b5_w36 = np.stack([
+        (10.0 + xx9 * 0.5).astype(np.float32),
+        (20.0 + yy9 * 0.5).astype(np.float32),
+        (30.0 + xx9 * 0.8 + yy9 * 0.2).astype(np.float32),
+        (80.0 + yy9 * 1.2 + xx9 * 0.3).astype(np.float32),
+        (50.0 + (xx9 + yy9) * 0.4).astype(np.float32),
+    ])
+    with rasterio.open(
+        p_w36_5b, "w", driver="GTiff", width=128, height=128, count=5, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(b5_w36)
+    out["w36_5band"] = p_w36_5b
+
+    p_w36_dem = synth_dir / "w36_dem.tif"
+    dem_w36 = (200.0 + xx9 * 5.0 + yy9 * 3.0 + 40.0 * np.sin(xx9 / 8.0)).astype(np.float32)
+    with rasterio.open(
+        p_w36_dem, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(dem_w36, 1)
+    out["w36_dem"] = p_w36_dem
+
+    p_w36_stac = synth_dir / "w36_stac5b.json"
+    p_w36_stac.write_text(json.dumps({
+        "type": "Feature", "stac_version": "1.0.0", "id": "w36-5b",
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.5], [-122.0, 37.5], [-122.0, 38.0], [-122.5, 38.0], [-122.5, 37.5]]]},
+        "bbox": [-122.5, 37.5, -122.0, 38.0], "properties": {"datetime": "2024-06-01T00:00:00Z"}, "links": [],
+        "assets": {"ms": {"href": str(p_w36_5b)}},
+    }))
+    out["w36_stac5b"] = p_w36_stac
+
     return out
 
 
@@ -4331,6 +4365,20 @@ def main() -> int:
                 ("PARITY W35 NODATA=nan tagless f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w35_f32_nan_notag'])}&nodata=nan", None, "npy"),
                 ("PARITY W35 NODATA=nan tagless f32 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w35_f32_nan_notag'])}&nodata=nan&rescale=0,400&colormap_name=viridis", None, "png"),
                 ("PARITY W35 NODATA=nan tagless f32 /statistics", "GET", f"/cog/statistics?url={q(s['w35_f32_nan_notag'])}&nodata=nan", None, "stats"),
+                # --- Wave 36: 5-band multispectral COG, /bbox & /feature algorithms, STAC FC stats & expr sci-notation ---
+                ("PARITY W36 5-BAND CIR bidx=4,3,2 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w36_5band'])}&bidx=4&bidx=3&bidx=2&rescale=0,300", None, "png"),
+                ("PARITY W36 5-BAND NDVI (b4-b3)/(b4+b3) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w36_5band'])}&expression={qe('(b4-b3)/(b4+b3)')}", None, "npy"),
+                ("PARITY W36 5-BAND /statistics (b1..b5)", "GET", f"/cog/statistics?url={q(s['w36_5band'])}", None, "stats"),
+                ("PARITY W36 BBOX algorithm=terrarium .png", "GET", f"/cog/bbox/-122.45,37.55,-122.05,37.95/64x64.png?url={q(s['w36_dem'])}&algorithm=terrarium", None, "png"),
+                ("BETTER W36 BBOX algorithm=hillshade (cw 64x64, tt 58x58)", "GET", f"/cog/bbox/-122.45,37.55,-122.05,37.95/64x64.png?url={q(s['w36_dem'])}&algorithm=hillshade", None, "better_bbox_hillshade_64"),
+                ("PARITY W36 BBOX algorithm=contours inc=100 .png", "GET", f"/cog/bbox/-122.45,37.55,-122.05,37.95/64x64.png?url={q(s['w36_dem'])}&algorithm=contours&algorithm_params={qe(json.dumps({'increment':100}))}", None, "png"),
+                ("PARITY W36 POST /feature algorithm=terrarium .png", "POST", f"/cog/feature/64x64.png?url={q(s['w36_dem'])}&algorithm=terrarium", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}, "png"),
+                ("PARITY W36 POST /feature expr NDVI .npy", "POST", f"/cog/feature/64x64.npy?url={q(s['w36_5band'])}&expression={qe('(b4-b3)/(b4+b3)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}, "npy"),
+                ("PARITY W36 POST /stac/statistics FC 2-feat ms|bidx=4", "POST", f"/stac/statistics?url={q(s['w36_stac5b'])}&assets={qe('ms|bidx=4')}", {"type": "FeatureCollection", "features": [
+                    {"type": "Feature", "id": "a", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.80], [-122.30, 37.80], [-122.30, 37.95], [-122.45, 37.95], [-122.45, 37.80]]]}},
+                    {"type": "Feature", "id": "b", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.20, 37.55], [-122.05, 37.55], [-122.05, 37.70], [-122.20, 37.70], [-122.20, 37.55]]]}},
+                ]}, "post_fc_stats_w23"),
+                ("PARITY W36 EXPR sci-notation + arctan .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w36_5band'])}&expression={qe('arctan(b1*1e-2)+2.5e1')}", None, "npy"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -4704,6 +4752,14 @@ def main() -> int:
                             vmax = int(ac[0][vm].max()) if vm.any() else 0
                             ok = ac.shape == (2, 256, 256) and ac.dtype == np.uint64 and int(vm.sum()) > 10000 and vmin >= 1000 and vmax > 10000000
                             detail = f"cw=200 dtype={ac.dtype} valid={int(vm.sum())} range=[{vmin}..{vmax}] tt=500"
+                    elif kind == "better_bbox_hillshade_64":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            ok = imc.shape == (64, 64, 4) and imt.shape[:2] == (58, 58) and int((imc[..., 3] == 255).sum()) == 64 * 64
+                            detail = f"cw={imc.shape[:2]} tt={imt.shape[:2]}"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
