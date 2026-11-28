@@ -1374,17 +1374,43 @@ fn build_band_request(
     if let Some(def) = pq.algorithm.as_deref().and_then(crate::algorithms::lookup_algorithm) {
         use crate::algorithms::AlgorithmId;
         let band_1based = pq.bidx.first().copied().unwrap_or(1);
+        // A terrain algorithm over band math reads the expression's first output, as rio-tiler
+        // gives the algorithm the expression's results.
+        let dem_math = match pq
+            .expr_raw
+            .as_deref()
+            .filter(|_| def.kind == crate::algorithms::AlgorithmKind::Dem)
+            // A spectral preset (`ndvi`) is left to the algorithm's own band, as the band
+            // math algorithms leave it (`algorithm_over_expression`).
+            .filter(|expr| SpectralExpr::from_str_opt(expr).is_none())
+            .and_then(|expr| expression_parts(expr).next())
+        {
+            Some(first) => {
+                let prog = ExprProgram::compile(first).map_err(EngineError::BadRequest)?;
+                // The elevations are read where the bands are: an expression that reads
+                // none has no raster to read them over.
+                if prog.used_bands.is_empty() {
+                    return Err(EngineError::BadRequest(format!(
+                        "a terrain algorithm's expression must read a band: '{first}'"
+                    )));
+                }
+                Some(prog)
+            }
+            None => None,
+        };
         match def.id {
             AlgorithmId::Terrarium => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     algorithm: DemAlgorithm::Terrarium,
+                    math: dem_math,
                 });
             }
             AlgorithmId::TerrainRgb => {
                 return Ok(BandRequest::Terrain {
                     band_1based,
                     algorithm: DemAlgorithm::TerrainRgb,
+                    math: dem_math,
                 });
             }
             AlgorithmId::Hillshade => {
@@ -1403,6 +1429,7 @@ fn build_band_request(
                     },
                     rescale,
                     colormap,
+                    math: dem_math,
                 });
             }
             AlgorithmId::Slope => {
@@ -1414,6 +1441,7 @@ fn build_band_request(
                     },
                     rescale,
                     colormap: pq.colormap,
+                    math: dem_math,
                 });
             }
             AlgorithmId::Aspect => {
@@ -1423,6 +1451,7 @@ fn build_band_request(
                     algorithm: DemAlgorithm::Aspect,
                     rescale,
                     colormap: pq.colormap,
+                    math: dem_math,
                 });
             }
             AlgorithmId::Contours => {
@@ -1434,6 +1463,7 @@ fn build_band_request(
                         minz: pq.contour_minz,
                         maxz: pq.contour_maxz,
                     },
+                    math: dem_math,
                 });
             }
             AlgorithmId::NormalizedIndex

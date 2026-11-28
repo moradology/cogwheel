@@ -6683,6 +6683,73 @@ async fn stac_stacks_every_band_of_several_assets() {
     assert_eq!(pixel("&assets=a%7Cbidx%3D2&assets=b").await, [5.0, 11.0, 13.0]);
     assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b").await, [8.0, 11.0, 13.0]);
     assert_eq!(pixel("&assets=a%7Cexpression%3Db1%2Bb2&assets=b&expression=b1*b3").await, [104.0]);
+    // A terrain algorithm over band math reads its first output, as rio-tiler does: terrarium
+    // encodes 32768 + the value as red, green and blue.
+    assert_eq!(pixel("&assets=a&algorithm=terrarium").await, [128.0, 3.0, 0.0]);
+    assert_eq!(pixel("&assets=a&expression=b2*2&algorithm=terrarium").await, [128.0, 10.0, 0.0]);
+    assert_eq!(pixel("&assets=a&assets=b&expression=b3-b1;b1&algorithm=terrarium").await, [128.0, 8.0, 0.0]);
+    // Its statistics read the same stack, asset names included (terrarium's green is the value).
+    // An asset's own band math is read there too: `a|expression=b1+b2` is 3 + 5.
+    for q in [
+        "&assets=a&assets=b&expression=b3-b1",
+        "&assets=a&assets=b&expression=b_b1-a_b1",
+        "&assets=a%7Cexpression%3Db1%2Bb2",
+    ] {
+        let resp = client
+            .get(format!("{base}/stac/statistics?url={url}&max_size=16&algorithm=terrarium{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{q}");
+        let stats: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+        assert_eq!(stats["b2"]["mean"].as_f64(), Some(8.0), "{q}: {stats}");
+    }
+    // An expression beside an algorithm that is not a terrain one is left to that algorithm.
+    let resp = client
+        .get(format!("{base}/stac/preview.png?url={url}&max_size=16&assets=a&expression=ndvi&algorithm=cast"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    // ... and a spectral preset beside a terrain algorithm reads the band, as before.
+    assert_eq!(pixel("&assets=a&expression=ndvi&algorithm=terrarium").await, [128.0, 3.0, 0.0]);
+    let resp = client
+        .get(format!("{base}/stac/statistics?url={url}&max_size=16&assets=a&expression=ndvi&algorithm=terrarium"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let stats: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(stats["b2"]["mean"].as_f64(), Some(3.0), "{stats}");
+    // An expression that reads no band has nowhere to read elevations.
+    let resp = client
+        .get(format!("{base}/stac/preview.png?url={url}&assets=a&expression=42&algorithm=hillshade"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    // Band math over assets on different grids is refused, not sent round the mixed-grid
+    // fallback again.
+    let coarse = tmp.join("coarse.tif");
+    write_synthetic_u16_2band_4326_geotiff(&coarse, 32, 32, bounds, 7, 9, None);
+    let mixed = serde_json::json!({
+        "type": "Feature", "stac_version": "1.0.0", "id": "mixed", "bbox": bounds,
+        "geometry": item["geometry"].clone(),
+        "properties": {"datetime": "2024-01-01T00:00:00Z"},
+        "assets": {"a": asset(&a), "c": asset(&coarse)},
+    });
+    let mixed_path = tmp.join("mixed.json");
+    std::fs::write(&mixed_path, mixed.to_string()).unwrap();
+    let resp = client
+        .get(format!(
+            "{base}/stac/preview.png?url={}&max_size=16&assets=a&assets=c&asset_bidx=a%7C1&asset_bidx=c%7C1&expression=b1%2Bb2&algorithm=slope",
+            mixed_path.to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert!(String::from_utf8_lossy(&resp.bytes().await.unwrap()).contains("one grid"));
     // An asset's name in the request expression is its first band.
     assert_eq!(pixel("&assets=a&assets=b&expression=b_b1-a_b1").await, [8.0]);
     // ... and `bN` beside it is still the Nth band of the stack.

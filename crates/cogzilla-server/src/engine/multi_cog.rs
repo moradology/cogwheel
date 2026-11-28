@@ -294,6 +294,41 @@ impl TileEngine {
             h | (1u64 << 63)
         };
 
+        // Band math over the assets (`bN` the Nth), block by block, read as one band.
+        // A terrain algorithm over band math reads it over the assets (`bN` the Nth), block
+        // by block, as one band.
+        let math_blocks = match &req.bands {
+            BandRequest::Dem { math: Some(prog), .. } | BandRequest::Terrain { math: Some(prog), .. } => {
+                let mut inputs = Vec::with_capacity(prog.used_bands.len());
+                for &b in &prog.used_bands {
+                    let idx = b.saturating_sub(1) as usize;
+                    if b == 0 || idx >= all_refs.len() {
+                        return Err(EngineError::BadRequest(format!(
+                            "band b{b} out of range (only {} assets were provided)",
+                            all_refs.len()
+                        )));
+                    }
+                    let scale_offset = req.unscale.then(|| {
+                        (
+                            cogs[idx].index.scales.first().copied().unwrap_or(1.0),
+                            cogs[idx].index.offsets.first().copied().unwrap_or(0.0),
+                        )
+                    });
+                    inputs.push((&all_refs[idx][..], None, scale_offset));
+                }
+                // Every pixel of every block read: kept off the async I/O workers.
+                Some(super::block_in_place_if_multithread(true, || cogzilla_kernel::band_math_blocks(prog, &inputs)))
+            }
+            _ => None,
+        };
+        let math_refs: Option<Vec<Option<&cogzilla_codec::DecodedBand>>> =
+            math_blocks.as_ref().map(|blocks| blocks.iter().map(Option::as_ref).collect());
+        let terrain_src = |b_1based: u16| -> Result<BandSource<'_>, EngineError> {
+            match &math_refs {
+                Some(refs) => Ok(BandSource::new(ifd.width, ifd.height, ifd.tile_width, ifd.tile_height, tx0, ty0, grid_w, grid_h, refs)),
+                None => make_src(b_1based),
+            }
+        };
         match &req.bands {
             BandRequest::Single {
                 band_1based,
@@ -325,9 +360,10 @@ impl TileEngine {
             BandRequest::Terrain {
                 band_1based,
                 algorithm,
+                math,
             } => {
-                let src = make_src(*band_1based)?;
-                if let Some(gpu) = &self.gpu {
+                let src = terrain_src(*band_1based)?;
+                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none()) {
                     let cid = cogs[band_1based.saturating_sub(1) as usize].id;
                     if let Some(bytes) = gpu
                         .try_render_terrain::<N>(
@@ -357,8 +393,9 @@ impl TileEngine {
                 algorithm,
                 rescale,
                 colormap,
+                math,
             } => {
-                let src = make_src(*band_1based)?;
+                let src = terrain_src(*band_1based)?;
                 let (bx0, _, bx1, _) = tile_bounds_3857(req.tile);
                 // The tile's pixel size in Web Mercator metres, as TiTiler's slope divides by the
                 // transform's pixel size.
@@ -370,7 +407,7 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                if let Some(gpu) = &self.gpu {
+                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none()) {
                     let cid = cogs[band_1based.saturating_sub(1) as usize].id;
                     if let Some(bytes) = gpu
                         .try_render_dem::<N>(

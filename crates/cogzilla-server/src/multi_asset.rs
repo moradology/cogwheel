@@ -90,23 +90,74 @@ pub(crate) async fn render_mixed_grid_bbox(
         algorithm,
         rescale,
         colormap,
+        math,
     } = bands
     {
-        if *band_1based == 0 || *band_1based > max_b {
-            return Err(EngineError::BadRequest(format!(
-                "band {band_1based} out of range (dataset has {max_b} assets)"
-            )));
+        let slot_band = |slot: u16| asset_bands.and_then(|ab| ab.get((slot - 1) as usize).copied()).unwrap_or(1);
+        let wanted: Vec<u16> = math.as_ref().map_or_else(|| vec![*band_1based], |prog| prog.used_bands.clone());
+        for &b in &wanted {
+            if b == 0 || b > max_b {
+                return Err(EngineError::BadRequest(format!("band {b} out of range (dataset has {max_b} assets)")));
+            }
         }
-        let single_cog = [cogs[(*band_1based - 1) as usize].clone()];
-        let src_band = asset_bands
-            .and_then(|ab| ab.get((*band_1based - 1) as usize).copied())
-            .unwrap_or(1);
-        let single_dem = BandRequest::Dem {
-            band_1based: src_band,
-            algorithm: *algorithm,
-            rescale: *rescale,
-            colormap: *colormap,
+        // Band math over the slots is read from the rasters themselves: the bands of one
+        // asset, or the first bands of several.
+        let (read_cogs, single_dem) = match math {
+            None => (
+                vec![cogs[(*band_1based - 1) as usize].clone()],
+                BandRequest::Dem {
+                    band_1based: slot_band(*band_1based),
+                    algorithm: *algorithm,
+                    rescale: *rescale,
+                    colormap: *colormap,
+                    math: None,
+                },
+            ),
+            Some(prog) => {
+                let first = &cogs[(wanted[0] - 1) as usize];
+                let mut remapped = prog.clone();
+                let read_cogs = if wanted.iter().all(|&b| Arc::ptr_eq(&cogs[(b - 1) as usize], first)) {
+                    remapped.used_bands = wanted.iter().map(|&b| slot_band(b)).collect();
+                    vec![first.clone()]
+                } else if wanted.iter().all(|&b| slot_band(b) == 1) {
+                    let mut read: Vec<Arc<cogzilla_io::OpenedCog>> = Vec::new();
+                    remapped.used_bands = wanted
+                        .iter()
+                        .map(|&b| {
+                            let cog = &cogs[(b - 1) as usize];
+                            let at = read.iter().position(|c| Arc::ptr_eq(c, cog)).unwrap_or_else(|| {
+                                read.push(cog.clone());
+                                read.len() - 1
+                            });
+                            (at + 1) as u16
+                        })
+                        .collect();
+                    // Rasters on different grids would come back here from the mixed-grid
+                    // fallback; the expression is not resampled onto a common grid for these.
+                    if !crate::engine::cogs_share_base_grid(&read) {
+                        return Err(EngineError::BadRequest(
+                            "a terrain algorithm over band math reads assets on one grid".into(),
+                        ));
+                    }
+                    read
+                } else {
+                    return Err(EngineError::BadRequest(
+                        "a terrain algorithm over band math reads the bands of one asset, or the first band of several".into(),
+                    ));
+                };
+                (
+                    read_cogs,
+                    BandRequest::Dem {
+                        band_1based: 1,
+                        algorithm: *algorithm,
+                        rescale: *rescale,
+                        colormap: *colormap,
+                        math: Some(remapped),
+                    },
+                )
+            }
         };
+        let single_cog = read_cogs;
         return Box::pin(render_bbox_impl(
             engine,
             &single_cog,
@@ -163,6 +214,12 @@ pub(crate) async fn render_mixed_grid_bbox(
         Ok(())
     };
     match bands {
+        // A terrain encoding over band math reads the bands of the band math.
+        BandRequest::Terrain { math: Some(prog), .. } => {
+            for &b in &prog.used_bands {
+                push_b(b)?;
+            }
+        }
         BandRequest::Single { band_1based, .. }
         | BandRequest::Terrain { band_1based, .. }
         | BandRequest::Dem { band_1based, .. }
@@ -432,6 +489,29 @@ pub(crate) async fn render_mixed_grid_bbox(
             .map(|(_, v)| v.as_slice())
             .unwrap()
     };
+    // A terrain encoding over band math: the band math over the resampled bands, pixel by
+    // pixel (missing where any band is), as rio-tiler reads an expression before an algorithm.
+    let terrain_math: Option<Vec<f32>> = match bands {
+        BandRequest::Terrain { math: Some(prog), .. } => {
+            let inputs: Vec<&[f32]> = prog.used_bands.iter().map(|&b| get_plane(b)).collect();
+            let mut vals = vec![0.0f32; inputs.len()];
+            Some(
+                (0..w * h)
+                    .map(|i| {
+                        for (v, plane) in vals.iter_mut().zip(&inputs) {
+                            *v = plane[i];
+                        }
+                        if vals.iter().any(|v| v.is_nan()) {
+                            return f32::NAN;
+                        }
+                        cogzilla_kernel::band_math_nan_to_num(prog.eval(&vals))
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    let terrain_plane = |b1: u16| -> &[f32] { terrain_math.as_deref().unwrap_or_else(|| get_plane(b1)) };
 
     let npix = w * h;
     if matches!(format, OutputFormat::RawF32 | OutputFormat::Npy) {
@@ -446,8 +526,9 @@ pub(crate) async fn render_mixed_grid_bbox(
             BandRequest::Terrain {
                 band_1based,
                 algorithm,
+                ..
             } => {
-                let p = get_plane(*band_1based);
+                let p = terrain_plane(*band_1based);
                 let mut g_p = Vec::with_capacity(npix * 4);
                 let mut b_p = Vec::with_capacity(npix * 4);
                 for &elev in p {
@@ -682,8 +763,9 @@ pub(crate) async fn render_mixed_grid_bbox(
         BandRequest::Terrain {
             band_1based,
             algorithm,
+            ..
         } => {
-            for (i, &v) in get_plane(*band_1based).iter().enumerate() {
+            for (i, &v) in terrain_plane(*band_1based).iter().enumerate() {
                 if !v.is_nan() {
                     let [r, g, b] = cogzilla_kernel::encode_terrain_pixel(*algorithm, v);
                     rgba[i * 4..i * 4 + 4].copy_from_slice(&[r, g, b, 255]);

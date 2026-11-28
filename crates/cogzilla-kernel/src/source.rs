@@ -821,10 +821,118 @@ pub fn copy_band_data_rect_to_f32(
     }
 }
 
+/// A band math result where every band it reads has a value: a number all the same, as
+/// rio-tiler passes it through numpy's `nan_to_num` (zero for `0/0`, the largest number of
+/// either sign for a division by zero), so only a missing input leaves a pixel missing.
+pub fn band_math_nan_to_num(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else if v.is_nan() {
+        0.0
+    } else if v > 0.0 {
+        f32::MAX
+    } else {
+        f32::MIN
+    }
+}
+
+/// One band of band math, block by block: for a terrain algorithm (hillshade, slope, ...)
+/// over an expression's first output, read like any one band. `inputs` are the blocks of
+/// each band `prog` reads, in its slot order (`prog.used_bands`), each with the request's
+/// `nodata` and the band's scale and offset; a pixel missing in any band is missing in the
+/// result (`NaN`), as rio-tiler masks band math. Blocks missing in every band stay missing.
+pub fn band_math_blocks(
+    prog: &crate::expr_vm::ExprProgram,
+    inputs: &[(&[Option<&DecodedBand>], Option<f32>, Option<(f32, f32)>)],
+) -> Vec<Option<DecodedBand>> {
+    use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats};
+    let blocks = inputs.iter().map(|(b, _, _)| b.len()).max().unwrap_or(0);
+    let mut planes: Vec<Vec<f32>> = vec![Vec::new(); inputs.len()];
+    let mut vals = vec![0.0f32; inputs.len()];
+    (0..blocks)
+        .map(|i| {
+            let shape = inputs.iter().find_map(|(b, _, _)| b.get(i).copied().flatten()).map(|band| (band.width, band.height))?;
+            let (w, h) = (shape.0 as usize, shape.1 as usize);
+            let n = w * h;
+            for (plane, (b, nodata, scale_offset)) in planes.iter_mut().zip(inputs) {
+                plane.clear();
+                plane.resize(n, f32::NAN);
+                if let Some(band) = b.get(i).copied().flatten() {
+                    let (bw, bh) = (band.width as usize, band.height as usize);
+                    copy_band_data_rect_to_f32(&band.data, bw, 0, 0, bw.min(w), bh.min(h), plane, w, 0, 0, *nodata, *scale_offset, true);
+                }
+            }
+            let mut out = AlignedF32Slab::new_uninit(n);
+            let (mut min, mut max, mut any, mut all) = (f32::INFINITY, f32::NEG_INFINITY, false, true);
+            for (px, o) in out.as_mut_slice().iter_mut().enumerate() {
+                let mut missing = false;
+                for (v, plane) in vals.iter_mut().zip(&planes) {
+                    *v = plane[px];
+                    missing |= v.is_nan();
+                }
+                *o = if missing { f32::NAN } else { band_math_nan_to_num(prog.eval(&vals)) };
+                if o.is_nan() {
+                    all = false;
+                } else {
+                    any = true;
+                    min = min.min(*o);
+                    max = max.max(*o);
+                }
+            }
+            Some(DecodedBand {
+                width: shape.0,
+                height: shape.1,
+                data: BandData::F32(out),
+                stats: if any { BlockStats { all_nodata: false, no_nodata: all, min, max } } else { BlockStats::ALL_NODATA },
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cogzilla_codec::{AlignedF32Slab, BandData, BlockStats, DecodedBand};
+
+    #[test]
+    fn band_math_blocks_read_as_one_band() {
+        let block = |vals: &[f32]| {
+            let mut slab = AlignedF32Slab::new_uninit(vals.len());
+            slab.as_mut_slice().copy_from_slice(vals);
+            DecodedBand {
+                width: 2,
+                height: 2,
+                data: BandData::F32(slab),
+                stats: BlockStats { all_nodata: false, no_nodata: false, min: 0.0, max: 0.0 },
+            }
+        };
+        let (a, b) = (block(&[1.0, 2.0, f32::NAN, 4.0]), block(&[10.0, 20.0, 30.0, 40.0]));
+        let prog = crate::expr_vm::ExprProgram::compile("b1*2+b2").unwrap();
+        let (ar, br) = ([Some(&a), None], [Some(&b), None]);
+        let out = band_math_blocks(&prog, &[(&ar[..], None, None), (&br[..], None, Some((0.5, 1.0)))]);
+        // b2 is unscaled first; a pixel missing in b1 is missing; a block missing in both stays so.
+        let first = out[0].as_ref().unwrap();
+        let BandData::F32(slab) = &first.data else { panic!("f32") };
+        let v = slab.as_slice();
+        assert_eq!((v[0], v[1], v[3]), (8.0, 15.0, 29.0));
+        assert!(v[2].is_nan());
+        assert!(!first.stats.all_nodata && !first.stats.no_nodata);
+        assert!(out[1].is_none());
+        // A request nodata masks the input's matching pixels.
+        let out = band_math_blocks(&prog, &[(&ar[..], Some(2.0), None), (&br[..], None, None)]);
+        let BandData::F32(slab) = &out[0].as_ref().unwrap().data else { panic!("f32") };
+        assert!(slab.as_slice()[1].is_nan());
+        // Arithmetic with no value to give over bands that have one is a number, as numpy's
+        // `nan_to_num` makes it (0/0 and the root of a negative are 0); a missing band is not.
+        for expr in ["(b1-1)/(b1-1)", "sqrt(1-b1)+1"] {
+            let prog = crate::expr_vm::ExprProgram::compile(expr).unwrap();
+            let out = band_math_blocks(&prog, &[(&ar[..], None, None)]);
+            let BandData::F32(slab) = &out[0].as_ref().unwrap().data else { panic!("f32") };
+            let v = slab.as_slice();
+            assert_eq!((v[0], v[1]), if expr.starts_with("sqrt") { (1.0, 0.0) } else { (0.0, 1.0) }, "{expr}");
+            assert!(v[2].is_nan(), "{expr}");
+        }
+    }
 
     #[test]
     fn band_source_scale_offset_applies_consistently_and_disables_raw_fastpaths() {
