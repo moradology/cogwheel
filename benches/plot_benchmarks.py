@@ -387,16 +387,23 @@ def render_s3_cache_scaling() -> None:
 
     ax1.annotate(
         "4.3× less CPU (0% cache hit / cold CDN origin)\n11 vs 47 c7g.xlarge for 1,000 tiles/s",
-        xy=(0, 13.2), xytext=(12, 28),
+        xy=(0, 13.2), xytext=(10, 26),
         arrowprops=dict(arrowstyle="->", color=C_RTX, lw=1.4),
-        fontsize=8.8, fontweight="bold",
+        fontsize=8.6, fontweight="bold",
         bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=C_RTX, alpha=0.92),
+    )
+    ax1.annotate(
+        "Why TiTiler stays flat (even with GDAL_CACHEMAX=200 &\nCPL_VSIL_CURL_CACHE_SIZE=200MB): rio-tiler closes the\ndataset per request (flushing GDAL_CACHEMAX/VSI_CACHE)\n& GTiff multi-range reads bypass /vsicurl/ (4.2 origin reqs/tile)",
+        xy=(65, 55.5), xytext=(28, 86),
+        arrowprops=dict(arrowstyle="->", color=C_TT, lw=1.2),
+        fontsize=7.9, color="#ffa198",
+        bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=C_TT, alpha=0.92),
     )
     ax1.annotate(
         "32× less CPU (588 vs 18 tiles/s per core)\n(100% block-cache hit)",
         xy=(100, 1.7), xytext=(52, 0.9),
         arrowprops=dict(arrowstyle="->", color=C_M5G, lw=1.4),
-        fontsize=8.8, fontweight="bold", color="#7ee787",
+        fontsize=8.6, fontweight="bold", color="#7ee787",
         bbox=dict(boxstyle="round,pad=0.35", fc="#0d1117", ec=C_M5G, alpha=0.92),
     )
 
@@ -409,9 +416,131 @@ def render_s3_cache_scaling() -> None:
     plt.close(fig)
 
 
+def render_gpu_scaling() -> None:
+    """Graph 4 (2x2): Dedicated GPU acceleration overview — heavy single-request endpoints
+    (1-core CPU vs Metal vs Vulkan latency & speedup) and sustained map-server soak
+    (CPU-only vs GPU auto continuous batching throughput & latency, 3x medians at 3787b88)."""
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14.5, 9.8), dpi=200)
+    fig.suptitle(
+        "GPU Acceleration (wgpu Metal & Vulkan) — Heavy Endpoints & Sustained Map-Server Soak",
+        fontsize=14, fontweight="bold", y=0.985, color="#f0f6fc",
+    )
+
+    workloads = [
+        "4096² UTM→WGS84\nGrid2D Stats",
+        "2048² 4-Band\n/cog/statistics",
+        "4096² Polygon\nMasked Stats",
+        "4096² RGB\nLanczos3 JPEG",
+        "2048² Exact\n4-Band Zonal",
+        "2048²×12 Median\nMosaic → JPEG",
+    ]
+    rtx_ms = np.array([1.33, 1.37, 4.36, 32.26, 36.29, 31.12])
+    m5g_ms = np.array([8.93, 5.28, 7.64, 56.53, 17.66, 33.12])
+    rtx_sp = np.array([702.5, 424.5, 85.5, 405.3, 9.4, 7.7])
+    m5g_sp = np.array([42.5, 47.7, 23.6, 85.7, 5.8, 4.4])
+    tr_cpu_ms = rtx_ms * rtx_sp
+    m5_cpu_ms = m5g_ms * m5g_sp
+
+    # Top-Left (A): Heavy Endpoints Latency (ms, log10)
+    x = np.arange(len(workloads))
+    ax1.plot(x, tr_cpu_ms, "-^", color=C_TR,  lw=2.2, ms=7.0, label="Threadripper 3960X CPU (1 core)")
+    ax1.plot(x, m5_cpu_ms, "-D", color=C_M5C, lw=2.2, ms=6.5, label="Apple M5 CPU (1 core)")
+    ax1.plot(x, m5g_ms,    "-s", color=C_M5G, lw=2.5, ms=7.0, label="Apple M5 GPU (Metal, floor ≈ 1.5 ms)")
+    ax1.plot(x, rtx_ms,    "-o", color=C_RTX, lw=2.5, ms=7.0, label="RTX 3090 Ti (Vulkan, floor ≈ 50 µs)")
+
+    ax1.set_yscale("log")
+    ax1.set_ylim(0.5, 40000)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(workloads, fontsize=8.0)
+    ax1.set_ylabel("Single-Request Latency (ms, log₁₀, lower is better)")
+    ax1.set_title("A. Heavy Endpoints: 1-Core CPU vs. Metal vs. Vulkan")
+    ax1.grid(True, axis="y", which="both", alpha=0.35)
+    ax1.legend(loc="upper right", fontsize=7.9, framealpha=0.92)
+
+    # Top-Right (B): Heavy Endpoints GPU Speedup (vs 1-core CPU)
+    w = 0.36
+    ax2.bar(x - w / 2, rtx_sp, width=w, color=C_RTX, alpha=0.92, label="RTX 3090 Ti (Vulkan) vs 1-core 3960X")
+    ax2.bar(x + w / 2, m5g_sp, width=w, color=C_M5G, alpha=0.92, label="Apple M5 (Metal) vs 1-core M5")
+
+    ax2.set_yscale("log")
+    ax2.set_ylim(1, 2200)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(workloads, fontsize=8.0)
+    ax2.set_ylabel("Speedup vs. 1-Core CPU (×, log₁₀, higher is better)")
+    ax2.set_title("B. Heavy Endpoints: GPU Speedup Factor")
+    ax2.grid(True, axis="y", which="both", alpha=0.35)
+    for i in range(len(workloads)):
+        ax2.text(x[i] - w / 2, rtx_sp[i] * 1.12, f"{rtx_sp[i]:.0f}×" if rtx_sp[i] >= 10 else f"{rtx_sp[i]:.1f}×",
+                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
+        ax2.text(x[i] + w / 2, m5g_sp[i] * 1.12, f"{m5g_sp[i]:.0f}×" if m5g_sp[i] >= 10 else f"{m5g_sp[i]:.1f}×",
+                 ha="center", va="bottom", fontsize=8.0, color="#7ee787", fontweight="bold")
+    ax2.legend(loc="upper right", fontsize=8.0, framealpha=0.92)
+
+    # Bottom-Left (C): Sustained Map-Server Soak Throughput (RTX 3090 Ti vs 3960X 24C/48T, 3x med)
+    soak_lbls = [
+        "Pan & Zoom\n(16c mixed)",
+        "Mixed Tile Flood\n(32c, 0ms think)",
+        "Contention:\nLive Tiles (12c)",
+        "Contention:\nHeavy 2048² (2c)",
+    ]
+    tr_cpu_soak = [2215, 8400, 1828, 7]
+    rtx_soak    = [2560, 11197, 2183, 45]
+    xs = np.arange(len(soak_lbls))
+    ax3.bar(xs - w / 2, tr_cpu_soak, width=w, color=C_TR,  alpha=0.88, label="Threadripper 3960X CPU-only (24C/48T)")
+    ax3.bar(xs + w / 2, rtx_soak,    width=w, color=C_RTX, alpha=0.92, label="RTX 3090 Ti GPU auto (Vulkan coalesced)")
+
+    ax3.set_yscale("log")
+    ax3.set_ylim(2, 35000)
+    ax3.set_xticks(xs)
+    ax3.set_xticklabels(soak_lbls, fontsize=8.5)
+    ax3.set_ylabel("Throughput (req/s, log₁₀, higher is better)")
+    ax3.set_title("C. Sustained Soak Throughput (3960X + RTX 3090 Ti, 3× Medians)")
+    ax3.grid(True, axis="y", which="both", alpha=0.35)
+    for i in range(len(soak_lbls)):
+        ax3.text(xs[i] - w / 2, tr_cpu_soak[i] * 1.12, f"{tr_cpu_soak[i]:,}",
+                 ha="center", va="bottom", fontsize=8.0, color="#ffa657")
+        ratio = rtx_soak[i] / tr_cpu_soak[i]
+        ax3.text(xs[i] + w / 2, rtx_soak[i] * 1.12, f"{rtx_soak[i]:,}\n({ratio:.1f}×)",
+                 ha="center", va="bottom", fontsize=8.0, color="#79c0ff", fontweight="bold")
+    ax3.legend(loc="upper right", fontsize=8.0, framealpha=0.92)
+
+    # Bottom-Right (D): Sustained Soak Latency (Heavy 2048^2 p50 & Mixed Flood p99 across both hosts)
+    lat_lbls = [
+        "Apple M5\nMixed Flood\n(p99)",
+        "Apple M5\nHeavy 2048²\n(p50)",
+        "3960X + 3090 Ti\nMixed Flood\n(p50)",
+        "3960X + 3090 Ti\nHeavy 2048²\n(p50)",
+    ]
+    cpu_lat = [58.4, 120.2, 3.0, 237.7]
+    gpu_lat = [31.1, 34.6,  2.5, 46.4]
+    xl = np.arange(len(lat_lbls))
+    ax4.bar(xl - w / 2, cpu_lat, width=w, color=C_TR,  alpha=0.88, label="CPU-Only (all cores)")
+    ax4.bar(xl + w / 2, gpu_lat, width=w, color=C_M5G, alpha=0.92, label="GPU auto (Metal / Vulkan)")
+
+    ax4.set_yscale("log")
+    ax4.set_ylim(1, 600)
+    ax4.set_xticks(xl)
+    ax4.set_xticklabels(lat_lbls, fontsize=8.5)
+    ax4.set_ylabel("Latency (ms, log₁₀, lower is better)")
+    ax4.set_title("D. Sustained Soak Latency: CPU-Only vs. GPU Continuous Batching")
+    ax4.grid(True, axis="y", which="both", alpha=0.35)
+    for i in range(len(lat_lbls)):
+        ax4.text(xl[i] - w / 2, cpu_lat[i] * 1.12, f"{cpu_lat[i]:.1f}ms",
+                 ha="center", va="bottom", fontsize=8.0, color="#ffa657")
+        gain = cpu_lat[i] / gpu_lat[i]
+        ax4.text(xl[i] + w / 2, gpu_lat[i] * 1.12, f"{gpu_lat[i]:.1f}ms\n({gain:.1f}×)",
+                 ha="center", va="bottom", fontsize=8.0, color="#7ee787", fontweight="bold")
+    ax4.legend(loc="upper left", fontsize=8.2, framealpha=0.92)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.955])
+    fig.savefig(ASSETS / "bench-gpu-scaling.png", dpi=200)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     ASSETS.mkdir(parents=True, exist_ok=True)
     render_concurrency_overload()
     render_workload_contention()
     render_s3_cache_scaling()
-    print(f"Wrote 3 benchmark charts to {ASSETS}")
+    render_gpu_scaling()
+    print(f"Wrote 4 benchmark charts to {ASSETS}")
