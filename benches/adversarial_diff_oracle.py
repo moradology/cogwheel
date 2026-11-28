@@ -36,6 +36,8 @@ import httpx
 import numpy as np
 from PIL import Image
 import rasterio
+from rasterio.control import GroundControlPoint
+from rasterio.enums import Resampling
 from rasterio.transform import Affine, from_bounds
 from rasterio.warp import transform_bounds
 
@@ -52,6 +54,8 @@ from oracle_lib import (
     compare_geotiffs,
     compare_images,
     compare_npy,
+    first_json_diff,
+    same_place,
     wait_ready,
 )
 
@@ -248,6 +252,73 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         "links": [],
     }))
     out["stac_mix"] = p_stac_mix
+
+    # Wave 5: Exotic CRSs (LAEA 3035, LCC 3978, NZTM 2193, EASE 6933, UPS 32661/32761, BNG 27700, NAD83 4269, MODIS Sinusoidal)
+    for name, crs, bounds in [
+        ("laea_3035", "EPSG:3035", (4000000.0, 2800000.0, 4200000.0, 3000000.0)),
+        ("lcc_3978", "EPSG:3978", (-1000000.0, 0.0, -800000.0, 200000.0)),
+        ("nztm_2193", "EPSG:2193", (1700000.0, 5400000.0, 1800000.0, 5500000.0)),
+        ("ease_6933", "EPSG:6933", (-11800000.0, 4400000.0, -11600000.0, 4600000.0)),
+        ("ups_n_32661", "EPSG:32661", (1900000.0, 1000000.0, 2100000.0, 1200000.0)),
+        ("ups_s_32761", "EPSG:32761", (1900000.0, 2800000.0, 2100000.0, 3000000.0)),
+        ("bng_27700", "EPSG:27700", (400000.0, 200000.0, 500000.0, 300000.0)),
+        ("nad83_4269", "EPSG:4269", (-123.0, 37.0, -122.0, 38.0)),
+        ("modis_sinu", "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +R=6371007.181 +units=m +no_defs", (-10000000.0, 4000000.0, -9800000.0, 4200000.0)),
+    ]:
+        p_crs = synth_dir / f"{name}.tif"
+        arr_c = (xx * 1.5 + yy * 2.5 + 10.0).astype(np.float32)
+        arr_c[0:24, 0:24] = -9999.0
+        with rasterio.open(p_crs, "w", driver="GTiff", width=256, height=256, count=1, dtype="float32", crs=crs, transform=from_bounds(*bounds, 256, 256), tiled=True, blockxsize=256, blockysize=256, compress="deflate", nodata=-9999.0) as ds:
+            ds.write(arr_c[None, ...])
+        out[name] = p_crs
+
+    # GCP-only affine GeoTIFF (no geotransform)
+    p_gcp = synth_dir / "gcp_affine_4326.tif"
+    gcps = [
+        GroundControlPoint(row=0, col=0, x=-123.0, y=38.0, id="1"),
+        GroundControlPoint(row=0, col=256, x=-122.0, y=38.0, id="2"),
+        GroundControlPoint(row=256, col=0, x=-123.0, y=37.0, id="3"),
+        GroundControlPoint(row=256, col=256, x=-122.0, y=37.0, id="4"),
+    ]
+    with rasterio.open(p_gcp, "w", driver="GTiff", width=256, height=256, count=1, dtype="float32", gcps=gcps, crs="EPSG:4326", tiled=True, blockxsize=256, blockysize=256, compress="deflate", nodata=-9999.0) as ds:
+        ds.write((xx + yy * 2.0 + 10.0)[None, ...])
+    out["gcp_affine"] = p_gcp
+
+    # Multi-overview + unscale + nodata COG
+    p_ov = synth_dir / "multi_ovr_unscale_u16.tif"
+    yy1k, xx1k = np.mgrid[0:1024, 0:1024].astype(np.uint16)
+    arr_ov = ((xx1k * 20 + yy1k * 30 + 1000) % 50000 + 100).astype(np.uint16)
+    arr_ov[0:128, 0:128] = 0
+    with rasterio.open(p_ov, "w", driver="GTiff", width=1024, height=1024, count=1, dtype="uint16", crs="EPSG:3857", transform=from_bounds(-13650000.0, 4500000.0, -13550000.0, 4600000.0, 1024, 1024), tiled=True, blockxsize=256, blockysize=256, compress="deflate", predictor=2, nodata=0) as ds:
+        ds.write(arr_ov[None, ...])
+        ds.scales = (0.0001,)
+        ds.offsets = (-0.1,)
+        ds.build_overviews([2, 4, 8], Resampling.nearest)
+    out["multi_ovr_unscale"] = p_ov
+
+    # Stripped float64 predictor=3 deflate, BigTIFF int32 predictor=2 zstd, int8 nodata=-128 unscale
+    p_f64p3 = synth_dir / "stripped_f64_p3.tif"
+    arr_f64 = (xx.astype(np.float64) * 1.234567890123 + yy.astype(np.float64) * 9.876543210987 + 1e9)
+    arr_f64[0:32, 0:32] = -9999.0
+    with rasterio.open(p_f64p3, "w", driver="GTiff", width=256, height=256, count=1, dtype="float64", crs="EPSG:3857", transform=tf_sf, tiled=False, compress="deflate", predictor=3, nodata=-9999.0) as ds:
+        ds.write(arr_f64[None, ...])
+    out["stripped_f64_p3"] = p_f64p3
+
+    p_big = synth_dir / "bigtiff_i32_p2_zstd.tif"
+    arr_big = (xx.astype(np.int32) * 100000 - yy.astype(np.int32) * 50000 + 50000000)
+    arr_big[0:32, 0:32] = -2147483648
+    with rasterio.open(p_big, "w", driver="GTiff", width=256, height=256, count=1, dtype="int32", crs="EPSG:3857", transform=tf_sf, tiled=True, blockxsize=256, blockysize=256, compress="zstd", predictor=2, nodata=-2147483648, BIGTIFF="YES") as ds:
+        ds.write(arr_big[None, ...])
+    out["bigtiff_i32"] = p_big
+
+    p_i8 = synth_dir / "int8_nd128_unscale.tif"
+    arr_i8 = (((xx + yy) % 200) - 100).astype(np.int8)
+    arr_i8[0:32, 0:32] = -128
+    with rasterio.open(p_i8, "w", driver="GTiff", width=256, height=256, count=1, dtype="int8", crs="EPSG:3857", transform=tf_sf, tiled=True, blockxsize=256, blockysize=256, compress="deflate", nodata=-128) as ds:
+        ds.write(arr_i8[None, ...])
+        ds.scales = (0.1,)
+        ds.offsets = (10.0,)
+    out["int8_unscale"] = p_i8
 
     return out
 
@@ -544,6 +615,39 @@ def main() -> int:
                 ("PARITY STAC asset_bidx .npy", "GET", f"/stac/tiles/WebMercatorQuad/12/652/1583.npy?url={q(landsat_stac)}&assets=red&assets=green&asset_bidx=red|1&asset_bidx=green|1", None, "npy"),
             ]
 
+            # --- 5b. Wave 5: Exotic CRSs, GCP-only, multi-overview+unscale, exotic codecs ---
+            for name in ("laea_3035", "lcc_3978", "nztm_2193", "ease_6933", "ups_n_32661", "ups_s_32761", "bng_27700", "nad83_4269", "modis_sinu"):
+                p = s[name]
+                lon, lat, z, tx, ty, _ = center_lonlat_and_tile(p)
+                cases += [
+                    (f"PARITY CRS [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/{z}/{tx}/{ty}.npy?url={q(p)}", None, "npy"),
+                    (f"PARITY CRS [{name}] point", "GET", f"/cog/point/{lon:.5f},{lat:.5f}?url={q(p)}", None, "point"),
+                ]
+            cases += [
+                ("PARITY GCP affine .npy", "GET", f"/cog/tiles/WebMercatorQuad/9/81/197.npy?url={q(s['gcp_affine'])}", None, "npy"),
+                ("PARITY GCP affine point", "GET", f"/cog/point/-122.5,37.5?url={q(s['gcp_affine'])}", None, "point"),
+                ("PARITY OVR+UNSCALE z9 cubic .npy", "GET", f"/cog/tiles/WebMercatorQuad/9/81/197.npy?url={q(s['multi_ovr_unscale'])}&unscale=true&resampling=cubic", None, "npy"),
+                ("PARITY OVR+UNSCALE z9 average .npy", "GET", f"/cog/tiles/WebMercatorQuad/9/81/197.npy?url={q(s['multi_ovr_unscale'])}&unscale=true&resampling=average", None, "npy"),
+                ("PARITY CODEC stripped_f64_p3 .npy", "GET", f"/cog/tiles/WebMercatorQuad/11/327/792.npy?url={q(s['stripped_f64_p3'])}", None, "npy"),
+                ("PARITY CODEC bigtiff_i32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/11/327/792.npy?url={q(s['bigtiff_i32'])}", None, "npy"),
+                ("PARITY CODEC int8_unscale .npy", "GET", f"/cog/tiles/WebMercatorQuad/11/327/792.npy?url={q(s['int8_unscale'])}&unscale=true", None, "npy"),
+            ]
+
+            # --- 5c. Wave 6: Colormap LUTs, Content-Crs/Content-Bbox headers, expr VM, custom colormaps ---
+            for cm in ("viridis", "plasma", "inferno", "terrain", "coolwarm", "turbo", "gray", "twilight"):
+                cases.append((f"PARITY CMAP LUT [{cm}]", "GET", f"/colorMaps/{cm}", None, "json_exact"))
+            cases += [
+                ("PARITY HDR tile WebMercatorQuad", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=0,1000", None, "headers"),
+                ("PARITY HDR bbox dst_crs=3857", "GET", f"/cog/bbox/-122.8,37.6,-122.5,37.9/64x64.png?url={q(sat)}&dst_crs=epsg:3857&rescale=0,0.35", None, "headers"),
+                ("PARITY HDR preview native", "GET", f"/cog/preview/64x64.png?url={q(sat)}&rescale=0,0.35", None, "headers"),
+                ("PARITY HDR feature 4326", "POST", f"/cog/feature/64x64.png?url={q(sat)}&rescale=0,0.35", donut_poly, "headers"),
+                ("PARITY EXPR trig+log+pow .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('sin(b1)+log1p(b2)+(b3+0.1)**-0.5')}", None, "npy"),
+                ("PARITY EXPR where+and int32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('where((b1>0.1)&(b2<0.3),1,0)')}", None, "npy"),
+                ("PARITY EXPR where+or f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/12/652/1583.npy?url={q(sat)}&expression={qe('where((b1>0.25)|(b3>0.25),b1,b2)')}", None, "npy"),
+                ("PARITY CMAP neg float interval .png", "GET", f"/cog/tiles/WebMercatorQuad/11/327/792.png?url={q(s['neg_f32'])}&colormap={qe(json.dumps([[[-100,0],[0,0,255,255]],[[0,100],[255,0,0,255]]]))}", None, "png"),
+                ("PARITY CMAP semi-transparent alpha .png", "GET", f"/cog/tiles/WebMercatorQuad/11/327/792.png?url={q(s['cat_u8'])}&colormap={qe(json.dumps({'1':[255,0,0,128],'2':[0,255,0,0],'3':[0,0,255,255],'5':[255,255,0,200],'10':[255,0,255,255]}))}", None, "png"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
                 ("BETTER inverted rescale (cw inverts, tt clips 255)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=1000,0&colormap_name=viridis", None, "better_inverted_rescale"),
@@ -582,6 +686,7 @@ def main() -> int:
                             r_tt = c2.request(method, tt_base + path, json=body)
 
                     is_unmasked = "return_mask=false" in path
+                    is_smooth = "resampling=" in path and "nearest" not in path
 
                     if gpu_base is not None:
                         r_gpu = client.request(method, gpu_base + path, json=body)
@@ -589,10 +694,17 @@ def main() -> int:
                             gpu_diffs.append({"label": label, "detail": f"status cpu={r_cw.status_code} gpu={r_gpu.status_code}"})
                         elif r_cw.status_code == 200:
                             ct = r_cw.headers.get("content-type", "")
-                            if "image/png" in ct or "image/jpeg" in ct or "image/webp" in ct:
+                            if kind == "headers":
+                                hok, hd = same_place(r_cw, r_gpu)
+                                iok, idet = compare_images(r_cw.content, r_gpu.content)
+                                gok, gd = (hok and iok), (hd if not hok else idet)
+                            elif kind == "json_exact":
+                                d = first_json_diff(r_cw.json(), r_gpu.json())
+                                gok, gd = (d is None), (d or "exact JSON match")
+                            elif "image/png" in ct or "image/jpeg" in ct or "image/webp" in ct:
                                 gok, gd = compare_images(r_cw.content, r_gpu.content)
                             elif "application/x-binary" in ct or ".npy" in path:
-                                gok, gd = compare_npy(r_cw.content, r_gpu.content, check_values=True, masked=not is_unmasked)
+                                gok, gd = compare_npy(r_cw.content, r_gpu.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                             elif "image/tiff" in ct:
                                 gok, gd = compare_geotiffs(r_cw.content, r_gpu.content, compare_pixels=True)
                             elif kind == "stats":
@@ -688,9 +800,17 @@ def main() -> int:
                     elif kind == "png":
                         ok, detail = compare_images(r_cw.content, r_tt.content)
                     elif kind == "npy":
-                        ok, detail = compare_npy(r_cw.content, r_tt.content, check_values=True, masked=not is_unmasked)
+                        ok, detail = compare_npy(r_cw.content, r_tt.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                     elif kind == "geotiff":
                         ok, detail = compare_geotiffs(r_cw.content, r_tt.content, compare_pixels=True)
+                    elif kind == "json_exact":
+                        d = first_json_diff(r_cw.json(), r_tt.json())
+                        ok, detail = (d is None), (d or "exact JSON match")
+                    elif kind == "headers":
+                        if not (r_cw.headers.get("content-crs") and r_cw.headers.get("content-bbox") and r_tt.headers.get("content-crs") and r_tt.headers.get("content-bbox")):
+                            ok, detail = False, f"missing geo headers: cw=({r_cw.headers.get('content-crs')},{r_cw.headers.get('content-bbox')}) tt=({r_tt.headers.get('content-crs')},{r_tt.headers.get('content-bbox')})"
+                        else:
+                            ok, detail = same_place(r_cw, r_tt)
                     elif kind == "stats":
                         ok, detail = compare_stats_strict(r_cw.json(), r_tt.json())
                     elif kind == "post_stats":
