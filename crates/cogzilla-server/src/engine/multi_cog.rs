@@ -363,13 +363,13 @@ impl TileEngine {
                 math,
             } => {
                 let src = terrain_src(*band_1based)?;
-                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none()) {
-                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                if let Some(gpu) = self.gpu.as_ref() {
+                    let source_id = math
+                        .is_none()
+                        .then(|| (cogs[band_1based.saturating_sub(1) as usize].id, ifd_idx, 0));
                     if let Some(bytes) = gpu
                         .try_render_terrain::<N>(
-                            cid,
-                            ifd_idx,
-                            0,
+                            source_id,
                             tx0,
                             ty0,
                             &plan,
@@ -407,13 +407,13 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none()) {
-                    let cid = cogs[band_1based.saturating_sub(1) as usize].id;
+                if let Some(gpu) = self.gpu.as_ref() {
+                    let source_id = math
+                        .is_none()
+                        .then(|| (cogs[band_1based.saturating_sub(1) as usize].id, ifd_idx, 0));
                     if let Some(bytes) = gpu
                         .try_render_dem::<N>(
-                            cid,
-                            ifd_idx,
-                            0,
+                            source_id,
                             tx0,
                             ty0,
                             &plan,

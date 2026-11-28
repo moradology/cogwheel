@@ -824,9 +824,7 @@ impl GpuBackend {
     #[allow(clippy::too_many_arguments)]
     fn gate_and_resolve_single_band(
         &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        band0: u16,
+        cache_key: Option<SlabKey>,
         src: &BandSource<'_>,
         op: GpuOp,
         dst_pixels: usize,
@@ -834,8 +832,7 @@ impl GpuBackend {
         readback_bytes: usize,
         active: usize,
     ) -> Option<(Arc<GpuSlab>, u32, u32)> {
-        let key = source_slab_key(cog_id, ifd_idx, band0, src);
-        let warm_slab = key.and_then(|k| self.slab_cache.get(&k));
+        let warm_slab = cache_key.and_then(|k| self.slab_cache.get(&k));
         let upload_bytes = Self::estimate_upload_bytes(&warm_slab, src) + coord_upload_bytes;
         let decision = self.policy.decide(&DispatchRequest {
             op,
@@ -848,7 +845,7 @@ impl GpuBackend {
         if !decision.use_gpu {
             return None;
         }
-        self.resolve_source_slab(key, warm_slab, src)
+        self.resolve_source_slab(cache_key, warm_slab, src)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1004,9 +1001,7 @@ impl GpuBackend {
             GpuPixelOutput::Rgba8 => dst_w * dst_h * 4,
         };
         let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
-            cog_id,
-            ifd_idx,
-            band0,
+            source_slab_key(cog_id, ifd_idx, band0, src),
             src,
             gpu_mode.to_policy_op(),
             dst_w * dst_h,
@@ -1715,9 +1710,7 @@ impl GpuBackend {
     #[allow(clippy::too_many_arguments)]
     fn prepare_bbox_dem(
         &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        band0: u16,
+        cache_key: Option<SlabKey>,
         coords: BboxCoordSource<'_>,
         src: &BandSource<'_>,
         alg: DemAlgorithm,
@@ -1747,9 +1740,7 @@ impl GpuBackend {
             _ => GpuOp::DemHornCubic,
         };
         let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
-            cog_id,
-            ifd_idx,
-            band0,
+            cache_key,
             src,
             op,
             dst_w * dst_h,
@@ -1797,9 +1788,7 @@ impl GpuBackend {
     ) -> Option<Bytes> {
         let (active, _guard) = self.enter_in_flight();
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
-            cog_id,
-            ifd_idx,
-            band0,
+            source_slab_key(cog_id, ifd_idx, band0, src),
             coords,
             src,
             alg,
@@ -1816,9 +1805,7 @@ impl GpuBackend {
     #[allow(clippy::too_many_arguments)]
     fn prepare_bbox_terrain(
         &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        band0: u16,
+        cache_key: Option<SlabKey>,
         coords: BboxCoordSource<'_>,
         src: &BandSource<'_>,
         algorithm: DemAlgorithm,
@@ -1844,9 +1831,7 @@ impl GpuBackend {
             _ => GpuOp::DemTerrainRgbCubic,
         };
         let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
-            cog_id,
-            ifd_idx,
-            band0,
+            cache_key,
             src,
             op,
             dst_w * dst_h,
@@ -1890,7 +1875,13 @@ impl GpuBackend {
     ) -> Option<Bytes> {
         let (active, _guard) = self.enter_in_flight();
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
-            cog_id, ifd_idx, band0, coords, src, algorithm, resample, format, active,
+            source_slab_key(cog_id, ifd_idx, band0, src),
+            coords,
+            src,
+            algorithm,
+            resample,
+            format,
+            active,
         )?;
         self.submit_rgba(job, dst_w, dst_h, format, return_mask)
     }
@@ -1919,12 +1910,12 @@ impl GpuBackend {
     }
 
     /// Attempt GPU-accelerated DEM Horn 3×3 tile rendering (non-blocking async coalesced).
+    /// Pass `source_id = None` for derived planes (e.g. band-math outputs) that have no
+    /// `(cog_id, ifd_idx, band0)` slab-cache identity.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_render_dem<const N: usize>(
         &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        band0: u16,
+        source_id: Option<(u64, usize, u16)>,
         _tx0: u32,
         _ty0: u32,
         plan: &CoordPlan<N>,
@@ -1936,10 +1927,10 @@ impl GpuBackend {
         let coords = BboxCoordSource::from_coord_plan(plan);
         let (active, _guard) = self.enter_in_flight();
         let rgb_lut = &style.colormap.lut().rgb;
+        let cache_key =
+            source_id.and_then(|(cog_id, ifd_idx, band0)| source_slab_key(cog_id, ifd_idx, band0, src));
         let (job, out_kind, dst_w, dst_h) = self.prepare_bbox_dem(
-            cog_id,
-            ifd_idx,
-            band0,
+            cache_key,
             coords,
             src,
             alg,
@@ -1955,12 +1946,12 @@ impl GpuBackend {
     }
 
     /// Attempt GPU-accelerated `Terrarium` / `TerrainRgb` tile rendering (non-blocking async coalesced).
+    /// Pass `source_id = None` for derived planes (e.g. band-math outputs) that have no
+    /// `(cog_id, ifd_idx, band0)` slab-cache identity.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_render_terrain<const N: usize>(
         &self,
-        cog_id: u64,
-        ifd_idx: usize,
-        band0: u16,
+        source_id: Option<(u64, usize, u16)>,
         _tx0: u32,
         _ty0: u32,
         plan: &CoordPlan<N>,
@@ -1971,8 +1962,10 @@ impl GpuBackend {
     ) -> Option<Bytes> {
         let coords = BboxCoordSource::from_coord_plan(plan);
         let (active, _guard) = self.enter_in_flight();
+        let cache_key =
+            source_id.and_then(|(cog_id, ifd_idx, band0)| source_slab_key(cog_id, ifd_idx, band0, src));
         let (job, dst_w, dst_h) = self.prepare_bbox_terrain(
-            cog_id, ifd_idx, band0, coords, src, algorithm, resample, format, active,
+            cache_key, coords, src, algorithm, resample, format, active,
         )?;
         self.submit_rgba_async(job, dst_w, dst_h, format, true).await
     }
@@ -2764,9 +2757,7 @@ impl GpuBackend {
         }
         let (active, _guard) = self.enter_in_flight();
         let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
-            cog_id,
-            ifd_idx,
-            band0,
+            source_slab_key(cog_id, ifd_idx, band0, src),
             src,
             gpu_mode.to_policy_op(),
             dst_w * dst_h,
@@ -3012,9 +3003,7 @@ impl GpuBackend {
         };
         let (active, _guard) = self.enter_in_flight();
         let (slab, base_col, base_row) = self.gate_and_resolve_single_band(
-            cog_id,
-            ifd_idx,
-            band0,
+            source_slab_key(cog_id, ifd_idx, band0, src),
             src,
             op,
             dst_w * dst_h,
@@ -5076,5 +5065,123 @@ mod tests {
         let viridis = ColormapName::Viridis.lut().rgb;
         let colored = encode_indexed_u8_png(&[0, 128, 200, 255], 2, 2, &viridis);
         assert_eq!(colored[25], 3, "colored LUT PNG must use color_type 3 (Indexed P)");
+    }
+
+    #[tokio::test]
+    async fn derived_terrain_and_dem_with_no_source_id_match_cpu_and_bypass_slab_cache() {
+        let Some(gpu) = GpuBackend::try_init(64 * 1024 * 1024) else {
+            return;
+        };
+        const N: usize = 256;
+        let mut slab = cogzilla_codec::AlignedF32Slab::new_uninit(N * N);
+        for y in 0..N {
+            for x in 0..N {
+                slab.as_mut_slice()[y * N + x] = 100.0 + (x as f32) * 3.5 + (y as f32) * 1.25;
+            }
+        }
+        let band = cogzilla_codec::DecodedBand {
+            width: N as u32,
+            height: N as u32,
+            data: cogzilla_codec::BandData::F32(slab),
+            stats: cogzilla_codec::BlockStats {
+                all_nodata: false,
+                no_nodata: true,
+                min: 100.0,
+                max: 1400.0,
+            },
+        };
+        let blocks = [Some(&band)];
+        let src = BandSource::new(N as u32, N as u32, N as u32, N as u32, 0, 0, 1, 1, &blocks);
+        let mut u = Box::new([0.0f32; N]);
+        let mut v = Box::new([0.0f32; N]);
+        for i in 0..N {
+            u[i] = i as f32;
+            v[i] = i as f32;
+        }
+        let plan = CoordPlan::<N>::Separable1D {
+            u,
+            v,
+            src_min_col: 0,
+            src_max_col: (N - 1) as i32,
+            src_min_row: 0,
+            src_max_row: (N - 1) as i32,
+            all_in_bounds: true,
+        };
+        let before = gpu.slab_cache.stats();
+        let gpu_terr = gpu
+            .try_render_terrain::<N>(
+                None,
+                0,
+                0,
+                &plan,
+                &src,
+                DemAlgorithm::Terrarium,
+                ResampleMode::Lanczos,
+                OutputFormat::RawRgba,
+            )
+            .await
+            .expect("GPU must execute derived terrain tile");
+        let cpu_terr = cogzilla_kernel::render_terrain_tile::<N>(
+            &plan,
+            &src,
+            DemAlgorithm::Terrarium,
+            ResampleMode::Lanczos,
+            OutputFormat::RawRgba,
+        );
+        assert_eq!(
+            gpu_terr.as_ref(),
+            cpu_terr.as_ref(),
+            "derived terrain GPU output must match CPU"
+        );
+
+        let style = SingleBandStyle {
+            rescale_min: 0.0,
+            rescale_max: 255.0,
+            colormap: ColormapName::Grayscale,
+            resample: ResampleMode::Lanczos,
+            format: OutputFormat::RawRgba,
+        };
+        let gpu_dem = gpu
+            .try_render_dem::<N>(
+                None,
+                0,
+                0,
+                &plan,
+                &src,
+                DemAlgorithm::Hillshade {
+                    azimuth_deg: 315.0,
+                    altitude_deg: 45.0,
+                    z_factor: 1.0,
+                },
+                30.0,
+                &style,
+            )
+            .await
+            .expect("GPU must execute derived DEM tile");
+        let cpu_dem = cogzilla_kernel::render_dem_algorithm::<N>(
+            &plan,
+            &src,
+            DemAlgorithm::Hillshade {
+                azimuth_deg: 315.0,
+                altitude_deg: 45.0,
+                z_factor: 1.0,
+            },
+            30.0,
+            &style,
+        );
+        assert_eq!(gpu_dem.len(), cpu_dem.len());
+        let max_diff = gpu_dem
+            .iter()
+            .zip(cpu_dem.iter())
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap_or(0);
+        assert!(max_diff <= 1, "derived DEM GPU output must match CPU within 1 ULP (got {max_diff})");
+
+        let after = gpu.slab_cache.stats();
+        assert_eq!(
+            after.entries, before.entries,
+            "source_id = None must not insert derived planes into slab_cache"
+        );
     }
 }

@@ -420,9 +420,7 @@ impl GpuBackend {
     #[inline(always)]
     pub async fn try_render_dem<const N: usize>(
         &self,
-        _cog_id: u64,
-        _ifd_idx: usize,
-        _band0: u16,
+        _source_id: Option<(u64, usize, u16)>,
         _tx0: u32,
         _ty0: u32,
         _plan: &CoordPlan<N>,
@@ -437,9 +435,7 @@ impl GpuBackend {
     #[inline(always)]
     pub async fn try_render_terrain<const N: usize>(
         &self,
-        _cog_id: u64,
-        _ifd_idx: usize,
-        _band0: u16,
+        _source_id: Option<(u64, usize, u16)>,
         _tx0: u32,
         _ty0: u32,
         _plan: &CoordPlan<N>,

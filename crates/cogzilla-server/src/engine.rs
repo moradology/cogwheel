@@ -1168,12 +1168,10 @@ impl TileEngine {
                 if src.all_nodata {
                     self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none())
+                if let Some(gpu) = self.gpu.as_ref()
                     && let Some(bytes) = gpu
                         .try_render_terrain::<N>(
-                            cog.id,
-                            ifd_idx,
-                            band0,
+                            math.is_none().then_some((cog.id, ifd_idx, band0)),
                             tx0,
                             ty0,
                             &plan,
@@ -1270,12 +1268,10 @@ impl TileEngine {
                     resample: req.resample,
                     format: req.format,
                 };
-                if let Some(gpu) = self.gpu.as_ref().filter(|_| math.is_none())
+                if let Some(gpu) = self.gpu.as_ref()
                     && let Some(bytes) = gpu
                         .try_render_dem::<N>(
-                            cog.id,
-                            ifd_idx,
-                            band0,
+                            math.is_none().then_some((cog.id, ifd_idx, band0)),
                             tx0,
                             ty0,
                             &plan,
