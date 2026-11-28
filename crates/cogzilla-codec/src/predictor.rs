@@ -2711,6 +2711,192 @@ pub fn reconstruct_uint12(
         .collect()
 }
 
+/// Convert IEEE 754 binary16 bit pattern to `f32`.
+#[inline(always)]
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let mant = u32::from(bits & 0x03FF);
+    let f_bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            // Subnormal: normalize to binary32
+            let mut m = mant;
+            let mut e = 127u32 - 14;
+            while (m & 0x0400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03FF;
+            sign | (e << 23) | (m << 13)
+        }
+    } else if exp == 31 {
+        // Inf or NaN (preserve quiet/signaling payload bits)
+        sign | 0x7F80_0000 | (mant << 13)
+    } else {
+        sign | ((exp + 112) << 23) | (mant << 13)
+    };
+    f32::from_bits(f_bits)
+}
+
+/// Zero-copy IEEE 754 `float16` (`Predictor::None`) decode directly into `BandData::F32`.
+pub fn reconstruct_f16_uncompressed(
+    raw: &[u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let pixels = (tile_w as usize) * (tile_h as usize);
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    for i in 0..pixels {
+        for b in 0..bands_in_tile {
+            let off = (i * bands_in_tile + b) * 2;
+            let bytes = [raw[off], raw[off + 1]];
+            let bits = match byte_order {
+                ByteOrder::Little => u16::from_le_bytes(bytes),
+                ByteOrder::Big => u16::from_be_bytes(bytes),
+            };
+            let (v, is_nd) = check_val(f16_to_f32(bits), finite_nodata);
+            slabs[b].as_mut_slice()[i] = v;
+            if is_nd {
+                any_nodata[b] = true;
+            } else {
+                any_valid[b] = true;
+                if v < min_val[b] {
+                    min_val[b] = v;
+                }
+                if v > max_val[b] {
+                    max_val[b] = v;
+                }
+            }
+        }
+    }
+
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, slab)| DecodedBand {
+            data: BandData::F32(slab),
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
+/// Reconstruct IEEE 754 `float16` (Predictor 1, Predictor 2, or 2-plane Predictor 3) -> `BandData::F32`.
+pub fn reconstruct_f16(
+    raw: &mut [u8],
+    tile_w: u32,
+    tile_h: u32,
+    bands_in_tile: usize,
+    byte_order: ByteOrder,
+    predictor: cogzilla_tiff::Predictor,
+    nodata: Option<f32>,
+) -> Vec<DecodedBand> {
+    if predictor == cogzilla_tiff::Predictor::None {
+        return reconstruct_f16_uncompressed(raw, tile_w, tile_h, bands_in_tile, byte_order, nodata);
+    }
+
+    let finite_nodata = nodata.filter(|v| !v.is_nan());
+    let w = tile_w as usize;
+    let h = tile_h as usize;
+    let pixels = w * h;
+    let mut slabs: Vec<AlignedF32Slab> = (0..bands_in_tile)
+        .map(|_| AlignedF32Slab::new_uninit(pixels))
+        .collect();
+    let mut any_valid = vec![false; bands_in_tile];
+    let mut any_nodata = vec![false; bands_in_tile];
+    let mut min_val = vec![f32::INFINITY; bands_in_tile];
+    let mut max_val = vec![f32::NEG_INFINITY; bands_in_tile];
+
+    match predictor {
+        cogzilla_tiff::Predictor::FloatingPoint => {
+            let samples_per_row = w * bands_in_tile;
+            let row_bytes = samples_per_row * 2;
+            for y in 0..h {
+                let row = &mut raw[y * row_bytes..(y + 1) * row_bytes];
+                prefix_sum_scalar(row, bands_in_tile);
+                let row_off = y * w;
+                for x in 0..w {
+                    let base = x * bands_in_tile;
+                    for b in 0..bands_in_tile {
+                        let idx = base + b;
+                        let bits = u16::from_be_bytes([row[idx], row[samples_per_row + idx]]);
+                        let (v, is_nd) = check_val(f16_to_f32(bits), finite_nodata);
+                        slabs[b].as_mut_slice()[row_off + x] = v;
+                        if is_nd {
+                            any_nodata[b] = true;
+                        } else {
+                            any_valid[b] = true;
+                            if v < min_val[b] {
+                                min_val[b] = v;
+                            }
+                            if v > max_val[b] {
+                                max_val[b] = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cogzilla_tiff::Predictor::HorizontalInt => {
+            let mut acc = vec![0u16; bands_in_tile];
+            for y in 0..h {
+                acc.fill(0);
+                let row_off = y * w;
+                for x in 0..w {
+                    for b in 0..bands_in_tile {
+                        let off = ((row_off + x) * bands_in_tile + b) * 2;
+                        let bytes = [raw[off], raw[off + 1]];
+                        let delta = match byte_order {
+                            ByteOrder::Little => u16::from_le_bytes(bytes),
+                            ByteOrder::Big => u16::from_be_bytes(bytes),
+                        };
+                        acc[b] = acc[b].wrapping_add(delta);
+                        let (v, is_nd) = check_val(f16_to_f32(acc[b]), finite_nodata);
+                        slabs[b].as_mut_slice()[row_off + x] = v;
+                        if is_nd {
+                            any_nodata[b] = true;
+                        } else {
+                            any_valid[b] = true;
+                            if v < min_val[b] {
+                                min_val[b] = v;
+                            }
+                            if v > max_val[b] {
+                                max_val[b] = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cogzilla_tiff::Predictor::None => unreachable!(),
+    }
+
+    slabs
+        .into_iter()
+        .enumerate()
+        .map(|(b, slab)| DecodedBand {
+            data: BandData::F32(slab),
+            width: tile_w,
+            height: tile_h,
+            stats: finalize_stats(any_valid[b], any_nodata[b], min_val[b], max_val[b]),
+        })
+        .collect()
+}
+
 /// Zero-copy `float64` (`Predictor::None`) decode directly into exact `BandData::F64`.
 pub fn reconstruct_f64_uncompressed(
     raw: &[u8],
@@ -3280,5 +3466,89 @@ mod tests {
         assert!(!bands[0].stats.no_nodata);
         assert_eq!(bands[0].stats.min, 1.0);
         assert_eq!(bands[0].stats.max, 4095.0);
+    }
+
+    #[test]
+    fn f16_to_f32_handles_normals_subnormals_inf_nan_and_neg_zero() {
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert!(f16_to_f32(0x8000).is_sign_negative() && f16_to_f32(0x8000) == 0.0);
+        assert_eq!(f16_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_to_f32(0xBC00), -1.0);
+        assert_eq!(f16_to_f32(0x4200), 3.0);
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0);
+        // Smallest positive subnormal: 2^-24
+        assert_eq!(f16_to_f32(0x0001), 2.0_f32.powi(-24));
+        assert_eq!(f16_to_f32(0x7C00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xFC00), f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn reconstruct_f16_supports_none_horizontal_and_floating_point_predictors() {
+        // 2x2 single-band values: [1.0 (0x3C00), 3.0 (0x4200); -2.0 (0xC000), -4.0 (0xC400, nodata)]
+        let bits: [u16; 4] = [0x3C00, 0x4200, 0xC000, 0xC400];
+        let mut raw_le = Vec::new();
+        for b in bits {
+            raw_le.extend_from_slice(&b.to_le_bytes());
+        }
+        let bands = reconstruct_f16_uncompressed(&raw_le, 2, 2, 1, ByteOrder::Little, Some(-4.0));
+        assert_eq!(bands.len(), 1);
+        let vals: Vec<f32> = (0..4).map(|i| bands[0].data.get_f32(i)).collect();
+        assert_eq!(vals[0], 1.0);
+        assert_eq!(vals[1], 3.0);
+        assert_eq!(vals[2], -2.0);
+        assert!(vals[3].is_nan());
+        assert_eq!(bands[0].stats.min, -2.0);
+        assert_eq!(bands[0].stats.max, 3.0);
+        assert!(!bands[0].stats.no_nodata);
+
+        // Predictor::FloatingPoint (2-plane MSB-first + horizontal byte delta per row)
+        let mut raw_p3 = Vec::new();
+        for row in 0..2 {
+            let s0 = bits[row * 2].to_be_bytes();
+            let s1 = bits[row * 2 + 1].to_be_bytes();
+            let planes = [s0[0], s1[0], s0[1], s1[1]];
+            let mut enc = [0u8; 4];
+            enc[0] = planes[0];
+            for i in 1..4 {
+                enc[i] = planes[i].wrapping_sub(planes[i - 1]);
+            }
+            raw_p3.extend_from_slice(&enc);
+        }
+        let bands_p3 = reconstruct_f16(
+            &mut raw_p3,
+            2,
+            2,
+            1,
+            ByteOrder::Little,
+            cogzilla_tiff::Predictor::FloatingPoint,
+            Some(-4.0),
+        );
+        assert_eq!(bands_p3[0].data.get_f32(0), 1.0);
+        assert_eq!(bands_p3[0].data.get_f32(1), 3.0);
+        assert_eq!(bands_p3[0].data.get_f32(2), -2.0);
+        assert!(bands_p3[0].data.get_f32(3).is_nan());
+
+        // Predictor::HorizontalInt (16-bit wrapping delta per row, Big-Endian)
+        let mut raw_p2 = Vec::new();
+        for row in 0..2 {
+            let d0 = bits[row * 2];
+            let d1 = bits[row * 2 + 1].wrapping_sub(d0);
+            raw_p2.extend_from_slice(&d0.to_be_bytes());
+            raw_p2.extend_from_slice(&d1.to_be_bytes());
+        }
+        let bands_p2 = reconstruct_f16(
+            &mut raw_p2,
+            2,
+            2,
+            1,
+            ByteOrder::Big,
+            cogzilla_tiff::Predictor::HorizontalInt,
+            Some(-4.0),
+        );
+        assert_eq!(bands_p2[0].data.get_f32(0), 1.0);
+        assert_eq!(bands_p2[0].data.get_f32(1), 3.0);
+        assert_eq!(bands_p2[0].data.get_f32(2), -2.0);
+        assert!(bands_p2[0].data.get_f32(3).is_nan());
     }
 }

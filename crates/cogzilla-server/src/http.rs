@@ -315,7 +315,9 @@ fn reads_whole_numbers(unscale: bool, bands: &BandRequest, sample_type: cogzilla
         )
         && !matches!(
             sample_type,
-            cogzilla_raster::SampleType::Float32 | cogzilla_raster::SampleType::Float64
+            cogzilla_raster::SampleType::Float16
+                | cogzilla_raster::SampleType::Float32
+                | cogzilla_raster::SampleType::Float64
         )
 }
 

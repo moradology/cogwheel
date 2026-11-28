@@ -8,7 +8,7 @@ pub enum TiffError {
     NeedRange { offset: u64, end: u64 },
     #[error("invalid TIFF header magic or byte order")]
     InvalidHeader,
-    #[error("unsupported sample format: cogzilla supports u8, i8, u16, i16, u32, i32, f32, f64, got format={format}, bits={bits}")]
+    #[error("unsupported sample format: cogzilla supports u1, u4, u8, i8, u12, u16, i16, u32, i32, u64, i64, f16, f32, f64, got format={format}, bits={bits}")]
     UnsupportedSampleFormat { format: u16, bits: u16 },
     #[error("unsupported compression code: {0}")]
     UnsupportedCompression(u16),

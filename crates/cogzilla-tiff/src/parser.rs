@@ -954,6 +954,7 @@ fn parse_cog_with_backing(backing: Backing<'_>) -> Result<CogIndex, TiffError> {
             (2, 32) => SampleType::Int32,
             (1, 64) => SampleType::Uint64,
             (2, 64) => SampleType::Int64,
+            (3, 16) => SampleType::Float16,
             (3, 32) => SampleType::Float32,
             (3, 64) => SampleType::Float64,
             _ => {

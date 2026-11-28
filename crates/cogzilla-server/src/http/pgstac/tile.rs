@@ -666,7 +666,8 @@ pub(super) async fn tile(
                     let kind = rule
                         .kind(&reads, band_math.map(String::as_str))
                         .unwrap_or(full.sample_type);
-                    let whole = band_math.is_none() && !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    let whole = band_math.is_none()
+                        && !matches!(kind, SampleType::Float16 | SampleType::Float32 | SampleType::Float64);
                     // A whole-number raster's values between pixels are rounded to its type.
                     let read = raw
                         .chunks_exact(4)
@@ -765,7 +766,7 @@ pub(super) async fn tile(
                         _ if pq.unscale => SampleType::Float32,
                         _ => kind,
                     };
-                    let whole = !matches!(kind, SampleType::Float32 | SampleType::Float64);
+                    let whole = !matches!(kind, SampleType::Float16 | SampleType::Float32 | SampleType::Float64);
                     let values: Vec<f32> = match selected {
                         Some(selected) => selected.values.iter().map(|v| if whole { v.round() } else { *v }).collect(),
                         // No scene reached the tile: nothing, in the method's own shape.

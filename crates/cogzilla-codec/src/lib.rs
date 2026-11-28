@@ -1346,6 +1346,26 @@ fn reconstruct_bands(
             horiz,
             recon_nodata_f64,
         ),
+        (SampleType::Float16, Predictor::None, r) => predictor::reconstruct_f16_uncompressed(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            recon_nodata,
+        ),
+        (SampleType::Float16, p, RawTileBuf::Mut(r)) => predictor::reconstruct_f16(
+            r,
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
+            byte_order,
+            p,
+            recon_nodata,
+        ),
+        (SampleType::Float16, _, RawTileBuf::Shared(_)) => {
+            unreachable!("Float16 with predictor always uses scratch buffer")
+        }
         (SampleType::Float64, Predictor::None, r) => predictor::reconstruct_f64_uncompressed(
             r.as_slice(),
             ifd.tile_width,
@@ -1366,8 +1386,8 @@ fn reconstruct_bands(
         (SampleType::Float64, _, RawTileBuf::Shared(_)) => {
             unreachable!("Float64 with predictor always uses scratch buffer")
         }
-        (SampleType::Bool | SampleType::Float16, _, _) => {
-            unreachable!("TIFF IFDs never produce Bool or Float16 sample types")
+        (SampleType::Bool, _, _) => {
+            unreachable!("TIFF IFDs never produce Bool sample types")
         }
     }
 }
