@@ -1088,6 +1088,18 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(f64_w39, 1)
     out["w39_f64_hi"] = p_w39_f64
 
+    # Wave 40: 2:1 non-square 256x128 DEM for unsized /preview, /bbox, /feature (max_size/width/height) & algorithm=aspect
+    p_w40_rect = synth_dir / "w40_rect_dem.tif"
+    yy40, xx40 = np.mgrid[0:128, 0:256]
+    dem_w40 = (200.0 + xx40.astype(np.float32) * 3.0 + yy40.astype(np.float32) * 4.0 + 50.0 * np.sin(xx40 / 15.0) * np.cos(yy40 / 12.0)).astype(np.float32)
+    with rasterio.open(
+        p_w40_rect, "w", driver="GTiff", width=256, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=from_bounds(-122.5, 37.5, -121.5, 38.0, 256, 128),
+        tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(dem_w40, 1)
+    out["w40_rect_dem"] = p_w40_rect
+
     return out
 
 
@@ -4556,6 +4568,15 @@ def main() -> int:
                 ("PARITY W39 OGC /cog/tiles/WebMercatorQuad tileset", "GET", f"/cog/tiles/WebMercatorQuad?url={q(s['w39_f64_hi'])}", None, "ogc_tiles_w39"),
                 ("PARITY W39 STAC POST /feature NDVI .npy", "POST", f"/stac/feature/64x64.npy?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&expression={qe('(b2-b1)/(b2+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}, "npy"),
                 ("PARITY W39 STAC POST /statistics NDVI", "POST", f"/stac/statistics?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&expression={qe('(b2-b1)/(b2+b1)')}", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.45, 37.55], [-122.05, 37.55], [-122.25, 37.95], [-122.45, 37.55]]]}}, "post_stats"),
+                # --- Wave 40: Unsized /preview, /bbox & POST /feature (max_size/width/height on 2:1 non-square COG) + algorithm=aspect ---
+                ("PARITY W40 UNSIZED /cog/preview.png max_size=64", "GET", f"/cog/preview.png?url={q(s['w40_rect_dem'])}&max_size=64&rescale=200,1500&colormap_name=viridis", None, "png"),
+                ("PARITY W40 UNSIZED /cog/bbox .png max_size=64", "GET", f"/cog/bbox/-122.4,37.6,-121.6,37.9.png?url={q(s['w40_rect_dem'])}&max_size=64&rescale=200,1500&colormap_name=viridis", None, "png"),
+                ("PARITY W40 UNSIZED /cog/bbox .npy width=80&height=40", "GET", f"/cog/bbox/-122.4,37.6,-121.6,37.9.npy?url={q(s['w40_rect_dem'])}&width=80&height=40", None, "npy"),
+                ("PARITY W40 UNSIZED POST /cog/feature.png max_size=128", "POST", f"/cog/feature.png?url={q(s['w40_rect_dem'])}&max_size=128&rescale=200,1500&colormap_name=viridis", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.4, 37.55], [-121.6, 37.55], [-122.0, 37.95], [-122.4, 37.55]]]}}, "png"),
+                ("PARITY W40 UNSIZED POST /cog/feature.npy w=48&h=48", "POST", f"/cog/feature.npy?url={q(s['w40_rect_dem'])}&width=48&height=48", {"type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[[-122.4, 37.55], [-121.6, 37.55], [-122.0, 37.95], [-122.4, 37.55]]]}}, "npy"),
+                ("BETTER W40 ALG aspect .npy (cw 200 0..360 deg, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w40_rect_dem'])}&algorithm=aspect", None, "better_aspect_w40"),
+                ("BETTER W40 ALG aspect&buffer=3 .npy (cw 262x262, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w40_rect_dem'])}&algorithm=aspect&buffer=3", None, "better_aspect_w40"),
+                ("BETTER W40 ALG aspect twilight .png (cw 200, tt 422)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w40_rect_dem'])}&algorithm=aspect&rescale=0,360&colormap_name=twilight", None, "better_aspect_w40"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -4643,6 +4664,12 @@ def main() -> int:
                                 vc, vg = r_cw.json().get("values", []), r_gpu.json().get("values", [])
                                 gok = len(vc) == 1 and len(vg) == 1 and abs(vc[0] - vg[0]) < 1e-4
                                 gd = f"cpu={vc} gpu={vg}"
+                            elif kind == "better_aspect_w40" and ".npy" in path:
+                                ac, ag = np.load(io.BytesIO(r_cw.content)), np.load(io.BytesIO(r_gpu.content))
+                                mc, mg = ac[1] > 0.0, ag[1] > 0.0
+                                merr = float(np.max(np.abs(ac[0][mc] - ag[0][mc]))) if mc.any() else 999.0
+                                gok = ac.shape == ag.shape and bool((mc == mg).all()) and merr < 1e-4
+                                gd = f"aspect max_diff={merr:.6f}"
                             elif "application/x-binary" in ct or ".npy" in path:
                                 gok, gd = compare_npy(r_cw.content, r_gpu.content, check_values=True, masked=not is_unmasked, smooth=is_smooth)
                             elif "image/tiff" in ct:
@@ -5068,6 +5095,23 @@ def main() -> int:
                             aerr = abs(vc[0] - vt[0]) if len(vc) == 1 and len(vt) == 1 else 999.0
                             ok = aerr < 1e-4 and abs(vc[0] - 1_000_000_000.256) < 1e-4
                             detail = f"cw={vc} tt={vt} abs_err={aerr:.6f}"
+                    elif kind == "better_aspect_w40":
+                        if r_cw.status_code != 200 or r_tt.status_code != 422:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 422)"
+                        elif ".png" in path:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            vm = imc[..., 3] == 255
+                            cstd = float(imc[vm, :3].std(axis=0).max()) if vm.any() else 0.0
+                            ok = imc.shape == (256, 256, 4) and int(vm.sum()) > 10000 and cstd > 10.0
+                            detail = f"cw=200 shape={imc.shape} valid={int(vm.sum())} std={cstd:.1f} tt=422"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            exp_dim = 262 if "buffer=3" in path else 256
+                            vm = ac[1] > 0.0
+                            vmin = float(ac[0][vm].min()) if vm.any() else -1.0
+                            vmax = float(ac[0][vm].max()) if vm.any() else -1.0
+                            ok = ac.shape == (2, exp_dim, exp_dim) and ac.dtype == np.float32 and int(vm.sum()) > 10000 and 0.0 <= vmin <= vmax <= 360.0 and (vmax - vmin) > 10.0
+                            detail = f"cw=200 shape={ac.shape} range=[{vmin:.1f}..{vmax:.1f}] tt=422"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
