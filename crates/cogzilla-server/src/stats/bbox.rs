@@ -3496,11 +3496,15 @@ async fn render_bbox_core(
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[1], rescale_max[1]),
                     255.0 / cogzilla_kernel::safe_rescale_denom(rescale_min[2], rescale_max[2]),
                 ];
+                let fill = [s0.nodata_fill(), s1.nodata_fill(), s2.nodata_fill()];
                 if let (Some(p0), Some(p1), Some(p2)) = (plane_of(&s0), plane_of(&s1), plane_of(&s2)) {
                     let n = w * h;
                     let px = rgba[..n * 4].chunks_exact_mut(4);
                     for (((o, &r), &g), &b) in px.zip(&p0[..n]).zip(&p1[..n]).zip(&p2[..n]) {
-                        if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                        if !(r.is_nan() && g.is_nan() && b.is_nan()) {
+                            let r = if r.is_nan() { fill[0] } else { r };
+                            let g = if g.is_nan() { fill[1] } else { g };
+                            let b = if b.is_nan() { fill[2] } else { b };
                             o[0] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
                             o[1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
                             o[2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;
@@ -3512,7 +3516,10 @@ async fn render_bbox_core(
                         let r = sample(&s0, u, v);
                         let g = sample(&s1, u, v);
                         let b = sample(&s2, u, v);
-                        if !r.is_nan() && !g.is_nan() && !b.is_nan() {
+                        if !(r.is_nan() && g.is_nan() && b.is_nan()) {
+                            let r = if r.is_nan() { fill[0] } else { r };
+                            let g = if g.is_nan() { fill[1] } else { g };
+                            let b = if b.is_nan() { fill[2] } else { b };
                             rgba[i * 4] = ((r - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
                             rgba[i * 4 + 1] = ((g - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
                             rgba[i * 4 + 2] = ((b - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;

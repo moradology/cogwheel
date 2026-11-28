@@ -752,7 +752,10 @@ pub(crate) async fn render_mixed_grid_bbox(
             ];
             for i in 0..npix {
                 let (v0, v1, v2) = (p0[i], p1[i], p2[i]);
-                if !(v0.is_nan() || v1.is_nan() || v2.is_nan()) {
+                if !(v0.is_nan() && v1.is_nan() && v2.is_nan()) {
+                    let v0 = if v0.is_nan() { 0.0 } else { v0 };
+                    let v1 = if v1.is_nan() { 0.0 } else { v1 };
+                    let v2 = if v2.is_nan() { 0.0 } else { v2 };
                     rgba[i * 4] = ((v0 - rescale_min[0]) * inv[0]).clamp(0.0, 255.0) as u8;
                     rgba[i * 4 + 1] = ((v1 - rescale_min[1]) * inv[1]).clamp(0.0, 255.0) as u8;
                     rgba[i * 4 + 2] = ((v2 - rescale_min[2]) * inv[2]).clamp(0.0, 255.0) as u8;

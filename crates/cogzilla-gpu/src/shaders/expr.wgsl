@@ -20,6 +20,7 @@ struct ExprParams {
     saturation: f32,
     rgb_min: vec4<f32>,
     rgb_inv_255: vec4<f32>,
+    rgb_nodata_fill: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: ExprParams;
@@ -328,12 +329,18 @@ fn rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vb = sample_band(2u, uv.x, uv.y);
     let out_idx = py * params.dst_w + px;
 
-    if (!is_finite_f32(vr) || !is_finite_f32(vg) || !is_finite_f32(vb)) {
+    let r_ok = is_finite_f32(vr);
+    let g_ok = is_finite_f32(vg);
+    let b_ok = is_finite_f32(vb);
+    if (!r_ok && !g_ok && !b_ok) {
         dst_words[out_idx] = 0u;
         return;
     }
 
-    dst_words[out_idx] = pack_rgb_formula(vr, vg, vb);
+    let r_val = select(params.rgb_nodata_fill.x, vr, r_ok);
+    let g_val = select(params.rgb_nodata_fill.y, vg, g_ok);
+    let b_val = select(params.rgb_nodata_fill.z, vb, b_ok);
+    dst_words[out_idx] = pack_rgb_formula(r_val, g_val, b_val);
 }
 
 /// Fused Dual-Pol SAR False-Color RGB ([VV_dB, VH_dB, VV_dB - VH_dB]) -> rescale ->
@@ -393,12 +400,18 @@ fn expr_rgb_color_formula_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vg = eval_expr_vm_range(&bvals, len0, len0 + len1);
     let vb = eval_expr_vm_range(&bvals, len0 + len1, len0 + len1 + len2);
 
-    if (!is_finite_f32(vr) || !is_finite_f32(vg) || !is_finite_f32(vb)) {
+    let r_ok = is_finite_f32(vr);
+    let g_ok = is_finite_f32(vg);
+    let b_ok = is_finite_f32(vb);
+    if (!r_ok && !g_ok && !b_ok) {
         dst_words[out_idx] = 0u;
         return;
     }
 
-    dst_words[out_idx] = pack_rgb_formula(vr, vg, vb);
+    let r_val = select(params.rgb_nodata_fill.x, vr, r_ok);
+    let g_val = select(params.rgb_nodata_fill.y, vg, g_ok);
+    let b_val = select(params.rgb_nodata_fill.z, vb, b_ok);
+    dst_words[out_idx] = pack_rgb_formula(r_val, g_val, b_val);
 }
 
 /// Multi-band planar `(num_bands, dst_h, dst_w)` Float32 resampling for scientific `.npy` / `.tif`

@@ -95,6 +95,32 @@ impl<'a> BandSource<'a> {
         self
     }
 
+    /// The scaled scalar nodata value for this band, used to restore a single band's
+    /// sample when another band at the same pixel is valid (GDAL `GMF_PER_DATASET` /
+    /// `dataset_mask()` semantics for multi-band RGB imagery). Returns `0.0` when no
+    /// scalar nodata value is present.
+    pub fn nodata_fill(&self) -> f32 {
+        let raw = self.nodata_override.or_else(|| {
+            self.blocks.iter().flatten().find_map(|b| match b.data {
+                cogzilla_codec::BandData::U8 {
+                    nodata: Some(nd), ..
+                } => Some(f32::from(nd)),
+                cogzilla_codec::BandData::U16 {
+                    nodata: Some(nd), ..
+                } => Some(f32::from(nd)),
+                cogzilla_codec::BandData::RgbU8Channel {
+                    nodata: Some(nd), ..
+                } => Some(f32::from(nd)),
+                _ => None,
+            })
+        });
+        match (raw, self.scale_offset) {
+            (Some(nd), Some((sc, off))) => nd * sc + off,
+            (Some(nd), None) => nd,
+            (None, _) => 0.0,
+        }
+    }
+
     /// Whether 1D sample coordinate `c` lies inside the pixel-center extent
     /// `[-0.5, dim - 0.5]` (inclusive on both edges, finite only).
     ///

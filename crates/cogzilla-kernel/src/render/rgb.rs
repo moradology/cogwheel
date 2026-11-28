@@ -1423,6 +1423,11 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
         255.0 / safe_rescale_denom(style.rescale_min[2], style.rescale_max[2]),
     ];
     let mins = style.rescale_min;
+    let fill = [
+        srcs[0].nodata_fill(),
+        srcs[1].nodata_fill(),
+        srcs[2].nodata_fill(),
+    ];
 
     match style.format {
         OutputFormat::RawF32 | OutputFormat::RawF64 | OutputFormat::Npy | OutputFormat::NpyF64 => {
@@ -1480,12 +1485,15 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                         let g = sample_val::<BILINEAR, false>(&srcs[1], u, v);
                         let b = sample_val::<BILINEAR, false>(&srcs[2], u, v);
                         let off = px * 4;
-                        if r.is_nan() || g.is_nan() || b.is_nan() {
+                        if r.is_nan() && g.is_nan() && b.is_nan() {
                             row_rgba[off] = 0;
                             row_rgba[off + 1] = 0;
                             row_rgba[off + 2] = 0;
                             row_rgba[off + 3] = 0;
                         } else {
+                            let r = if r.is_nan() { fill[0] } else { r };
+                            let g = if g.is_nan() { fill[1] } else { g };
+                            let b = if b.is_nan() { fill[2] } else { b };
                             row_rgba[off] = rescale_u8(r, inv[0], mins[0]);
                             row_rgba[off + 1] = rescale_u8(g, inv[1], mins[1]);
                             row_rgba[off + 2] = rescale_u8(b, inv[2], mins[2]);
@@ -1556,12 +1564,15 @@ fn render_rgb_specialized<const N: usize, const BILINEAR: bool, const CLEAN: boo
                         let g = sample_val::<BILINEAR, false>(&srcs[1], u, v);
                         let b = sample_val::<BILINEAR, false>(&srcs[2], u, v);
                         let off = row_off + px * 4;
-                        if r.is_nan() || g.is_nan() || b.is_nan() {
+                        if r.is_nan() && g.is_nan() && b.is_nan() {
                             buf[off] = 0;
                             buf[off + 1] = 0;
                             buf[off + 2] = 0;
                             buf[off + 3] = 0;
                         } else {
+                            let r = if r.is_nan() { fill[0] } else { r };
+                            let g = if g.is_nan() { fill[1] } else { g };
+                            let b = if b.is_nan() { fill[2] } else { b };
                             buf[off] = rescale_u8(r, inv[0], mins[0]);
                             buf[off + 1] = rescale_u8(g, inv[1], mins[1]);
                             buf[off + 2] = rescale_u8(b, inv[2], mins[2]);
@@ -1589,9 +1600,14 @@ pub fn render_rgb_bands<const N: usize>(
     srcs: &[BandSource<'_>; 3],
     style: &RgbStyle,
 ) -> Bytes {
-    if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
+    if srcs[0].all_nodata && srcs[1].all_nodata && srcs[2].all_nodata {
         return empty_tile_bytes(N as u32, style.format, 3);
     }
+    let fill = [
+        srcs[0].nodata_fill(),
+        srcs[1].nodata_fill(),
+        srcs[2].nodata_fill(),
+    ];
     let (c0, c1, r0, r1) = plan.src_pixel_bounds();
     let clean = plan.all_in_bounds()
         && srcs[0].is_clean_inbounds(c0, c1, r0, r1)
@@ -1700,7 +1716,7 @@ pub fn render_rgb_bands<const N: usize>(
                     widened_plane_separable_into_with_tables(
                         &u[..], &v[..], &srcs[2], mode, sx, sy, &cols, &rows, &mut p2[..len],
                     );
-                    render_rgb_planes::<N>([&p0[..len], &p1[..len], &p2[..len]], style, clean)
+                    render_rgb_planes::<N>([&p0[..len], &p1[..len], &p2[..len]], style, clean, fill)
                 })
             } else {
                 let planes = [
@@ -1708,14 +1724,14 @@ pub fn render_rgb_bands<const N: usize>(
                     widened_plane(plan, &srcs[1], mode, sx, sy),
                     widened_plane(plan, &srcs[2], mode, sx, sy),
                 ];
-                render_rgb_planes::<N>([&planes[0], &planes[1], &planes[2]], style, clean)
+                render_rgb_planes::<N>([&planes[0], &planes[1], &planes[2]], style, clean, fill)
             }
         }
         (ResampleMode::Bilinear, true) => render_rgb_specialized::<N, true, true>(plan, srcs, style),
         (ResampleMode::Bilinear, false) => render_rgb_specialized::<N, true, false>(plan, srcs, style),
         (mode, _) => {
             let (sx, sy) = coord_plan_scale(plan);
-            render_rgb_cubic::<N>(plan, style, clean, |b, u, v| {
+            render_rgb_cubic::<N>(plan, style, clean, fill, |b, u, v| {
                 if mode == ResampleMode::Cubic {
                     sample_cubic(&srcs[b], u, v)
                 } else {
@@ -1728,7 +1744,12 @@ pub fn render_rgb_bands<const N: usize>(
 
 /// Direct encoder for 3 precomputed `N x N` f32 planes (zero `index_plan` allocation, direct flat
 /// indexing, and 3-byte RGB fast path for clean JPEG/WebP without RGBA alpha stripping).
-fn render_rgb_planes<const N: usize>(planes: [&[f32]; 3], style: &RgbStyle, clean: bool) -> Bytes {
+fn render_rgb_planes<const N: usize>(
+    planes: [&[f32]; 3],
+    style: &RgbStyle,
+    clean: bool,
+    fill: [f32; 3],
+) -> Bytes {
     let inv = [
         255.0 / safe_rescale_denom(style.rescale_min[0], style.rescale_max[0]),
         255.0 / safe_rescale_denom(style.rescale_min[1], style.rescale_max[1]),
@@ -1791,9 +1812,12 @@ fn render_rgb_planes<const N: usize>(planes: [&[f32]; 3], style: &RgbStyle, clea
                 for px in 0..N {
                     let (r, g, b) = (rr[px], rg[px], rb[px]);
                     let off = px * 4;
-                    if r.is_nan() || g.is_nan() || b.is_nan() {
+                    if r.is_nan() && g.is_nan() && b.is_nan() {
                         row[off..off + 4].fill(0);
                     } else {
+                        let r = if r.is_nan() { fill[0] } else { r };
+                        let g = if g.is_nan() { fill[1] } else { g };
+                        let b = if b.is_nan() { fill[2] } else { b };
                         row[off] = rescale_u8(r, inv[0], mins[0]);
                         row[off + 1] = rescale_u8(g, inv[1], mins[1]);
                         row[off + 2] = rescale_u8(b, inv[2], mins[2]);
@@ -1833,9 +1857,12 @@ fn render_rgb_planes<const N: usize>(planes: [&[f32]; 3], style: &RgbStyle, clea
             for i in 0..N * N {
                 let (r, g, b) = (pr[i], pg[i], pb[i]);
                 let off = i * 4;
-                if r.is_nan() || g.is_nan() || b.is_nan() {
+                if r.is_nan() && g.is_nan() && b.is_nan() {
                     buf[off..off + 4].fill(0);
                 } else {
+                    let r = if r.is_nan() { fill[0] } else { r };
+                    let g = if g.is_nan() { fill[1] } else { g };
+                    let b = if b.is_nan() { fill[2] } else { b };
                     buf[off] = rescale_u8(r, inv[0], mins[0]);
                     buf[off + 1] = rescale_u8(g, inv[1], mins[1]);
                     buf[off + 2] = rescale_u8(b, inv[2], mins[2]);
@@ -1856,6 +1883,7 @@ fn render_rgb_cubic<const N: usize>(
     plan: &CoordPlan<N>,
     style: &RgbStyle,
     clean: bool,
+    fill: [f32; 3],
     sample_band: impl Fn(usize, f32, f32) -> f32,
 ) -> Bytes {
     let inv = [
@@ -1918,9 +1946,12 @@ fn render_rgb_cubic<const N: usize>(
                     let g = sample_band(1, u, v);
                     let b = sample_band(2, u, v);
                     let off = px * 4;
-                    if r.is_nan() || g.is_nan() || b.is_nan() {
+                    if r.is_nan() && g.is_nan() && b.is_nan() {
                         row[off..off + 4].fill(0);
                     } else {
+                        let r = if r.is_nan() { fill[0] } else { r };
+                        let g = if g.is_nan() { fill[1] } else { g };
+                        let b = if b.is_nan() { fill[2] } else { b };
                         row[off] = rescale_u8(r, inv[0], mins[0]);
                         row[off + 1] = rescale_u8(g, inv[1], mins[1]);
                         row[off + 2] = rescale_u8(b, inv[2], mins[2]);
@@ -1945,9 +1976,12 @@ fn render_rgb_cubic<const N: usize>(
                     let g = sample_band(1, u, v);
                     let b = sample_band(2, u, v);
                     let off = (py * N + px) * 4;
-                    if r.is_nan() || g.is_nan() || b.is_nan() {
+                    if r.is_nan() && g.is_nan() && b.is_nan() {
                         buf[off..off + 4].fill(0);
                     } else {
+                        let r = if r.is_nan() { fill[0] } else { r };
+                        let g = if g.is_nan() { fill[1] } else { g };
+                        let b = if b.is_nan() { fill[2] } else { b };
                         buf[off] = rescale_u8(r, inv[0], mins[0]);
                         buf[off + 1] = rescale_u8(g, inv[1], mins[1]);
                         buf[off + 2] = rescale_u8(b, inv[2], mins[2]);

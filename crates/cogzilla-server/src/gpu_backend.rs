@@ -2382,6 +2382,11 @@ impl GpuBackend {
                 mode: gpu_mode,
                 rescale_min: style.rescale_min,
                 rescale_max: style.rescale_max,
+                nodata_fill: [
+                    srcs[0].nodata_fill(),
+                    srcs[1].nodata_fill(),
+                    srcs[2].nodata_fill(),
+                ],
                 formula: gpu_formula,
             },
             dst_w,
