@@ -904,6 +904,35 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     }))
     out["w32_stac"] = p_w32_stac
 
+    # Wave 33: US Survey Feet (EPSG:2227), Intl Feet (EPSG:2913), Ellipsoidal World Mercator (EPSG:3395),
+    # NAD83 UTM 10N (EPSG:26910), Arctic Polar Stereographic (EPSG:3995), and PlanarConfiguration=SEPARATE f32 ZSTD P3
+    grad_w33 = (100.0 + xx9.astype(np.float32) * 3.0 + yy9.astype(np.float32) * 2.0).astype(np.float32)
+    for cname, crs_str, wgs_bb in [
+        ("w33_ca_usft_2227", "EPSG:2227", (-122.4, 37.6, -122.1, 37.9)),
+        ("w33_or_intlft_2913", "EPSG:2913", (-122.8, 45.4, -122.5, 45.7)),
+        ("w33_merc_3395", "EPSG:3395", (-122.5, 37.5, -122.0, 38.0)),
+        ("w33_nad83_26910", "EPSG:26910", (-122.5, 37.5, -122.0, 38.0)),
+        ("w33_arctic_3995", "EPSG:3995", (10.0, 78.0, 16.0, 80.0)),
+    ]:
+        p_c = synth_dir / f"{cname}.tif"
+        bb_c = transform_bounds("EPSG:4326", crs_str, *wgs_bb, densify_pts=21)
+        with rasterio.open(
+            p_c, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+            crs=crs_str, transform=from_bounds(*bb_c, 128, 128),
+            tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+        ) as ds:
+            ds.write(grad_w33, 1)
+        out[cname] = p_c
+
+    p_w33_sep = synth_dir / "w33_planar_f32_zstd_p3.tif"
+    with rasterio.open(
+        p_w33_sep, "w", driver="GTiff", width=128, height=128, count=3, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="ZSTD", predictor=3, interleave="BAND",
+    ) as ds:
+        ds.write(np.stack([grad_w33, grad_w33 * 0.5 + 10.0, grad_w33 * 0.25 - 5.0]))
+    out["w33_planar_f32_zstd_p3"] = p_w33_sep
+
     return out
 
 
@@ -4191,7 +4220,16 @@ def main() -> int:
                 ("PARITY W32 STAC /stac/map 4326 64x64 .png", "GET", f"/stac/map?url={q(s['w32_stac'])}&assets=dem&bbox=-122.5,37.5,-122.0,38.0&width=64&height=64&rescale=100,900&colormap_name=viridis&f=png", None, "png"),
                 ("PARITY W32 STAC TileJSON WebMercatorQuad", "GET", f"/stac/WebMercatorQuad/tilejson.json?url={q(s['w32_stac'])}&assets=dem", None, "tilejson_w32"),
                 ("BETTER W32 STAC WMTS Capabilities XML (cw 200, tt 404)", "GET", f"/stac/WebMercatorQuad/WMTSCapabilities.xml?url={q(s['w32_stac'])}&assets=dem", None, "better_stac_wmts"),
+                # --- Wave 33: US Survey Feet, Intl Feet, Ellipsoidal World Mercator 3395, NAD83 UTM 10N, Arctic 3995 & Planar SEPARATE f32 ZSTD P3 ---
+                ("PARITY W33 PLANAR SEPARATE 3-band f32 ZSTD P3 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w33_planar_f32_zstd_p3'])}", None, "npy"),
             ]
+            for name in ("w33_ca_usft_2227", "w33_or_intlft_2913", "w33_merc_3395", "w33_nad83_26910", "w33_arctic_3995"):
+                p = s[name]
+                lon_c, lat_c, z_c, tx_c, ty_c, _ = center_lonlat_and_tile(p, z=6 if name == "w33_arctic_3995" else 10)
+                cases += [
+                    (f"PARITY W33 CRS [{name}] .npy", "GET", f"/cog/tiles/WebMercatorQuad/{z_c}/{tx_c}/{ty_c}.npy?url={q(p)}", None, "npy"),
+                    (f"PARITY W33 CRS [{name}] point", "GET", f"/cog/point/{lon_c:.5f},{lat_c:.5f}?url={q(p)}", None, "point"),
+                ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
