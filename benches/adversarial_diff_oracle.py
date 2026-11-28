@@ -1192,6 +1192,37 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.build_overviews([2, 4], Resampling.average)
     out["w43_stripped_ovr"] = p_w43_strip
 
+    # Wave 45: unrescaled 16-bit uint16 PNG (with nodata=0 hole), categorical uint8 (classes 1/2/3 + nodata=0)
+    # for discrete RGBA JSON colormap, and float32 DEM for ceil/floor/cast(output_dtype)/terrainrgb/contours/expr+alg
+    p_w45_u16 = synth_dir / "w45_u16.tif"
+    u16_45 = (1000 + xx9.astype(np.uint32) * 300 + yy9.astype(np.uint32) * 200).astype(np.uint16)
+    u16_45[80:110, 60:90] = 0
+    with rasterio.open(
+        p_w45_u16, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=0,
+    ) as ds:
+        ds.write(u16_45, 1)
+    out["w45_u16"] = p_w45_u16
+
+    p_w45_cat = synth_dir / "w45_cat.tif"
+    cat_45 = np.where(xx9 < 64, 1, np.where(yy9 < 96, 2, 3)).astype(np.uint8)
+    cat_45[80:100, 60:80] = 0
+    with rasterio.open(
+        p_w45_cat, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=0,
+    ) as ds:
+        ds.write(cat_45, 1)
+    out["w45_cat"] = p_w45_cat
+
+    p_w45_dem = synth_dir / "w45_dem.tif"
+    dem_45 = (100.25 + xx9 * 3.7 + yy9 * 2.3).astype(np.float32)
+    with rasterio.open(
+        p_w45_dem, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(dem_45, 1)
+    out["w45_dem"] = p_w45_dem
+
     return out
 
 
@@ -4966,6 +4997,19 @@ def main() -> int:
                 ("PARITY W44 color_formula chained Gamma+Sigmoidal+Sat .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&color_formula={qe('Gamma RGB 1.5 Sigmoidal RGB 15 0.35 Saturation 1.3')}", None, "png"),
                 ("PARITY W44 color_formula per-channel Gamma R/B .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&color_formula={qe('Gamma R 1.8 Gamma B 0.7')}", None, "png"),
                 ("PARITY W44 color_formula per-channel Sigmoidal G .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&color_formula={qe('Sigmoidal G 10 0.5')}", None, "png"),
+                # --- Wave 45: 16-bit unrescaled uint16 PNG, discrete RGBA JSON colormap, cast(output_dtype), ceil/floor/grayscale/terrainrgb/contours, expr+alg ---
+                ("PARITY W45 16-bit unrescaled uint16 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_u16'])}", None, "png"),
+                ("PARITY W45 discrete RGBA JSON colormap (alpha 0/128/255)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_cat'])}&colormap={qe(json.dumps({'1':[255,0,0,255],'2':[0,255,0,128],'3':[0,0,255,0]}))}", None, "png"),
+                ("PARITY W45 ALG ceil .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w45_dem'])}&algorithm=ceil", None, "npy"),
+                ("PARITY W45 ALG floor .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w45_dem'])}&algorithm=floor", None, "npy"),
+                ("PARITY W45 ALG cast default uint8 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w45_dem'])}&algorithm=cast", None, "npy"),
+                ("BETTER W45 ALG cast output_dtype=int16 (cw i16, tt u8)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w45_dem'])}&algorithm=cast&algorithm_params={qe(json.dumps({'output_dtype':'int16'}))}", None, "better_cast_int16"),
+                ("PARITY W45 ALG grayscale (3-band RGB) .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w43_rgb_nodata'])}&algorithm=grayscale", None, "npy"),
+                ("PARITY W45 ALG grayscale (3-band RGB) .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w43_rgb_nodata'])}&algorithm=grayscale", None, "png"),
+                ("PARITY W45 ALG terrainrgb .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_dem'])}&algorithm=terrainrgb", None, "png"),
+                ("PARITY W45 ALG contours custom (inc=50, thick=2) .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_dem'])}&algorithm=contours&algorithm_params={qe(json.dumps({'increment':50,'thickness':2}))}", None, "png"),
+                ("PARITY W45 EXPR+ALG expression=b1*0.5+10 & ceil .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w45_dem'])}&expression={qe('b1*0.5+10')}&algorithm=ceil", None, "npy"),
+                ("PARITY W45 EXPR+ALG expression=b1*2.0 & terrarium .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_dem'])}&expression={qe('b1*2.0')}&algorithm=terrarium", None, "png"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -5511,6 +5555,24 @@ def main() -> int:
                             vmax = int(ac[0][vm].max()) if vm.any() else 0
                             ok = ac.shape == (2, 256, 256) and ac.dtype == np.uint64 and int(vm.sum()) > 10000 and vmin > 100000 and vmax < 160000
                             detail = f"cw=200 dtype={ac.dtype} valid={int(vm.sum())} sum_range=[{vmin}..{vmax}] tt=500"
+                    elif kind == "better_cast_int16":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            at = np.load(io.BytesIO(r_tt.content))
+                            vm = ac[1] > 0
+                            vmin = int(ac[0][vm].min()) if vm.any() else 0
+                            vmax = int(ac[0][vm].max()) if vm.any() else 0
+                            ok = (
+                                ac.shape == (2, 256, 256)
+                                and ac.dtype == np.int16
+                                and at.dtype == np.uint8
+                                and int(vm.sum()) > 10000
+                                and vmin > 300
+                                and vmax < 900
+                            )
+                            detail = f"cw={ac.dtype} [{vmin}..{vmax}] vs tt={at.dtype} (hardcoded uint8)"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"

@@ -735,10 +735,10 @@ pub(super) fn parse_query(q: Option<&str>) -> ParsedQuery {
                         if let Some(t) = number("threshold") {
                             pq.threshold = t as f32;
                         }
-                        if let Some(val) = obj.get("dtype") {
+                        if let Some(val) = obj.get("output_dtype").or_else(|| obj.get("dtype")) {
                             match val.as_str() {
                                 Some(dt) => pq.cast_dtype = Some(dt.to_ascii_lowercase()),
-                                None => bad("dtype must be a string"),
+                                None => bad("output_dtype must be a string"),
                             }
                         }
                         if let Some(x) = number("increment").filter(|x| *x > 0.0) {
@@ -1371,5 +1371,22 @@ mod tests {
             assert_eq!(c.keys, base.keys, "{name}: keys");
             assert_eq!(c.errors, base.errors, "{name}: errors");
         }
+    }
+
+    #[test]
+    fn cast_algorithm_params_accepts_output_dtype_and_dtype_alias() {
+        let pq_tt = parse_query(Some("algorithm=cast&algorithm_params=%7B%22output_dtype%22%3A%22int16%22%7D"));
+        assert_eq!(pq_tt.cast_dtype.as_deref(), Some("int16"));
+        assert!(pq_tt.errors.is_empty());
+
+        let pq_alias = parse_query(Some("algorithm=cast&algorithm_params=%7B%22dtype%22%3A%22UINT16%22%7D"));
+        assert_eq!(pq_alias.cast_dtype.as_deref(), Some("uint16"));
+        assert!(pq_alias.errors.is_empty());
+
+        // TiTiler's canonical `output_dtype` takes precedence if both are present
+        let pq_both = parse_query(Some(
+            "algorithm=cast&algorithm_params=%7B%22output_dtype%22%3A%22int16%22%2C%22dtype%22%3A%22uint8%22%7D",
+        ));
+        assert_eq!(pq_both.cast_dtype.as_deref(), Some("int16"));
     }
 }
