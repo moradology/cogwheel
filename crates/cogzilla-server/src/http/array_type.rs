@@ -18,7 +18,7 @@ pub(crate) fn wider_type(a: SampleType, b: SampleType) -> SampleType {
     let signed = |t| matches!(t, T::Int8 | T::Int16 | T::Int32 | T::Int64);
     let bits = |t| match t {
         T::Bool | T::Uint1 | T::Uint4 | T::Uint8 | T::Int8 => 8u32,
-        T::Uint16 | T::Int16 | T::Float16 => 16,
+        T::Uint12 | T::Uint16 | T::Int16 | T::Float16 => 16,
         T::Uint32 | T::Int32 | T::Float32 => 32,
         T::Uint64 | T::Int64 | T::Float64 => 64,
     };
@@ -142,6 +142,7 @@ fn single_expr_type(expr: &str, read: SampleType) -> SampleType {
             | SampleType::Uint4
             | SampleType::Uint8
             | SampleType::Int8
+            | SampleType::Uint12
             | SampleType::Uint16
             | SampleType::Int16 => SampleType::Int32,
             _ => SampleType::Float64,
@@ -183,6 +184,7 @@ pub(crate) fn integer_range(kind: SampleType) -> Option<(f64, f64)> {
         T::Uint4 => (0.0, 15.0),
         T::Uint8 => (0.0, 255.0),
         T::Int8 => (-128.0, 127.0),
+        T::Uint12 => (0.0, 4095.0),
         T::Uint16 => (0.0, 65_535.0),
         T::Int16 => (-32_768.0, 32_767.0),
         T::Uint32 => (0.0, 4_294_967_295.0),
@@ -198,7 +200,7 @@ pub(crate) fn integer_range(kind: SampleType) -> Option<(f64, f64)> {
 pub(crate) fn cast_type(dtype: Option<&str>) -> Option<SampleType> {
     let st = SampleType::from_numpy_name(dtype.unwrap_or("uint8"))?;
     match st {
-        SampleType::Bool | SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint64 | SampleType::Int64 | SampleType::Float16 => None,
+        SampleType::Bool | SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint12 | SampleType::Uint64 | SampleType::Int64 | SampleType::Float16 => None,
         _ => Some(st),
     }
 }
@@ -228,6 +230,7 @@ fn round_into(kind: SampleType) -> fn(f64) -> f64 {
         T::Uint4 => |v: f64| v.round().clamp(0.0, 15.0),
         T::Uint8 => |v: f64| v.round().clamp(0.0, 255.0),
         T::Int8 => |v: f64| v.round().clamp(-128.0, 127.0),
+        T::Uint12 => |v: f64| v.round().clamp(0.0, 4095.0),
         T::Uint16 => |v: f64| v.round().clamp(0.0, 65_535.0),
         T::Int16 => |v: f64| v.round().clamp(-32_768.0, 32_767.0),
         T::Uint32 => |v: f64| v.round().clamp(0.0, 4_294_967_295.0),

@@ -415,7 +415,9 @@ fn compute_statistics_cpu(
             && opts.histogram_edges.is_none()
             && !matches!(
                 ifd.sample_type,
-                cogzilla_raster::SampleType::Uint8 | cogzilla_raster::SampleType::Uint16
+                cogzilla_raster::SampleType::Uint8
+                    | cogzilla_raster::SampleType::Uint12
+                    | cogzilla_raster::SampleType::Uint16
             )
             && !ifd.sample_type.needs_f64()
             && let Some(gpu_ref) = gpu

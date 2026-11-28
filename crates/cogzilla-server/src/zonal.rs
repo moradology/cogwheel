@@ -3674,6 +3674,7 @@ pub(crate) async fn compute_native_exact_mosaic_fold_stats(
             ifd.sample_type,
             cogzilla_raster::SampleType::Uint1
                 | cogzilla_raster::SampleType::Uint4
+                | cogzilla_raster::SampleType::Uint12
                 | cogzilla_raster::SampleType::Uint8
                 | cogzilla_raster::SampleType::Uint16
                 | cogzilla_raster::SampleType::Uint32

@@ -386,8 +386,8 @@ fn append_native_as_f64(bytes: &[u8], dtype: SampleType, count: usize, out: &mut
                 out.push(f as f64);
             }
         }
-        SampleType::Uint1 | SampleType::Uint4 => {
-            unreachable!("Zarr stores never produce sub-byte TIFF sample types")
+        SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint12 => {
+            unreachable!("Zarr stores never produce bit-packed TIFF sample types")
         }
     }
 }

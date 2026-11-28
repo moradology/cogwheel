@@ -413,7 +413,7 @@ const MAX_DECODED_TILE_BYTES: usize = 128 * 1024 * 1024;
 pub const fn decoded_bytes_per_sample(st: SampleType) -> usize {
     match st {
         SampleType::Bool | SampleType::Uint1 | SampleType::Uint4 | SampleType::Uint8 => 1,
-        SampleType::Uint16 => 2,
+        SampleType::Uint12 | SampleType::Uint16 => 2,
         SampleType::Int8 | SampleType::Int16 | SampleType::Float16 | SampleType::Float32 => 4,
         SampleType::Uint32
         | SampleType::Int32
@@ -1317,6 +1317,13 @@ fn reconstruct_bands(
             tile_h,
             bands_in_tile,
             4,
+            recon_nodata,
+        ),
+        (SampleType::Uint12, _, r) => predictor::reconstruct_uint12(
+            r.as_slice(),
+            ifd.tile_width,
+            tile_h,
+            bands_in_tile,
             recon_nodata,
         ),
         (SampleType::Uint64, _, r) => predictor::reconstruct_int64(

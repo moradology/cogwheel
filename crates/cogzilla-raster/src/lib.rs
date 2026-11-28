@@ -22,6 +22,8 @@ pub enum SampleType {
     Uint8,
     /// Signed 8-bit integer.
     Int8,
+    /// Unsigned 12-bit packed integer (TIFF `NBITS=12`, unpacked to `uint16` values `0..=4095`).
+    Uint12,
     /// Unsigned 16-bit integer (Landsat Collection 2, Sentinel-2 L2A).
     Uint16,
     /// Signed 16-bit integer (SRTM / Copernicus DEMs, MODIS).
@@ -48,14 +50,14 @@ impl SampleType {
     pub const fn bytes_per_sample(self) -> usize {
         match self {
             Self::Bool | Self::Uint1 | Self::Uint4 | Self::Uint8 | Self::Int8 => 1,
-            Self::Uint16 | Self::Int16 | Self::Float16 => 2,
+            Self::Uint12 | Self::Uint16 | Self::Int16 | Self::Float16 => 2,
             Self::Uint32 | Self::Int32 | Self::Float32 => 4,
             Self::Uint64 | Self::Int64 | Self::Float64 => 8,
         }
     }
 
     /// Packed byte width of one uncompressed scanline of `width` pixels × `bands_in_tile` samples.
-    /// For sub-byte types (`Uint1`, `Uint4`), TIFF pads each row to a byte boundary.
+    /// For sub-byte / packed types (`Uint1`, `Uint4`, `Uint12`), TIFF pads each row to a byte boundary.
     #[inline(always)]
     pub const fn row_bytes(self, width: usize, bands_in_tile: usize) -> Option<usize> {
         let Some(samples) = width.checked_mul(bands_in_tile) else {
@@ -64,19 +66,23 @@ impl SampleType {
         match self {
             Self::Uint1 => Some(samples.div_ceil(8)),
             Self::Uint4 => Some(samples.div_ceil(2)),
+            Self::Uint12 => match samples.checked_mul(3) {
+                Some(n) => Some(n.div_ceil(2)),
+                None => None,
+            },
             _ => samples.checked_mul(self.bytes_per_sample()),
         }
     }
 
     /// Canonical NumPy/Zarr/GDAL dtype name (`"uint16"`, `"float32"`, `"bool"`, `"float16"`, …).
-    /// Sub-byte TIFF types (`Uint1`, `Uint4`) report `"uint8"` to match GDAL / TiTiler.
+    /// Sub-byte / packed TIFF types (`Uint1`, `Uint4`, `Uint12`) report their unpacked GDAL / TiTiler dtype.
     #[inline(always)]
     pub const fn numpy_name(self) -> &'static str {
         match self {
             Self::Bool => "bool",
             Self::Uint1 | Self::Uint4 | Self::Uint8 => "uint8",
             Self::Int8 => "int8",
-            Self::Uint16 => "uint16",
+            Self::Uint12 | Self::Uint16 => "uint16",
             Self::Int16 => "int16",
             Self::Uint32 => "uint32",
             Self::Int32 => "int32",
@@ -121,7 +127,7 @@ impl SampleType {
             Self::Bool => "|b1",
             Self::Uint1 | Self::Uint4 | Self::Uint8 => "|u1",
             Self::Int8 => "|i1",
-            Self::Uint16 => "<u2",
+            Self::Uint12 | Self::Uint16 => "<u2",
             Self::Int16 => "<i2",
             Self::Uint32 => "<u4",
             Self::Int32 => "<i4",
@@ -142,7 +148,7 @@ impl SampleType {
             Self::Bool => Some((0.0, 1.0)),
             Self::Uint1 | Self::Uint4 | Self::Uint8 => Some((0.0, 255.0)),
             Self::Int8 => Some((-128.0, 127.0)),
-            Self::Uint16 => Some((0.0, 65_535.0)),
+            Self::Uint12 | Self::Uint16 => Some((0.0, 65_535.0)),
             Self::Int16 => Some((-32_768.0, 32_767.0)),
             Self::Uint32 => Some((0.0, u32::MAX as f32)),
             Self::Int32 => Some((i32::MIN as f32, i32::MAX as f32)),
@@ -313,6 +319,7 @@ mod tests {
             SampleType::Uint4,
             SampleType::Uint8,
             SampleType::Int8,
+            SampleType::Uint12,
             SampleType::Uint16,
             SampleType::Int16,
             SampleType::Uint32,
@@ -329,6 +336,8 @@ mod tests {
             let parsed = SampleType::from_numpy_name(st.numpy_name()).unwrap();
             if matches!(st, SampleType::Uint1 | SampleType::Uint4) {
                 assert_eq!(parsed, SampleType::Uint8);
+            } else if st == SampleType::Uint12 {
+                assert_eq!(parsed, SampleType::Uint16);
             } else {
                 assert_eq!(parsed, st);
             }
@@ -373,6 +382,11 @@ mod tests {
         assert_eq!(SampleType::Uint4.row_bytes(2, 1), Some(1));
         assert_eq!(SampleType::Uint4.row_bytes(3, 1), Some(2));
         assert_eq!(SampleType::Uint4.row_bytes(3, 3), Some(5));
+        assert_eq!(SampleType::Uint12.row_bytes(0, 1), Some(0));
+        assert_eq!(SampleType::Uint12.row_bytes(1, 1), Some(2));
+        assert_eq!(SampleType::Uint12.row_bytes(2, 1), Some(3));
+        assert_eq!(SampleType::Uint12.row_bytes(3, 1), Some(5));
+        assert_eq!(SampleType::Uint12.row_bytes(2, 3), Some(9));
         assert_eq!(SampleType::Uint16.row_bytes(256, 3), Some(256 * 3 * 2));
         assert_eq!(SampleType::Float64.row_bytes(10, 2), Some(160));
         // Overflow returns None rather than wrapping.
@@ -391,6 +405,7 @@ mod tests {
             SampleType::Uint4,
             SampleType::Uint8,
             SampleType::Int8,
+            SampleType::Uint12,
             SampleType::Uint16,
             SampleType::Int16,
             SampleType::Float16,
