@@ -1380,6 +1380,9 @@ fn build_band_request(
             .expr_raw
             .as_deref()
             .filter(|_| def.kind == crate::algorithms::AlgorithmKind::Dem)
+            // A spectral preset (`ndvi`) is left to the algorithm's own band, as the band
+            // math algorithms leave it (`algorithm_over_expression`).
+            .filter(|expr| SpectralExpr::from_str_opt(expr).is_none())
             .and_then(|expr| expression_parts(expr).next())
         {
             Some(first) => {

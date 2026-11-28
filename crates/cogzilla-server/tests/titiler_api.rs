@@ -6711,6 +6711,16 @@ async fn stac_stacks_every_band_of_several_assets() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+    // ... and a spectral preset beside a terrain algorithm reads the band, as before.
+    assert_eq!(pixel("&assets=a&expression=ndvi&algorithm=terrarium").await, [128.0, 3.0, 0.0]);
+    let resp = client
+        .get(format!("{base}/stac/statistics?url={url}&max_size=16&assets=a&expression=ndvi&algorithm=terrarium"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let stats: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(stats["b2"]["mean"].as_f64(), Some(3.0), "{stats}");
     // An expression that reads no band has nowhere to read elevations.
     let resp = client
         .get(format!("{base}/stac/preview.png?url={url}&assets=a&expression=42&algorithm=hillshade"))
