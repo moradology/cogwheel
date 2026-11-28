@@ -44,6 +44,7 @@ import httpx
 import mercantile
 import numpy as np
 from PIL import Image
+from pyproj import Transformer
 import rasterio
 from rasterio.control import GroundControlPoint
 from rasterio.crs import CRS as RasterioCRS
@@ -663,6 +664,37 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.offsets = (10.0,)
         ds.build_overviews([2, 4], Resampling.nearest)
     out["w20_multi_ov"] = p_ov20
+
+    # Wave 21: Heterogeneous multi-CRS / multi-resolution / multi-dtype STAC item
+    p_w21_red = synth_dir / "w21_red_4326_u16.tif"
+    red21 = (500 + xx9 * 10 + yy9 * 5).astype(np.uint16)
+    red21[85:100, 70:85] = 0  # nodata hole inside tile 10/164/396
+    with rasterio.open(p_w21_red, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint16", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=0) as ds:
+        ds.write(red21, 1)
+
+    t_utm21 = Transformer.from_crs("EPSG:4326", "EPSG:32610", always_xy=True)
+    ux0, uy0 = t_utm21.transform(-122.55, 37.45)
+    ux1, uy1 = t_utm21.transform(-121.95, 38.05)
+    yy256, xx256 = np.mgrid[0:256, 0:256]
+    p_w21_nir = synth_dir / "w21_nir_32610_f32.tif"
+    with rasterio.open(p_w21_nir, "w", driver="GTiff", width=256, height=256, count=1, dtype="float32", crs="EPSG:32610", transform=from_bounds(ux0, uy0, ux1, uy1, 256, 256), tiled=True, blockxsize=64, blockysize=64, compress="deflate", nodata=-9999.0) as ds:
+        ds.write((1200.0 + xx256.astype(np.float32) * 8.0 + yy256.astype(np.float32) * 4.0), 1)
+
+    p_w21_stac = synth_dir / "w21_hetero_item.json"
+    p_w21_stac.write_text(json.dumps({
+        "type": "Feature",
+        "stac_version": "1.0.0",
+        "id": "w21-hetero",
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.5], [-122.0, 37.5], [-122.0, 38.0], [-122.5, 38.0], [-122.5, 37.5]]]},
+        "bbox": [-122.5, 37.5, -122.0, 38.0],
+        "properties": {"datetime": "2024-06-01T00:00:00Z"},
+        "links": [],
+        "assets": {
+            "red": {"href": str(p_w21_red), "type": "image/tiff; application=geotiff"},
+            "nir": {"href": str(p_w21_nir), "type": "image/tiff; application=geotiff"},
+        },
+    }))
+    out["w21_stac"] = p_w21_stac
 
     return out
 
@@ -2870,6 +2902,12 @@ def main() -> int:
                 ("PARITY W20 MULTI-OV nodata=200 override .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_multi_ov'])}&nodata=200", None, "npy"),
                 ("PARITY W20 MULTI-OV nodata=200 override /statistics", "GET", f"/cog/statistics?url={q(s['w20_multi_ov'])}&nodata=200", None, "stats"),
                 ("PARITY W20 MULTI-OV nodata=200 override /point (-9999)", "GET", f"/cog/point/-122.22,37.67?url={q(s['w20_multi_ov'])}&nodata=200", None, "point"),
+                # --- Wave 21: Heterogeneous multi-CRS / multi-resolution / multi-dtype STAC ---
+                ("PARITY W21 STAC hetero stack red(4326 u16)+nir(32610 f32) .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w21_stac'])}&assets=red&assets=nir", None, "npy"),
+                ("PARITY W21 STAC hetero /point red+nir", "GET", f"/stac/point/-122.25,37.75?url={q(s['w21_stac'])}&assets=red&assets=nir", None, "point"),
+                ("BETTER W21 STAC hetero NDVI asset_as_band .png (cw 200, tt 400)", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w21_stac'])}&assets=red&assets=nir&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}&rescale=-1,1&colormap_name=viridis", None, "better_cw200_tt400"),
+                ("BETTER W21 STAC hetero NDVI without assets= (cw 200, tt 422)", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w21_stac'])}&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}&rescale=-1,1&colormap_name=viridis", None, "better_cw200_tt422"),
+                ("BETTER W21 STAC hetero /point NDVI without assets= (cw 200, tt 422)", "GET", f"/stac/point/-122.25,37.75?url={q(s['w21_stac'])}&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}", None, "better_cw200_tt422"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -2961,7 +2999,7 @@ def main() -> int:
                             tt_spatial_std = max(float(at[..., c].std()) for c in range(3))
                             ok = cw_spatial_std > 1.0 and tt_spatial_std < 1e-6
                             detail = f"cw spatial_std={cw_spatial_std:.1f} vs tt spatial_std={tt_spatial_std:.1f}"
-                    elif kind in ("better_cw200_tt422", "better_cw200_tt500", "better_cw200_tt404"):
+                    elif kind in ("better_cw200_tt400", "better_cw200_tt422", "better_cw200_tt500", "better_cw200_tt404"):
                         exp_tt = int(kind.split("_tt")[1])
                         payload_ok = False
                         if r_cw.status_code == 200:
