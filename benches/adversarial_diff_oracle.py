@@ -1223,6 +1223,58 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(dem_45, 1)
     out["w45_dem"] = p_w45_dem
 
+    # Wave 46: LERC / LERC_DEFLATE (int16) / LERC_ZSTD (lossy float32) COGs + 6 projected CRS families
+    # (Conus Albers 5070, Lambert-93 2154, LAEA Europe 3035, EASE-Grid 6933, Antarctic Polar Stereo 3031, British National Grid 27700)
+    a46 = (100.0 + xx9 * 2.5 + yy9 * 1.5).astype(np.float32)
+    a46_hole = a46.copy()
+    a46_hole[80:110, 60:90] = -9999.0
+    p_w46_lerc = synth_dir / "w46_lerc_f32.tif"
+    with rasterio.open(
+        p_w46_lerc, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="lerc", max_z_error=0.0, nodata=-9999.0,
+    ) as ds:
+        ds.write(a46_hole, 1)
+    out["w46_lerc_f32"] = p_w46_lerc
+
+    i16_46 = (-500 + xx9.astype(np.int32) * 20 + yy9.astype(np.int32) * 15).astype(np.int16)
+    i16_46[80:110, 60:90] = -32768
+    p_w46_lerc_def = synth_dir / "w46_lerc_deflate_i16.tif"
+    with rasterio.open(
+        p_w46_lerc_def, "w", driver="GTiff", width=128, height=128, count=1, dtype="int16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="lerc_deflate", nodata=-32768,
+    ) as ds:
+        ds.write(i16_46, 1)
+    out["w46_lerc_deflate_i16"] = p_w46_lerc_def
+
+    p_w46_lerc_zstd = synth_dir / "w46_lerc_zstd_lossy.tif"
+    with rasterio.open(
+        p_w46_lerc_zstd, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="lerc_zstd", max_z_error=0.5, nodata=-9999.0,
+    ) as ds:
+        ds.write(a46_hole, 1)
+    out["w46_lerc_zstd_lossy"] = p_w46_lerc_zstd
+
+    for tag, epsg, (bw, bs, be, bn) in [
+        ("5070", "EPSG:5070", (-98.0, 38.0, -97.0, 39.0)),
+        ("2154", "EPSG:2154", (2.0, 48.0, 3.0, 49.0)),
+        ("3035", "EPSG:3035", (10.0, 50.0, 11.0, 51.0)),
+        ("6933", "EPSG:6933", (15.0, 20.0, 16.0, 21.0)),
+        ("3031", "EPSG:3031", (0.0, -76.0, 2.0, -75.0)),
+        ("27700", "EPSG:27700", (-1.5, 51.5, -0.5, 52.5)),
+    ]:
+        l_, b_, r_, t_ = transform_bounds("EPSG:4326", epsg, bw, bs, be, bn)
+        p_crs = synth_dir / f"w46_crs_{tag}.tif"
+        with rasterio.open(
+            p_crs, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+            crs=epsg, transform=from_bounds(l_, b_, r_, t_, 128, 128),
+            tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+        ) as ds:
+            ds.write(a46, 1)
+        out[f"w46_crs_{tag}"] = p_crs
+
     return out
 
 
@@ -5010,7 +5062,26 @@ def main() -> int:
                 ("PARITY W45 ALG contours custom (inc=50, thick=2) .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_dem'])}&algorithm=contours&algorithm_params={qe(json.dumps({'increment':50,'thickness':2}))}", None, "png"),
                 ("PARITY W45 EXPR+ALG expression=b1*0.5+10 & ceil .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w45_dem'])}&expression={qe('b1*0.5+10')}&algorithm=ceil", None, "npy"),
                 ("PARITY W45 EXPR+ALG expression=b1*2.0 & terrarium .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w45_dem'])}&expression={qe('b1*2.0')}&algorithm=terrarium", None, "png"),
+                # --- Wave 46: LERC / LERC_DEFLATE (int16) / LERC_ZSTD (lossy f32) + 6 projected CRS families ---
+                ("PARITY W46 LERC lossless f32 + hole .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w46_lerc_f32'])}", None, "npy"),
+                ("PARITY W46 LERC_DEFLATE int16 + hole .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w46_lerc_deflate_i16'])}", None, "npy"),
+                ("PARITY W46 LERC_DEFLATE int16 /statistics", "GET", f"/cog/statistics?url={q(s['w46_lerc_deflate_i16'])}", None, "stats"),
+                ("PARITY W46 LERC_ZSTD lossy f32 + hole .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w46_lerc_zstd_lossy'])}", None, "npy"),
+                ("PARITY W46 LERC_ZSTD lossy f32 /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w46_lerc_zstd_lossy'])}", None, "point"),
             ]
+            for tag, desc, lon_c, lat_c in [
+                ("5070", "EPSG:5070 Conus Albers", -97.5, 38.5),
+                ("2154", "EPSG:2154 Lambert-93 LCC", 2.5, 48.5),
+                ("3035", "EPSG:3035 LAEA Europe", 10.5, 50.5),
+                ("6933", "EPSG:6933 EASE-Grid CEA", 15.5, 20.5),
+                ("3031", "EPSG:3031 Antarctic Stereo", 1.0, -75.5),
+                ("27700", "EPSG:27700 British Natl Grid", -1.0, 52.0),
+            ]:
+                t46 = mercantile.tile(lon_c, lat_c, 9)
+                cases += [
+                    (f"PARITY W46 CRS {desc} .npy", "GET", f"/cog/tiles/WebMercatorQuad/{t46.z}/{t46.x}/{t46.y}.npy?url={q(s[f'w46_crs_{tag}'])}", None, "npy"),
+                    (f"PARITY W46 CRS {desc} /point", "GET", f"/cog/point/{lon_c},{lat_c}?url={q(s[f'w46_crs_{tag}'])}", None, "point"),
+                ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
