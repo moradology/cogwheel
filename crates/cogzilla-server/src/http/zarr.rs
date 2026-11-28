@@ -954,6 +954,63 @@ fn build_general_tile_plan<const N: usize>(
     })
 }
 
+/// Compute the ground-resolution downsampling ratio (`tile_res_in_src_units / base_res`)
+/// for multiscale Zarr overview selection, properly projecting a 1-pixel step from `dst_crs`
+/// into `base_crs` so cross-CRS requests (e.g. `WebMercatorQuad` meters over `EPSG:4326`
+/// degrees) do not compare meters against degrees.
+fn multiscale_downsample_factor(
+    dst_crs: &CrsModel,
+    tile_bounds: [f64; 4],
+    tile_size: u32,
+    base_crs: &CrsModel,
+    base_res: f64,
+) -> f64 {
+    if !base_res.is_finite() || base_res <= 0.0 {
+        return 1.0;
+    }
+    let denom = tile_size.max(1) as f64;
+    let step_x = (tile_bounds[2] - tile_bounds[0]).abs() / denom;
+    let step_y = (tile_bounds[3] - tile_bounds[1]).abs() / denom;
+    let same_crs = (matches!(dst_crs, CrsModel::Epsg3857)
+        && matches!(base_crs, CrsModel::Epsg3857))
+        || (matches!(dst_crs, CrsModel::Geographic) && matches!(base_crs, CrsModel::Geographic));
+    if same_crs {
+        return step_x.min(step_y) / base_res;
+    }
+    let cx = 0.5 * (tile_bounds[0] + tile_bounds[2]);
+    let cy = 0.5 * (tile_bounds[1] + tile_bounds[3]);
+    let project = |dx: f64, dy: f64| -> Option<(f64, f64)> {
+        let (lon, lat) = dst_crs.to_lonlat_deg(dx, dy);
+        if !lon.is_finite() || !lat.is_finite() {
+            return None;
+        }
+        let (sx, sy) = base_crs.from_lonlat_deg(lon, lat);
+        (sx.is_finite() && sy.is_finite()).then_some((sx, sy))
+    };
+    if let (Some((x0, y0)), Some((x1, y1)), Some((x2, y2))) = (
+        project(cx, cy),
+        project(cx + step_x, cy),
+        project(cx, cy + step_y),
+    ) {
+        let is_geo = matches!(base_crs, CrsModel::Geographic);
+        let wrap_dx = |d: f64| {
+            if is_geo && d.abs() > 180.0 {
+                d - 360.0 * d.signum()
+            } else {
+                d
+            }
+        };
+        let rx = wrap_dx(x1 - x0).hypot(y1 - y0);
+        let ry = wrap_dx(x2 - x0).hypot(y2 - y0);
+        let tile_res_src = rx.min(ry);
+        if tile_res_src.is_finite() && tile_res_src > 0.0 {
+            return tile_res_src / base_res;
+        }
+    }
+    // Degenerate projection (e.g. pole): stay on the finest level rather than over-downsampling.
+    1.0
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_tile(
     engine: &Arc<TileEngine>,
@@ -989,6 +1046,10 @@ async fn handle_tile(
             detail: format!("tile {z}/{x}/{y} is out of matrix bounds for {tms_id}"),
         });
     };
+    let dst_crs = tms.crs_model().map_err(|e| ZarrError::UnsupportedCrs {
+        crs: tms_id.to_string(),
+        detail: e.to_string(),
+    })?;
 
     let (store, hierarchy, validator) = open_store_and_hierarchy(&engine.store, q).await?;
     // Honour GeoZarr / OME-Zarr `multiscales` when `?group=` is not explicitly pinned (#375).
@@ -1002,10 +1063,14 @@ async fn handle_tile(
             && let Some(base_meta) = base_g.array(&base_lvl.variable)
             && let Ok(base_geo) = resolve_geo(&store, &base_g, base_meta).await
         {
-            let tile_res = ((tile_bounds[2] - tile_bounds[0]).abs() / tile_size as f64)
-                .min((tile_bounds[3] - tile_bounds[1]).abs() / tile_size as f64);
             let base_res = base_geo.affine.a.abs().min(base_geo.affine.e.abs()).max(1e-9);
-            let req_downsample = tile_res / base_res;
+            let req_downsample = multiscale_downsample_factor(
+                &dst_crs,
+                tile_bounds,
+                tile_size,
+                &base_geo.crs.model,
+                base_res,
+            );
             let chosen = pyr.select_for_downsample(req_downsample);
             effective_group = Some(chosen.group_path.clone());
         }
@@ -1021,10 +1086,6 @@ async fn handle_tile(
         dim: geo.x_dim.clone(),
         index: 0,
         detail: "singular affine transform".into(),
-    })?;
-    let dst_crs = tms.crs_model().map_err(|e| ZarrError::UnsupportedCrs {
-        crs: tms_id.to_string(),
-        detail: e.to_string(),
     })?;
 
     let (fmt, content_type) = parse_output_format(ext_opt, q.format.as_deref());
@@ -1735,5 +1796,32 @@ mod tests {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(vals_nm, vec![12.5, 0.0, -3.25, 0.0]);
+    }
+
+    #[test]
+    fn multiscale_downsample_factor_handles_cross_crs_mercator_over_epsg4326() {
+        // 128x128 EPSG:4326 base level over 1 deg x 1 deg -> 0.0078125 deg/px
+        let base_res = 1.0 / 128.0;
+        let tms = require_tms("WebMercatorQuad").unwrap();
+        let b_z10 = tms.tile_bounds(10, 163, 396, 0.0, 256).unwrap();
+        let b_z5 = tms.tile_bounds(5, 5, 12, 0.0, 256).unwrap();
+        let f_z10 = multiscale_downsample_factor(
+            &CrsModel::Epsg3857,
+            b_z10,
+            256,
+            &CrsModel::Geographic,
+            base_res,
+        );
+        let f_z5 = multiscale_downsample_factor(
+            &CrsModel::Epsg3857,
+            b_z5,
+            256,
+            &CrsModel::Geographic,
+            base_res,
+        );
+        // At z=10 (~152 m/px ~= 0.0011 deg/px), factor must be < 1.0 (selects finest level 0).
+        assert!(f_z10 < 1.0, "expected z10 downsample < 1.0, got {f_z10}");
+        // At z=5 (~4892 m/px ~= 0.035 deg/px), factor must be > 4.0 (selects 4x coarser overview).
+        assert!(f_z5 > 4.0 && f_z5 < 8.0, "expected z5 downsample in (4, 8), got {f_z5}");
     }
 }
