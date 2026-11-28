@@ -29,8 +29,8 @@ pub use self::dem::{
 };
 pub use self::npy::{
     encode_npy_f32_header, encode_npy_header, encode_npy_typed, encode_npy_typed_f64,
-    f32_npy_shape, npy_descr, retype_f32_npy, retype_f32_npy_with, wrap_raw_f32_as_npy,
-    wrap_raw_f32_as_npy_with_mask,
+    f32_npy_shape, is_valid_mask_sample, npy_descr, retype_f32_npy, retype_f32_npy_with,
+    retype_value_with_mask, wrap_raw_f32_as_npy, wrap_raw_f32_as_npy_with_mask,
 };
 use self::widened::{
     AxisTapTable, lanczos3_lut, plan_separable_conv_scale, widened_plane_separable_into_with_tables,

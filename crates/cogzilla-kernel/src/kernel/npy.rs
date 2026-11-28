@@ -203,6 +203,31 @@ pub fn retype_f32_npy(npy: &[u8], kind: SampleType, mask: bool) -> Option<Bytes>
     retype_f32_npy_with(npy, kind, mask, |v| v)
 }
 
+/// Whether a floating-point validity mask sample represents a valid pixel.
+///
+/// Works uniformly across both mask conventions used in cogzilla:
+/// - `.npy` masks (`255.0` valid / `0.0` masked), and
+/// - retyped float GeoTIFF / `.npy` masks (`MAX` valid / `MIN` masked).
+///
+/// Checking `m.is_finite() && m > 0.0` ensures negative mask sentinels (such as `f32::MIN`)
+/// are treated as masked rather than valid (#574).
+#[inline(always)]
+pub fn is_valid_mask_sample(m: f64) -> bool {
+    m.is_finite() && m > 0.0
+}
+
+/// Normalize a sample `v` against its pixel's optional mask sample before retyping:
+/// a `NaN` on a pixel the mask marks valid becomes `0.0` (matching rio-tiler's `.npy`/GeoTIFF
+/// retype, where only masked-out pixels stay absent).
+#[inline(always)]
+pub fn retype_value_with_mask(v: f64, mask_sample: Option<f64>) -> f64 {
+    if v.is_nan() && mask_sample.is_some_and(is_valid_mask_sample) {
+        0.0
+    } else {
+        v
+    }
+}
+
 /// [`retype_f32_npy`], each value (not the mask) passed through `prepare` before it is cast:
 /// how an algorithm rounds or wraps it into `kind`.
 pub fn retype_f32_npy_with(
@@ -225,23 +250,20 @@ pub fn retype_f32_npy_with(
     out.extend_from_slice(&hdr);
     let mask_slice = mask.then(|| &body[data_bytes..]);
     let data = body[..data_bytes].chunks_exact(4).enumerate().map(|(i, v)| {
-        let mut x = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
-        if x.is_nan()
-            && let Some(ms) = mask_slice
-        {
-            let px = i % pixels;
-            let off = px * 4;
-            let m = f32::from_le_bytes([ms[off], ms[off + 1], ms[off + 2], ms[off + 3]]);
-            if m.is_finite() && m != 0.0 {
-                x = 0.0;
-            }
-        }
-        prepare(f64::from(x))
+        let x = f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+        let mask_sample = if x.is_nan() {
+            mask_slice.map(|ms| {
+                let off = (i % pixels) * 4;
+                f64::from(f32::from_le_bytes([ms[off], ms[off + 1], ms[off + 2], ms[off + 3]]))
+            })
+        } else {
+            None
+        };
+        prepare(retype_value_with_mask(x, mask_sample))
     });
     let mask_bits = mask_slice.map(|ms| {
         ms.chunks_exact(4).map(|v| {
-            let m = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
-            m.is_finite() && m != 0.0
+            is_valid_mask_sample(f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]])))
         })
     });
     write_npy_typed_planes(&mut out, kind, data, mask_bits);
