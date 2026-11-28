@@ -1715,7 +1715,7 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
+                        if srcs[0].all_nodata && srcs[1].all_nodata && srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Some(gpu) = &self.gpu
@@ -1786,7 +1786,7 @@ impl TileEngine {
                             )
                             .with_scale_offset(s2, o2),
                         ];
-                        if srcs[0].all_nodata || srcs[1].all_nodata || srcs[2].all_nodata {
+                        if srcs[0].all_nodata && srcs[1].all_nodata && srcs[2].all_nodata {
                             self.stats.empty_short_circuits.fetch_add(1, Ordering::Relaxed);
                         }
                         if let Some(gpu) = &self.gpu

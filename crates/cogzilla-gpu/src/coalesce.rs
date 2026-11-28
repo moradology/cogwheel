@@ -86,6 +86,7 @@ struct ExprParams {
     saturation: f32,
     rgb_min: [f32; 4],
     rgb_inv_255: [f32; 4],
+    rgb_nodata_fill: [f32; 4],
 }
 
 /// Owned coordinate plan for submission to `GpuCoalescer`.
@@ -257,6 +258,7 @@ pub enum CoalescedJob {
         mode: GpuColormapMode,
         rescale_min: [f32; 3],
         rescale_max: [f32; 3],
+        nodata_fill: [f32; 3],
         formula: GpuColorFormula,
     },
     SarRgb {
@@ -1267,6 +1269,7 @@ impl WorkerState {
                         saturation: 1.0,
                         rgb_min: [0.0; 4],
                         rgb_inv_255: [1.0; 4],
+                        rgb_nodata_fill: [0.0; 4],
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
@@ -1342,15 +1345,16 @@ impl WorkerState {
                     });
                 }
                 job @ (CoalescedJob::Rgb { .. } | CoalescedJob::SarRgb { .. }) => {
-                    let (is_sar, slab, plan, mode, rescale_min, rescale_max, formula) = match job {
+                    let (is_sar, slab, plan, mode, rescale_min, rescale_max, nodata_fill, formula) = match job {
                         CoalescedJob::Rgb {
                             slab,
                             plan,
                             mode,
                             rescale_min,
                             rescale_max,
+                            nodata_fill,
                             formula,
-                        } => (false, slab, plan, mode, rescale_min, rescale_max, formula),
+                        } => (false, slab, plan, mode, rescale_min, rescale_max, nodata_fill, formula),
                         CoalescedJob::SarRgb {
                             slab,
                             plan,
@@ -1358,7 +1362,7 @@ impl WorkerState {
                             rescale_min,
                             rescale_max,
                             formula,
-                        } => (true, slab, plan, mode, rescale_min, rescale_max, formula),
+                        } => (true, slab, plan, mode, rescale_min, rescale_max, [0.0; 3], formula),
                         _ => unreachable!(),
                     };
                     let (dst_w, dst_h, coord_mode, u_slice, v_slice) = match plan.dims_mode_slices()
@@ -1420,6 +1424,7 @@ impl WorkerState {
                             inv(rescale_min[2], rescale_max[2]),
                             0.0,
                         ],
+                        rgb_nodata_fill: [nodata_fill[0], nodata_fill[1], nodata_fill[2], 0.0],
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
@@ -1563,6 +1568,7 @@ impl WorkerState {
                             inv(rescale_min[2], rescale_max[2]),
                             0.0,
                         ],
+                        rgb_nodata_fill: [0.0; 4],
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
@@ -1664,6 +1670,7 @@ impl WorkerState {
                         saturation: 1.0,
                         rgb_min: [0.0; 4],
                         rgb_inv_255: [1.0; 4],
+                        rgb_nodata_fill: [0.0; 4],
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
@@ -1779,6 +1786,7 @@ impl WorkerState {
                         saturation: 1.0,
                         rgb_min: [0.0; 4],
                         rgb_inv_255: [1.0; 4],
+                        rgb_nodata_fill: [0.0; 4],
                     };
                     self.queue
                         .write_buffer(&slot.expr_params_buf, 0, bytemuck::bytes_of(&params));
@@ -2869,6 +2877,7 @@ mod tests {
                 mode: GpuColormapMode::Lanczos3,
                 rescale_min: [0.0, 0.0, 0.0],
                 rescale_max: [2.0, 2.0, 2.0],
+                nodata_fill: [0.0; 3],
                 formula: formula.clone(),
             })
             .unwrap();
@@ -2941,6 +2950,7 @@ mod tests {
                         mode: GpuColormapMode::Lanczos3,
                         rescale_min: [0.0, 0.0, 0.0],
                         rescale_max: [2.0, 2.0, 2.0],
+                        nodata_fill: [0.0; 3],
                         formula: form,
                     },
                     _ => CoalescedJob::SarRgb {

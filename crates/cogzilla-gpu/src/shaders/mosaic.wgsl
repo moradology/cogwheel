@@ -214,22 +214,20 @@ fn mosaic_select_rgb_rgba8(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let idx = py * params.width + px;
     let r = select_pixel_at(0u, idx);
-    if (!is_finite_f32(r)) {
-        dst_words[idx] = 0u;
-        return;
-    }
     let g = select_pixel_at(params.band_stride, idx);
-    if (!is_finite_f32(g)) {
-        dst_words[idx] = 0u;
-        return;
-    }
     let b = select_pixel_at(2u * params.band_stride, idx);
-    if (!is_finite_f32(b)) {
+    let r_ok = is_finite_f32(r);
+    let g_ok = is_finite_f32(g);
+    let b_ok = is_finite_f32(b);
+    if (!r_ok && !g_ok && !b_ok) {
         dst_words[idx] = 0u;
         return;
     }
-    let r8 = u32(clamp((r - params.rescale_min) * params.inv_range_255, 0.0, 255.0));
-    let g8 = u32(clamp((g - params.rescale_min_g) * params.inv_range_255_g, 0.0, 255.0));
-    let b8 = u32(clamp((b - params.rescale_min_b) * params.inv_range_255_b, 0.0, 255.0));
+    let r_val = select(0.0, r, r_ok);
+    let g_val = select(0.0, g, g_ok);
+    let b_val = select(0.0, b, b_ok);
+    let r8 = u32(clamp((r_val - params.rescale_min) * params.inv_range_255, 0.0, 255.0));
+    let g8 = u32(clamp((g_val - params.rescale_min_g) * params.inv_range_255_g, 0.0, 255.0));
+    let b8 = u32(clamp((b_val - params.rescale_min_b) * params.inv_range_255_b, 0.0, 255.0));
     dst_words[idx] = r8 | (g8 << 8u) | (b8 << 16u) | 0xff000000u;
 }

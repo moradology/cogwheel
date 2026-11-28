@@ -7402,3 +7402,260 @@ async fn rgba_and_gray_alpha_preserve_continuous_alpha_across_png_and_npy() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn rgb_scalar_nodata_masks_only_when_all_bands_match_gdal_dataset_mask() {
+    let tmp = std::env::temp_dir().join(format!(
+        "cogzilla_rgb_nodata_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // Minimal PNG RGBA8 decoder returning (w, h, Vec<[u8; 4]>).
+    let decode_png_rgba = |png: &[u8]| -> (u32, u32, Vec<[u8; 4]>) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let mut pos = 8usize;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        let mut color_type = 0u8;
+        let mut idat = Vec::new();
+        while pos + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+            let ctype = &png[pos + 4..pos + 8];
+            let data = &png[pos + 8..pos + 8 + len];
+            if ctype == b"IHDR" {
+                w = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                h = u32::from_be_bytes(data[4..8].try_into().unwrap());
+                color_type = data[9];
+            } else if ctype == b"IDAT" {
+                idat.extend_from_slice(data);
+            }
+            pos += 12 + len;
+        }
+        assert_eq!(color_type, 6, "expected RGBA8 PNG");
+        let bpp = 4usize;
+        let stride = (w as usize) * bpp;
+        let mut raw = vec![0u8; (h as usize) * (1 + stride)];
+        let n = libdeflater::Decompressor::new()
+            .zlib_decompress(&idat, &mut raw)
+            .expect("zlib decompress PNG");
+        assert_eq!(n, raw.len());
+        let mut unfilt = vec![0u8; (h as usize) * stride];
+        for y in 0..h as usize {
+            let filter = raw[y * (1 + stride)];
+            let src = &raw[y * (1 + stride) + 1..(y + 1) * (1 + stride)];
+            for x in 0..stride {
+                let left = if x >= bpp { unfilt[y * stride + x - bpp] } else { 0 };
+                let up = if y > 0 { unfilt[(y - 1) * stride + x] } else { 0 };
+                let up_left = if x >= bpp && y > 0 {
+                    unfilt[(y - 1) * stride + x - bpp]
+                } else {
+                    0
+                };
+                unfilt[y * stride + x] = match filter {
+                    0 => src[x],
+                    1 => src[x].wrapping_add(left),
+                    2 => src[x].wrapping_add(up),
+                    3 => src[x].wrapping_add(((u16::from(left) + u16::from(up)) / 2) as u8),
+                    4 => {
+                        let p = i32::from(left) + i32::from(up) - i32::from(up_left);
+                        let pa = (p - i32::from(left)).abs();
+                        let pb = (p - i32::from(up)).abs();
+                        let pc = (p - i32::from(up_left)).abs();
+                        let pr = if pa <= pb && pa <= pc {
+                            left
+                        } else if pb <= pc {
+                            up
+                        } else {
+                            up_left
+                        };
+                        src[x].wrapping_add(pr)
+                    }
+                    other => panic!("unexpected PNG filter {other}"),
+                };
+            }
+        }
+        let pixels = unfilt
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+        (w, h, pixels)
+    };
+
+    // Helper: write a 16x16 3-band uint8 RGB EPSG:4326 GeoTIFF with optional GDAL_NODATA.
+    let write_rgb_4326 = |path: &std::path::Path, pixels: &[u8], nodata_str: Option<&str>| {
+        let w = 16u32;
+        let h = 16u32;
+        let bounds = [5.0f64, 36.0, 12.0, 42.0];
+        let mut buf = Vec::<u8>::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&42u16.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+
+        let nd_bytes = nodata_str.map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        });
+        let num_entries: u16 = 13 + u16::from(nd_bytes.is_some());
+        let ifd_size = 2 + (num_entries as usize) * 12 + 4;
+        let data_start = 8 + ifd_size;
+        let bps_off = data_start as u32;
+        let scale_off = bps_off + 6;
+        let tiepoint_off = scale_off + 24;
+        let geokey_off = tiepoint_off + 48;
+        let nd_off = geokey_off + 24;
+        let nd_len = nd_bytes.as_ref().map_or(0, Vec::len) as u32;
+        let pixel_off = nd_off + nd_len;
+
+        let push_entry = |b: &mut Vec<u8>, tag: u16, ty: u16, count: u32, val: u32| {
+            b.extend_from_slice(&tag.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&count.to_le_bytes());
+            b.extend_from_slice(&val.to_le_bytes());
+        };
+
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        push_entry(&mut buf, 256, 4, 1, w);
+        push_entry(&mut buf, 257, 4, 1, h);
+        push_entry(&mut buf, 258, 3, 3, bps_off);
+        push_entry(&mut buf, 259, 3, 1, 1);
+        push_entry(&mut buf, 262, 3, 1, 2); // RGB
+        push_entry(&mut buf, 273, 4, 1, pixel_off);
+        push_entry(&mut buf, 277, 3, 1, 3);
+        push_entry(&mut buf, 278, 4, 1, h);
+        push_entry(&mut buf, 279, 4, 1, pixels.len() as u32);
+        push_entry(&mut buf, 284, 3, 1, 1); // Chunky
+        push_entry(&mut buf, 33550, 12, 3, scale_off);
+        push_entry(&mut buf, 33922, 12, 6, tiepoint_off);
+        push_entry(&mut buf, 34735, 3, 12, geokey_off);
+        if let Some(ref ndb) = nd_bytes {
+            if ndb.len() <= 4 {
+                let mut val_bytes = [0u8; 4];
+                val_bytes[..ndb.len()].copy_from_slice(ndb);
+                push_entry(&mut buf, 42113, 2, ndb.len() as u32, u32::from_le_bytes(val_bytes));
+            } else {
+                push_entry(&mut buf, 42113, 2, ndb.len() as u32, nd_off);
+            }
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        for _ in 0..3 {
+            buf.extend_from_slice(&8u16.to_le_bytes());
+        }
+        let sx = (bounds[2] - bounds[0]) / w as f64;
+        let sy = (bounds[3] - bounds[1]) / h as f64;
+        for v in [sx, sy, 0.0f64] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [0.0f64, 0.0, 0.0, bounds[0], bounds[3], 0.0] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(ref ndb) = nd_bytes {
+            buf.extend_from_slice(ndb);
+        }
+        buf.extend_from_slice(pixels);
+        std::fs::write(path, buf).unwrap();
+    };
+
+    // 16x16 RGB image with 4 quadrants:
+    // - top-left:     [0, 0, 0]       (all-zero hole -> masked under nodata=0)
+    // - top-right:    [0, 120, 200]   (only R=0 -> VALID & opaque [0, 120, 200, 255] under nodata=0!)
+    // - bottom-left:  [255, 255, 255] (all-255 hole -> masked under nodata=255)
+    // - bottom-right: [255, 120, 200] (only R=255 -> VALID & opaque [255, 120, 200, 255] under nodata=255!)
+    let mut rgb_px = Vec::with_capacity(16 * 16 * 3);
+    for y in 0..16 {
+        for x in 0..16 {
+            let p = match (y < 8, x < 8) {
+                (true, true) => [0u8, 0, 0],
+                (true, false) => [0u8, 120, 200],
+                (false, true) => [255u8, 255, 255],
+                (false, false) => [255u8, 120, 200],
+            };
+            rgb_px.extend_from_slice(&p);
+        }
+    }
+    let rgb_no_nd = tmp.join("rgb_plain.tif");
+    let rgb_nd0 = tmp.join("rgb_nd0.tif");
+    let rgb_nd255 = tmp.join("rgb_nd255.tif");
+    write_rgb_4326(&rgb_no_nd, &rgb_px, None);
+    write_rgb_4326(&rgb_nd0, &rgb_px, Some("0"));
+    write_rgb_4326(&rgb_nd255, &rgb_px, Some("255"));
+
+    let engine = Arc::new(TileEngine::new(64 * 1024 * 1024));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_listener(engine, listener).await;
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. Runtime ?nodata=0 on /cog/tiles PNG (general path) AND embedded GDAL_NODATA=0 (tile fast path)
+    for url_q in [
+        format!("url={}&nodata=0&resampling=nearest", rgb_no_nd.display()),
+        format!("url={}&resampling=nearest", rgb_nd0.display()),
+    ] {
+        let r = client
+            .get(format!("{base}/cog/tiles/WebMercatorQuad/6/33/24.png?{url_q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let (_, _, px) = decode_png_rgba(&r.bytes().await.unwrap());
+        assert!(
+            px.contains(&[0, 120, 200, 255]),
+            "expected valid opaque [0, 120, 200, 255] under nodata=0 ({url_q})"
+        );
+        assert!(
+            px.contains(&[0, 0, 0, 0]),
+            "expected transparent [0, 0, 0, 0] hole under nodata=0 ({url_q})"
+        );
+    }
+
+    // 2. Runtime ?nodata=255 AND embedded GDAL_NODATA=255:
+    //    [255, 120, 200] must stay opaque with exact R=255 (NOT 0 or transparent!).
+    for url_q in [
+        format!("url={}&nodata=255&resampling=nearest", rgb_no_nd.display()),
+        format!("url={}&resampling=nearest", rgb_nd255.display()),
+    ] {
+        let r = client
+            .get(format!("{base}/cog/tiles/WebMercatorQuad/6/33/24.png?{url_q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let (_, _, px) = decode_png_rgba(&r.bytes().await.unwrap());
+        assert!(
+            px.contains(&[255, 120, 200, 255]),
+            "expected valid opaque [255, 120, 200, 255] under nodata=255 ({url_q})"
+        );
+        assert!(
+            px.contains(&[0, 0, 0, 0]),
+            "expected transparent [0, 0, 0, 0] hole for [255,255,255] under nodata=255 ({url_q})"
+        );
+    }
+
+    // 3. /cog/preview.png with ?nodata=0 and ?nodata=255
+    let r_prev = client
+        .get(format!(
+            "{base}/cog/preview.png?url={}&nodata=255&resampling=nearest",
+            rgb_no_nd.display()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_prev.status(), 200);
+    let (_, _, prev_px) = decode_png_rgba(&r_prev.bytes().await.unwrap());
+    assert!(prev_px.contains(&[255, 120, 200, 255]));
+    assert!(prev_px.contains(&[0, 0, 0, 0]));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

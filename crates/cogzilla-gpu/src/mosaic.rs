@@ -1625,10 +1625,13 @@ mod tests {
             let cg = cpu_select(&g_band, i, GpuPixelSelection::Median);
             let cb = cpu_select(&b_band, i, GpuPixelSelection::Median);
             let off = i * 4;
-            if cr.is_finite() && cg.is_finite() && cb.is_finite() {
+            if cr.is_finite() || cg.is_finite() || cb.is_finite() {
                 if rgba[off + 3] != 255 {
                     mask_err += 1;
                 } else {
+                    let cr = if cr.is_finite() { cr } else { 0.0 };
+                    let cg = if cg.is_finite() { cg } else { 0.0 };
+                    let cb = if cb.is_finite() { cb } else { 0.0 };
                     let er = ((cr - rmin[0]) * inv[0]).clamp(0.0, 255.0) as u8;
                     let eg = ((cg - rmin[1]) * inv[1]).clamp(0.0, 255.0) as u8;
                     let eb = ((cb - rmin[2]) * inv[2]).clamp(0.0, 255.0) as u8;
