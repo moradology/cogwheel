@@ -81,9 +81,6 @@ def render_concurrency_overload() -> None:
     ax1.plot([*c_scale, 128], [*m5c_rps, m5c_128], "-D", color=C_M5C, lw=2.3, ms=6,
              label="Apple M5 CPU-only (10 cores)")
 
-    ax1.axhline(142, color=C_TT, ls=":", lw=1.8, alpha=0.9,
-                label="TiTiler 2.4 ceiling (M5 10 workers, 256² PNG)")
-
     ax1.set_xscale("log", base=2)
     ax1.set_yscale("log")
     ax1.set_xticks([1, 4, 16, 32, 128, 256, 512, 2048])
