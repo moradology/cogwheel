@@ -858,6 +858,33 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     }))
     out["w29_stac_ab"] = p_w29_stac
 
+    # Wave 31: Rescale/color_formula/BGR-reorder/non-square preview fixtures
+    p_w31_f32 = synth_dir / "w31_f32_neg_pos.tif"
+    f32_w31 = ((xx9.astype(np.float32) - 64.0) * 3.0 + (yy9.astype(np.float32) - 64.0) * 1.5)
+    f32_w31[80:100, 60:90] = -9999.0  # interior nodata hole inside tile 10/164/396
+    with rasterio.open(
+        p_w31_f32, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", nodata=-9999.0,
+    ) as ds:
+        ds.write(f32_w31, 1)
+    out["w31_f32"] = p_w31_f32
+
+    p_w31_rgb = synth_dir / "w31_rgb_asym.tif"
+    rgb_w31 = np.stack([
+        np.maximum(((xx9 * 2) % 255).astype(np.uint8), 1),
+        np.maximum(((yy9 * 2) % 255).astype(np.uint8), 1),
+        np.maximum((((127 - xx9) * 2) % 255).astype(np.uint8), 1),
+    ], axis=0)
+    rgb_w31[:, 80:100, 60:90] = 0
+    with rasterio.open(
+        p_w31_rgb, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", nodata=0,
+    ) as ds:
+        ds.write(rgb_w31)
+    out["w31_rgb"] = p_w31_rgb
+
     return out
 
 
@@ -4042,6 +4069,16 @@ def main() -> int:
                 ("PARITY W29 CODEC YCbCr JPEG internal mask .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w29_ycbcr_jpeg_mask'])}", None, "png"),
                 ("PARITY W29 STAC NDVI positional (b2-b1)/(b2+b1) .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&expression={qe('(b2-b1)/(b2+b1)')}", None, "npy"),
                 ("BETTER W29 STAC asset_as_band=true named expr (cw 200, tt 400)", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}", None, "better_stac_asset_as_band"),
+                # --- Wave 31: Inverted & negative rescale, BGR band reorder, colormap+color_formula, opaque WebP, non-square preview ---
+                ("BETTER W31 RESCALE inverted 200,0 gray (cw ramp, tt solid 255)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w31_f32'])}&rescale=200,0", None, "better_inverted_rescale_w31"),
+                ("BETTER W31 RESCALE inverted 200,0 viridis (cw ramp, tt flat)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w31_f32'])}&rescale=200,0&colormap_name=viridis", None, "better_inverted_rescale_w31"),
+                ("PARITY W31 RESCALE all-negative -150,-10 viridis .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w31_f32'])}&rescale=-150,-10&colormap_name=viridis", None, "png"),
+                ("PARITY W31 BIDX BGR 3,2,1 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w31_rgb'])}&bidx=3&bidx=2&bidx=1", None, "png"),
+                ("PARITY W31 BIDX BGR 3,2,1 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w31_rgb'])}&bidx=3&bidx=2&bidx=1", None, "npy"),
+                ("PARITY W31 BIDX BGR 3,2,1 .tif", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.tif?url={q(s['w31_rgb'])}&bidx=3&bidx=2&bidx=1", None, "geotiff"),
+                ("BETTER W31 CMAP+CF viridis + Gamma RGB 1.8 (cw 200, tt 500)", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w31_f32'])}&rescale=-100,200&colormap_name=viridis&color_formula={qe('Gamma RGB 1.8')}", None, "better_cmap_color_formula"),
+                ("PARITY W31 RETURN_MASK=false .webp", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.webp?url={q(s['w31_rgb'])}&return_mask=false", None, "png"),
+                ("PARITY W31 PREVIEW non-square 96x48 .png", "GET", f"/cog/preview/96x48.png?url={q(s['w31_rgb'])}", None, "png"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -4357,6 +4394,27 @@ def main() -> int:
                             vmax = float(ac[0][vm].max()) if vm.any() else -999.0
                             ok = ac.shape == (2, 256, 256) and ac.dtype == np.float32 and int(vm.sum()) > 10000 and 0.08 < vmin < 0.11 and 0.67 < vmax < 0.72
                             detail = f"cw=200 shape={ac.shape} valid={int(vm.sum())} ndvi=[{vmin:.4f}..{vmax:.4f}] tt=400"
+                    elif kind == "better_inverted_rescale_w31":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            imt = np.array(Image.open(io.BytesIO(r_tt.content)).convert("RGBA"))
+                            vm = (imc[..., 3] == 255) & (imt[..., 3] == 255)
+                            cw_std = float(imc[vm, :3].std(axis=0).max()) if vm.any() else 0.0
+                            tt_std = float(imt[vm, :3].std(axis=0).max()) if vm.any() else 999.0
+                            # cogzilla renders a true inverted ramp (std > 40), whereas TiTiler's np.clip(x, 200, 0) collapses to a flat constant (std == 0).
+                            ok = imc.shape == (256, 256, 4) and int(vm.sum()) > 10000 and cw_std > 40.0 and tt_std < 0.5
+                            detail = f"cw_std={cw_std:.1f} vs tt_std={tt_std:.2f} (tt flat={imt[vm,:3][0].tolist() if vm.any() else []})"
+                    elif kind == "better_cmap_color_formula":
+                        if r_cw.status_code != 200 or r_tt.status_code != 500:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 500)"
+                        else:
+                            imc = np.array(Image.open(io.BytesIO(r_cw.content)).convert("RGBA"))
+                            vm = imc[..., 3] == 255
+                            cw_std = float(imc[vm, :3].std(axis=0).max()) if vm.any() else 0.0
+                            ok = imc.shape == (256, 256, 4) and int(vm.sum()) > 10000 and cw_std > 20.0
+                            detail = f"cw=200 valid={int(vm.sum())} std={cw_std:.1f} tt=500"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
