@@ -24,7 +24,7 @@ use cogzilla_zarr::{
 use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE, ETAG, HeaderValue};
-use hyper::{Method, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
 use crate::engine::TileEngine;
@@ -532,11 +532,7 @@ struct ZarrQuery {
 }
 
 impl ZarrQuery {
-    fn from_family_request(req: super::query::FamilyRequestParams) -> Self {
-        let common = req.common;
-        let super::query::FamilyParams::Zarr(zp) = req.family else {
-            unreachable!("handle_zarr_request must receive FamilyParams::Zarr");
-        };
+    fn from_parts(common: super::query::RequestParams, zp: super::query::ZarrParams) -> Self {
         let has_key = |names: &[&str]| common.keys.iter().any(|k| names.contains(&k.as_str()));
         Self {
             url: common.urls.last().cloned(),
@@ -645,22 +641,38 @@ fn zarr_err_to_engine_err(err: ZarrError) -> crate::engine::EngineError {
 }
 
 /// Main dispatcher for all `/zarr/*` routes.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_zarr_request(
-    engine: &Arc<TileEngine>,
+pub(super) async fn handle<B>(
+    ctx: super::RequestCtx<'_>,
     method: Method,
-    path: &str,
     sub: &[&str],
-    req_params: super::query::FamilyRequestParams,
-    raw_query: &str,
-    host: &str,
-    if_none_match: Option<&str>,
-    post_body: Option<Bytes>,
-) -> Response<Full<Bytes>> {
+    pq: super::query::RequestParams,
+    zp: super::query::ZarrParams,
+    req: Request<B>,
+) -> super::Resp
+where
+    B: hyper::body::Body,
+    B::Error: std::fmt::Display,
+{
+    let super::RequestCtx {
+        engine,
+        path,
+        raw_query,
+        host,
+        forwarded_prefix: _,
+        if_none_match,
+    } = ctx;
+    let post_body = if method == Method::POST {
+        match super::read_limited_body(req.into_body()).await {
+            Ok(b) => Some(b),
+            Err(e) => return super::error_to_http_response(&e),
+        }
+    } else {
+        None
+    };
     let io = &engine.store;
     let is_head = method == Method::HEAD;
     let dispatch_method = if is_head { Method::GET } else { method };
-    let q = ZarrQuery::from_family_request(req_params);
+    let q = ZarrQuery::from_parts(pq, zp);
     let result = match (dispatch_method, sub) {
         // Metadata & introspection family (#372)
         (Method::GET, ["info"]) => handle_info(io, &q, false).await,

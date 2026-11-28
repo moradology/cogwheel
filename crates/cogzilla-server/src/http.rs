@@ -42,6 +42,21 @@ use query::{ParsedQuery, parse_bool_encoded as parse_bool_param};
 #[cfg(test)]
 use query::parse_query;
 
+/// Shared HTTP response type returned by every route-family handler.
+pub(super) type Resp = Response<Full<Bytes>>;
+
+/// Request context shared by all route-family handlers (`/cog`, `/stac`,
+/// `/mosaicjson`/`/mosaic`, `/zarr`, `/searches`/`/collections`).
+#[derive(Clone, Copy)]
+pub(super) struct RequestCtx<'a> {
+    pub(super) engine: &'a Arc<TileEngine>,
+    pub(super) path: &'a str,
+    pub(super) raw_query: &'a str,
+    pub(super) host: &'a str,
+    pub(super) forwarded_prefix: &'a str,
+    pub(super) if_none_match: Option<&'a str>,
+}
+
 pub use self::server::{serve, serve_listener, serve_listener_with_shutdown};
 pub(crate) use self::geo::{parse_coord_crs_with_epsg, tile_box_intersects_cog};
 use self::geo::{
@@ -5340,6 +5355,14 @@ where
         common: mut pq,
         family: req_family,
     } = req_params;
+    let req_ctx = RequestCtx {
+        engine: &engine,
+        path: &path,
+        raw_query: &raw_query,
+        host: &host,
+        forwarded_prefix: &forwarded_prefix,
+        if_none_match: if_none_match.as_deref(),
+    };
 
     // titiler-pgstac's item routes, /collections/{c}/items/{i}/..., are the /stac router over
     // an item read from pgSTAC instead of from `url`.
@@ -5349,15 +5372,7 @@ where
     let item_preview: Option<String>;
     let item_rest: Option<Vec<&str>> = match segs.as_slice() {
         ["collections", c, "items", i, rest @ ..] if !rest.is_empty() => {
-            let ctx = pgstac::Ctx {
-                engine: &engine,
-                host: &host,
-                forwarded_prefix: &forwarded_prefix,
-                path: &path,
-                raw_query: &raw_query,
-                if_none_match: if_none_match.as_deref(),
-                only: None,
-            };
+            let ctx = pgstac::Ctx::from_request(req_ctx);
             // A feature posted for an item's statistics is read here: those are worked out by
             // the search routes, from the item alone, and never reach `/stac`.
             if method == Method::POST && rest == ["statistics"] {
@@ -5463,23 +5478,11 @@ where
 
     // titiler-pgstac's routes: /searches/... and /collections/...
     if matches!(segs.first(), Some(&("searches" | "collections"))) {
-        let ctx = pgstac::Ctx {
-            engine: &engine,
-            host: &host,
-            forwarded_prefix: &forwarded_prefix,
-            path: &path,
-            raw_query: &raw_query,
-            if_none_match: if_none_match.as_deref(),
-            only: None,
-        };
         let list = matches!(segs[..], ["searches"] | ["searches", "" | "list"]);
-        let cacheable = method == Method::GET && !list;
-        let search_params = query::FamilyRequestParams {
-            common: pq,
-            family: req_family,
-        };
-        let mut resp = Box::pin(pgstac::handle(ctx, &method, &segs, search_params, req)).await;
-        if list && method == Method::GET && resp.status() == StatusCode::OK {
+        let is_get = method == Method::GET;
+        let cacheable = is_get && !list;
+        let mut resp = Box::pin(pgstac::handle(req_ctx, method, &segs, pq, req)).await;
+        if list && is_get && resp.status() == StatusCode::OK {
             // Prevent handle_request's default GET Cache-Control from caching live search listings.
             resp.headers_mut()
                 .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -5513,32 +5516,7 @@ where
     // MosaicJSON & Dynamic Spatial Catalog Router (`/mosaicjson/*`, `/mosaic/*`)
     // ------------------------------------------------------------------------
     if matches!(segs.first(), Some(&("mosaicjson" | "mosaic"))) {
-        if let Some(resp) = Box::pin(mosaicjson::handle_mosaic_request(
-            engine,
-            method,
-            &path,
-            &segs,
-            &raw_query,
-            &host,
-            &forwarded_prefix,
-            if_none_match.as_deref(),
-            pq,
-            req,
-        ))
-        .await
-        {
-            return Ok(resp);
-        }
-        let allow = if matches!(segs.as_slice(), ["mosaicjson", "validate" | "statistics" | "feature", ..]) {
-            "POST"
-        } else {
-            "GET, HEAD"
-        };
-        return Ok(if segs.first() == Some(&"mosaicjson") {
-            method_not_allowed_resp(allow)
-        } else {
-            json_error_resp(StatusCode::NOT_FOUND, &path)
-        });
+        return Ok(Box::pin(mosaicjson::handle(req_ctx, method, &segs, pq, req)).await);
     }
 
 
@@ -5808,55 +5786,20 @@ where
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"stac") {
         let sub = &segs[1..];
-        let resp = Box::pin(stac::handle_stac_request(
-            engine,
-            method,
-            &path,
-            sub,
-            &raw_query,
-            &host,
-            &forwarded_prefix,
-            if_none_match.as_deref(),
-            &stac_prefix,
+        let stac_ctx = stac::StacContext {
+            prefix: &stac_prefix,
             pgstac_item,
             pgstac_item_extent,
-            pq,
-            req,
-        ))
-        .await;
-        return Ok(resp);
+        };
+        return Ok(Box::pin(stac::handle(req_ctx, method, sub, pq, stac_ctx, req)).await);
     }
 
     // ------------------------------------------------------------------------
     // Zarr API: /zarr/* (metadata, introspection, raster, and POST zonal routes)
     // ------------------------------------------------------------------------
-    if segs.first() == Some(&"zarr") {
+    if let query::FamilyParams::Zarr(zp) = req_family {
         let sub = &segs[1..];
-        let body_bytes = if method == Method::POST {
-            match read_limited_body(req.into_body()).await {
-                Ok(b) => Some(b),
-                Err(e) => return Ok(error_to_http_response(&e)),
-            }
-        } else {
-            None
-        };
-        let zarr_params = query::FamilyRequestParams {
-            common: pq,
-            family: req_family,
-        };
-        let resp = Box::pin(zarr::handle_zarr_request(
-            &engine,
-            method,
-            &path,
-            sub,
-            zarr_params,
-            &raw_query,
-            &host,
-            if_none_match.as_deref(),
-            body_bytes,
-        ))
-        .await;
-        return Ok(resp);
+        return Ok(Box::pin(zarr::handle(req_ctx, method, sub, pq, zp, req)).await);
     }
 
     // ------------------------------------------------------------------------
@@ -5864,20 +5807,7 @@ where
     // ------------------------------------------------------------------------
     if segs.first() == Some(&"cog") {
         let sub = &segs[1..];
-        let resp = Box::pin(cog::handle_cog_request(
-            engine,
-            method,
-            &path,
-            sub,
-            &raw_query,
-            &host,
-            &forwarded_prefix,
-            if_none_match.as_deref(),
-            pq,
-            req,
-        ))
-        .await;
-        return Ok(resp);
+        return Ok(Box::pin(cog::handle(req_ctx, method, sub, pq, req)).await);
     }
 
     // 405 Method Not Allowed when a known route is requested with an unsupported HTTP verb

@@ -2,23 +2,26 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn handle_cog_request<B>(
-    engine: Arc<TileEngine>,
+pub(super) async fn handle<B>(
+    ctx: RequestCtx<'_>,
     method: Method,
-    path: &str,
     sub: &[&str],
-    raw_query: &str,
-    host: &str,
-    forwarded_prefix: &str,
-    if_none_match: Option<&str>,
     pq: ParsedQuery,
     req: Request<B>,
-) -> Response<Full<Bytes>>
+) -> Resp
 where
     B: hyper::body::Body,
     B::Error: std::fmt::Display,
 {
+    let RequestCtx {
+        engine,
+        path,
+        raw_query,
+        host,
+        forwarded_prefix,
+        if_none_match,
+    } = ctx;
+    let engine = Arc::clone(engine);
     let mut geo_meta: Option<([f64; 4], Option<u16>, bool)> = None;
     let cog_array = array_asked(&pq, sub.last());
     let cog_urls = pq.urls.clone();
