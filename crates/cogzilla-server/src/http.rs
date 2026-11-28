@@ -6140,6 +6140,9 @@ fn error_to_http_response(err: &EngineError) -> Response<Full<Bytes>> {
             e @ cogzilla_io::IoError::Tiff(_) => {
                 json_error_resp(StatusCode::BAD_REQUEST, &e.to_string())
             }
+            e @ cogzilla_io::IoError::Codec(_) => {
+                json_error_resp(StatusCode::BAD_GATEWAY, &e.to_string())
+            }
             e @ cogzilla_io::IoError::Forbidden(_) => {
                 json_error_resp(StatusCode::FORBIDDEN, &e.to_string())
             }
