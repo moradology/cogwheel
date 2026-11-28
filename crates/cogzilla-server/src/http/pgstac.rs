@@ -4316,8 +4316,11 @@ async fn resampled_planes(
 /// warp leaves them: in the raster's type, so whole for a raster of whole numbers. What is
 /// done with them after (statistics, band math, a picture) starts from there.
 fn in_raster_type(mut planes: Vec<Vec<f32>>, sample_type: SampleType, unscale: bool) -> Vec<Vec<f32>> {
-    // A cubic kernel overshoots: the type's own range holds what it can.
-    let range = sample_type.value_range();
+    // A cubic kernel overshoots: the type's own storable range holds what it can
+    // (e.g. Uint1 -> 0..1, Uint4 -> 0..15, Uint12 -> 0..4095).
+    let range = sample_type
+        .storable_range()
+        .map(|(lo, hi)| (lo as f32, hi as f32));
     if let (false, Some((low, high))) = (unscale, range) {
         for plane in &mut planes {
             for v in plane.iter_mut() {

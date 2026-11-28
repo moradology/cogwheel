@@ -252,7 +252,7 @@ pub fn encode_npy_typed_f64(
     let hdr = encode_npy_header(npy_descr(kind), &[planes, height, width]);
     let mut out = Vec::with_capacity(hdr.len() + planes * pixels * kind.bytes_per_sample());
     out.extend_from_slice(&hdr);
-    let absent = absent.unwrap_or(if kind.value_range().is_none() {
+    let absent = absent.unwrap_or(if kind.storable_range().is_none() {
         f64::NAN
     } else {
         0.0

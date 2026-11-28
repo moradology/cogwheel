@@ -9,11 +9,11 @@
 
 use cogzilla_raster::SampleType;
 
-use super::array_type::{cast_type, integer_range};
+use super::array_type::cast_type;
 
 /// The type `whole` asks for: `source` when its bands are read as its own whole numbers.
 pub(super) fn whole_numbers(source: SampleType, unscale: bool) -> Option<SampleType> {
-    (!unscale && integer_range(source).is_some()).then_some(source)
+    (!unscale && source.storable_range().is_some()).then_some(source)
 }
 
 /// `b{band}` as TiTiler's `cast` (to `dtype`, uint8 when none is named), `ceil` or
@@ -24,7 +24,7 @@ pub(super) fn whole_numbers(source: SampleType, unscale: bool) -> Option<SampleT
 pub(super) fn integer_band(alg: &str, band: u16, whole: Option<SampleType>, dtype: Option<&str>) -> (String, Option<(f32, f32)>) {
     let b = format!("b{band}");
     let kind = if alg == "cast" { cast_type(dtype) } else { Some(SampleType::Uint8) };
-    let Some((kind, (lo, hi))) = kind.and_then(|kind| Some((kind, integer_range(kind)?))) else {
+    let Some((kind, (lo, hi))) = kind.and_then(|kind| Some((kind, kind.storable_range()?))) else {
         return (b, None);
     };
     let rounded = match (whole, alg) {
@@ -35,7 +35,7 @@ pub(super) fn integer_band(alg: &str, band: u16, whole: Option<SampleType>, dtyp
     };
     // Whole numbers already inside the type's range are what `astype` leaves them, and
     // 32-bit types are only truncated, as `astype` does.
-    let fits = whole.and_then(integer_range).is_some_and(|(from, to)| from >= lo && to <= hi);
+    let fits = whole.and_then(SampleType::storable_range).is_some_and(|(from, to)| from >= lo && to <= hi);
     let expr = if fits || kind.bytes_per_sample() > 2 {
         rounded
     } else if lo == 0.0 {

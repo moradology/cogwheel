@@ -1714,3 +1714,25 @@ fn encoded_query_strips_doc_negotiation_params() {
     assert_eq!(encoded_query(&img), "assets=data&format=png");
 }
 
+#[test]
+fn in_raster_type_clamps_packed_overshoot_to_storable_range() {
+    use cogzilla_raster::SampleType as T;
+    // Cubic/Lanczos overshoots past packed bit widths must clamp to each type's own
+    // storable_range (0..1, 0..15, 0..4095), not the wider GDAL reported_range (0..255, 0..65535).
+    let clamped_u1 = in_raster_type(vec![vec![-0.4, 0.4, 0.6, 5.2, f32::NAN]], T::Uint1, false);
+    assert_eq!(&clamped_u1[0][..4], &[0.0, 0.0, 1.0, 1.0]);
+    assert!(clamped_u1[0][4].is_nan());
+
+    let clamped_u4 = in_raster_type(vec![vec![-3.0, 7.6, 42.0, f32::NAN]], T::Uint4, false);
+    assert_eq!(&clamped_u4[0][..3], &[0.0, 8.0, 15.0]);
+    assert!(clamped_u4[0][3].is_nan());
+
+    let clamped_u12 = in_raster_type(vec![vec![-12.3, 2048.4, 5120.7, 65_000.0, f32::NAN]], T::Uint12, false);
+    assert_eq!(&clamped_u12[0][..4], &[0.0, 2048.0, 4095.0, 4095.0]);
+    assert!(clamped_u12[0][4].is_nan());
+
+    // Unscaled rasters are floats and bypass integer clamping.
+    let unscaled = in_raster_type(vec![vec![-12.3, 5120.7]], T::Uint12, true);
+    assert_eq!(unscaled[0], vec![-12.3, 5120.7]);
+}
+
