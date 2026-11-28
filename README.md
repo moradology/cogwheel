@@ -10,17 +10,17 @@
 
 **A COG, STAC, MosaicJSON & Zarr tile server that speaks TiTiler's API, without GDAL.** Written in Rust. Point your map client at a new base URL and keep everything else.
 
-| Against TiTiler | `cogzilla` | TiTiler | |
+| Against TiTiler (CPU-only unless noted) | `cogzilla` | TiTiler | |
 | :--- | ---: | ---: | ---: |
-| CPU per 1,000 tiles it has never seen (real S3 COGs) | **13.2 CPU-s** | 56.0 CPU-s | **4.3× less** |
-| CPU per 1,000 tiles once source blocks are cached | **1.7 CPU-s** | 55.3 CPU-s | **32× less** |
-| Warm tiles per second over HTTP, 4-vCPU Linux | **3,363** | 85 | **40×** |
-| Warm tiles per second over HTTP, Apple M5 | **13,195** | 180 | **73×** |
-| Reprojected 3-band RGB / 3-asset STAC band-math tile (M5, warm) | **1.0–1.2 ms** | 45–50 ms | **43–46×** |
-| GeoJSON polygon statistics / 3-asset STAC point query (M5, warm) | **1.49 / 0.24 ms** | 112 / 18 ms | **75×** |
+| CPU per 1,000 tiles it has never seen (real S3 COGs, Apple M5) | **13.2 CPU-s** | 56.0 CPU-s | **4.3× less** |
+| CPU per 1,000 tiles once source blocks are cached (Apple M5) | **1.7 CPU-s** | 55.3 CPU-s | **32× less** |
+| Warm tiles/s over HTTP, 4-vCPU Linux (AMD EPYC 9V45, all cores) | **3,363** | 85 | **40×** |
+| Warm tiles/s over HTTP, Apple M5 (10 cores, all cores) | **13,195** | 180 | **73×** |
+| Reprojected 3-band RGB / 3-asset STAC band-math tile (M5, 1 core, warm) | **1.0–1.2 ms** | 45–50 ms | **43–46×** |
+| GeoJSON polygon statistics / 3-asset STAC point query (M5, 1 core, warm) | **1.49 / 0.24 ms** | 112 / 18 ms | **75×** |
 | Memory at idle | **4 MiB** | 1,112 MiB | **278× less** |
 
-Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network (lossy WebP on 4-vCPU Linux is **10.9×** warm / **7.0×** cold vs GDAL). Each row comes from a single benchmark run; hardware, method and caveats are in [docs/benchmarks.md](docs/benchmarks.md).
+Plan with the 4.3×: uncached tiles are what an origin behind a CDN mostly serves. The larger multiples need the block cache to hold your working set, and the warm rows are local files with no network (lossy WebP on 4-vCPU Linux is **10.9×** warm / **7.0×** cold vs GDAL). Hardware specs, core counts, scaling graphs, and caveats are in [docs/benchmarks.md](docs/benchmarks.md) and [docs/gpu-benchmarks.md](docs/gpu-benchmarks.md).
 
 <p align="center">
   <img src="assets/terrain-gallery.jpg" alt="Mt. Rainier rendered six ways by cogzilla: colormapped elevation, hillshade, slope, aspect, Terrarium RGB and Mapbox Terrain-RGB" width="100%" />
