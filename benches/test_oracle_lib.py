@@ -116,6 +116,17 @@ class OracleLibTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("PSNR=99.0dB", note)
 
+        # Translucent alpha (e.g. 128 vs 255) must fail compare_images (#555).
+        img_half = Image.fromarray(np.full((16, 16, 4), [10, 20, 30, 128], dtype=np.uint8), mode="RGBA")
+        buf_half = io.BytesIO()
+        img_half.save(buf_half, format="PNG")
+        raw_half = buf_half.getvalue()
+        ok_same, _ = olib.compare_images(raw_half, raw_half)
+        self.assertTrue(ok_same)
+        ok_bin, note_bin = olib.compare_images(raw, raw_half)
+        self.assertFalse(ok_bin)
+        self.assertIn("aMAE=", note_bin)
+
     @unittest.skipIf(np is None or rasterio is None, "numpy or rasterio not installed")
     def test_compare_geotiffs_both_modes(self):
         arr = np.zeros((2, 16, 16), dtype=np.uint8)

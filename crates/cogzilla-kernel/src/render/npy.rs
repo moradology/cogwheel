@@ -261,6 +261,23 @@ pub fn retype_f32_npy_with(
         };
         prepare(retype_value_with_mask(x, mask_sample))
     });
+    if kind == SampleType::Uint8
+        && let Some(ms) = mask_slice
+    {
+        write_npy_typed_planes(&mut out, kind, data, None::<std::iter::Empty<bool>>);
+        for v in ms.chunks_exact(4) {
+            let m = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let b = if !m.is_finite() || m <= 0.0 {
+                0u8
+            } else if m >= 255.0 {
+                255u8
+            } else {
+                m.round() as u8
+            };
+            out.push(b);
+        }
+        return Some(Bytes::from(out));
+    }
     let mask_bits = mask_slice.map(|ms| {
         ms.chunks_exact(4).map(|v| {
             is_valid_mask_sample(f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]])))
@@ -317,6 +334,20 @@ pub fn wrap_raw_f32_as_npy_with_mask(
     width: u32,
     return_mask: bool,
 ) -> Bytes {
+    wrap_raw_f32_as_npy_with_alpha_mask(raw, bands, height, width, None, return_mask)
+}
+
+/// Like [`wrap_raw_f32_as_npy_with_mask`], but when `alpha_mask` is `Some` and `return_mask`
+/// is `true`, writes the continuous `0.0..=255.0` resampled alpha values for valid pixels
+/// instead of binarizing to `255.0`.
+pub fn wrap_raw_f32_as_npy_with_alpha_mask(
+    raw: Bytes,
+    bands: usize,
+    height: u32,
+    width: u32,
+    alpha_mask: Option<&[f32]>,
+    return_mask: bool,
+) -> Bytes {
     if !return_mask {
         let hdr = encode_npy_f32_header(bands, height, width);
         let mut out = BytesMut::with_capacity(hdr.len() + raw.len());
@@ -345,7 +376,19 @@ pub fn wrap_raw_f32_as_npy_with_mask(
                 }
             }
         }
-        out.put_slice(if any_valid { &valid_le } else { &zero_le });
+        if !any_valid {
+            out.put_slice(&zero_le);
+        } else if let Some(alpha) = alpha_mask {
+            let a = alpha.get(px).copied().unwrap_or(0.0);
+            let clamped = if a.is_finite() && a > 0.0 {
+                a.clamp(0.0, 255.0)
+            } else {
+                0.0
+            };
+            out.put_slice(&clamped.to_le_bytes());
+        } else {
+            out.put_slice(&valid_le);
+        }
     }
     out.freeze()
 }
@@ -416,5 +459,35 @@ mod tests {
         // Mask plane: pixel 0 = f32::MAX, pixel 1 = f32::MIN.
         assert_eq!(out[4], f32::MAX);
         assert_eq!(out[5], f32::MIN);
+    }
+
+    #[test]
+    fn continuous_alpha_mask_is_preserved_in_f32_and_retyped_u8_npy() {
+        // 1-band, 1x4 CHW float32 array with continuous alpha [0, 64, 128, 255].
+        let raw_vals: [f32; 4] = [f32::NAN, 10.0, 20.0, 30.0];
+        let mut raw_bytes = Vec::with_capacity(16);
+        for v in raw_vals {
+            raw_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let alpha = [0.0f32, 64.0, 128.0, 255.0];
+        let wrapped = wrap_raw_f32_as_npy_with_alpha_mask(
+            Bytes::from(raw_bytes),
+            1,
+            1,
+            4,
+            Some(&alpha),
+            true,
+        );
+        let f32_body = npy_body(&wrapped);
+        let f32_out: Vec<f32> = f32_body
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(&f32_out[4..8], &[0.0, 64.0, 128.0, 255.0]);
+
+        let u8_npy = retype_f32_npy(&wrapped, SampleType::Uint8, true).expect("retype u8");
+        let u8_body = npy_body(&u8_npy);
+        assert_eq!(&u8_body[0..4], &[0u8, 10, 20, 30]);
+        assert_eq!(&u8_body[4..8], &[0u8, 64, 128, 255]);
     }
 }

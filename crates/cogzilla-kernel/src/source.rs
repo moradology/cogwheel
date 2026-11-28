@@ -347,6 +347,86 @@ impl<'a> BandSource<'a> {
     pub fn is_clean_inbounds(&self, c0: i32, c1: i32, r0: i32, r1: i32) -> bool {
         self.no_nodata && c0 >= 0 && r0 >= 0 && c1 < self.ifd_w && r1 < self.ifd_h
     }
+}
+
+/// Full-opaque sample value for an `ExtraSamples` alpha band of `sample_type`.
+#[inline]
+pub fn alpha_full_opaque(sample_type: cogzilla_raster::SampleType) -> f32 {
+    match sample_type {
+        cogzilla_raster::SampleType::Uint16 => 65535.0,
+        _ => 255.0,
+    }
+}
+
+/// Returns `true` when any decoded block in `alpha_src` contains an intermediate
+/// translucency sample strictly between `0` and `full_opaque` (e.g. `1..=254` for 8-bit
+/// alpha, `1..=65534` for 16-bit alpha).
+///
+/// O(number of blocks) fast path for all-opaque (`min == max >= full_opaque`) and
+/// all-transparent (`min == max <= 0`) tiles; scans pixels only on edge blocks whose
+/// `[min, max]` spans `0..=full_opaque`.
+pub fn has_intermediate_alpha(alpha_src: &BandSource<'_>, full_opaque: f32) -> bool {
+    for blk in alpha_src.blocks.iter().flatten() {
+        let s = blk.stats;
+        if s.all_nodata {
+            continue;
+        }
+        if s.min == s.max && (s.min <= 0.0 || s.min >= full_opaque) {
+            continue;
+        }
+        if (s.min > 0.0 && s.min < full_opaque) || (s.max > 0.0 && s.max < full_opaque) {
+            return true;
+        }
+        match &blk.data {
+            cogzilla_codec::BandData::U8 { data, .. } => {
+                let hi = full_opaque.clamp(0.0, 255.0) as u8;
+                if data.iter().any(|&v| v > 0 && v < hi) {
+                    return true;
+                }
+            }
+            cogzilla_codec::BandData::U16 { data, .. } => {
+                let hi = full_opaque.clamp(0.0, 65535.0) as u16;
+                if data.iter().any(|&v| v > 0 && v < hi) {
+                    return true;
+                }
+            }
+            other => {
+                for i in 0..other.len() {
+                    let v = other.get_f32(i);
+                    if v.is_finite() && v > 0.0 && v < full_opaque {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Apply a resampled continuous `0.0..=255.0` alpha plane onto an RGBA8 buffer in place.
+///
+/// Pixels already masked out (`px[3] == 0`, e.g. nodata, polygon mask, or out-of-bounds)
+/// remain `0`; opaque pixels (`px[3] == 255`) take the rounded `alpha` directly; partially
+/// translucent colormap pixels compose multiplicatively.
+#[inline]
+pub fn apply_continuous_alpha_to_rgba(rgba: &mut [u8], alpha: &[f32]) {
+    for (px, &a) in rgba.chunks_exact_mut(4).zip(alpha.iter()) {
+        if px[3] > 0 {
+            let v = if a.is_finite() && a > 0.0 {
+                a.round().clamp(0.0, 255.0) as u8
+            } else {
+                0
+            };
+            px[3] = if px[3] == 255 {
+                v
+            } else {
+                ((u16::from(px[3]) * u16::from(v) + 127) / 255) as u8
+            };
+        }
+    }
+}
+
+impl<'a> BandSource<'a> {
 
     #[inline(always)]
     fn single_block_base_exact(&self) -> Option<(u32, u32)> {

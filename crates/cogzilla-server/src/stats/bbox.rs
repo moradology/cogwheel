@@ -1975,6 +1975,27 @@ async fn render_bbox_core(
         }
     }
 
+    // For single-COG RGBA / Gray+Alpha sources, capture the 1-based alpha band index and
+    // include it in `planar_bands` when planar so intermediate translucency (1..254) can be
+    // preserved on visual and `.npy` outputs.
+    let alpha_band_info: Option<(u16, f32)> = if cogs.len() == 1
+        && fused_stats.is_none()
+        && matches!(
+            format,
+            OutputFormat::Png | OutputFormat::Webp { .. } | OutputFormat::RawRgba | OutputFormat::Npy
+        )
+        && let Some(alpha_idx) =
+            cogzilla_codec::alpha_channel_index(ifd.samples_per_pixel as usize, &ifd.extra_samples)
+    {
+        let alpha_b0 = alpha_idx as u16;
+        if is_single_planar && !planar_bands.contains(&alpha_b0) {
+            planar_bands.push(alpha_b0);
+        }
+        Some((alpha_b0 + 1, cogzilla_kernel::alpha_full_opaque(ifd.sample_type)))
+    } else {
+        None
+    };
+
     // Skip block I/O completely for 0-band constant expressions (u_map/v_map already enforce
     // raster footprint + polygon bounds).
     let zero_band_expr = match bands {
@@ -2286,6 +2307,39 @@ async fn render_bbox_core(
                 .with_scale_offset(sc, off)
             }};
         }
+
+        // Preserve continuous 0..255 alpha from RGBA / Gray+Alpha COGs when any intersecting
+        // block has intermediate translucency (1..254). Returns `None` in O(blocks) for opaque
+        // or binary 0/255 alpha tiles.
+        let continuous_alpha: Option<Vec<f32>> =
+            alpha_band_info.and_then(|(alpha_b1, full_opaque)| {
+                let (refs, _) = get_band_refs(alpha_b1, 0);
+                let alpha_src = BandSource::new(
+                    ifd_width,
+                    ifd_height,
+                    ifd_tile_width,
+                    ifd_tile_height,
+                    tx0,
+                    ty0,
+                    grid_w,
+                    grid_h,
+                    &refs,
+                )
+                .with_scale_offset(255.0 / full_opaque, 0.0);
+                if !cogzilla_kernel::has_intermediate_alpha(&alpha_src, full_opaque) {
+                    return None;
+                }
+                if let Some(p) = plane_of(&alpha_src) {
+                    Some(p[..w * h].to_vec())
+                } else {
+                    let mut buf = vec![0.0f32; w * h];
+                    coord_map.for_each_uv(w, h, |i, u, v| {
+                        let val = sample(&alpha_src, u, v);
+                        buf[i] = if val.is_finite() { val } else { 0.0 };
+                    });
+                    Some(buf)
+                }
+            });
 
         // A terrain algorithm over band math reads it block by block as one band (on the CPU):
         // each band with the request's nodata and its own scale and offset first.
@@ -2709,11 +2763,12 @@ async fn render_bbox_core(
                             _ => 1,
                         };
                         return BboxRenderOutput::Bytes(
-                            cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
+                            cogzilla_kernel::wrap_raw_f32_as_npy_with_alpha_mask(
                                 raw,
                                 nb,
                                 h as u32,
                                 w as u32,
+                                continuous_alpha.as_deref(),
                                 return_mask,
                             ),
                         );
@@ -2954,13 +3009,16 @@ async fn render_bbox_core(
                     BandRequest::CustomExprMulti { progs } => progs.len().max(1),
                     _ => 1,
                 };
-                return BboxRenderOutput::Bytes(cogzilla_kernel::wrap_raw_f32_as_npy_with_mask(
-                    raw,
-                    nb,
-                    h as u32,
-                    w as u32,
-                    return_mask,
-                ));
+                return BboxRenderOutput::Bytes(
+                    cogzilla_kernel::wrap_raw_f32_as_npy_with_alpha_mask(
+                        raw,
+                        nb,
+                        h as u32,
+                        w as u32,
+                        continuous_alpha.as_deref(),
+                        return_mask,
+                    ),
+                );
             }
             return BboxRenderOutput::Bytes(raw);
         }
@@ -3000,13 +3058,15 @@ async fn render_bbox_core(
             }
         };
 
-        if matches!(
-            format,
-            OutputFormat::Png
-                | OutputFormat::Webp { .. }
-                | OutputFormat::Jpeg { .. }
-                | OutputFormat::RawRgba
-        ) && let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx
+        if continuous_alpha.is_none()
+            && matches!(
+                format,
+                OutputFormat::Png
+                    | OutputFormat::Webp { .. }
+                    | OutputFormat::Jpeg { .. }
+                    | OutputFormat::RawRgba
+            )
+            && let Some((ref gpu, ref stats, primary_id, ref asset_ids)) = gpu_ctx
         {
             let single_band_key = |b1: u16| -> (u64, u16) {
                 if num_cogs > 1 {
@@ -3639,6 +3699,10 @@ async fn render_bbox_core(
             && let Some(cf) = color_formula
         {
             cf.apply_buffer_in_place(&mut rgba, 4);
+        }
+
+        if let Some(ref alpha) = continuous_alpha {
+            cogzilla_kernel::apply_continuous_alpha_to_rgba(&mut rgba, alpha);
         }
 
         BboxRenderOutput::Bytes(encode_rgba_output(w, h, &rgba, format, return_mask))
