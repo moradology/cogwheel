@@ -973,6 +973,44 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
     }))
     out["w34_stac_pipe"] = p_w34_stac
 
+    # Wave 35: Scaled int16 DEM (scale=0.1, offset=500.0), heterogeneous per-band scaled 2-band int16
+    # (Landsat/Sentinel-2 style), and tagless float32 with NaN hole for ?nodata=nan override
+    p_w35_sdem = synth_dir / "w35_scaled_dem.tif"
+    raw_dem_w35 = (xx9.astype(np.int32) * 50 + yy9.astype(np.int32) * 25).astype(np.int16)
+    raw_dem_w35[80:100, 60:90] = -32768
+    with rasterio.open(
+        p_w35_sdem, "w", driver="GTiff", width=128, height=128, count=1, dtype="int16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", nodata=-32768,
+    ) as ds:
+        ds.write(raw_dem_w35, 1)
+        ds.scales = (0.1,)
+        ds.offsets = (500.0,)
+    out["w35_scaled_dem"] = p_w35_sdem
+
+    p_w35_s2b = synth_dir / "w35_scaled_2b.tif"
+    b1_w35 = (xx9.astype(np.int32) * 100 + 2000).astype(np.int16)
+    b2_w35 = (yy9.astype(np.int32) * 50 + 5000).astype(np.int16)
+    with rasterio.open(
+        p_w35_s2b, "w", driver="GTiff", width=128, height=128, count=2, dtype="int16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="deflate", nodata=-9999,
+    ) as ds:
+        ds.write(np.stack([b1_w35, b2_w35]))
+        ds.scales = (0.0001, 0.0002)
+        ds.offsets = (-0.1, -0.2)
+    out["w35_scaled_2b"] = p_w35_s2b
+
+    p_w35_nan = synth_dir / "w35_f32_nan_notag.tif"
+    f32_nan_w35 = (10.0 + xx9.astype(np.float32) * 2.0 + yy9.astype(np.float32)).astype(np.float32)
+    f32_nan_w35[80:100, 60:90] = np.nan
+    with rasterio.open(
+        p_w35_nan, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write(f32_nan_w35, 1)
+    out["w35_f32_nan_notag"] = p_w35_nan
+
     return out
 
 
@@ -4282,6 +4320,17 @@ def main() -> int:
                 ("PARITY W34 STAC inline assets=multi|bidx=2 /point", "GET", f"/stac/point/-122.25,37.75?url={q(s['w34_stac_pipe'])}&assets={qe('multi|bidx=2')}", None, "point"),
                 ("PARITY W34 BBOX dst_crs=EPSG:32610 cubic .npy", "GET", f"/cog/bbox/-122.4,37.6,-122.1,37.9/64x64.npy?url={q(s['w34_multi3b'])}&bidx=1&dst_crs=EPSG:32610&resampling=cubic", None, "npy"),
                 ("PARITY W34 BBOX coord_crs=EPSG:32610 dst_crs=32610 .npy", "GET", f"/cog/bbox/550000,4165000,575000,4190000/64x64.npy?url={q(s['w34_multi3b'])}&bidx=1&coord_crs=EPSG:32610&dst_crs=EPSG:32610", None, "npy"),
+                # --- Wave 35: unscale=true + DEM/colormap/per-band-scaled expression & ?nodata=nan query override ---
+                ("PARITY W35 UNSCALE+VIRIDIS scaled DEM .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w35_scaled_dem'])}&unscale=true&rescale=500,1500&colormap_name=viridis", None, "png"),
+                ("PARITY W35 UNSCALE+SLOPE buffer=3 scaled b1 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w35_scaled_2b'])}&bidx=1&unscale=true&algorithm=slope&buffer=3", None, "npy"),
+                ("PARITY W35 UNSCALE+TERRARIUM scaled DEM .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w35_scaled_dem'])}&unscale=true&algorithm=terrarium", None, "png"),
+                ("PARITY W35 UNSCALE+EXPR hetero 2-band NDVI .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w35_scaled_2b'])}&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}", None, "npy"),
+                ("PARITY W35 UNSCALE+EXPR hetero 2-band NDVI .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w35_scaled_2b'])}&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}&rescale=-1,1&colormap_name=viridis", None, "png"),
+                ("PARITY W35 UNSCALE hetero 2-band /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w35_scaled_2b'])}&unscale=true", None, "point"),
+                ("PARITY W35 UNSCALE+EXPR hetero 2-band /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w35_scaled_2b'])}&unscale=true&expression={qe('(b2-b1)/(b2+b1)')}", None, "point"),
+                ("PARITY W35 NODATA=nan tagless f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w35_f32_nan_notag'])}&nodata=nan", None, "npy"),
+                ("PARITY W35 NODATA=nan tagless f32 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w35_f32_nan_notag'])}&nodata=nan&rescale=0,400&colormap_name=viridis", None, "png"),
+                ("PARITY W35 NODATA=nan tagless f32 /statistics", "GET", f"/cog/statistics?url={q(s['w35_f32_nan_notag'])}&nodata=nan", None, "stats"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
