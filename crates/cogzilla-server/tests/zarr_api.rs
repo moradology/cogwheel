@@ -434,7 +434,12 @@ async fn zarr_tile_cache_coalesces_concurrent_requests() {
     let Some(dir) = zarr_fixtures_dir() else {
         return;
     };
-    let engine = test_engine();
+    // Disable AIMD admission shedding so all 32 barrier-synchronized requests reach
+    // `TileCache::get_or_render` even on low-vCPU CI runners where the default AIMD limit is <32.
+    let engine = Arc::new(
+        TileEngine::new(64 * 1024 * 1024)
+            .with_aimd(cogzilla_server::aimd::AimdLimiter::new(false, 64, 1, 64, 1000)),
+    );
     let zarr_url = dir.join("geotiff_twin.zarr").to_string_lossy().to_string();
     let uri = format!(
         "/zarr/tiles/WebMercatorQuad/10/163/395.png?url={zarr_url}&rescale=100,900&colormap_name=viridis&resampling=bilinear"
