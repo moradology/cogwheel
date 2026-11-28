@@ -438,6 +438,13 @@ pub(crate) fn retype_f32_geotiff_with(
     // Which band a sample belongs to, from its place among the samples.
     let band_of = |i: usize| if planar { i / pixels } else { i % bands_us };
     let is_mask = |i: usize| mask && band_of(i) + 1 == bands_us;
+    let mask_index_of = |i: usize| {
+        if planar {
+            (bands_us - 1) * pixels + (i % pixels)
+        } else {
+            (i / bands_us) * bands_us + (bands_us - 1)
+        }
+    };
     Some(write_geotiff_placed(&spec, pixel_size, corner, |buf| {
         let total_samples = bands_us * pixels;
         let read_sample = |i: usize| -> f64 {
@@ -458,8 +465,14 @@ pub(crate) fn retype_f32_geotiff_with(
             ($t:ty, $cast:expr) => {{
                 let cast = $cast;
                 for i in 0..total_samples {
-                    let v = read_sample(i);
+                    let mut v = read_sample(i);
                     let x: $t = if !is_mask(i) {
+                        if mask && v.is_nan() {
+                            let m = read_sample(mask_index_of(i));
+                            if m.is_finite() && m > 0.0 {
+                                v = 0.0;
+                            }
+                        }
                         cast(prepare(v))
                     } else if v.is_finite() && v > 0.0 {
                         <$t>::MAX
@@ -1500,5 +1513,28 @@ mod retype_tests {
         assert!(retype_f32_geotiff(&f32_tif[..f32_tif.len() - 1], T::Uint16, false).is_none());
         assert!(retype_f32_geotiff(b"II*\0 not a tiff at all", T::Uint16, false).is_none());
         assert!(retype_f32_geotiff(b"\x93NUMPY", T::Uint16, false).is_none());
+    }
+
+    #[test]
+    fn retype_f32_geotiff_replaces_nan_with_zero_on_valid_masked_pixels() {
+        let bbox = [0.0, 0.0, 2.0, 1.0];
+        // 2-band CHW + mask (2x1): pixel 0 has band0=NaN, band1=100.0 (valid); pixel 1 has both NaN (masked).
+        let f32_tif = encode_geotiff_f32(2, 1, &f32s(&[f32::NAN, f32::NAN, 100.0, f32::NAN]), bbox, 3857, true);
+        let retyped = retype_f32_geotiff(&f32_tif, T::Float32, true).expect("retype f32 geotiff");
+        // Chunky output layout: [px0_b0, px0_b1, px0_mask, px1_b0, px1_b1, px1_mask]
+        let expected_px = f32s(&[0.0, 100.0, f32::MAX, f32::NAN, f32::NAN, f32::MIN]);
+        let expected = made(GeoTiffSample::F32, 3, &[0, 2], bbox, 3857, &expected_px);
+        assert_eq!(retyped.len(), expected.len());
+        let data_off = retyped.len() - expected_px.len();
+        let got: Vec<f32> = retyped[data_off..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(got[0], 0.0, "valid pixel band0 NaN must become 0.0");
+        assert_eq!(got[1], 100.0);
+        assert_eq!(got[2], f32::MAX);
+        assert!(got[3].is_nan(), "masked pixel band0 stays NaN");
+        assert!(got[4].is_nan(), "masked pixel band1 stays NaN");
+        assert_eq!(got[5], f32::MIN);
     }
 }
