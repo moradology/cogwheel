@@ -19,18 +19,14 @@ fn etag_hasher() -> ahash::RandomState {
     )
 }
 
-/// Fast, deterministic weak ETag (`W/"cgz-<ahash64>-<len>"`) for rendered tile bytes.
-pub fn compute_tile_etag(bytes: &[u8]) -> HeaderValue {
-    let h = etag_hasher().hash_one(bytes);
+/// Fast, deterministic weak ETag (`W/"cgz-<ahash64>-<len>"`) for rendered tile bytes,
+/// optionally folding in a request/freshness key (e.g. store validator or scene identity).
+pub fn compute_tile_etag(key: Option<&str>, bytes: &[u8]) -> HeaderValue {
+    let h = match key {
+        Some(k) => etag_hasher().hash_one((k, bytes)),
+        None => etag_hasher().hash_one(bytes),
+    };
     let s = format!("W/\"cgz-{h:016x}-{}\"", bytes.len());
-    HeaderValue::from_str(&s).expect("valid ASCII ETag")
-}
-
-/// Fast, deterministic strong ETag (`"cgz-<ahash64>-<len>"`) folding in a freshness key
-/// (such as a mutable Zarr store validator) plus the full response body.
-pub fn compute_keyed_etag(key: &str, bytes: &[u8]) -> HeaderValue {
-    let h = etag_hasher().hash_one((key, bytes));
-    let s = format!("\"cgz-{h:016x}-{}\"", bytes.len());
     HeaderValue::from_str(&s).expect("valid ASCII ETag")
 }
 
@@ -170,7 +166,9 @@ impl TileCache {
         }
     }
 
-    /// Look up an encoded tile directly in the ready micro-cache.
+    /// Look up an encoded tile directly in the ready micro-cache (test-only; production
+    /// callers must use [`Self::get_or_render`] so singleflight coalescing is never bypassed).
+    #[cfg(test)]
     pub fn get(&self, key: &str) -> Option<CachedTile> {
         if self.budget.max_bytes() == 0 {
             return None;
@@ -181,7 +179,8 @@ impl TileCache {
         Some(entry.tile.clone())
     }
 
-    /// Insert a rendered encoded tile into the ready micro-cache, respecting `max_bytes` and LRU eviction.
+    /// Insert a rendered encoded tile directly into the ready micro-cache (test-only).
+    #[cfg(test)]
     pub fn insert(&self, key: String, bytes: Bytes, content_type: &'static str) {
         if self.budget.max_bytes() == 0 {
             return;
@@ -250,7 +249,7 @@ impl TileCache {
                                     || content_type == "application/octet-stream"
                                     || content_type == "application/x-binary"
                                     || content_type == "application/x-npy";
-                                let etag = is_binary.then(|| compute_tile_etag(&bytes));
+                                let etag = is_binary.then(|| compute_tile_etag(Some(&key), &bytes));
                                 let tile = CachedTile {
                                     bytes,
                                     content_type,

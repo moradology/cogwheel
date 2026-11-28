@@ -515,13 +515,12 @@ fn parse_output_format(ext: Option<&str>, q_fmt: Option<&str>) -> (OutputFormat,
     }
 }
 
-fn binary_ok_with_etag(
+fn binary_ok_with_etag_hdr(
     body: Bytes,
     content_type: &'static str,
-    etag_key: &str,
+    etag_hdr: HeaderValue,
     if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
-    let etag_hdr = crate::tile_cache::compute_keyed_etag(etag_key, &body);
     let etag = etag_hdr.to_str().unwrap_or("");
     let cc = zarr_cache_control_header().clone();
     if let Some(inm) = if_none_match
@@ -545,10 +544,46 @@ fn binary_ok_with_etag(
         .unwrap()
 }
 
+fn binary_ok_with_etag(
+    body: Bytes,
+    content_type: &'static str,
+    etag_key: &str,
+    if_none_match: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let etag_hdr = crate::tile_cache::compute_tile_etag(Some(etag_key), &body);
+    binary_ok_with_etag_hdr(body, content_type, etag_hdr, if_none_match)
+}
+
+fn binary_ok_from_cached_tile(
+    tile: crate::tile_cache::CachedTile,
+    if_none_match: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let etag_hdr = tile
+        .etag
+        .unwrap_or_else(|| crate::tile_cache::compute_tile_etag(None, &tile.bytes));
+    binary_ok_with_etag_hdr(tile.bytes, tile.content_type, etag_hdr, if_none_match)
+}
+
+fn zarr_err_to_engine_err(err: ZarrError) -> crate::engine::EngineError {
+    use crate::engine::EngineError;
+    if matches!(err, ZarrError::CapExceeded { .. } | ZarrError::ChunkTooLarge { .. }) {
+        ZARR_METRICS.cap_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+    match err {
+        ZarrError::NotFound { key } => EngineError::NotFound(key),
+        ZarrError::UpstreamRefused { .. } => {
+            EngineError::Io(cogzilla_io::IoError::Forbidden(err.to_string()))
+        }
+        other => EngineError::BadRequest(other.to_string()),
+    }
+}
+
 /// Main dispatcher for all `/zarr/*` routes.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_zarr_request(
     engine: &Arc<TileEngine>,
     method: Method,
+    path: &str,
     sub: &[&str],
     req_params: super::query::FamilyRequestParams,
     raw_query: &str,
@@ -589,12 +624,13 @@ pub(super) async fn handle_zarr_request(
         }
         (Method::GET, [tms, "WMTSCapabilities.xml"]) => handle_wmts(io, &q, tms, host, raw_query).await,
         (Method::GET, ["tiles", tms, zs, xs, ys]) => {
-            handle_tile(engine, &q, tms, zs, xs, ys, raw_query, if_none_match).await
+            handle_tile(engine, &q, path, tms, zs, xs, ys, raw_query, if_none_match).await
         }
         (Method::GET, ["tiles", zs, xs, ys]) => {
             handle_tile(
                 engine,
                 &q,
+                path,
                 "WebMercatorQuad",
                 zs,
                 xs,
@@ -922,6 +958,7 @@ fn build_general_tile_plan<const N: usize>(
 async fn handle_tile(
     engine: &Arc<TileEngine>,
     q: &ZarrQuery,
+    path: &str,
     tms_id: &str,
     zs: &str,
     xs: &str,
@@ -1001,123 +1038,119 @@ async fn handle_tile(
     };
 
     let caps = ZarrCaps::from_env();
-    let etag_key = format!("zarr:tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}:{content_type}?{raw_query}");
-    let tile_cache_key = format!("zarr_tile:{validator}:{tms_id}/{z}/{x}/{y}/{tile_size}:{content_type}?{raw_query}");
+    // Key on the full request path + query (which carries extension, format, tilesize, TMS, etc.)
+    // plus the store freshness validator — the same seam used by the other four route families.
+    let cache_key = format!("{path}?{raw_query}#{validator}");
 
-    // Fast warm-tile cache hit (keyed by store validator so mutated stores never serve stale tiles).
-    if let Some(cached) = engine.tile_cache.get(&tile_cache_key) {
-        engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
-        return Ok(binary_ok_with_etag(
-            cached.bytes.clone(),
-            content_type,
-            &etag_key,
-            if_none_match,
-        ));
-    }
+    let rendered = engine
+        .tile_cache
+        .get_or_render(cache_key, || async {
+            let body = if tile_size == 256 {
+                let plan = if tms_id == "WebMercatorQuad" {
+                    CoordPlan::<256>::build(
+                        &geo.crs.model,
+                        &crs_to_pixel,
+                        ifd_w,
+                        ifd_h,
+                        TileCoord { z, x, y },
+                    )
+                } else {
+                    build_general_tile_plan::<256>(&dst_crs, tile_bounds, &geo, ifd_w, ifd_h)
+                };
+                let Some(plan) = plan else {
+                    return Err(crate::engine::EngineError::NotFound(format!(
+                        "tile {tms_id}/{z}/{x}/{y} outside Zarr dataset bounds"
+                    )));
+                };
+                let (c0, c1, r0, r1) = plan.src_pixel_bounds();
+                let pad = 2u32;
+                let wx0 = (c0.max(0) as u32).saturating_sub(pad);
+                let wy0 = (r0.max(0) as u32).saturating_sub(pad);
+                let wx1 = ((c1.max(0) as u32) + 1 + pad).min(ifd_w);
+                let wy1 = ((r1.max(0) as u32) + 1 + pad).min(ifd_h);
 
-    // Fast path for standard 256x256 and 512x512 tiles directly through `render_single_band`
-    if tile_size == 256 {
-        let plan = if tms_id == "WebMercatorQuad" {
-            CoordPlan::<256>::build(
-                &geo.crs.model,
-                &crs_to_pixel,
-                ifd_w,
-                ifd_h,
-                TileCoord { z, x, y },
-            )
-        } else {
-            build_general_tile_plan::<256>(&dst_crs, tile_bounds, &geo, ifd_w, ifd_h)
-        };
-        let Some(plan) = plan else {
-            return Err(ZarrError::NotFound {
-                key: format!("tile {tms_id}/{z}/{x}/{y} outside Zarr dataset bounds"),
-            });
-        };
-        let (c0, c1, r0, r1) = plan.src_pixel_bounds();
-        let pad = 2u32;
-        let wx0 = (c0.max(0) as u32).saturating_sub(pad);
-        let wy0 = (r0.max(0) as u32).saturating_sub(pad);
-        let wx1 = ((c1.max(0) as u32) + 1 + pad).min(ifd_w);
-        let wy1 = ((r1.max(0) as u32) + 1 + pad).min(ifd_h);
+                let wb = read_chunk_window_for_band_with_caps(
+                    &store,
+                    &sel_var.store_prefix,
+                    sel_var.meta,
+                    band_idx,
+                    wx0,
+                    wy0,
+                    wx1,
+                    wy1,
+                    16,
+                    &caps,
+                )
+                .await
+                .map_err(zarr_err_to_engine_err)?;
+                let refs = wb.block_refs();
+                let mut src = wb.as_band_source(&refs);
+                if !q.unscale {
+                    src.scale_offset = None;
+                }
+                if let Some(nd) = q.nodata {
+                    src = src.with_nodata_override(Some(nd));
+                }
+                match fmt {
+                    OutputFormat::RawF32 => {
+                        let raw = render_single_band::<256>(
+                            &plan,
+                            &src,
+                            &SingleBandStyle {
+                                format: OutputFormat::RawF32,
+                                ..style
+                            },
+                        );
+                        encode_geotiff_f32(256, 256, &raw, tile_bounds, tms.epsg, q.return_mask)
+                    }
+                    OutputFormat::Npy => {
+                        let raw = render_single_band::<256>(
+                            &plan,
+                            &src,
+                            &SingleBandStyle {
+                                format: OutputFormat::RawF32,
+                                ..style
+                            },
+                        );
+                        let plane: Vec<f32> = raw
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        encode_zarr_npy(&plane, 256, 256, q.return_mask)
+                    }
+                    _ => render_single_band::<256>(&plan, &src, &style),
+                }
+            } else {
+                // General tile size (e.g. 512x512, @2x, custom tilesize): sample through `sample_general`
+                render_zarr_rect_bytes(
+                    &store,
+                    &sel_var,
+                    &geo,
+                    band_idx,
+                    &dst_crs,
+                    tile_bounds,
+                    tms.epsg,
+                    tile_size,
+                    tile_size,
+                    q,
+                    fmt,
+                )
+                .await
+                .map_err(zarr_err_to_engine_err)?
+            };
+            Ok((body, content_type))
+        })
+        .await;
 
-        let wb = read_chunk_window_for_band_with_caps(
-            &store,
-            &sel_var.store_prefix,
-            sel_var.meta,
-            band_idx,
-            wx0,
-            wy0,
-            wx1,
-            wy1,
-            16,
-            &caps,
-        )
-        .await?;
-        let refs = wb.block_refs();
-        let mut src = wb.as_band_source(&refs);
-        if !q.unscale {
-            src.scale_offset = None;
-        }
-        if let Some(nd) = q.nodata {
-            src = src.with_nodata_override(Some(nd));
-        }
-        let body = match fmt {
-            OutputFormat::RawF32 => {
-                let raw = render_single_band::<256>(
-                    &plan,
-                    &src,
-                    &SingleBandStyle {
-                        format: OutputFormat::RawF32,
-                        ..style
-                    },
-                );
-                encode_geotiff_f32(256, 256, &raw, tile_bounds, tms.epsg, q.return_mask)
-            }
-            OutputFormat::Npy => {
-                let raw = render_single_band::<256>(
-                    &plan,
-                    &src,
-                    &SingleBandStyle {
-                        format: OutputFormat::RawF32,
-                        ..style
-                    },
-                );
-                let plane: Vec<f32> = raw
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                encode_zarr_npy(&plane, 256, 256, q.return_mask)
-            }
-            _ => render_single_band::<256>(&plan, &src, &style),
-        };
-        engine.tile_cache.insert(tile_cache_key, body.clone(), content_type);
-        engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
-        return Ok(binary_ok_with_etag(body, content_type, &etag_key, if_none_match));
-    }
-
-    // General tile size (e.g. 512x512, @2x, custom tilesize): sample through `sample_general`
     engine.stats.tiles_served.fetch_add(1, Ordering::Relaxed);
-    render_zarr_rect(
-        &store,
-        &sel_var,
-        &geo,
-        band_idx,
-        &dst_crs,
-        tile_bounds,
-        tms.epsg,
-        tile_size,
-        tile_size,
-        q,
-        fmt,
-        content_type,
-        &etag_key,
-        if_none_match,
-    )
-    .await
+    match rendered {
+        Ok(cached) => Ok(binary_ok_from_cached_tile(cached, if_none_match)),
+        Err(e) => Ok(super::error_to_http_response(&e)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn render_zarr_rect(
+async fn render_zarr_rect_bytes(
     store: &ServerZarrStore,
     sel_var: &cogzilla_zarr::SelectedVariable<'_>,
     geo: &ZarrGeo,
@@ -1129,10 +1162,7 @@ async fn render_zarr_rect(
     out_h: u32,
     q: &ZarrQuery,
     fmt: OutputFormat,
-    content_type: &'static str,
-    etag_key: &str,
-    if_none_match: Option<&str>,
-) -> Result<Response<Full<Bytes>>, ZarrError> {
+) -> Result<Bytes, ZarrError> {
     let ifd_w = sel_var.meta.shape[sel_var.dims.x_axis] as u32;
     let ifd_h = sel_var.meta.shape[sel_var.dims.y_axis] as u32;
     let crs_to_pixel = geo.affine.invert().ok_or_else(|| ZarrError::IrregularGrid {
@@ -1234,7 +1264,40 @@ async fn render_zarr_rect(
         }
     }
 
-    let body = encode_zarr_plane(&plane, out_w, out_h, dst_bounds, dst_epsg, q, fmt);
+    Ok(encode_zarr_plane(&plane, out_w, out_h, dst_bounds, dst_epsg, q, fmt))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_zarr_rect(
+    store: &ServerZarrStore,
+    sel_var: &cogzilla_zarr::SelectedVariable<'_>,
+    geo: &ZarrGeo,
+    band_idx: Option<u64>,
+    dst_crs: &CrsModel,
+    dst_bounds: [f64; 4],
+    dst_epsg: u16,
+    out_w: u32,
+    out_h: u32,
+    q: &ZarrQuery,
+    fmt: OutputFormat,
+    content_type: &'static str,
+    etag_key: &str,
+    if_none_match: Option<&str>,
+) -> Result<Response<Full<Bytes>>, ZarrError> {
+    let body = render_zarr_rect_bytes(
+        store,
+        sel_var,
+        geo,
+        band_idx,
+        dst_crs,
+        dst_bounds,
+        dst_epsg,
+        out_w,
+        out_h,
+        q,
+        fmt,
+    )
+    .await?;
     Ok(binary_ok_with_etag(body, content_type, etag_key, if_none_match))
 }
 
