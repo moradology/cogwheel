@@ -1642,8 +1642,60 @@ def main() -> int:
                 ("PARITY W11 STAC POST /statistics", "POST", f"/stac/statistics?url={q(s['w11_stac'])}&assets=a&max_size=128", poly_stac, "post_stats"),
             ]
 
+            # --- 5g. Wave 12: Zonal geometry torture (2-hole Polygon, MultiPolygon, GeometryCollection, MultiPoint) & stats params ---
+            w12_swiss = {
+                "type": "Feature", "properties": {"id": "swiss"},
+                "geometry": {"type": "Polygon", "coordinates": [
+                    [[-122.72, 37.68], [-122.48, 37.68], [-122.48, 37.92], [-122.72, 37.92], [-122.72, 37.68]],
+                    [[-122.68, 37.72], [-122.62, 37.72], [-122.62, 37.78], [-122.68, 37.78], [-122.68, 37.72]],
+                    [[-122.58, 37.82], [-122.52, 37.82], [-122.52, 37.88], [-122.58, 37.88], [-122.58, 37.82]],
+                ]},
+            }
+            w12_mp = {
+                "type": "Feature", "properties": {"id": "mp"},
+                "geometry": {"type": "MultiPolygon", "coordinates": [
+                    [[[-122.72, 37.68], [-122.60, 37.68], [-122.60, 37.80], [-122.72, 37.80], [-122.72, 37.68]],
+                     [[-122.68, 37.71], [-122.64, 37.71], [-122.64, 37.75], [-122.68, 37.75], [-122.68, 37.71]]],
+                    [[[-122.56, 37.82], [-122.48, 37.82], [-122.48, 37.92], [-122.56, 37.92], [-122.56, 37.82]]],
+                ]},
+            }
+            w12_ls = {
+                "type": "Feature", "properties": {"id": "ls"},
+                "geometry": {"type": "LineString", "coordinates": [[-122.72, 37.68], [-122.60, 37.80], [-122.48, 37.90]]},
+            }
+            w12_gc = {
+                "type": "Feature", "properties": {"id": "gc"},
+                "geometry": {"type": "GeometryCollection", "geometries": [
+                    {"type": "Polygon", "coordinates": [[[-122.70, 37.70], [-122.60, 37.70], [-122.60, 37.80], [-122.70, 37.80], [-122.70, 37.70]]]},
+                    {"type": "LineString", "coordinates": [[-122.58, 37.80], [-122.50, 37.90]]},
+                ]},
+            }
+            w12_mpt = {
+                "type": "Feature", "properties": {"id": "mpt"},
+                "geometry": {"type": "MultiPoint", "coordinates": [[-122.70, 37.70], [-122.60, 37.80], [-122.50, 37.90]]},
+            }
+            cases += [
+                ("PARITY W12 ZONAL Polygon 2-holes stats", "POST", f"/cog/statistics?url={q(sat)}&max_size=128", w12_swiss, "post_stats"),
+                ("PARITY W12 ZONAL MultiPolygon+hole stats", "POST", f"/cog/statistics?url={q(sat)}&max_size=128", w12_mp, "post_stats"),
+                ("PARITY W12 ZONAL GeometryCollection stats", "POST", f"/cog/statistics?url={q(sat)}&max_size=128", w12_gc, "post_stats"),
+                ("PARITY W12 FEAT MultiPolygon 64x64.npy", "POST", f"/cog/feature/64x64.npy?url={q(sat)}", w12_mp, "npy"),
+                ("PARITY W12 FEAT Polygon 2-holes 64x64.png", "POST", f"/cog/feature/64x64.png?url={q(sat)}&rescale=0,0.35", w12_swiss, "png"),
+                ("PARITY W12 FEAT LineString 64x64.npy", "POST", f"/cog/feature/64x64.npy?url={q(sat)}", w12_ls, "npy"),
+                ("PARITY W12 FEAT GeometryCollection 64x64.npy", "POST", f"/cog/feature/64x64.npy?url={q(sat)}", w12_gc, "npy"),
+                ("PARITY W12 STATS categorical=true", "GET", f"/cog/statistics?url={q(s['cat_u8'])}&categorical=true", None, "stats"),
+                ("PARITY W12 STATS categorical+c=1,3,5,99", "GET", f"/cog/statistics?url={q(s['cat_u8'])}&categorical=true&c=1&c=3&c=5&c=99", None, "stats"),
+                ("PARITY W12 STATS histogram_bins=4+range", "GET", f"/cog/statistics?url={q(merc)}&histogram_bins=4&histogram_range=0,500", None, "stats"),
+                ("PARITY W12 STATS explicit histogram_bins", "GET", f"/cog/statistics?url={q(merc)}&histogram_bins=0,100,300,600,1200", None, "stats"),
+                ("PARITY W12 STATS custom p=10,25,75,90", "GET", f"/cog/statistics?url={q(merc)}&p=10&p=25&p=75&p=90", None, "stats"),
+                ("PARITY W12 STATS bidx=3&bidx=1 reorder", "GET", f"/cog/statistics?url={q(sat)}&bidx=3&bidx=1&max_size=128", None, "stats"),
+                ("PARITY W12 STATS nodata=1 override", "GET", f"/cog/statistics?url={q(s['cat_u8'])}&nodata=1", None, "stats"),
+                ("PARITY W12 STATS GET expr NDVI", "GET", f"/cog/statistics?url={q(sat)}&expression={qe('(b1-b2)/(b1+b2)')}&max_size=128", None, "stats"),
+                ("PARITY W12 STATS POST expr NDVI", "POST", f"/cog/statistics?url={q(sat)}&expression={qe('(b1-b2)/(b1+b2)')}&max_size=128", w12_swiss, "post_stats"),
+            ]
+
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
             cases += [
+                ("BETTER W12 ZONAL MultiPoint exact count=3 (cw 3.0, tt 0.03)", "POST", f"/cog/statistics?url={q(sat)}&max_size=128", w12_mpt, "better_multipoint_3"),
                 ("BETTER W11 rot30 EPSG:3857 tile (cw exact, tt unrotated)", "GET", f"/cog/tiles/WebMercatorQuad/12/655/1582.npy?url={q(s['w11_rot30'])}", None, "better_rot30_3857"),
                 ("BETTER W9 nbits_1 .npy raw 0/1 (cw 2ch, tt 4ch)", "GET", f"/cog/tiles/WebMercatorQuad/{z_j}/{tx_j}/{ty_j}.npy?url={q(s['w9_nbits_1'])}", None, "better_palette_npy"),
                 ("BETTER W9 hillshade custom 256x256 (cw 256, tt 250)", "GET", f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&algorithm=hillshade&algorithm_params={qe(json.dumps({'azimuth':135,'angle_altitude':30,'z_exaggeration':2.0}))}", None, "better_hillshade_256"),
@@ -1814,6 +1866,21 @@ def main() -> int:
                             cw_v, tt_v = float(ac[0, 128, 128]), float(at[0, 128, 128])
                             ok = ac.shape == (2, 256, 256) and abs(cw_v - 373.5) < 1e-3 and abs(tt_v - 373.5) > 5.0
                             detail = f"cw[128,128]={cw_v:.2f} (exact=373.50) vs tt[128,128]={tt_v:.2f}"
+                    elif kind == "better_multipoint_3":
+                        if r_cw.status_code != 200 or r_tt.status_code != 200:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
+                        else:
+                            sc = r_cw.json()["properties"]["statistics"]["b1"]
+                            st = r_tt.json()["properties"]["statistics"]["b1"]
+                            # cogzilla samples all 3 points (including extrema on bbox corners!) with exact count=3.0;
+                            # TiTiler rasterizes on 10x10 sub-pixels so count ~= 0.03 while mean/min/max match.
+                            ok = (
+                                abs(sc["count"] - 3.0) < 1e-6
+                                and st["count"] < 0.1
+                                and sc["std"] > 0.005
+                                and abs(sc["mean"] - st["mean"]) < 0.02
+                            )
+                            detail = f"cw count={sc['count']:.1f} mean={sc['mean']:.4f} std={sc['std']:.4f} vs tt count={st['count']:.3f} mean={st['mean']:.4f}"
                     elif r_cw.status_code != 200 or r_tt.status_code != 200:
                         ok = False
                         detail = f"HTTP cw={r_cw.status_code} ({r_cw.text[:100]!r}) vs tt={r_tt.status_code} ({r_tt.text[:100]!r})"

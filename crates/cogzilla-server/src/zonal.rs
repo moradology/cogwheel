@@ -860,17 +860,30 @@ pub fn rasterize_exact_coverage(
     });
 
     // Point / MultiPoint: weight 1.0 per point at its containing pixel.
+    // A point lying directly on the right (`px == c0 + win_w`) or bottom (`py == r0 + win_h`)
+    // boundary of its own bounding window (e.g. MultiPoint extrema on a `max_size`-capped grid)
+    // belongs to the last column/row of the window rather than being dropped.
+    let c_min_f = c0_i as f64;
+    let r_min_f = r0_i as f64;
+    let c_max_f = (c0_i + win_w as i64) as f64;
+    let r_max_f = (r0_i + win_h as i64) as f64;
+    const EDGE_EPS: f64 = 1e-9;
     for &(px, py) in points_px {
         if px.is_finite() && py.is_finite() {
-            let c = px.floor() as i64;
-            let r = py.floor() as i64;
-            if c >= c0_i && c < c0_i + win_w as i64 && r >= r0_i && r < r0_i + win_h as i64 {
-                let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
-                if polygons_px.is_empty() && lines_px.is_empty() {
-                    cov[idx] += 1.0;
-                } else {
-                    cov[idx] = 1.0;
-                }
+            if px < c_min_f - EDGE_EPS
+                || px > c_max_f + EDGE_EPS
+                || py < r_min_f - EDGE_EPS
+                || py > r_max_f + EDGE_EPS
+            {
+                continue;
+            }
+            let c = (px.floor() as i64).clamp(c0_i, c0_i + win_w as i64 - 1);
+            let r = (py.floor() as i64).clamp(r0_i, r0_i + win_h as i64 - 1);
+            let idx = (r - r0_i) as usize * win_w + (c - c0_i) as usize;
+            if polygons_px.is_empty() && lines_px.is_empty() {
+                cov[idx] += 1.0;
+            } else {
+                cov[idx] = 1.0;
             }
         }
     }
@@ -4372,5 +4385,17 @@ mod tests {
         assert!((sum - 16.0).abs() < 1e-9, "expected exact 16.0 coverage without bleed, got {sum}");
         // Pixels to the right of col 6 must remain 0.0 (no unmatched run_delta bleed)
         assert_eq!(cov[3 * 10 + 8], 0.0);
+    }
+
+    #[test]
+    fn multipoint_on_window_edges_is_not_dropped() {
+        // MultiPoint whose extrema sit directly on the window corners (0, 10), (5, 5), (10, 0),
+        // plus one strictly outside point (10.5, 5.0) that must still be excluded.
+        let pts = [(0.0, 10.0), (5.0, 5.0), (10.0, 0.0), (10.5, 5.0)];
+        let cov = rasterize_exact_coverage(&[], &[], &pts, 0, 0, 10, 10);
+        assert_eq!(cov.iter().sum::<f64>(), 3.0);
+        assert_eq!(cov[9 * 10], 1.0); // (0, 10) -> bottom-left cell (0, 9)
+        assert_eq!(cov[5 * 10 + 5], 1.0); // (5, 5) -> center cell (5, 5)
+        assert_eq!(cov[9], 1.0); // (10, 0) -> top-right cell (9, 0)
     }
 }
