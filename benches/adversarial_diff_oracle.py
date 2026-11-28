@@ -617,6 +617,53 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(np.stack([50.0 + xx9.astype(np.float32) * 2.0, 20.0 + yy9.astype(np.float32) * 1.5]))
     out["w19_nir_red"] = p_2b19
 
+    # Wave 20: BigTIFF (LE & BE, Predictor=3), PackBits, non-square tiles (128x32), 4:1 anisotropic pixels, multi-overview nodata override + unscale
+    grad20 = 50.0 + xx9.astype(np.float32) * 1.75 + yy9.astype(np.float32) * 1.25
+    p_bt_le = synth_dir / "w20_bigtiff_le.tif"
+    with rasterio.open(p_bt_le, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", predictor=3, BIGTIFF="YES") as ds:
+        ds.write(grad20[None])
+    out["w20_bigtiff_le"] = p_bt_le
+
+    p_bt_be = synth_dir / "w20_bigtiff_be.tif"
+    with rasterio.open(p_bt_be, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate", predictor=3, BIGTIFF="YES", endianness="BIG") as ds:
+        ds.write(grad20[None])
+    assert p_bt_be.read_bytes()[:4] == b"MM\x00+", "expected Big-Endian BigTIFF header"
+    out["w20_bigtiff_be"] = p_bt_be
+
+    p_pb20 = synth_dir / "w20_packbits_rgb.tif"
+    pb_rgb = np.stack([((xx9 // 8) * 15 % 256).astype(np.uint8), ((yy9 * 3) % 256).astype(np.uint8), (((xx9 + yy9) * 2) % 256).astype(np.uint8)])
+    pb_rgb[:, 80:112, 64:96] = 128  # constant patch inside tile 10/164/396 so PackBits emits genuine RLE repeat runs
+    with rasterio.open(p_pb20, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8", crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="packbits") as ds:
+        ds.write(pb_rgb)
+    out["w20_packbits_rgb"] = p_pb20
+
+    p_ns20 = synth_dir / "w20_nonsq_128x32.tif"
+    tf_ns20 = from_bounds(-122.5, 37.5, -122.0, 38.0, 256, 96)
+    yy_ns20, xx_ns20 = np.mgrid[0:96, 0:256].astype(np.float32)
+    with rasterio.open(p_ns20, "w", driver="GTiff", width=256, height=96, count=1, dtype="float32", crs="EPSG:4326", transform=tf_ns20, tiled=True, blockxsize=128, blockysize=32, compress="deflate") as ds:
+        ds.write((10.0 + xx_ns20 * 0.5 + yy_ns20 * 3.0)[None])
+    out["w20_nonsq"] = p_ns20
+
+    p_an20 = synth_dir / "w20_aniso_4to1.tif"
+    tf_an20 = from_bounds(-122.5, 37.5, -122.0, 38.0, 256, 64)
+    yy_an20, xx_an20 = np.mgrid[0:64, 0:256].astype(np.float32)
+    with rasterio.open(p_an20, "w", driver="GTiff", width=256, height=64, count=1, dtype="float32", crs="EPSG:4326", transform=tf_an20, tiled=True, blockxsize=64, blockysize=64, compress="deflate") as ds:
+        ds.write((20.0 + xx_an20 * 0.75 + yy_an20 * 4.0)[None])
+    out["w20_aniso"] = p_an20
+
+    p_ov20 = synth_dir / "w20_multi_ov_unscale.tif"
+    tf_512 = from_bounds(-122.5, 37.5, -122.0, 38.0, 512, 512)
+    yy5, xx5 = np.mgrid[0:512, 0:512]
+    arr5 = (100 + (xx5 // 2) + (yy5 // 4)).astype(np.int16)
+    arr5[300:360, 240:320] = -9999
+    arr5[360:400, 240:320] = 200
+    with rasterio.open(p_ov20, "w", driver="GTiff", width=512, height=512, count=1, dtype="int16", crs="EPSG:4326", transform=tf_512, tiled=True, blockxsize=128, blockysize=128, compress="deflate", nodata=-9999) as ds:
+        ds.write(arr5[None])
+        ds.scales = (0.1,)
+        ds.offsets = (10.0,)
+        ds.build_overviews([2, 4], Resampling.nearest)
+    out["w20_multi_ov"] = p_ov20
+
     return out
 
 
@@ -2809,6 +2856,20 @@ def main() -> int:
                 ("PARITY W19 ALG ceil negative f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w19_dem_f32'])}&algorithm=ceil", None, "npy"),
                 ("PARITY W19 ALG floor negative f32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w19_dem_f32'])}&algorithm=floor", None, "npy"),
                 ("PARITY W19 ALG contours increment=50 .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w19_dem_f32'])}&algorithm=contours&algorithm_params={qe(json.dumps({'increment':50}))}", None, "png"),
+                # --- Wave 20: BigTIFF (LE/BE), PackBits, Non-Square Tiles, 4:1 Anisotropic Pixels & Multi-Overview Nodata ---
+                ("PARITY W20 BIGTIFF LE predictor=3 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_bigtiff_le'])}", None, "npy"),
+                ("PARITY W20 BIGTIFF BE predictor=3 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_bigtiff_be'])}", None, "npy"),
+                ("PARITY W20 PACKBITS RGB .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_packbits_rgb'])}", None, "npy"),
+                ("PARITY W20 PACKBITS RGB .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w20_packbits_rgb'])}", None, "png"),
+                ("PARITY W20 NONSQ tile 128x32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_nonsq'])}", None, "npy"),
+                ("PARITY W20 ANISO 4:1 bilinear .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_aniso'])}&resampling=bilinear", None, "npy"),
+                ("PARITY W20 ANISO 4:1 cubic .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w20_aniso'])}&resampling=cubic&rescale=0,500&colormap_name=viridis", None, "png"),
+                ("PARITY W20 ANISO 4:1 /statistics", "GET", f"/cog/statistics?url={q(s['w20_aniso'])}", None, "stats"),
+                ("PARITY W20 MULTI-OV z11 unscale=true .npy", "GET", f"/cog/tiles/WebMercatorQuad/11/328/793.npy?url={q(s['w20_multi_ov'])}&unscale=true", None, "npy"),
+                ("PARITY W20 MULTI-OV z8 (4x ov) unscale=true .npy", "GET", f"/cog/tiles/WebMercatorQuad/8/41/99.npy?url={q(s['w20_multi_ov'])}&unscale=true", None, "npy"),
+                ("PARITY W20 MULTI-OV nodata=200 override .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w20_multi_ov'])}&nodata=200", None, "npy"),
+                ("PARITY W20 MULTI-OV nodata=200 override /statistics", "GET", f"/cog/statistics?url={q(s['w20_multi_ov'])}&nodata=200", None, "stats"),
+                ("PARITY W20 MULTI-OV nodata=200 override /point (-9999)", "GET", f"/cog/point/-122.22,37.67?url={q(s['w20_multi_ov'])}&nodata=200", None, "point"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
