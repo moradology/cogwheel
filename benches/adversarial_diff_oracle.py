@@ -774,6 +774,90 @@ def build_synthetic_fixtures(synth_dir: Path) -> dict[str, Path]:
         ds.write(np.stack([((xx9 * 2) % 256).astype(np.uint8), ((yy9 * 2) % 256).astype(np.uint8), ((xx9 + yy9) % 256).astype(np.uint8)]))
     out["w27_opaque_rgb"] = p_w27_op
 
+    # Wave 29: Unprobed TIFF codecs/predictors (Grayscale JPEG, LZW P2 u16/i16, LZW P3 f32, ZSTD P2 u16, YCbCr JPEG + internal mask) & STAC asset_as_band=true
+    p_w29_gj = synth_dir / "w29_gray_jpeg.tif"
+    with rasterio.open(
+        p_w29_gj, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint8",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="JPEG", jpeg_quality=90,
+    ) as ds:
+        ds.write(((xx9 * 2 + yy9) % 256).astype(np.uint8), 1)
+    out["w29_gray_jpeg"] = p_w29_gj
+
+    p_w29_lzw_u16 = synth_dir / "w29_lzw_p2_u16.tif"
+    u16_w29 = (xx9.astype(np.uint32) * 300 + yy9.astype(np.uint32) * 150 + 500).astype(np.uint16)
+    with rasterio.open(
+        p_w29_lzw_u16, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="LZW", predictor=2,
+    ) as ds:
+        ds.write(u16_w29, 1)
+    out["w29_lzw_p2_u16"] = p_w29_lzw_u16
+
+    p_w29_lzw_i16 = synth_dir / "w29_lzw_p2_i16.tif"
+    i16_w29 = ((xx9.astype(np.int32) - 64) * 200 + (yy9.astype(np.int32) - 64) * 100).astype(np.int16)
+    i16_w29[80:110, 60:100] = -32768  # interior nodata hole inside tile 10/164/396
+    with rasterio.open(
+        p_w29_lzw_i16, "w", driver="GTiff", width=128, height=128, count=1, dtype="int16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="LZW", predictor=2, nodata=-32768,
+    ) as ds:
+        ds.write(i16_w29, 1)
+    out["w29_lzw_p2_i16"] = p_w29_lzw_i16
+
+    p_w29_lzw_f32 = synth_dir / "w29_lzw_p3_f32.tif"
+    f32_w29 = ((xx9 - 64) * 1.375 + (yy9 - 64) * 0.625).astype(np.float32)
+    with rasterio.open(
+        p_w29_lzw_f32, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="LZW", predictor=3,
+    ) as ds:
+        ds.write(f32_w29, 1)
+    out["w29_lzw_p3_f32"] = p_w29_lzw_f32
+
+    p_w29_zstd_u16 = synth_dir / "w29_zstd_p2_u16.tif"
+    with rasterio.open(
+        p_w29_zstd_u16, "w", driver="GTiff", width=128, height=128, count=1, dtype="uint16",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+        compress="ZSTD", predictor=2,
+    ) as ds:
+        ds.write(u16_w29, 1)
+    out["w29_zstd_p2_u16"] = p_w29_zstd_u16
+
+    p_w29_jmsk = synth_dir / "w29_ycbcr_jpeg_mask.tif"
+    with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+        with rasterio.open(
+            p_w29_jmsk, "w", driver="GTiff", width=128, height=128, count=3, dtype="uint8",
+            crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64,
+            compress="JPEG", photometric="YCBCR", jpeg_quality=90,
+        ) as ds:
+            ds.write(np.stack([((xx9 * 2) % 256).astype(np.uint8), ((yy9 * 2) % 256).astype(np.uint8), ((xx9 + yy9) % 256).astype(np.uint8)]))
+            msk_j = np.full((128, 128), 255, dtype=np.uint8)
+            msk_j[80:110, 60:100] = 0
+            ds.write_mask(msk_j)
+    out["w29_ycbcr_jpeg_mask"] = p_w29_jmsk
+
+    p_w29_red = synth_dir / "w29_stac_red.tif"
+    p_w29_nir = synth_dir / "w29_stac_nir.tif"
+    with rasterio.open(
+        p_w29_red, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write((xx9.astype(np.float32) + 10.0), 1)
+    with rasterio.open(
+        p_w29_nir, "w", driver="GTiff", width=128, height=128, count=1, dtype="float32",
+        crs="EPSG:4326", transform=tf_w9, tiled=True, blockxsize=64, blockysize=64, compress="deflate",
+    ) as ds:
+        ds.write((yy9.astype(np.float32) * 2.0 + 20.0), 1)
+    p_w29_stac = synth_dir / "w29_stac_ab.json"
+    p_w29_stac.write_text(json.dumps({
+        "type": "Feature", "stac_version": "1.0.0", "id": "w29-ab",
+        "geometry": {"type": "Polygon", "coordinates": [[[-122.5, 37.5], [-122.0, 37.5], [-122.0, 38.0], [-122.5, 38.0], [-122.5, 37.5]]]},
+        "bbox": [-122.5, 37.5, -122.0, 38.0], "properties": {"datetime": "2024-06-01T00:00:00Z"}, "links": [],
+        "assets": {"red": {"href": str(p_w29_red)}, "nir": {"href": str(p_w29_nir)}},
+    }))
+    out["w29_stac_ab"] = p_w29_stac
+
     return out
 
 
@@ -3137,6 +3221,67 @@ def run_wave28_wms_and_mosaic_checks(
     return ran
 
 
+def run_wave29_http_protocol_checks(
+    client: httpx.Client,
+    cw_base: str,
+    s: dict[str, Path],
+    only_filter: str | None,
+    failures: list[dict],
+) -> int:
+    """Wave 29: HTTP ETag / If-None-Match 304 revalidation, HEAD empty body + ETag, and CORS OPTIONS preflight."""
+    ran = 0
+
+    def wanted(lb: str) -> bool:
+        return not only_filter or only_filter.lower() in lb.lower()
+
+    def rec(lb: str, ok: bool, detail: str, path: str, method: str = "GET") -> None:
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": lb, "method": method, "path": path, "kind": "w29_http", "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {lb:54s} | {detail}")
+
+    tile_p = f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w29_lzw_p2_u16'])}&rescale=0,60000&colormap_name=viridis"
+
+    lb = "W29 HTTP ETag + If-None-Match -> 304 Not Modified"
+    if wanted(lb):
+        r1 = client.get(cw_base + tile_p, headers={"Origin": "https://example.com"})
+        etag = r1.headers.get("etag")
+        if r1.status_code == 200 and etag:
+            r2 = client.get(cw_base + tile_p, headers={"If-None-Match": etag})
+            ok = r2.status_code == 304 and len(r2.content) == 0 and r2.headers.get("etag") == etag
+            rec(lb, ok, f"etag={etag!r} 304_st={r2.status_code} 304_len={len(r2.content)}", tile_p)
+        else:
+            rec(lb, False, f"GET st={r1.status_code} etag={etag!r}", tile_p)
+
+    lb = "W29 HTTP HEAD tile -> 200 empty body + matching ETag"
+    if wanted(lb):
+        rg = client.get(cw_base + tile_p)
+        rh = client.head(cw_base + tile_p)
+        ok = (
+            rg.status_code == 200
+            and rh.status_code == 200
+            and len(rh.content) == 0
+            and rh.headers.get("content-type") == "image/png"
+            and rh.headers.get("etag") is not None
+            and rh.headers.get("etag") == rg.headers.get("etag")
+        )
+        rec(lb, ok, f"st={rh.status_code} len={len(rh.content)} etag_match={rh.headers.get('etag') == rg.headers.get('etag')}", tile_p, "HEAD")
+
+    lb = "W29 HTTP OPTIONS CORS preflight -> 204 + ACAO/ACAM"
+    if wanted(lb):
+        ro = client.options(
+            cw_base + tile_p,
+            headers={"Origin": "https://example.com", "Access-Control-Request-Method": "GET"},
+        )
+        acao = ro.headers.get("access-control-allow-origin", "")
+        acam = ro.headers.get("access-control-allow-methods", "")
+        ok = ro.status_code == 204 and acao == "*" and "GET" in acam and "POST" in acam
+        rec(lb, ok, f"st={ro.status_code} acao={acao!r} acam={acam!r}", tile_p, "OPTIONS")
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -3659,6 +3804,16 @@ def main() -> int:
                 ("BETTER W27 POST /statistics LineString (cw exact, tt 10x low)", "POST", f"/cog/statistics?url={q(s['w23_f32_3b'])}&bidx=1", {"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-122.45, 37.55], [-122.25, 37.75], [-122.05, 37.95]]}, "properties": {}}, "better_linestring_stats"),
                 ("BETTER W27 POST /statistics MultiLineString (cw 204.8, tt 20.5)", "POST", f"/cog/statistics?url={q(s['w23_f32_3b'])}&bidx=1", {"type": "Feature", "geometry": {"type": "MultiLineString", "coordinates": [[[-122.45, 37.60], [-122.05, 37.60]], [[-122.45, 37.90], [-122.05, 37.90]]]}, "properties": {}}, "better_linestring_stats"),
                 ("PARITY W27 AUTO-FMT extensionless opaque -> JPEG", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396?url={q(s['w27_opaque_rgb'])}", None, "auto_jpeg"),
+                # --- Wave 29: Unprobed TIFF codecs/predictors & STAC asset_as_band=true named expressions ---
+                ("PARITY W29 CODEC Grayscale JPEG .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w29_gray_jpeg'])}", None, "png"),
+                ("PARITY W29 CODEC Grayscale JPEG /point", "GET", f"/cog/point/-122.25,37.75?url={q(s['w29_gray_jpeg'])}", None, "point"),
+                ("PARITY W29 CODEC LZW Predictor=2 uint16 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_lzw_p2_u16'])}", None, "npy"),
+                ("PARITY W29 CODEC LZW Predictor=2 int16+nodata .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_lzw_p2_i16'])}", None, "npy"),
+                ("PARITY W29 CODEC LZW Predictor=3 float32 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_lzw_p3_f32'])}", None, "npy"),
+                ("PARITY W29 CODEC ZSTD Predictor=2 uint16 .npy", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_zstd_p2_u16'])}", None, "npy"),
+                ("PARITY W29 CODEC YCbCr JPEG internal mask .png", "GET", f"/cog/tiles/WebMercatorQuad/10/164/396.png?url={q(s['w29_ycbcr_jpeg_mask'])}", None, "png"),
+                ("PARITY W29 STAC NDVI positional (b2-b1)/(b2+b1) .npy", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&expression={qe('(b2-b1)/(b2+b1)')}", None, "npy"),
+                ("BETTER W29 STAC asset_as_band=true named expr (cw 200, tt 400)", "GET", f"/stac/tiles/WebMercatorQuad/10/164/396.npy?url={q(s['w29_stac_ab'])}&assets=red&assets=nir&asset_as_band=true&expression={qe('(nir-red)/(nir+red)')}", None, "better_stac_asset_as_band"),
             ]
 
             # --- 6. INTENTIONALLY BETTER contracts (docs/titiler-divergences.md) ---
@@ -3964,6 +4119,16 @@ def main() -> int:
                                 and int(imc[128, 128, 1]) == 0
                             )
                             detail = f"cw_cov={cw_cov:.1f}% px[128,128]={imc[128,128,:3].tolist()} vs tt_cov={tt_cov:.2f}%"
+                    elif kind == "better_stac_asset_as_band":
+                        if r_cw.status_code != 200 or r_tt.status_code != 400:
+                            ok, detail = False, f"HTTP cw={r_cw.status_code} (exp 200) tt={r_tt.status_code} (exp 400)"
+                        else:
+                            ac = np.load(io.BytesIO(r_cw.content))
+                            vm = ac[1] > np.finfo(np.float32).min
+                            vmin = float(ac[0][vm].min()) if vm.any() else -999.0
+                            vmax = float(ac[0][vm].max()) if vm.any() else -999.0
+                            ok = ac.shape == (2, 256, 256) and ac.dtype == np.float32 and int(vm.sum()) > 10000 and 0.08 < vmin < 0.11 and 0.67 < vmax < 0.72
+                            detail = f"cw=200 shape={ac.shape} valid={int(vm.sum())} ndvi=[{vmin:.4f}..{vmax:.4f}] tt=400"
                     elif kind == "better_expr_nan_masked":
                         if r_cw.status_code != 200 or r_tt.status_code != 200:
                             ok, detail = False, f"HTTP cw={r_cw.status_code} tt={r_tt.status_code}"
@@ -4075,6 +4240,7 @@ def main() -> int:
                 w17_ran = run_wave17_zarr_deep_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
                 w26_ran = run_wave26_security_checks(client, cw_base, bin_path, tmp_dir, args.only, failures)
                 w28_ran = run_wave28_wms_and_mosaic_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+                w29_ran = run_wave29_http_protocol_checks(client, cw_base, s, args.only, failures)
                 w18_extra = 0
                 lb_wmts = "W18 WMTS Capabilities XML WebMercatorQuad"
                 if not args.only or args.only.lower() in lb_wmts.lower():
@@ -4091,7 +4257,7 @@ def main() -> int:
                         failures.append({"label": lb_wmts, "method": "GET", "path": wmts_path, "kind": "w18_wmts", "detail": det_w})
                     print(f"{'PASS' if ok_w else 'FAIL'} | {lb_wmts:54s} | {det_w}")
 
-            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w28_ran + w18_extra
+            total_checks = len(cases) + w7_ran + w8_ran + w14_ran + w15_ran + w17_ran + w26_ran + w28_ran + w29_ran + w18_extra
 
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
