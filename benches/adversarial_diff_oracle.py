@@ -29,10 +29,12 @@ import socket
 import subprocess
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+import mercantile
 import numpy as np
 from PIL import Image
 import rasterio
@@ -413,6 +415,432 @@ def start_cogzilla(bin_path: Path, port: int, cpu_only: bool) -> subprocess.Pope
     )
 
 
+def build_mosaic_fixtures(d: Path) -> dict:
+    """Build 1-band, 2-band, and 3-band RGB aligned COGs on exact z=12/657/1582 grid."""
+    d.mkdir(parents=True, exist_ok=True)
+    b = mercantile.xy_bounds(657, 1582, 12)
+    tf = from_bounds(b.left, b.bottom, b.right, b.top, 256, 256)
+
+    s1 = np.full((256, 256), 10.0, dtype=np.float32)
+    s2 = np.full((256, 256), 50.0, dtype=np.float32)
+    s3 = np.full((256, 256), 20.0, dtype=np.float32)
+    yy, xx = np.mgrid[0:256, 0:256].astype(np.float32)
+    s1 += xx * 0.1
+    s2 += yy * 0.2
+    s3 += (xx + yy) * 0.05
+
+    # Staggered nodata holes (-9999.0) covering overlap cardinalities 0, 1, 2, 3:
+    s1[0:64, 0:128] = -9999.0
+    s2[0:64, 0:64] = -9999.0
+    s2[64:128, 0:64] = -9999.0
+    s3[0:64, 0:128] = -9999.0
+
+    paths_1b = []
+    for idx, arr in enumerate((s1, s2, s3), 1):
+        p = d / f"scene_{idx}_1b.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=256, height=256, count=1, dtype="float32", crs="EPSG:3857", transform=tf, tiled=True, blockxsize=256, blockysize=256, compress="deflate", nodata=-9999.0) as ds:
+            ds.write(arr[None, ...])
+        paths_1b.append(str(p.resolve()))
+
+    scores = [30.0, 10.0, 20.0]
+    vals = [100.0, 200.0, 300.0]
+    paths_2b, s2b_data, s2b_score = [], [], []
+    for idx, (val, sc, mask_src) in enumerate(zip(vals, scores, (s1, s2, s3)), 1):
+        b1 = np.where(mask_src == -9999.0, -9999.0, val + xx * 0.01).astype(np.float32)
+        b2 = np.where(mask_src == -9999.0, -9999.0, sc + yy * 0.01).astype(np.float32)
+        p = d / f"scene_{idx}_2b.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=256, height=256, count=2, dtype="float32", crs="EPSG:3857", transform=tf, tiled=True, blockxsize=256, blockysize=256, compress="deflate", nodata=-9999.0) as ds:
+            ds.write(np.stack([b1, b2], axis=0))
+        paths_2b.append(str(p.resolve()))
+        s2b_data.append(np.where(b1 == -9999.0, np.nan, b1))
+        s2b_score.append(np.where(b2 == -9999.0, np.nan, b2))
+
+    paths_rgb, rgb_scenes = [], []
+    rgb_bases = [(40, 120, 200), (180, 60, 100), (100, 220, 50)]
+    for idx, ((r0, g0, b0), mask_src) in enumerate(zip(rgb_bases, (s1, s2, s3)), 1):
+        r = np.where(mask_src == -9999.0, 0, np.clip(r0 + (xx // 8).astype(np.int32), 1, 255)).astype(np.uint8)
+        g = np.where(mask_src == -9999.0, 0, np.clip(g0 + (yy // 8).astype(np.int32), 1, 255)).astype(np.uint8)
+        bl = np.where(mask_src == -9999.0, 0, np.clip(b0 + ((xx + yy) // 16).astype(np.int32), 1, 255)).astype(np.uint8)
+        arr3 = np.stack([r, g, bl], axis=0)
+        p = d / f"scene_{idx}_rgb.tif"
+        with rasterio.open(p, "w", driver="GTiff", width=256, height=256, count=3, dtype="uint8", crs="EPSG:3857", transform=tf, tiled=True, blockxsize=256, blockysize=256, compress="deflate", nodata=0) as ds:
+            ds.write(arr3)
+        paths_rgb.append(str(p.resolve()))
+        rgb_scenes.append(np.where(arr3 == 0, np.nan, arr3.astype(np.float64)))
+
+    qk = mercantile.quadkey(657, 1582, 12)
+    lonlat = mercantile.bounds(657, 1582, 12)
+    bounds_wgs = [lonlat.west, lonlat.south, lonlat.east, lonlat.north]
+
+    mj_1b = d / "mosaic_1b.json"
+    mj_1b.write_text(json.dumps({"mosaicjson": "0.0.2", "name": "test-1b", "minzoom": 12, "maxzoom": 12, "quadkey_zoom": 12, "bounds": bounds_wgs, "tiles": {qk: paths_1b}}))
+    mj_2b = d / "mosaic_2b.json"
+    mj_2b.write_text(json.dumps({"mosaicjson": "0.0.2", "name": "test-2b", "minzoom": 12, "maxzoom": 12, "quadkey_zoom": 12, "bounds": bounds_wgs, "tiles": {qk: paths_2b}}))
+    mj_rgb = d / "mosaic_rgb.json"
+    mj_rgb.write_text(json.dumps({"mosaicjson": "0.0.2", "name": "test-rgb", "minzoom": 12, "maxzoom": 12, "quadkey_zoom": 12, "bounds": bounds_wgs, "tiles": {qk: paths_rgb}}))
+
+    stack = np.stack([np.where(a == -9999.0, np.nan, a) for a in (s1, s2, s3)], axis=0)
+    valid_cnt = np.isfinite(stack).sum(axis=0)
+    rgb_stack = np.stack(rgb_scenes, axis=0)
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        gt: dict[str, np.ndarray] = {}
+        gt["first"] = np.where(np.isfinite(stack[0]), stack[0], np.where(np.isfinite(stack[1]), stack[1], stack[2]))
+        gt["highest"] = np.nanmax(stack, axis=0)
+        gt["lowest"] = np.nanmin(stack, axis=0)
+        gt["mean"] = np.nanmean(stack, axis=0)
+        gt["median"] = np.nanmedian(stack, axis=0)
+        gt["stdev"] = np.nanstd(stack, axis=0, ddof=0)
+        gt["count"] = valid_cnt.astype(np.float32)
+
+        d_stack = np.stack(s2b_data, axis=0)
+        sc_stack = np.stack(s2b_score, axis=0)
+        idx_low = np.argmin(np.where(np.isfinite(sc_stack), sc_stack, np.inf), axis=0)
+        gt["lastbandlow"] = np.where(valid_cnt > 0, np.take_along_axis(d_stack, idx_low[None], axis=0)[0], np.nan)
+        idx_high = np.argmax(np.where(np.isfinite(sc_stack), sc_stack, -np.inf), axis=0)
+        gt["lastbandhigh"] = np.where(valid_cnt > 0, np.take_along_axis(d_stack, idx_high[None], axis=0)[0], np.nan)
+
+        gt_rgb: dict[str, np.ndarray] = {}
+        gt_rgb["first"] = np.where(np.isfinite(rgb_stack[0]), rgb_stack[0], np.where(np.isfinite(rgb_stack[1]), rgb_stack[1], rgb_stack[2]))
+        gt_rgb["highest"] = np.nanmax(rgb_stack, axis=0)
+        gt_rgb["lowest"] = np.nanmin(rgb_stack, axis=0)
+        gt_rgb["mean"] = np.nanmean(rgb_stack, axis=0)
+        gt_rgb["median"] = np.nanmedian(rgb_stack, axis=0)
+        gt_rgb["stdev"] = np.nanstd(rgb_stack, axis=0, ddof=0)
+
+    return {"mj_1b": mj_1b, "mj_2b": mj_2b, "mj_rgb": mj_rgb, "gt": gt, "gt_rgb": gt_rgb, "bounds_wgs": bounds_wgs, "xy_bounds": b, "s1": s1, "s2": s2, "s3": s3}
+
+
+def run_wave7_checks(
+    client: httpx.Client,
+    cw_base: str,
+    gpu_base: str | None,
+    tmp_dir: Path,
+    only_substr: str | None,
+    failures: list[dict],
+    gpu_diffs: list[dict],
+) -> int:
+    """Wave 7: MosaicJSON (all 9 pixel_selection methods, 3-band RGB, expr, bbox, point, POST stats) + HTTP protocol contracts."""
+    def wants(label: str) -> bool:
+        return not only_substr or only_substr.lower() in label.lower()
+
+    all_labels = [
+        *[f"W7 MOSAIC {m} .npy" for m in ("first", "highest", "lowest", "mean", "median", "stdev", "count", "lastbandlow", "lastbandhigh")],
+        *[f"W7 MOSAIC {m} .png" for m in ("first", "highest", "lowest", "mean", "median", "stdev", "count", "lastbandlow", "lastbandhigh")],
+        *[f"W7 MOSAIC RGB {m} .npy" for m in ("first", "highest", "lowest", "mean", "median", "stdev")],
+        *[f"W7 MOSAIC expr+{m} .npy" for m in ("first", "mean", "highest")],
+        "W7 MOSAIC /point multi-asset",
+        *[f"W7 MOSAIC /bbox {m}" for m in ("first", "mean", "highest")],
+        *[f"W7 MOSAIC POST /statistics {m}" for m in ("first", "mean", "highest")],
+        "W7 HTTP ETag + If-None-Match -> 304",
+        "W7 HTTP If-None-Match:* -> 304",
+        "W7 HTTP HEAD tile -> 200 empty",
+        "W7 HTTP OPTIONS -> 204",
+        "W7 HTTP trailing slash /cog/info/ -> 200",
+        "W7 HTTP X-Forwarded-{Proto,Host,Prefix}",
+        "W7 HTTP Vary: Accept on /colorMaps",
+    ]
+    if not any(wants(lb) for lb in all_labels):
+        return 0
+
+    fx = build_mosaic_fixtures(tmp_dir / "wave7_mosaic")
+    mj_1b, mj_2b, mj_rgb = fx["mj_1b"], fx["mj_2b"], fx["mj_rgb"]
+    gt, gt_rgb, xb = fx["gt"], fx["gt_rgb"], fx["xy_bounds"]
+    sat = FIXTURES / "satellite_utm10n_rgb_zstd_p3.tif"
+    merc = FIXTURES / "mercator_4k_zstd_p3.tif"
+
+    ran = 0
+
+    def record(label: str, path: str, kind: str, ok: bool, detail: str, method: str = "GET"):
+        nonlocal ran
+        ran += 1
+        if not ok:
+            failures.append({"label": label, "method": method, "path": path, "kind": kind, "detail": detail})
+        print(f"{'PASS' if ok else 'FAIL'} | {label:54s} | {detail}")
+
+    # 1. All 9 pixel_selection methods on 1-band (or 2-band for lastband*) .npy + .png
+    for method in ("first", "highest", "lowest", "mean", "median", "stdev", "count", "lastbandlow", "lastbandhigh"):
+        mj = mj_2b if method in ("lastbandlow", "lastbandhigh") else mj_1b
+        lb_npy = f"W7 MOSAIC {method} .npy"
+        if wants(lb_npy):
+            path = f"/mosaicjson/tiles/WebMercatorQuad/12/657/1582.npy?url={q(mj)}&pixel_selection={method}"
+            rc = client.get(cw_base + path)
+            if gpu_base is not None:
+                rg = client.get(gpu_base + path)
+                if rc.status_code != rg.status_code:
+                    gpu_diffs.append({"label": lb_npy, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+                elif rc.status_code == 200:
+                    gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                    if not gok:
+                        gpu_diffs.append({"label": lb_npy, "detail": gd})
+            if rc.status_code != 200:
+                record(lb_npy, path, "mosaic_gt", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+            else:
+                arr = np.load(io.BytesIO(rc.content))
+                low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+                mask = arr[-1] > low
+                exp = gt[method]
+                shape_ok = arr.shape == (2, 256, 256)
+                if method == "count":
+                    max_err = float(np.max(np.abs(arr[0].astype(np.float64) - exp.astype(np.float64))))
+                    all_valid = bool(mask.all())
+                    record(lb_npy, path, "mosaic_gt", shape_ok and all_valid and max_err < 1e-4, f"shape={arr.shape} dtype={arr.dtype} all_valid={all_valid} max_err={max_err:.6f}")
+                else:
+                    exp_mask = np.isfinite(exp)
+                    mask_eq = float((mask == exp_mask).mean()) * 100.0
+                    both = mask & exp_mask
+                    max_err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp[both].astype(np.float64)))) if both.any() else 0.0
+                    record(lb_npy, path, "mosaic_gt", shape_ok and mask_eq == 100.0 and max_err < 1e-2, f"shape={arr.shape} dtype={arr.dtype} mask_eq={mask_eq:.1f}% max_err={max_err:.5f}")
+
+        lb_png = f"W7 MOSAIC {method} .png"
+        if wants(lb_png):
+            path = f"/mosaicjson/tiles/WebMercatorQuad/12/657/1582.png?url={q(mj)}&pixel_selection={method}&rescale=0,300&colormap_name=viridis"
+            rc = client.get(cw_base + path)
+            if rc.status_code != 200:
+                record(lb_png, path, "mosaic_png", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+            else:
+                try:
+                    rgba = np.array(Image.open(io.BytesIO(rc.content)).convert("RGBA"))
+                except Exception as exc:
+                    record(lb_png, path, "mosaic_png", False, f"invalid PNG: {exc}")
+                    continue
+                alpha = rgba[..., 3]
+                if method == "count":
+                    alpha_ok = bool((alpha == 255).all())
+                    valid_rgb = rgba[..., :3]
+                else:
+                    exp_mask = np.isfinite(gt[method])
+                    alpha_ok = bool(((alpha > 0) == exp_mask).all())
+                    valid_rgb = rgba[exp_mask, :3]
+                rgb_std = float(valid_rgb.std()) if valid_rgb.size else 0.0
+                ok = rgba.shape == (256, 256, 4) and alpha_ok and rgb_std > 0.5
+                detail = f"shape={rgba.shape} alpha_ok={alpha_ok} rgb_std={rgb_std:.1f}"
+                if gpu_base is not None:
+                    rg = client.get(gpu_base + path)
+                    if rg.status_code != 200:
+                        gpu_diffs.append({"label": lb_png, "detail": f"status cpu=200 gpu={rg.status_code}"})
+                    else:
+                        iok, idet = compare_images(rc.content, rg.content)
+                        if not iok:
+                            gpu_diffs.append({"label": lb_png, "detail": idet})
+                        detail = f"{detail} | CPU==GPU {idet}"
+                record(lb_png, path, "mosaic_png", ok, detail)
+
+    # 2. 3-band RGB mosaic with pixel_selection
+    for method in ("first", "highest", "lowest", "mean", "median", "stdev"):
+        lb = f"W7 MOSAIC RGB {method} .npy"
+        if not wants(lb):
+            continue
+        path = f"/mosaicjson/tiles/WebMercatorQuad/12/657/1582.npy?url={q(mj_rgb)}&pixel_selection={method}"
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": lb, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                if not gok:
+                    gpu_diffs.append({"label": lb, "detail": gd})
+        if rc.status_code != 200:
+            record(lb, path, "mosaic_gt", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+        else:
+            arr = np.load(io.BytesIO(rc.content))
+            low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+            mask = arr[-1] > low
+            exp = gt_rgb[method]
+            exp_mask = np.isfinite(exp[0])
+            mask_eq = float((mask == exp_mask).mean()) * 100.0
+            both = mask & exp_mask
+            shape_ok = arr.shape == (4, 256, 256)
+            if arr.dtype == np.uint8:
+                # Integer mean/median truncates toward zero in cogzilla; first/highest/lowest are exact.
+                ref = np.trunc(exp) if method in ("mean", "median") else exp
+                max_err = max(float(np.max(np.abs(arr[bi][both].astype(np.float64) - ref[bi][both]))) for bi in range(3)) if both.any() else 0.0
+                tol = 0.0
+            else:
+                max_err = max(float(np.max(np.abs(arr[bi][both].astype(np.float64) - exp[bi][both]))) for bi in range(3)) if both.any() else 0.0
+                tol = 1e-2
+            record(lb, path, "mosaic_gt", shape_ok and mask_eq == 100.0 and max_err <= tol, f"shape={arr.shape} dtype={arr.dtype} mask_eq={mask_eq:.1f}% max_err={max_err:.4f}")
+
+    # 3. MosaicJSON expression + pixel_selection
+    for method in ("first", "mean", "highest"):
+        lb = f"W7 MOSAIC expr+{method} .npy"
+        if not wants(lb):
+            continue
+        path = f"/mosaicjson/tiles/WebMercatorQuad/12/657/1582.npy?url={q(mj_1b)}&pixel_selection={method}&expression={qe('b1*2.0+5.0')}"
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": lb, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                if not gok:
+                    gpu_diffs.append({"label": lb, "detail": gd})
+        if rc.status_code != 200:
+            record(lb, path, "mosaic_gt", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+        else:
+            arr = np.load(io.BytesIO(rc.content))
+            low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+            mask = arr[-1] > low
+            exp = gt[method] * 2.0 + 5.0
+            exp_mask = np.isfinite(exp)
+            both = mask & exp_mask
+            mask_eq = float((mask == exp_mask).mean()) * 100.0
+            max_err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp[both]))) if both.any() else 0.0
+            record(lb, path, "mosaic_gt", arr.shape == (2, 256, 256) and mask_eq == 100.0 and max_err < 1e-2, f"shape={arr.shape} dtype={arr.dtype} mask_eq={mask_eq:.1f}% max_err={max_err:.5f}")
+
+    # 4. MosaicJSON /point (multi-asset response at exact EPSG:3857 pixel center [row=128, col=128])
+    dx = (xb.right - xb.left) / 256.0
+    dy = (xb.top - xb.bottom) / 256.0
+    pt_ll = mercantile.lnglat(xb.left + 128.5 * dx, xb.top - 128.5 * dy)
+    lb_pt = "W7 MOSAIC /point multi-asset"
+    if wants(lb_pt):
+        path = f"/mosaicjson/point/{pt_ll.lng:.8f},{pt_ll.lat:.8f}?url={q(mj_1b)}"
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code or (rc.status_code == 200 and first_json_diff(rc.json(), rg.json()) is not None):
+                gpu_diffs.append({"label": lb_pt, "detail": f"cpu={rc.text[:80]} gpu={rg.text[:80]}"})
+        if rc.status_code != 200:
+            record(lb_pt, path, "mosaic_point", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+        else:
+            assets = rc.json().get("assets", [])
+            got_vals = [a["values"][0] for a in assets]
+            exp_vals = [float(fx["s1"][128, 128]), float(fx["s2"][128, 128]), float(fx["s3"][128, 128])]
+            ok = len(got_vals) == 3 and all(abs(g - e) < 1e-3 for g, e in zip(got_vals, exp_vals))
+            record(lb_pt, path, "mosaic_point", ok, f"got={[round(v, 4) for v in got_vals]} exp={[round(v, 4) for v in exp_vals]}")
+
+    # 5. MosaicJSON /bbox
+    bbox_s = f"{xb.left:.4f},{xb.bottom:.4f},{xb.right:.4f},{xb.top:.4f}"
+    for method in ("first", "mean", "highest"):
+        lb = f"W7 MOSAIC /bbox {method}"
+        if not wants(lb):
+            continue
+        path = f"/mosaicjson/bbox/{bbox_s}/256x256.npy?url={q(mj_1b)}&coord_crs=EPSG:3857&dst_crs=EPSG:3857&pixel_selection={method}"
+        rc = client.get(cw_base + path)
+        if gpu_base is not None:
+            rg = client.get(gpu_base + path)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": lb, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                gok, gd = compare_npy(rc.content, rg.content, check_values=True)
+                if not gok:
+                    gpu_diffs.append({"label": lb, "detail": gd})
+        if rc.status_code != 200:
+            record(lb, path, "mosaic_gt", False, f"HTTP {rc.status_code} {rc.text[:100]!r}")
+        else:
+            arr = np.load(io.BytesIO(rc.content))
+            low = np.finfo(arr.dtype).min if arr.dtype.kind == "f" else np.iinfo(arr.dtype).min
+            mask = arr[-1] > low
+            exp = gt[method]
+            exp_mask = np.isfinite(exp)
+            both = mask & exp_mask
+            mask_eq = float((mask == exp_mask).mean()) * 100.0
+            max_err = float(np.max(np.abs(arr[0][both].astype(np.float64) - exp[both]))) if both.any() else 0.0
+            record(lb, path, "mosaic_gt", arr.shape == (2, 256, 256) and mask_eq == 100.0 and max_err < 1e-2, f"shape={arr.shape} mask_eq={mask_eq:.1f}% max_err={max_err:.5f}")
+
+    # 6. MosaicJSON POST /statistics over west half [0:256, 0:128] covering overlap cardinalities 0, 1, 2, and 3!
+    mid_x = 0.5 * (xb.left + xb.right)
+    sw = mercantile.lnglat(xb.left, xb.bottom)
+    se_mid = mercantile.lnglat(mid_x, xb.bottom)
+    ne_mid = mercantile.lnglat(mid_x, xb.top)
+    nw = mercantile.lnglat(xb.left, xb.top)
+    poly_west = {
+        "type": "Feature",
+        "properties": {},
+        "geometry": {"type": "Polygon", "coordinates": [[[sw.lng, sw.lat], [se_mid.lng, se_mid.lat], [ne_mid.lng, ne_mid.lat], [nw.lng, nw.lat], [sw.lng, sw.lat]]]},
+    }
+    for method in ("first", "mean", "highest"):
+        lb = f"W7 MOSAIC POST /statistics {method}"
+        if not wants(lb):
+            continue
+        path = f"/mosaicjson/statistics?url={q(mj_1b)}&pixel_selection={method}"
+        rc = client.post(cw_base + path, json=poly_west)
+        if gpu_base is not None:
+            rg = client.post(gpu_base + path, json=poly_west)
+            if rc.status_code != rg.status_code:
+                gpu_diffs.append({"label": lb, "detail": f"status cpu={rc.status_code} gpu={rg.status_code}"})
+            elif rc.status_code == 200:
+                jd = first_json_diff(rc.json(), rg.json())
+                if jd is not None:
+                    gpu_diffs.append({"label": lb, "detail": f"CPU vs GPU stats diff: {jd}"})
+        if rc.status_code != 200:
+            record(lb, path, "mosaic_stats", False, f"HTTP {rc.status_code} {rc.text[:100]!r}", method="POST")
+        else:
+            st = rc.json()["properties"]["statistics"]["b1"]
+            sub = gt[method][:, 0:128]
+            valid_sub = sub[np.isfinite(sub)]
+            exp_mean = float(valid_sub.mean())
+            exp_min = float(valid_sub.min())
+            exp_max = float(valid_sub.max())
+            exp_count = float(valid_sub.size)
+            mean_err = abs(st["mean"] - exp_mean)
+            min_err = abs(st["min"] - exp_min)
+            max_err = abs(st["max"] - exp_max)
+            cnt_rel = abs(st["count"] - exp_count) / exp_count
+            ok = mean_err < 0.1 and min_err < 0.2 and max_err < 0.2 and cnt_rel < 0.02
+            record(lb, path, "mosaic_stats", ok, f"mean={st['mean']:.3f}/{exp_mean:.3f} min={st['min']:.2f}/{exp_min:.2f} max={st['max']:.2f}/{exp_max:.2f} cnt={st['count']:.0f}/{exp_count:.0f}", method="POST")
+
+    # 7. HTTP protocol contracts (ETag/304, HEAD, OPTIONS, trailing slash, X-Forwarded-*, Vary: Accept)
+    tile_u = f"/cog/tiles/WebMercatorQuad/12/657/1582.png?url={q(merc)}&rescale=0,1000&colormap_name=viridis"
+    etag: str | None = None
+    if wants("W7 HTTP ETag + If-None-Match -> 304"):
+        etag = client.get(cw_base + tile_u).headers.get("etag")
+
+    def check_x_forwarded() -> tuple[bool, str]:
+        r = client.get(
+            cw_base + f"/cog/WebMercatorQuad/tilejson.json?url={q(sat)}",
+            headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "tiles.example.com", "X-Forwarded-Prefix": "/v1"},
+        )
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code} {r.text[:80]!r}"
+        tiles = r.json().get("tiles") or []
+        tile0 = tiles[0] if tiles else ""
+        return tile0.startswith("https://tiles.example.com/v1/"), f"tile0={tile0[:60]}"
+
+    proto_specs = [
+        ("W7 HTTP ETag + If-None-Match -> 304", "GET", tile_u, lambda: (
+            (r := client.get(cw_base + tile_u, headers={"If-None-Match": etag or ""})),
+            bool(etag) and r.status_code == 304 and len(r.content) == 0 and r.headers.get("etag") == etag,
+            f"etag={etag} status={r.status_code}",
+        )[1:]),
+        ("W7 HTTP If-None-Match:* -> 304", "GET", tile_u, lambda: (
+            (r := client.get(cw_base + tile_u, headers={"If-None-Match": "*"})),
+            r.status_code == 304 and len(r.content) == 0,
+            f"status={r.status_code}",
+        )[1:]),
+        ("W7 HTTP HEAD tile -> 200 empty", "HEAD", tile_u, lambda: (
+            (r := client.head(cw_base + tile_u)),
+            r.status_code == 200 and len(r.content) == 0,
+            f"status={r.status_code} len={len(r.content)}",
+        )[1:]),
+        ("W7 HTTP OPTIONS -> 204", "OPTIONS", f"/cog/info?url={q(sat)}", lambda: (
+            (r := client.options(cw_base + f"/cog/info?url={q(sat)}")),
+            r.status_code == 204,
+            f"status={r.status_code}",
+        )[1:]),
+        ("W7 HTTP trailing slash /cog/info/ -> 200", "GET", f"/cog/info/?url={q(sat)}", lambda: (
+            (r := client.get(cw_base + f"/cog/info/?url={q(sat)}")),
+            r.status_code == 200,
+            f"status={r.status_code}",
+        )[1:]),
+        ("W7 HTTP X-Forwarded-{Proto,Host,Prefix}", "GET", f"/cog/WebMercatorQuad/tilejson.json?url={q(sat)}", check_x_forwarded),
+        ("W7 HTTP Vary: Accept on /colorMaps", "GET", "/colorMaps", lambda: (
+            (r := client.get(cw_base + "/colorMaps")),
+            r.status_code == 200 and "accept" in r.headers.get("vary", "").lower(),
+            f"status={r.status_code} vary={r.headers.get('vary')!r}",
+        )[1:]),
+    ]
+    for lb, http_method, path, fn in proto_specs:
+        if not wants(lb):
+            continue
+        ok, det = fn()
+        record(lb, path, "http_proto", ok, det, method=http_method)
+
+    return ran
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Adversarial differential oracle proving cogzilla is equal or intentionally better than TiTiler 2.4.1.")
     parser.add_argument("--cpu-only", action="store_true", help="Run cogzilla with COGZILLA_GPU_POLICY=never")
@@ -673,7 +1101,7 @@ def main() -> int:
                 cases = [c for c in cases if args.only.lower() in c[0].lower()]
 
             mode_str = "CPU-ONLY" if primary_cpu_only else "DEFAULT"
-            print(f"\n=== Adversarial Differential Oracle ({mode_str}): {len(cases)} checks ===")
+            print(f"\n=== Adversarial Differential Oracle ({mode_str}): {len(cases)} TiTiler-diff checks + Wave 7 Mosaic/HTTP checks ===")
             failures = []
             gpu_diffs = []
             with httpx.Client(timeout=30.0) as client:
@@ -825,6 +1253,10 @@ def main() -> int:
                         failures.append({"label": label, "method": method, "path": path, "kind": kind, "detail": detail})
                     print(f"{tag} | {label:54s} | {detail}")
 
+                w7_ran = run_wave7_checks(client, cw_base, gpu_base, tmp_dir, args.only, failures, gpu_diffs)
+
+            total_checks = len(cases) + w7_ran
+
             if gpu_diffs:
                 print("\nCPU-vs-GPU differences:")
                 for gd in gpu_diffs:
@@ -833,12 +1265,12 @@ def main() -> int:
             if args.json_out:
                 Path(args.json_out).write_text(json.dumps({
                     "mode": mode_str,
-                    "total": len(cases),
+                    "total": total_checks,
                     "failed": len(failures),
                     "gpu_diffs": gpu_diffs,
                     "failures": failures,
                 }, indent=2))
-            print(f"\nSummary ({mode_str}): {len(cases) - len(failures)}/{len(cases)} passed, {len(failures)} failed" + (f", {len(gpu_diffs)} CPU-vs-GPU diffs" if args.check_cpu_vs_gpu else ""))
+            print(f"\nSummary ({mode_str}): {total_checks - len(failures)}/{total_checks} passed, {len(failures)} failed" + (f", {len(gpu_diffs)} CPU-vs-GPU diffs" if args.check_cpu_vs_gpu else ""))
             return 1 if (failures or gpu_diffs) else 0
         finally:
             for p in procs:
